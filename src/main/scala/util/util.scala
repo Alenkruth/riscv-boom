@@ -23,6 +23,9 @@ import freechips.rocketchip.tile.{TileKey}
 import boom.common.{MicroOp}
 import boom.exu.{BrUpdateInfo}
 
+// test imports
+import boom.common._
+
 /**
  * Object to XOR fold a input register of fullLength into a compressedLength.
  */
@@ -531,6 +534,56 @@ class BranchKillableQueue[T <: boom.common.HasBoomUOP](gen: T, entries: Int, flu
                         entries.asUInt, 0.U),
                     Mux(deq_ptr.value > enq_ptr.value,
                         entries.asUInt + ptr_diff, ptr_diff))
+  }
+}
+
+// objects used for CoreFuzzing
+
+/* commented the object out because it does not synthesize. Not sure if that is 
+ * how it is
+ */
+
+/*object AddressPrivilegeTagSet extends boom.common.constants.CoreFuzzingConstants
+{
+  //Object to check the current PC and then set the privilege bit.
+  def apply(pc: UInt): UInt = {
+    val ret = Wire(UInt(IFT_BITS.W))
+    //val start = Reg(UInt(48.W))
+    //val end = Reg(UInt(48.W))
+    //start := IFT_PROTECTED_START
+    //end := IFT_PROTECTED_END
+    ret := 0.U(IFT_BITS.W)
+    printf("\nObject PC is 0x%x\n", pc)
+    // when ((pc >= 0x080001060.S(48.W).asUInt) && (pc <= 0x080001080.S(48.W).asUInt)) {
+    // when ((pc >= start) && (pc <= end)){
+    when ((pc >= IFT_PROTECTED_START.S(48.W).asUInt) && (pc <= IFT_PROTECTED_END.S(48.W).asUInt)) {
+      ret := 1.U(IFT_BITS.W)
+      printf("\n Inside the when\n")
+    }
+    ret
+  }
+}*/
+
+// module to check the address range and return true or false to set the bit.
+// This module can be extended to check the privilege level and whatever we 
+// care about.
+
+class AddressChecker (implicit p: org.chipsalliance.cde.config.Parameters)
+  extends BoomModule()(p) 
+  with boom.common.constants.CoreFuzzingConstants
+{
+  val io = IO(new Bundle{
+      val in  = Input(UInt(coreMaxAddrBits.W))
+      val out = Output(UInt(IFT_BITS.W))
+  })
+
+  // printf("\nObject PC is 0x%x\n", io.in)
+  
+  when ((io.in >= IFT_PROTECTED_START.U(coreMaxAddrBits.W)) && (io.in <= IFT_PROTECTED_END.U(coreMaxAddrBits.W))) {
+      io.out := 1.U(IFT_BITS.W)
+      // printf("\n Inside the when\n")
+  } .otherwise {
+      io.out := 0.U(IFT_BITS.W)
   }
 }
 

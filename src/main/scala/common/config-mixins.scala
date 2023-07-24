@@ -126,6 +126,58 @@ class WithNSmallBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends 
 )
 
 /**
+ * 1-wide BOOM with gshare (ak).
+ *
+ */
+
+class WithNSmallGShareBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends Config(
+  new WithBoom2BPD ++ // gshare BPD
+  new Config((site, here, up) => {
+    case TilesLocated(InSubsystem) => {
+      val prev = up(TilesLocated(InSubsystem), site)
+      val idOffset = overrideIdOffset.getOrElse(prev.size)
+      (0 until n).map { i =>
+        BoomTileAttachParams(
+          tileParams = BoomTileParams(
+            core = BoomCoreParams(
+              fetchWidth = 4,
+              decodeWidth = 1,
+              numRobEntries = 32,
+              issueParams = Seq(
+                IssueParams(issueWidth=1, numEntries=8, iqType=IQT_MEM.litValue, dispatchWidth=1),
+                IssueParams(issueWidth=1, numEntries=8, iqType=IQT_INT.litValue, dispatchWidth=1),
+                IssueParams(issueWidth=1, numEntries=8, iqType=IQT_FP.litValue , dispatchWidth=1)),
+              numIntPhysRegisters = 52,
+              numFpPhysRegisters = 48,
+              numLdqEntries = 8,
+              numStqEntries = 8,
+              maxBrCount = 8,
+              numFetchBufferEntries = 8,
+              ftq = FtqParameters(nEntries=16),
+              // nPerfCounters = 2, // small-boom
+              // small-boom with all performance counters
+              nPerfCounters = 29,
+              fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true))
+            ),
+            dcache = Some(
+              DCacheParams(rowBits = 64, nSets=64, nWays=4, nMSHRs=2, nTLBWays=8)
+            ),
+            icache = Some(
+              ICacheParams(rowBits = 64, nSets=64, nWays=4, fetchBytes=2*4)
+            ),
+            hartId = i + idOffset
+          ),
+          crossingParams = RocketCrossingParams()
+        )
+      } ++ prev
+    }
+    case SystemBusKey => up(SystemBusKey, site).copy(beatBytes = 8)
+    case XLen => 64
+  })
+)
+
+
+/**
  * 2-wide BOOM.
  */
 class WithNMediumBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends Config(
@@ -288,7 +340,7 @@ class WithNGigaBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends C
               numLdqEntries = 32,
               numStqEntries = 32,
               maxBrCount = 20,
-              numFetchBufferEntries = 32,
+              numFetchBufferEntries = 40, // keep this as a multiple of 5 to avoid issues.
               enablePrefetching = true,
               numDCacheBanks = 1,
               ftq = FtqParameters(nEntries=40),
