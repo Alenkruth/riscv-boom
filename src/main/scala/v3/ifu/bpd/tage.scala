@@ -188,6 +188,7 @@ case class BoomTageParams(
   tableInfo: Seq[Tuple3[Int, Int, Int]] = Seq((  128,       2,     7),
                                               (  128,       4,     7),
                                               (  256,       8,     8),
+                                              (  256,      16,     7), // for the fuzzy core - AK
                                               (  256,      16,     8),
                                               (  128,      32,     9),
                                               (  128,      64,     9)),
@@ -250,6 +251,11 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
   s1_update_alloc   := DontCare
   s1_update_u       := DontCare
 
+  // added for the fuzzycore project - AK
+  // Create a val that will be written with the reconfigure signal from io
+  val reconfigure_bpd = Wire(Bool())
+
+  reconfigure_bpd := io.reconfigure_bpd
 
   for (w <- 0 until bankWidth) {
     var altpred = io.resp_in(0).f3(w).taken
@@ -261,7 +267,26 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
     for (i <- 0 until tageNTables) {
       val hit = f3_resps(i)(w).valid
       val ctr = f3_resps(i)(w).bits.ctr
-      when (hit) {
+
+      // We use bank three of the TAGE predictor to emulate the behavior of a GShare predictor.
+      // Addition for the fuzzycore project - AK
+      // use_bank will be false only when reconfigure_bpd is true and i !== 0.
+      val bank_id = Wire(UInt(3.W))
+      // val temp_bank0 = Wire(Bool())
+      val use_bank3 = Wire(Bool())
+      bank_id := i.asUInt
+      use_bank3 := !(reconfigure_bpd ^ bank_id === 3.U(3.W))
+      // temp_bank0 := bank_id ===  0.U(3.W)
+      // printf(s"\nuse_bank is $use_bank3 = %c\n", use_bank3)
+      // use_bank0 := !reconfigure_bpd || temp_bank0
+      // printf("\nbank_id = %x || use_bank0 = %b || reconfigure_bpd = %b || hit = %b || condition = %b \n", bank_id, use_bank3, reconfigure_bpd, hit && !(reconfigure_bpd ^ bank_id === 3.U), !(reconfigure_bpd ^ bank_id === 3.U))
+      //when (reconfigure_bpd) {
+      //  printf("Baby Yoda!!")
+      // }
+      // printf("\nBank_id = %d | reconfigure_bpd = %b | prediction from bank? = %b \n", bank_id, reconfigure_bpd, hit && use_bank3)
+      when (hit && use_bank3) {
+        // printf("\nHit in tage bank %d\n", bank_id)
+        // printf("\n reconfigure_bpd = %b\n", reconfigure_bpd)
         io.resp.f3(w).taken := Mux(ctr === 3.U || ctr === 4.U, altpred, ctr(2))
         final_altpred       := altpred
       }

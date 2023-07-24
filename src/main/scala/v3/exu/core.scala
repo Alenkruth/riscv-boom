@@ -278,6 +278,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   (custom_csrs.csrs zip csr.io.customCSRs).map { case (lhs, rhs) => lhs <> rhs }
 
+  // for the fuzzycore project - AK
+  // Assigning the CSR's output to the reconfigure_bpd signal in the frontend.
+  //
+  io.ifu.reconfigure_bpd := custom_csrs.reconfigureBPD
+
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
   val icache_blocked = false.B
   csr.io.counters foreach { c => c.inc := RegNext(perfEvents.evaluate(c.eventSel)) }

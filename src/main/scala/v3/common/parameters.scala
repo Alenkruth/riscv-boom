@@ -150,6 +150,18 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     )
     Some(CustomCSR(chickenCSRId, mask, Some(init)))
   }
+
+  /**
+  * Define a custom CSR for Reconfiguring the design at runtime with Machine
+  * software. The address of the CSR is 0xbc0
+  */ 
+  override def configureCSR = {
+    val mask = BigInt(1 << 2) // Switch Tage to Gshare
+    val init = BigInt(0 << 2) // at Initialization
+    Some(CustomCSR(configureCSRId, mask, Some(init)))
+  }
+  
+  def reconfigureBPD = getOrElse(configureCSR, _.value(2), true.B)  
   def disableOOO = getOrElse(chickenCSR, _.value(3), true.B)
   def marchid = CustomCSR.constant(CSRs.marchid, BigInt(2))
 
