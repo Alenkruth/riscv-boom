@@ -18,8 +18,11 @@ import freechips.rocketchip.rocket._
 
 import boom.v3.common._
 import boom.v3.exu.BrUpdateInfo
-import boom.v3.util.{IsKilledByBranch, GetNewBrMask, BranchKillableQueue, IsOlder, UpdateBrMask, AgePriorityEncoder, WrapInc, Transpose}
+import boom.v3.util.{IsKilledByBranch, GetNewBrMask, BranchKillableQueue, IsOlder, UpdateBrMask, AgePriorityEncoder, WrapInc, Transpose, 
+                     AddressChecker} //for core Fuzzing
 
+// import test
+import freechips.rocketchip.rocket.constants.CoreFuzzingConstants
 
 class BoomWritebackUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCacheModule()(p) {
   val io = IO(new Bundle {
@@ -278,7 +281,7 @@ abstract class AbstractBoomDataArray(implicit p: Parameters) extends BoomModule 
 
 }
 
-class BoomDuplicatedDataArray(implicit p: Parameters) extends AbstractBoomDataArray
+class BoomDuplicatedDataArray(implicit p: Parameters) extends AbstractBoomDataArray with CoreFuzzingConstants
 {
 
   val waddr = io.write.bits.addr >> rowOffBits
@@ -432,7 +435,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   val prober = Module(new BoomProbeUnit)
   val mshrs = Module(new BoomMSHRFile)
   mshrs.io.clear_all    := io.lsu.force_order
-  mshrs.io.brupdate       := io.lsu.brupdate
+  mshrs.io.brupdate     := io.lsu.brupdate
   mshrs.io.exception    := io.lsu.exception
   mshrs.io.rob_pnr_idx  := io.lsu.rob_pnr_idx
   mshrs.io.rob_head_idx := io.lsu.rob_head_idx
@@ -462,6 +465,10 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   // 0 goes to pipeline, 1 goes to MSHR refills
   val dataReadArb = Module(new Arbiter(new BoomL1DataReadReq, 3))
   // 0 goes to MSHR replays, 1 goes to wb, 2 goes to pipeline
+
+  // corefuzzing address checker
+  val dcache_address_checker = Module(new AddressChecker)
+
   dataReadArb.io.in := DontCare
 
   for (w <- 0 until memWidth) {
@@ -471,7 +478,17 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   dataReadArb.io.out.ready := true.B
 
   data.io.write.valid := dataWriteArb.io.out.fire
-  data.io.write.bits  := dataWriteArb.io.out.bits
+  // assigning the wires individually to add the tag insertion
+  // corefuzzing - ak
+  data.io.write.bits.addr := dataWriteArb.io.out.bits.addr
+  dcache_address_checker.io.in := dataWriteArb.io.out.bits.addr
+  data.io.write.bits.data := Cat(dcache_address_checker.io.out, 
+                                dataWriteArb.io.out.bits.data(encDataBits-1, 0))  
+  data.io.write.bits.wmask := dataWriteArb.io.out.bits.wmask
+  data.io.write.bits.way_en := dataWriteArb.io.out.bits.way_en
+  // data.io.write.bits.p := dataWriteArb.io.out.bits.p
+
+  // data.io.write.bits  := dataWriteArb.io.out.bits
   dataWriteArb.io.out.ready := true.B
 
   // ------------
