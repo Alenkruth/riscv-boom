@@ -24,8 +24,8 @@ import boom.common.{MicroOp}
 import boom.exu.{BrUpdateInfo}
 
 // test imports
+import freechips.rocketchip.rocket.constants.CoreFuzzingConstants
 import boom.common._
-
 /**
  * Object to XOR fold a input register of fullLength into a compressedLength.
  */
@@ -570,7 +570,7 @@ class BranchKillableQueue[T <: boom.common.HasBoomUOP](gen: T, entries: Int, flu
 
 class AddressChecker (implicit p: org.chipsalliance.cde.config.Parameters)
   extends BoomModule()(p) 
-  with boom.common.constants.CoreFuzzingConstants
+  with CoreFuzzingConstants
 {
   val io = IO(new Bundle{
       val in  = Input(UInt(coreMaxAddrBits.W))

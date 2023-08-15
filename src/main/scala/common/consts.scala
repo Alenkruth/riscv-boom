@@ -17,6 +17,7 @@ import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.util.Str
 import freechips.rocketchip.rocket.RVCExpander
+import freechips.rocketchip.rocket.constants
 
 /**
  * Mixin for issue queue types
@@ -368,16 +369,18 @@ trait ExcCauseConstants
  * Comstants for the IFT tracking in the design - AK
  */
 
-trait CoreFuzzingConstants
-{
+// trait CoreFuzzingConstants extends constants.CoreFuzzingConstants
+// {
+  // commenting everything out here. We can override if needed.
+
   // number of bits used as tag for IFT
-  val IFT_BITS = 1
+  // val IFT_BITS = 1
 
   // protected address range
-  val IFT_PROTECTED_START = 0x80001060L //.S(48.W).asUInt // for the hello world example
-  val IFT_PROTECTED_END = 0x80001080L //.S(48.W).asUInt // will this work?
+  // val IFT_PROTECTED_START = 0x80001060L //.S(48.W).asUInt // for the hello world example
+  // val IFT_PROTECTED_END = 0x80001080L //.S(48.W).asUInt // will this work?
   //val IFT_PROTECTED_END = Wire(chiselTypeOf("h080001080".U(48.W))) // we are hardcoding the width to 48 (sv48 at most)
 
   // val IFT_PROTECTED_START = 0x80001206L // start of victim function in condbranchmispred
   // val IFT_PROTECTED_END = 0x800012acL // end of victim function in condbranchmispred
-}
+// }

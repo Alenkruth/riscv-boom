@@ -14,6 +14,8 @@ package boom.common
 import chisel3._
 import chisel3.util._
 
+import freechips.rocketchip.rocket.constants.CoreFuzzingConstants
+
 import org.chipsalliance.cde.config.Parameters
 
 import boom.exu.FUConstants
@@ -32,7 +34,7 @@ abstract trait HasBoomUOP extends BoomBundle
 class MicroOp(implicit p: Parameters) extends BoomBundle
   with freechips.rocketchip.rocket.constants.MemoryOpConstants
   with freechips.rocketchip.rocket.constants.ScalarOpConstants
-  with boom.common.constants.CoreFuzzingConstants // AK
+  with CoreFuzzingConstants // AK
 {
   val uopc             = UInt(UOPC_SZ.W)       // micro-op code
   val inst             = UInt(32.W)
