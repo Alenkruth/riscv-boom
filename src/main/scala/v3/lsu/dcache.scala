@@ -482,8 +482,10 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   // corefuzzing - ak
   data.io.write.bits.addr := dataWriteArb.io.out.bits.addr
   dcache_address_checker.io.in := dataWriteArb.io.out.bits.addr
-  data.io.write.bits.data := Cat(dcache_address_checker.io.out, 
-                                dataWriteArb.io.out.bits.data(encDataBits-1, 0))  
+  // data.io.write.bits.data := Cat(dcache_address_checker.io.out, 
+  data.io.write.bits.data := dataWriteArb.io.out.bits.data // (encDataBits-1, 0))
+  printf("\nTag value %x\n", dcache_address_checker.io.out)
+  printf("\nTag concatenated with the data value %x\n", Cat(dcache_address_checker.io.out, dataWriteArb.io.out.bits.data))
   data.io.write.bits.wmask := dataWriteArb.io.out.bits.wmask
   data.io.write.bits.way_en := dataWriteArb.io.out.bits.way_en
   // data.io.write.bits.p := dataWriteArb.io.out.bits.p
