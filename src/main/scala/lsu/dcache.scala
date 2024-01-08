@@ -27,14 +27,14 @@ import boom.util.{IsKilledByBranch, GetNewBrMask, BranchKillableQueue, IsOlder, 
 
 class BoomWritebackUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCacheModule()(p) {
   val io = IO(new Bundle {
-    val req = Flipped(Decoupled(new WritebackReq(edge.bundle)))
-    val meta_read = Decoupled(new L1MetaReadReq)
+    val req = Flipped(Decoupled(new WritebackReq(edge.bundle))) // input
+    val meta_read = Decoupled(new L1MetaReadReq) // ready - in, rest - output
     val resp = Output(Bool())
     val idx = Output(Valid(UInt()))
-    val data_req = Decoupled(new L1DataReadReq)
+    val data_req = Decoupled(new L1DataReadReq) // ready - in, rest - output
     val data_resp = Input(UInt(encRowBits.W))
     val mem_grant = Input(Bool())
-    val release = Decoupled(new TLBundleC(edge.bundle))
+    val release = Decoupled(new TLBundleC(edge.bundle)) // ready - in, rest - output
     val lsu_release = Decoupled(new TLBundleC(edge.bundle))
   })
 
@@ -43,7 +43,7 @@ class BoomWritebackUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1Hella
   val state = RegInit(s_invalid)
   val r1_data_req_fired = RegInit(false.B)
   val r2_data_req_fired = RegInit(false.B)
-  val r1_data_req_cnt = Reg(UInt(log2Up(refillCycles+1).W))
+  val r1_data_req_cnt = Reg(UInt(log2Up(refillCycles+1).W)) // refill cycles = 8*8 / 8
   val r2_data_req_cnt = Reg(UInt(log2Up(refillCycles+1).W))
   val data_req_cnt = RegInit(0.U(log2Up(refillCycles+1).W))
   val (_, last_beat, all_beats_done, beat_count) = edge.count(io.release)
@@ -270,6 +270,17 @@ class BoomL1DataReadReq(implicit p: Parameters) extends BoomBundle()(p) {
   val valid = Vec(memWidth, Bool())
 }
 
+// Adding definition again to reduce the time spent checking the NBDCache file
+//class L1DataReadReq(implicit p: Parameters) extends L1HellaCacheBundle()(p) {
+//  val way_en = Bits(nWays.W) 
+//  val addr   = Bits(untagBits.W) // blockOffsetBits + idxBits
+//}
+//
+//class L1DataWriteReq(implicit p: Parameters) extends L1DataReadReq()(p) {
+//  val wmask  = Bits(rowWords.W)
+//  val data   = Bits(encRowBits.W)
+//}
+
 abstract class AbstractBoomDataArray(implicit p: Parameters) extends BoomModule with HasL1HellaCacheParameters {
   val io = IO(new BoomBundle {
     val read  = Input(Vec(memWidth, Valid(new L1DataReadReq)))
@@ -458,8 +469,12 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
     meta(w).io.read.valid  := metaReadArb.io.out.valid
     meta(w).io.read.bits   := metaReadArb.io.out.bits.req(w)
   }
-  metaReadArb.io.out.ready  := meta.map(_.io.read.ready).reduce(_||_)
-  metaWriteArb.io.out.ready := meta.map(_.io.write.ready).reduce(_||_)
+  // fix from issue #667 in the riscv-boom repository
+  metaReadArb.io.out.ready := meta.map(_.io.read.ready).reduce(_&&_)
+  metaWriteArb.io.out.ready := meta.map(_.io.write.ready).reduce(_&&_)
+  //metaReadArb.io.out.ready  := meta.map(_.io.read.ready).reduce(_||_)
+  //metaWriteArb.io.out.ready := meta.map(_.io.write.ready).reduce(_||_)
+  
 
   // data
   val data = Module(if (boomParams.numDCacheBanks == 1) new BoomDuplicatedDataArray else new BoomBankedDataArray)
