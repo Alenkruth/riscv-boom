@@ -18,11 +18,10 @@ import freechips.rocketchip.rocket._
 
 import boom.v3.common._
 import boom.v3.exu.BrUpdateInfo
-import boom.v3.util.{IsKilledByBranch, GetNewBrMask, BranchKillableQueue, IsOlder, UpdateBrMask, AgePriorityEncoder, WrapInc, Transpose, 
-                     AddressChecker} //for core Fuzzing
+import boom.v3.util.{IsKilledByBranch, GetNewBrMask, BranchKillableQueue, IsOlder, UpdateBrMask, AgePriorityEncoder, WrapInc, Transpose} 
 
 // import test
-import freechips.rocketchip.rocket.constants.CoreFuzzingConstants
+// import freechips.rocketchip.rocket.constants.CoreFuzzingConstants
 
 class BoomWritebackUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCacheModule()(p) {
   val io = IO(new Bundle {
@@ -482,7 +481,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   // 0 goes to MSHR replays, 1 goes to wb, 2 goes to pipeline
 
   // corefuzzing address checker
-  val dcache_address_checker = Module(new AddressChecker)
+  // val dcache_address_checker = Module(new AddressChecker)
 
   dataReadArb.io.in := DontCare
 
@@ -496,11 +495,11 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   // assigning the wires individually to add the tag insertion
   // corefuzzing - ak
   data.io.write.bits.addr := dataWriteArb.io.out.bits.addr
-  dcache_address_checker.io.in := dataWriteArb.io.out.bits.addr
+  // dcache_address_checker.io.in := dataWriteArb.io.out.bits.addr
   // data.io.write.bits.data := Cat(dcache_address_checker.io.out, 
   data.io.write.bits.data := dataWriteArb.io.out.bits.data // (encDataBits-1, 0))
-  printf("\nTag value %x\n", dcache_address_checker.io.out)
-  printf("\nTag concatenated with the data value %x\n", Cat(dcache_address_checker.io.out, dataWriteArb.io.out.bits.data))
+  //printf("\nTag value %x\n", dcache_address_checker.io.out)
+  //printf("\nTag concatenated with the data value %x\n", Cat(dcache_address_checker.io.out, dataWriteArb.io.out.bits.data))
   data.io.write.bits.wmask := dataWriteArb.io.out.bits.wmask
   data.io.write.bits.way_en := dataWriteArb.io.out.bits.way_en
   // data.io.write.bits.p := dataWriteArb.io.out.bits.p

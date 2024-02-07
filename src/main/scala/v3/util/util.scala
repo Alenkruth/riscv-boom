@@ -24,7 +24,7 @@ import boom.v3.common.{MicroOp}
 import boom.v3.exu.{BrUpdateInfo}
 
 // test imports
-import freechips.rocketchip.rocket.constants.CoreFuzzingConstants
+//import freechips.rocketchip.rocket.constants.CoreFuzzingConstants
 import boom.common._
 /**
  * Object to XOR fold a input register of fullLength into a compressedLength.
@@ -568,7 +568,7 @@ class BranchKillableQueue[T <: boom.v3.common.HasBoomUOP](gen: T, entries: Int, 
 // This module can be extended to check the privilege level and whatever we 
 // care about.
 
-class AddressChecker (implicit p: org.chipsalliance.cde.config.Parameters)
+/*class AddressChecker (implicit p: org.chipsalliance.cde.config.Parameters)
   extends BoomModule()(p) 
   with CoreFuzzingConstants
 {
@@ -585,7 +585,7 @@ class AddressChecker (implicit p: org.chipsalliance.cde.config.Parameters)
   } .otherwise {
       io.out := 0.U(IFT_BITS.W)
   }
-}
+}*/
 
 // ------------------------------------------
 // Printf helper functions
