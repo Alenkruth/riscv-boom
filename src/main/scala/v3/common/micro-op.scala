@@ -14,7 +14,8 @@ package boom.v3.common
 import chisel3._
 import chisel3.util._
 
-import freechips.rocketchip.rocket.constants.CoreFuzzingConstants
+// for Corefuzzing
+import freechips.rocketchip.util._
 
 import org.chipsalliance.cde.config.Parameters
 
@@ -34,7 +35,7 @@ abstract trait HasBoomUOP extends BoomBundle
 class MicroOp(implicit p: Parameters) extends BoomBundle
   with freechips.rocketchip.rocket.constants.MemoryOpConstants
   with freechips.rocketchip.rocket.constants.ScalarOpConstants
-  with CoreFuzzingConstants // AK
+  with CoreFuzzingConstants // for CoreFuzzing
 {
   val uopc             = UInt(UOPC_SZ.W)       // micro-op code
   val inst             = UInt(32.W)
@@ -144,8 +145,8 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   // What prediction structure provides the prediction TO this op
   val debug_tsrc       = UInt(BSRC_SZ.W)
 
-  // adding a single bit here for IFT - AK
-  val privilege_tag    = UInt(IFT_BITS.W)
+  // adding the tag to the Microp to let it propagate through the pipeline once created
+  val privilege_tag    = UInt(TAG_WIDTH.W)
 
   // Do we allocate a branch tag for this?
   // SFB branches don't get a mask, they get a predicate bit
