@@ -84,6 +84,8 @@ class WithRationalBoomTiles extends Config((site, here, up) => {
  */
 class WithNSmallBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends Config(
   new WithTAGELBPD ++ // Default to TAGE-L BPD
+  new WithBoomCommitLogPrintf ++
+  new WithBoomBranchPrintf ++
   new Config((site, here, up) => {
     case TilesLocated(InSubsystem) => {
       val prev = up(TilesLocated(InSubsystem), site)
@@ -106,7 +108,7 @@ class WithNSmallBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends 
               maxBrCount = 8,
               numFetchBufferEntries = 8,
               ftq = FtqParameters(nEntries=16),
-              nPerfCounters = 2,
+              nPerfCounters = 32,
               fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true))
             ),
             dcache = Some(
@@ -274,6 +276,8 @@ class WithNLargeBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends 
  */
 class WithNMegaBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends Config(
   new WithTAGELBPD ++ // Default to TAGE-L BPD
+  new WithBoomBranchPrintf ++
+  new WithBoomCommitLogPrintf ++
   new Config((site, here, up) => {
     case TilesLocated(InSubsystem) => {
       val prev = up(TilesLocated(InSubsystem), site)
@@ -297,6 +301,7 @@ class WithNMegaBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends C
               numFetchBufferEntries = 32,
               enablePrefetching = true,
               ftq = FtqParameters(nEntries=40),
+              nPerfCounters = 29, // corefuzzing
               fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true))
             ),
             dcache = Some(
@@ -344,6 +349,7 @@ class WithNGigaBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends C
               enablePrefetching = true,
               numDCacheBanks = 1,
               ftq = FtqParameters(nEntries=40),
+              nPerfCounters = 29,
               fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true))
             ),
             dcache = Some(

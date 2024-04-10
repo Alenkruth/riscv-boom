@@ -24,7 +24,7 @@ import boom.exu.BrUpdateInfo
 import boom.util.{IsKilledByBranch, GetNewBrMask, BranchKillableQueue, IsOlder, UpdateBrMask, AgePriorityEncoder, WrapInc, Transpose}//,
                   //AddressChecker} //for core Fuzzing
 
-
+import boom.util.{BoomCoreStringPrefix}
 class BoomWritebackUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCacheModule()(p) {
   val io = IO(new Bundle {
     val req = Flipped(Decoupled(new WritebackReq(edge.bundle))) // input
@@ -947,4 +947,19 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
 
 
   io.lsu.ordered := mshrs.io.fence_rdy && !s1_valid.reduce(_||_) && !s2_valid.reduce(_||_)
+
+  override def toString: String = BoomCoreStringPrefix(
+    "==L1-ICache==",
+    "Fetch bytes   : " + 1.U,//+ cacheParams.fetchBytes,
+    "Block bytes   : " + 1.U,// (1 << blockOffBits),
+    "Row bytes     : " + 1.U,// rowBytes,
+    "Block Bytes   : " + 1.U,// outer.icacheParams.blockBytes,
+    "Word bits     : " + 1.U,// wordBits,
+    "RamDepth      : " + 1.U,// ramDepth,
+    "Sets          : " + 1.U,// nSets,
+    "Ways          : " + 1.U,// nWays,
+    "Refill cycles : " + 1.U,// refillCycles,
+    "RAMs          : (" +  1.U,// wordBits/nBanks + " x " + nSets*refillCycles + ") using " + nBanks + " banks",
+    //"" + (if (data.nBanks == 2) "Dual-banked" else "Single-banked"),
+    "I-TLB ways    : " + 1.U)// cacheParams.nTLBWays + "\n")
 }
