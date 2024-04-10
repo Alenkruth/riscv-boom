@@ -100,8 +100,8 @@ case class BoomCoreParams(
   trace: Boolean = false,
 
   /* debug stuff */
-  enableCommitLogPrintf: Boolean = false,
-  enableBranchPrintf: Boolean = false,
+  enableCommitLogPrintf: Boolean = true,
+  enableBranchPrintf: Boolean = true,
   enableMemtracePrintf: Boolean = false
 
 // DOC include end: BOOM Parameters
@@ -153,9 +153,12 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
 
   /**
   * Define a custom CSR for Reconfiguring the design at runtime with Machine
-  * software. The address of the CSR is 0xbc0
-  */ 
-  override def configureCSR = {
+  * software. The address of the CSR is 0x7c2
+  */
+  /* We use multiple CSRs for the configurations
+  * The first CSR - configureCSR
+  */
+  override def configureCSR = { 
     val mask = BigInt(1 << 2) // Switch Tage to Gshare
     val init = BigInt(0 << 2) // at Initialization
     Some(CustomCSR(configureCSRId, mask, Some(init)))
