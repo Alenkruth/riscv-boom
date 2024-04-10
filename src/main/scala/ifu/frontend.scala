@@ -958,12 +958,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   io.cpu.get_pc <> ftq.io.get_ftq_pc
 
   // set the privilege bit for IF tracking
-  for (i <- 0 until coreWidth) {
-    val address_checker = Module(new AddressChecker)
-    address_checker.io.in := fb.io.deq.bits.uops(i).bits.debug_pc
-    io.cpu.fetchpacket.bits.uops(i).bits.privilege_tag := address_checker.io.out
-
-  }
+  // for (i <- 0 until coreWidth) {
+  //  val address_checker = Module(new Tagger)
+  //  address_checker.io.in := fb.io.deq.bits.uops(i).bits.debug_pc
+  //  io.cpu.fetchpacket.bits.uops(i).bits.privilege_tag := address_checker.io.out
+  // }
 
   val test = Wire(UInt(1.W))
   test := io.cpu.fetchpacket.bits.uops(0).bits.privilege_tag;
