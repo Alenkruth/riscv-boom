@@ -22,6 +22,8 @@ import freechips.rocketchip.rocket.{MStatus, BP, BreakpointUnit}
 import boom.v4.common._
 import boom.v4.util.{BoolToChar, MaskUpper}
 
+// starting to work on implementing custom CSRs for fetch-buffer size - alex
+
 /**
  * Bundle that is made up of converted MicroOps from the Fetch Bundle
  * input to the Fetch Buffer. This is handed to the Decode stage.
