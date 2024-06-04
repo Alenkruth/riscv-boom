@@ -276,6 +276,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   //
   io.ifu.reconfigure_bpd := custom_csrs.reconfigureBPD
 
+  // for corefuzzing, assigning CSR output to frontend for reconfigureFB
+  io.ifu.reconfigureFB_width := custom_csrs.reconfigureFB_width
+  io.ifu.reconfigureFB_rows_b0 := custom_csrs.reconfigureFB_rows_b0
+  io.ifu.reconfigureFB_rows_b1 := custom_csrs.reconfigureFB_rows_b1
+
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
   val icache_blocked = false.B
   csr.io.counters foreach { c => c.inc := RegNext(perfEvents.evaluate(c.eventSel)) }

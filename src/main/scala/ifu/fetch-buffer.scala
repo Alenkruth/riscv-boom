@@ -50,6 +50,11 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
 
     // Was the pipeline redirected? Clear/reset the fetchbuffer.
     val clear = Input(Bool())
+
+    // adding for corefuzzing - alex
+    val reconfigureFB_width = Input(Bool())
+    val reconfigureFB_rows_b0 = Input(Bool())
+    val reconfigureFB_rows_b1 = Input(Bool())
   })
 
   require (numEntries > fetchWidth)
@@ -64,6 +69,29 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   val tail = RegInit(1.U(numEntries.W))
 
   val maybe_full = RegInit(false.B)
+
+  when (io.reconfigureFB_width) {
+    printf("width # 1, ")
+  }
+  .otherwise {
+    printf("width # 0, ")
+  }
+  when (io.reconfigureFB_rows_b1) {
+    when(io.reconfigureFB_rows_b0){
+      printf("row # 3\n")
+    }
+    .otherwise{
+      printf("row # 2\n")
+    }
+  }
+  .otherwise {
+    when(io.reconfigureFB_rows_b0){
+      printf("row # 1\n")  
+    }
+    .otherwise{
+      printf("row # 0\n")
+    }
+  }
 
   //-------------------------------------------------------------
   // **** Enqueue Uops ****
