@@ -163,7 +163,17 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     val init = BigInt(0 << 2) // at Initialization
     Some(CustomCSR(configureCSRId, mask, Some(init)))
   }
-  
+
+  // second CSR - fetch_bufferCSR
+  override def fetch_bufferCSR = {
+    val mask = BigInt(1 << 2 | 1 << 1 | 1 << 0) // bits 2:1 change numrows, bit 0 changes width
+    val init = BigInt(0 << 2 | 0 << 1 | 0 << 0) // at initialization
+    Some(CustomCSR(fetch_bufferCSRId, mask, Some(init)))
+  }
+
+  def reconfigureFB_width = getOrElse(fetch_bufferCSR, _.value(0), true.B)
+  def reconfigureFB_rows_b0 = getOrElse(fetch_bufferCSR, _.value(1), true.B)
+  def reconfigureFB_rows_b1 = getOrElse(fetch_bufferCSR, _.value(2), true.B)
   def reconfigureBPD = getOrElse(configureCSR, _.value(2), true.B)  
   def disableOOO = getOrElse(chickenCSR, _.value(3), true.B)
   def marchid = CustomCSR.constant(CSRs.marchid, BigInt(2))
