@@ -345,6 +345,7 @@ class WithNGigaBooms(n: Int = 1) extends Config(
               numLdqEntries = 32,
               numStqEntries = 32,
               maxBrCount = 20,
+              // alex - just testing if possible
               numFetchBufferEntries = 40, // keep this as a multiple of 5 to avoid issues.
               enablePrefetching = true,
               numDCacheBanks = 1,
