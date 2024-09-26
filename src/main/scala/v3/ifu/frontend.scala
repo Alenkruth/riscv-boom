@@ -291,7 +291,6 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   val reconfigure_bpd = Output(Bool())
 
   // for corefuzzing - reconfigureFP is ouput bc bundle gets flipped
-  val reconfigureFB_width = Output(Bool())
   val reconfigureFB_rows_b0 = Output(Bool())
   val reconfigureFB_rows_b1 = Output(Bool())
 }
@@ -932,7 +931,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   ).asBools
 
   // value from associated CSR for corefuzzing - alex
-  fb.io.reconfigureFB_width := io.cpu.reconfigureFB_width
   fb.io.reconfigureFB_rows_b0 := io.cpu.reconfigureFB_rows_b0
   fb.io.reconfigureFB_rows_b1 := io.cpu.reconfigureFB_rows_b1
 
