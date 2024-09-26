@@ -287,7 +287,7 @@ class WithNMegaBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends C
           tileParams = BoomTileParams(
             core = BoomCoreParams(
               fetchWidth = 8,
-              decodeWidth = 4,
+              decodeWidth = 4, 
               numRobEntries = 128,
               issueParams = Seq(
                 IssueParams(issueWidth=2, numEntries=24, iqType=IQT_MEM.litValue, dispatchWidth=4),
