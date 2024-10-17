@@ -298,7 +298,7 @@ class WithNMegaBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends C
               numLdqEntries = 32,
               numStqEntries = 32,
               maxBrCount = 20,
-              numFetchBufferEntries = 32,
+              numFetchBufferEntries = 64, // increased from 32
               enablePrefetching = true,
               ftq = FtqParameters(nEntries=40),
               nPerfCounters = 29, // corefuzzing
