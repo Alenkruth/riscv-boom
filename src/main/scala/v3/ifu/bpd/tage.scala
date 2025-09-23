@@ -253,9 +253,9 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
 
   // added for the fuzzycore project - AK
   // Create a val that will be written with the reconfigure signal from io
-  val reconfigure_bpd = Wire(Bool())
+  val cf_bpd_tage_to_gshare = Wire(Bool())
 
-  reconfigure_bpd := io.reconfigure_bpd
+  cf_bpd_tage_to_gshare := io.cf_bpd_tage_to_gshare
 
   for (w <- 0 until bankWidth) {
     var altpred = io.resp_in(0).f3(w).taken
@@ -270,23 +270,23 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
 
       // We use bank three of the TAGE predictor to emulate the behavior of a GShare predictor.
       // Addition for the fuzzycore project - AK
-      // use_bank will be false only when reconfigure_bpd is true and i !== 0.
+      // use_bank will be false only when cf_bpd_tage_to_gshare is true and i !== 0.
       val bank_id = Wire(UInt(3.W))
       // val temp_bank0 = Wire(Bool())
       val use_bank3 = Wire(Bool())
       bank_id := i.asUInt
-      use_bank3 := !(reconfigure_bpd ^ bank_id === 3.U(3.W))
+      use_bank3 := !(cf_bpd_tage_to_gshare ^ bank_id === 3.U(3.W))
       // temp_bank0 := bank_id ===  0.U(3.W)
       // printf(s"\nuse_bank is $use_bank3 = %c\n", use_bank3)
-      // use_bank0 := !reconfigure_bpd || temp_bank0
-      // printf("\nbank_id = %x || use_bank0 = %b || reconfigure_bpd = %b || hit = %b || condition = %b \n", bank_id, use_bank3, reconfigure_bpd, hit && !(reconfigure_bpd ^ bank_id === 3.U), !(reconfigure_bpd ^ bank_id === 3.U))
-      //when (reconfigure_bpd) {
+      // use_bank0 := !cf_bpd_tage_to_gshare || temp_bank0
+      // printf("\nbank_id = %x || use_bank0 = %b || cf_bpd_tage_to_gshare = %b || hit = %b || condition = %b \n", bank_id, use_bank3, cf_bpd_tage_to_gshare, hit && !(cf_bpd_tage_to_gshare ^ bank_id === 3.U), !(cf_bpd_tage_to_gshare ^ bank_id === 3.U))
+      //when (cf_bpd_tage_to_gshare) {
       //  printf("Baby Yoda!!")
       // }
-      // printf("\nBank_id = %d | reconfigure_bpd = %b | prediction from bank? = %b \n", bank_id, reconfigure_bpd, hit && use_bank3)
+      // printf("\nBank_id = %d | cf_bpd_tage_to_gshare = %b | prediction from bank? = %b \n", bank_id, cf_bpd_tage_to_gshare, hit && use_bank3)
       when (hit && use_bank3) {
         // printf("\nHit in tage bank %d\n", bank_id)
-        // printf("\n reconfigure_bpd = %b\n", reconfigure_bpd)
+        // printf("\n cf_bpd_tage_to_gshare = %b\n", cf_bpd_tage_to_gshare)
         io.resp.f3(w).taken := Mux(ctr === 3.U || ctr === 4.U, altpred, ctr(2))
         final_altpred       := altpred
       }

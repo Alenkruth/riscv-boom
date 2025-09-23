@@ -286,10 +286,12 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
 
   val perf = Input(new FrontendPerfEvents)
 
-  // for the fuzzycore. reconfigure_bpd is an output because the bundle gets flipped for 
+  // wire with the flag to enable debug log printing 
+  // val cf_debug_log = Output(Bool())
+  // for the fuzzycore. cf_tage_to_gshare is an output because the bundle gets flipped for 
   // some reason in the BoomFrontendBundle class.
-  val reconfigure_bpd = Output(Bool())
 
+  val cf_bpd_tage_to_gshare = Output(Bool())
   // for corefuzzing - reconfigureFP is ouput bc bundle gets flipped
   val reconfigureFB_rows_b0 = Output(Bool())
   val reconfigureFB_rows_b1 = Output(Bool())
@@ -382,7 +384,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   // Value from reconfigure CSR - AK
   // for the fuzzycore. 
-  bpd.io.reconfigure_bpd := io.cpu.reconfigure_bpd
+  bpd.io.cf_bpd_tage_to_gshare := io.cpu.cf_bpd_tage_to_gshare
 
   // --------------------------------------------------------
   // **** ICache Access (F1) ****
@@ -971,8 +973,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   }
 
-  val test = Wire(UInt(1.W))
-  test := io.cpu.fetchpacket.bits.uops(0).bits.privilege_tag;
+  // val test = Wire(UInt(1.W))
+  // test := io.cpu.fetchpacket.bits.uops(0).bits.privilege_tag;
   //  Trying to print the PCs in the Current Fetch Packet
   // for (i <- 0 until coreWidth) {
       // printf("\nThe (coreWidth index - %d ) PC of current Microop is 0x%x \n", i.asUInt, fb.io.deq.bits.uops(i).bits.debug_pc)
