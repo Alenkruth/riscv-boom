@@ -38,6 +38,7 @@ class BoomWritebackUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1Hella
     val lsu_release = Decoupled(new TLBundleC(edge.bundle))
   })
 
+  // refillCycles = cacheDataBeats (I think it is the number of cycles it takes to access an entire cache block)
   val req = Reg(new WritebackReq(edge.bundle))
   val s_invalid :: s_fill_buffer :: s_lsu_release :: s_active :: s_grant :: Nil = Enum(5)
   val state = RegInit(s_invalid)
@@ -168,6 +169,11 @@ class BoomProbeUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCach
        s_meta_write :: s_meta_write_resp :: Nil) = Enum(11)
   val state = RegInit(s_invalid)
 
+  // according to OpenAI's GPT overlords, the TLBundleB is for probe channel
+  // A for data request
+  // C for data response
+  // D for acknowledgment
+  // E for errors and error signaling
   val req = Reg(new TLBundleB(edge.bundle))
   val req_idx = req.address(idxMSB, idxLSB)
   val req_tag = req.address >> untagBits
@@ -288,18 +294,66 @@ abstract class AbstractBoomDataArray(implicit p: Parameters) extends BoomModule 
     val resp  = Output(Vec(memWidth, Vec(nWays, Bits(encRowBits.W))))
     val nacks = Output(Vec(memWidth, Bool()))
   })
+  
+  def pipeMap[T <: Data](f: Int => T) = VecInit((0 until memWidth).map(f))
 
+}
+// core fuzzing specific implementations
+
+class BoomL1MetaReadReqCF(implicit p: Parameters) extends BoomBundle()(p) {
+  val req = Vec(memWidth, new L1MetaReadReq)
+}
+
+class BoomL1DataReadReqCF(implicit p: Parameters) extends BoomBundle()(p) {
+  val req = Vec(memWidth, new L1DataReadReqCF)
+  val valid = Vec(memWidth, Bool())
+}
+// core fuzzing specific AbstractBoomDataArray definition.
+abstract class AbstractBoomDataArrayCF(implicit p:Parameters) extends BoomModule with HasL1HellaCacheParameters {
+  val io = IO(new BoomBundle {
+    val read  = Input(Vec(memWidth, Valid(new L1DataReadReqCF)))
+    val write = Input(Valid(new L1DataWriteReqCF))
+    val resp  = Output(Vec(memWidth, Vec(nWays, Bits(encRowBits.W))))
+    val nacks = Output(Vec(memWidth, Bool()))
+    val cf_debug_dcache_enable = Input(Bool())
+  })
+  
   def pipeMap[T <: Data](f: Int => T) = VecInit((0 until memWidth).map(f))
 
 }
 
-class BoomDuplicatedDataArray(implicit p: Parameters) extends AbstractBoomDataArray with CoreFuzzingConstants
+class BoomDuplicatedDataArray(implicit p: Parameters) extends AbstractBoomDataArrayCF with CoreFuzzingConstants
 {
 
+  val nBanks = 1 // adding to help with the prints during compile
+  
   val waddr = io.write.bits.addr >> rowOffBits
+  val cf_idx_mask = -1.S(idxBits.W).asUInt
+  val cf_idx_z_mask = 0.U(idxBits.W)
+  val cf_set_mask = -1.S(5.W).asUInt
+  val cf_idx = ((waddr & cf_idx_mask) & cf_set_mask)(4, 0)
+  val cf_waddr_tagbits = waddr >> idxBits
+  val cf_waddr = (cf_waddr_tagbits << idxBits) | cf_idx 
+
+  for (w <- 0 until memWidth) {
+    when(io.read(w).valid && io.cf_debug_dcache_enable) {
+      printf("[DCACHE] ADDR(TAG+OFF) is 0x%x \n", io.read(w).bits.addr)
+    }
+  } 
+  
+  when (io.write.valid && io.cf_debug_dcache_enable) {
+    printf("[DCACHE] ADDR(TAG+OFF) is 0x%x \n", io.write.bits.addr)
+  }
+
   for (j <- 0 until memWidth) {
 
     val raddr = io.read(j).bits.addr >> rowOffBits
+    val cf_ridx_mask = -1.S(idxBits.W).asUInt
+    val cf_rset_mask = -1.S(5.W).asUInt
+    val cf_ridx = (raddr & cf_ridx_mask) & cf_rset_mask
+    val cf_raddr_tagbits = raddr >> idxBits
+    val cf_raddr = Cat(cf_raddr_tagbits, cf_ridx)    
+     
     for (w <- 0 until nWays) {
       val array = DescribedSRAM(
         name = s"array_${w}_${j}",
@@ -317,7 +371,7 @@ class BoomDuplicatedDataArray(implicit p: Parameters) extends AbstractBoomDataAr
   }
 }
 
-class BoomBankedDataArray(implicit p: Parameters) extends AbstractBoomDataArray {
+class BoomBankedDataArray(implicit p: Parameters) extends AbstractBoomDataArrayCF {
 
   val nBanks   = boomParams.numDCacheBanks
   val bankSize = nSets * refillCycles / nBanks
@@ -329,6 +383,15 @@ class BoomBankedDataArray(implicit p: Parameters) extends AbstractBoomDataArray 
   val bidxBits    = log2Ceil(bankSize)
   val bidxOffBits = bankOffBits + bankBits
 
+  // print accessed addresses in a multibank dcache array
+  for (w <- 0 until memWidth) {
+    when(io.read(w).valid && io.cf_debug_dcache_enable) {
+      printf("[DCACHE] ADDR(TAG+OFF) is 0x%x \n", io.read(w).bits.addr)
+    }
+  }
+  when (io.write.valid && io.cf_debug_dcache_enable) {
+    printf("[DCACHE] ADDR(TAG+OFF) is 0x%x \n", io.write.bits.addr)
+  }
   //----------------------------------------------------------------------------------------------------
 
   val s0_rbanks = if (nBanks > 1) VecInit(io.read.map(r => (r.bits.addr >> bankOffBits)(bankBits-1,0))) else VecInit(0.U)
@@ -441,6 +504,55 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
 
   def widthMap[T <: Data](f: Int => T) = VecInit((0 until memWidth).map(f))
 
+  for (w <- 0 until memWidth){
+    when (io.lsu.req.valid && io.lsu.cf_debug_dcache_enable){
+      printf("[DCACHE] LSU request address - 0x%x + DCACHE configuration 0x%x 0x%x 0x%x 0x%x \n", io.lsu.req.bits(w).bits.addr, io.lsu.cf_dcache_repl_conf, io.lsu.cf_dcache_size_conf, io.lsu.cf_dcache_way_conf, io.lsu.cf_dcache_set_conf)
+    }
+  }
+  
+  // === Dynamic DCache Reconfiguration Support ===
+  val active_sets = io.lsu.cf_dcache_set_conf
+  val active_ways = io.lsu.cf_dcache_way_conf
+  val active_size = io.lsu.cf_dcache_size_conf
+  val active_repl = io.lsu.cf_dcache_repl_conf
+  val active_blocksize = io.lsu.cf_dcache_blocksize_conf // 16 or 8
+
+  val setBits = log2Ceil(active_sets)
+  val wayBits = log2Ceil(active_ways)
+  val offsetBits = log2Ceil(active_blocksize)
+  val tagBits = paddrBits - setBits - offsetBits
+
+  // Helper functions for dynamic address partitioning
+  // Mask set index to active sets
+  // Mask tag to active tag bits
+  // These are used for meta/data array accesses
+
+  def getSetIdx(addr: UInt): UInt = (addr >> offsetBits) & ((1.U << setBits) - 1.U)
+  def getTag(addr: UInt): UInt = addr >> (setBits + offsetBits)
+
+  def maskAddr(addr: UInt): UInt = {
+    val mask = ((1L << (setBits + wayBits + offsetBits)) - 1).U
+    addr & mask
+  }
+
+  // Print when config changes
+  val prev_sets = RegInit(active_sets)
+  val prev_ways = RegInit(active_ways)
+  val prev_size = RegInit(active_size)
+  val prev_repl = RegInit(active_repl)
+  val prev_blocksize = RegInit(active_blocksize)
+  when (active_sets =/= prev_sets || active_ways =/= prev_ways || active_size =/= prev_size || active_repl =/= prev_repl) {
+    printf("[DCACHE] Reconfigured: sets=%d ways=%d size=%d repl=%d\n", active_sets, active_ways, active_size, active_repl)
+    prev_sets := active_sets
+    prev_ways := active_ways
+    prev_size := active_size
+    prev_repl := active_repl
+  }
+  when (active_blocksize =/= prev_blocksize) {
+    printf("[DCACHE] Block size changed: %d -> %d\n", prev_blocksize, active_blocksize)
+    prev_blocksize := active_blocksize
+  }
+
   val t_replay :: t_probe :: t_wb :: t_mshr_meta_read :: t_lsu :: t_prefetch :: Nil = Enum(6)
 
   val wb = Module(new BoomWritebackUnit)
@@ -484,6 +596,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
 
   // corefuzzing address checker
   // val dcache_address_checker = Module(new AddressChecker)
+  data.io.cf_debug_dcache_enable := io.lsu.cf_debug_dcache_enable
 
   dataReadArb.io.in := DontCare
 
@@ -515,14 +628,23 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   io.lsu.req.ready := metaReadArb.io.in(4).ready && dataReadArb.io.in(2).ready
   metaReadArb.io.in(4).valid := io.lsu.req.valid
   dataReadArb.io.in(2).valid := io.lsu.req.valid
+
+  // MetaRead(4) goes to the pipeline
+  // DataRead(2) goes to the pipeline
+
+  // ideally masking the fields/updating the inputs to the arbiter from the pipeline 
+  // should trickle down to the requests from the MSHR, prefetchers, probers.
+
+  // Writeback might be affected though. So, we might have to create and propagate a copy of the
+  // original address to the writeback unit.
   for (w <- 0 until memWidth) {
     // Tag read for new requests
-    metaReadArb.io.in(4).bits.req(w).idx    := io.lsu.req.bits(w).bits.addr >> blockOffBits
+    metaReadArb.io.in(4).bits.req(w).idx    := getSetIdx(io.lsu.req.bits(w).bits.addr)
     metaReadArb.io.in(4).bits.req(w).way_en := DontCare
-    metaReadArb.io.in(4).bits.req(w).tag    := DontCare
+    metaReadArb.io.in(4).bits.req(w).tag    := getTag(io.lsu.req.bits(w).bits.addr)
     // Data read for new requests
     dataReadArb.io.in(2).bits.valid(w)      := io.lsu.req.bits(w).valid
-    dataReadArb.io.in(2).bits.req(w).addr   := io.lsu.req.bits(w).bits.addr
+    dataReadArb.io.in(2).bits.req(w).addr   := maskAddr(io.lsu.req.bits(w).bits.addr)
     dataReadArb.io.in(2).bits.req(w).way_en := ~0.U(nWays.W)
   }
 
@@ -536,80 +658,83 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   replay_req(0).is_hella   := mshrs.io.replay.bits.is_hella
   mshrs.io.replay.ready    := metaReadArb.io.in(0).ready && dataReadArb.io.in(0).ready
   // Tag read for MSHR replays
-  // We don't actually need to read the metadata, for replays we already know our way
   metaReadArb.io.in(0).valid              := mshrs.io.replay.valid
-  metaReadArb.io.in(0).bits.req(0).idx    := mshrs.io.replay.bits.addr >> blockOffBits
+  metaReadArb.io.in(0).bits.req(0).idx    := getSetIdx(mshrs.io.replay.bits.addr)
   metaReadArb.io.in(0).bits.req(0).way_en := DontCare
-  metaReadArb.io.in(0).bits.req(0).tag    := DontCare
+  metaReadArb.io.in(0).bits.req(0).tag    := getTag(mshrs.io.replay.bits.addr)
   // Data read for MSHR replays
   dataReadArb.io.in(0).valid              := mshrs.io.replay.valid
-  dataReadArb.io.in(0).bits.req(0).addr   := mshrs.io.replay.bits.addr
+  dataReadArb.io.in(0).bits.req(0).addr   := maskAddr(mshrs.io.replay.bits.addr)
   dataReadArb.io.in(0).bits.req(0).way_en := mshrs.io.replay.bits.way_en
   dataReadArb.io.in(0).bits.valid         := widthMap(w => (w == 0).B)
 
   // -----------
-  // MSHR Meta read
-  val mshr_read_req = Wire(Vec(memWidth, new BoomDCacheReq))
-  mshr_read_req             := DontCare
-  mshr_read_req(0).uop      := NullMicroOp
-  mshr_read_req(0).addr     := Cat(mshrs.io.meta_read.bits.tag, mshrs.io.meta_read.bits.idx) << blockOffBits
-  mshr_read_req(0).data     := DontCare
-  mshr_read_req(0).is_hella := false.B
-  metaReadArb.io.in(3).valid       := mshrs.io.meta_read.valid
-  metaReadArb.io.in(3).bits.req(0) := mshrs.io.meta_read.bits
-  mshrs.io.meta_read.ready         := metaReadArb.io.in(3).ready
+// MSHR Meta read
+val mshr_read_req = Wire(Vec(memWidth, new BoomDCacheReq))
+mshr_read_req             := DontCare
+mshr_read_req(0).uop      := NullMicroOp
+mshr_read_req(0).addr     := Cat(mshrs.io.meta_read.bits.tag, mshrs.io.meta_read.bits.idx) << offsetBits
+mshr_read_req(0).data     := DontCare
+mshr_read_req(0).is_hella := false.B
+metaReadArb.io.in(3).valid       := mshrs.io.meta_read.valid
+metaReadArb.io.in(3).bits.req(0).idx := getSetIdx(mshr_read_req(0).addr)
+metaReadArb.io.in(3).bits.req(0).way_en := DontCare
+metaReadArb.io.in(3).bits.req(0).tag := getTag(mshr_read_req(0).addr)
+mshrs.io.meta_read.ready         := metaReadArb.io.in(3).ready
 
+// -----------
+// Write-backs
+val wb_fire = wb.io.meta_read.fire && wb.io.data_req.fire
+val wb_req = Wire(Vec(memWidth, new BoomDCacheReq))
+wb_req             := DontCare
+wb_req(0).uop      := NullMicroOp
+wb_req(0).addr     := Cat(wb.io.meta_read.bits.tag, wb.io.data_req.bits.addr)
+wb_req(0).data     := DontCare
+wb_req(0).is_hella := false.B
+// Tag read for write-back
+metaReadArb.io.in(2).valid        := wb.io.meta_read.valid
+metaReadArb.io.in(2).bits.req(0).idx := getSetIdx(wb_req(0).addr)
+metaReadArb.io.in(2).bits.req(0).way_en := DontCare
+metaReadArb.io.in(2).bits.req(0).tag := getTag(wb_req(0).addr)
+wb.io.meta_read.ready := metaReadArb.io.in(2).ready && dataReadArb.io.in(1).ready
+// Data read for write-back
+dataReadArb.io.in(1).valid        := wb.io.data_req.valid
+dataReadArb.io.in(1).bits.req(0).addr := maskAddr(wb_req(0).addr)
+dataReadArb.io.in(1).bits.req(0).way_en := wb.io.data_req.bits.way_en
+dataReadArb.io.in(1).bits.valid   := widthMap(w => (w == 0).B)
+wb.io.data_req.ready  := metaReadArb.io.in(2).ready && dataReadArb.io.in(1).ready
+assert(!(wb.io.meta_read.fire ^ wb.io.data_req.fire))
 
+// -------
+// Prober
+val prober_fire  = prober.io.meta_read.fire
+val prober_req   = Wire(Vec(memWidth, new BoomDCacheReq))
+prober_req             := DontCare
+prober_req(0).uop      := NullMicroOp
+prober_req(0).addr     := Cat(prober.io.meta_read.bits.tag, prober.io.meta_read.bits.idx) << offsetBits
+prober_req(0).data     := DontCare
+prober_req(0).is_hella := false.B
+// Tag read for prober
+metaReadArb.io.in(1).valid       := prober.io.meta_read.valid
+metaReadArb.io.in(1).bits.req(0).idx := getSetIdx(prober_req(0).addr)
+metaReadArb.io.in(1).bits.req(0).way_en := DontCare
+metaReadArb.io.in(1).bits.req(0).tag := getTag(prober_req(0).addr)
+prober.io.meta_read.ready := metaReadArb.io.in(1).ready
+// Prober does not need to read data array
 
-  // -----------
-  // Write-backs
-  val wb_fire = wb.io.meta_read.fire && wb.io.data_req.fire
-  val wb_req = Wire(Vec(memWidth, new BoomDCacheReq))
-  wb_req             := DontCare
-  wb_req(0).uop      := NullMicroOp
-  wb_req(0).addr     := Cat(wb.io.meta_read.bits.tag, wb.io.data_req.bits.addr)
-  wb_req(0).data     := DontCare
-  wb_req(0).is_hella := false.B
-  // Couple the two decoupled interfaces of the WBUnit's meta_read and data_read
-  // Tag read for write-back
-  metaReadArb.io.in(2).valid        := wb.io.meta_read.valid
-  metaReadArb.io.in(2).bits.req(0)  := wb.io.meta_read.bits
-  wb.io.meta_read.ready := metaReadArb.io.in(2).ready && dataReadArb.io.in(1).ready
-  // Data read for write-back
-  dataReadArb.io.in(1).valid        := wb.io.data_req.valid
-  dataReadArb.io.in(1).bits.req(0)  := wb.io.data_req.bits
-  dataReadArb.io.in(1).bits.valid   := widthMap(w => (w == 0).B)
-  wb.io.data_req.ready  := metaReadArb.io.in(2).ready && dataReadArb.io.in(1).ready
-  assert(!(wb.io.meta_read.fire ^ wb.io.data_req.fire))
-
-  // -------
-  // Prober
-  val prober_fire  = prober.io.meta_read.fire
-  val prober_req   = Wire(Vec(memWidth, new BoomDCacheReq))
-  prober_req             := DontCare
-  prober_req(0).uop      := NullMicroOp
-  prober_req(0).addr     := Cat(prober.io.meta_read.bits.tag, prober.io.meta_read.bits.idx) << blockOffBits
-  prober_req(0).data     := DontCare
-  prober_req(0).is_hella := false.B
-  // Tag read for prober
-  metaReadArb.io.in(1).valid       := prober.io.meta_read.valid
-  metaReadArb.io.in(1).bits.req(0) := prober.io.meta_read.bits
-  prober.io.meta_read.ready := metaReadArb.io.in(1).ready
-  // Prober does not need to read data array
-
-  // -------
-  // Prefetcher
-  val prefetch_fire = mshrs.io.prefetch.fire
-  val prefetch_req  = Wire(Vec(memWidth, new BoomDCacheReq))
-  prefetch_req    := DontCare
-  prefetch_req(0) := mshrs.io.prefetch.bits
-  // Tag read for prefetch
-  metaReadArb.io.in(5).valid              := mshrs.io.prefetch.valid
-  metaReadArb.io.in(5).bits.req(0).idx    := mshrs.io.prefetch.bits.addr >> blockOffBits
-  metaReadArb.io.in(5).bits.req(0).way_en := DontCare
-  metaReadArb.io.in(5).bits.req(0).tag    := DontCare
-  mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
-  // Prefetch does not need to read data array
+// -------
+// Prefetcher
+val prefetch_fire = mshrs.io.prefetch.fire
+val prefetch_req  = Wire(Vec(memWidth, new BoomDCacheReq))
+prefetch_req    := DontCare
+prefetch_req(0) := mshrs.io.prefetch.bits
+// Tag read for prefetch
+metaReadArb.io.in(5).valid              := mshrs.io.prefetch.valid
+metaReadArb.io.in(5).bits.req(0).idx    := getSetIdx(mshrs.io.prefetch.bits.addr)
+metaReadArb.io.in(5).bits.req(0).way_en := DontCare
+metaReadArb.io.in(5).bits.req(0).tag    := getTag(mshrs.io.prefetch.bits.addr)
+mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
+// Prefetch does not need to read data array
 
   val s0_valid = Mux(io.lsu.req.fire, VecInit(io.lsu.req.bits.map(_.valid)),
                  Mux(mshrs.io.replay.fire || wb_fire || prober_fire || prefetch_fire || mshrs.io.meta_read.fire,
@@ -842,9 +967,9 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   wbArb.io.in(0)       <> prober.io.wb_req
   wbArb.io.in(1)       <> mshrs.io.wb_req
   wb.io.req            <> wbArb.io.out
-  wb.io.data_resp       := s2_data_muxed(0)
-  mshrs.io.wb_resp      := wb.io.resp
-  wb.io.mem_grant       := tl_out.d.fire && tl_out.d.bits.source === cfg.nMSHRs.U
+  wb.io.data_resp      := s2_data_muxed(0)
+  mshrs.io.wb_resp     := wb.io.resp
+  wb.io.mem_grant      := tl_out.d.fire && tl_out.d.bits.source === cfg.nMSHRs.U
 
   val lsu_release_arb = Module(new Arbiter(new TLBundleC(edge.bundle), 2))
   io.lsu.release <> lsu_release_arb.io.out
@@ -948,17 +1073,20 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   io.lsu.ordered := mshrs.io.fence_rdy && !s1_valid.reduce(_||_) && !s2_valid.reduce(_||_)
 
   override def toString: String = BoomCoreStringPrefix(
-    "==L1-ICache==",
-    "Fetch bytes   : " + 1.U,//+ cacheParams.fetchBytes,
-    "Block bytes   : " + 1.U,// (1 << blockOffBits),
-    "Row bytes     : " + 1.U,// rowBytes,
-    "Block Bytes   : " + 1.U,// outer.icacheParams.blockBytes,
-    "Word bits     : " + 1.U,// wordBits,
-    "RamDepth      : " + 1.U,// ramDepth,
-    "Sets          : " + 1.U,// nSets,
-    "Ways          : " + 1.U,// nWays,
-    "Refill cycles : " + 1.U,// refillCycles,
-    "RAMs          : (" +  1.U,// wordBits/nBanks + " x " + nSets*refillCycles + ") using " + nBanks + " banks",
-    //"" + (if (data.nBanks == 2) "Dual-banked" else "Single-banked"),
-    "I-TLB ways    : " + 1.U)// cacheParams.nTLBWays + "\n")
+    "==L1-DCache==",
+    "Mem Width     : " +  memWidth,
+    "EncRowBits    : " +  encRowBits,
+    "Row bytes     : " +  rowBytes,
+    "Block Bytes   : " +  dcacheParams.blockBytes,
+    "Word bits     : " +  wordBits,
+    "Sets          : " +  nSets,
+    "Ways          : " +  nWays,
+    "Refill cycles : " +  refillCycles,
+    "RAMs          : (" +  wordBits/boomParams.numDCacheBanks + " x " + nSets*refillCycles + ") using " + boomParams.numDCacheBanks + " banks" +
+    "" + (if (boomParams.numDCacheBanks == 2) "Dual-banked" else "Single-banked"),
+    "D-TLB ways    : " + dcacheParams.nTLBWays + "\n")
 }
+
+    // "Fetch bytes   : " +  cacheParams.fetchBytes,
+    // "Block bytes   : " +  (1 << blockOffBits),
+    // "RamDepth      : " +  ramDepth,
