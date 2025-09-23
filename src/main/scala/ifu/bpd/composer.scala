@@ -29,7 +29,7 @@ class ComposedBranchPredictorBank(implicit p: Parameters) extends BranchPredicto
     c.io.f3_fire   := io.f3_fire
 
     // addition for the fuzzycore project - AK
-    c.io.reconfigure_bpd := io.reconfigure_bpd
+    c.io.cf_bpd_tage_to_gshare := io.cf_bpd_tage_to_gshare
 
     if (c.metaSz > 0) {
       metas = (metas << c.metaSz) | c.io.f3_meta(c.metaSz-1,0)
