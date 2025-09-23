@@ -239,10 +239,13 @@ class BoomTileModuleImp(outer: BoomTile) extends BaseTileModuleImp(outer){
   // Generate a descriptive string
   val frontendStr = outer.frontend.module.toString
   val coreStr = core.toString
+  val dcacheStr = outer.dcache.module.toString
+
   val boomTileStr =
     (BoomCoreStringPrefix(s"======BOOM Tile ${staticIdForMetadataUseOnly} Params======") + "\n"
     + frontendStr
-    + coreStr + "\n")
+    + coreStr 
+    + dcacheStr + "\n")
 
   override def toString: String = boomTileStr
 

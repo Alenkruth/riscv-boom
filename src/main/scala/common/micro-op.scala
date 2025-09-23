@@ -86,7 +86,7 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   val prs1             = UInt(maxPregSz.W)
   val prs2             = UInt(maxPregSz.W)
   val prs3             = UInt(maxPregSz.W)
-  val ppred            = UInt(log2Ceil(ftqSz).W)
+  val ppred            = UInt(log2Ceil(ftqSz).W) // PP ready?
 
   val prs1_busy        = Bool()
   val prs2_busy        = Bool()
@@ -145,8 +145,22 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   // What prediction structure provides the prediction TO this op
   val debug_tsrc       = UInt(BSRC_SZ.W)
 
+  // Corefuzzing - IFT tags for every micro-op
   // adding the tag to the Microp to let it propagate through the pipeline once created
-  val privilege_tag    = UInt(TAG_WIDTH.W)
+  val cf_domain_id            = UInt(iftTagWidth.W)
+  val cf_speculated           = Bool()      // set when the micro-op is speculatively issued
+  val cf_attacker_influence   = Bool()      // set when the micro-op is either fetched/dispatched based on an attacker/secret dependent thread/micro-op
+  val cf_secret_access        = Bool()      // set when the micro-op accesses a secret
+  val cf_secret_propagation   = Bool()      // set when the micro-op is in the dependence chain of originating in a secret
+  val cf_secret_transmission  = Bool()      // set when a secret dependent micro-op makes a update to a stateful unit
+
+  override def toPrintable: Printable = {
+    val cf_info = Cat(cf_domain_id, cf_speculated, cf_attacker_influence, cf_secret_access, cf_secret_propagation, cf_secret_transmission)
+    cf"UOP Code is $uopc " +
+    cf"PC is $debug_pc " +
+    cf"IQ type $iq_type FU type $fu_code " +
+    cf"is branch $is_br, is taken $taken \n" 
+  }
 
   // Do we allocate a branch tag for this?
   // SFB branches don't get a mask, they get a predicate bit

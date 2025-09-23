@@ -146,8 +146,10 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val refill_done = refill_one_beat && d_done
   tl_out.d.ready := true.B
   require (edge_out.manager.minLatency > 0)
-  val replacer = outer.icacheParams.replacement
-  val repl_way = replacer.way // if (isDM) 0.U else LFSR(16, refill_fire)(log2Ceil(nWays)-1,0)
+  val replacer_LRU = outer.icacheParams.replacement_LRU
+  val replacer_RAND = outer.icacheParams.replacement_RAND
+  // replace truw with config CSR flag
+  val repl_way = if (isDM) 0.U else ( if (true) replacer_LRU.way else replacer_RAND.way) // if (isDM) 0.U else LFSR(16, refill_fire)(log2Ceil(nWays)-1,0)
 
   val tag_array = SyncReadMem(nSets, Vec(nWays, UInt(tagBits.W)))
   val tag_rdata = tag_array.read(s0_vaddr(untagBits-1, blockOffBits), !refill_done && s0_valid)
