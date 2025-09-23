@@ -49,7 +49,7 @@ import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.rocket
 import freechips.rocketchip.tilelink._
-import freechips.rocketchip.util.Str
+import freechips.rocketchip.util.{Str, CoreFuzzingConstants}
 
 import boom.common._
 import boom.exu.{BrUpdateInfo, Exception, FuncUnitResp, CommitSignals, ExeUnitResp}
@@ -80,6 +80,7 @@ class BoomDCacheResp(implicit p: Parameters) extends BoomBundle()(p)
 }
 
 class LSUDMemIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
+with CoreFuzzingConstants
 {
   // In LSU's dmem stage, send the request
   val req         = new DecoupledIO(Vec(memWidth, Valid(new BoomDCacheReq)))
@@ -101,6 +102,16 @@ class LSUDMemIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
   val force_order  = Output(Bool())
   val ordered     = Input(Bool())
 
+  // debug log fro corefuzzing
+  val cf_debug_dcache_enable = Output(Bool())
+
+  // for corefuzzing - dcache configuration flags
+  val cf_dcache_set_conf = Output(UInt(dcacheParamsWidthCF.W))
+  val cf_dcache_way_conf = Output(UInt(dcacheParamsWidthCF.W))
+  val cf_dcache_size_conf = Output(UInt(dcacheParamsWidthCF.W))
+  val cf_dcache_repl_conf = Output(UInt(dcacheParamsWidthCF.W))
+  val cf_dcache_blocksize = Output(Bool())
+
   val perf = Input(new Bundle {
     val acquire = Bool()
     val release = Bool()
@@ -109,6 +120,7 @@ class LSUDMemIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
 }
 
 class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
+  with CoreFuzzingConstants
 {
   val exe = Vec(memWidth, new LSUExeIO)
 
@@ -150,6 +162,17 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
 
   val tsc_reg     = Input(UInt())
 
+  // flag to print debug log
+  val cf_debug_lsu_enable = Input(Bool())
+
+  // for corefuzzing - dcache configuration flags
+  val cf_debug_dcache_enable = Input(Bool())
+  val cf_dcache_set_conf = Input(UInt(dcacheParamsWidthCF.W))
+  val cf_dcache_way_conf = Input(UInt(dcacheParamsWidthCF.W))
+  val cf_dcache_size_conf = Input(UInt(dcacheParamsWidthCF.W))
+  val cf_dcache_repl_conf = Input(UInt(dcacheParamsWidthCF.W))
+  val cf_dcache_blocksize = Input(Bool())
+
   val perf        = Output(new Bundle {
     val acquire = Bool()
     val release = Bool()
@@ -186,7 +209,6 @@ class LDQEntry(implicit p: Parameters) extends BoomBundle()(p)
 
   val debug_wb_data       = UInt(xLen.W)
 }
-
 class STQEntry(implicit p: Parameters) extends BoomBundle()(p)
    with HasBoomUOP
 {
@@ -741,9 +763,16 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // The address either was freshly translated, or we are
   // reading a physical address from the LDQ,STQ, or the HellaCache adapter
 
+  // pass corefuzzing configure values to dmem
+  io.dmem.cf_dcache_set_conf := io.core.cf_dcache_set_conf
+  io.dmem.cf_dcache_way_conf := io.core.cf_dcache_way_conf
+  io.dmem.cf_dcache_size_conf := io.core.cf_dcache_size_conf
+  io.dmem.cf_dcache_repl_conf := io.core.cf_dcache_repl_conf
+  io.dmem.cf_debug_dcache_enable := io.core.cf_debug_dcache_enable && io.core.cf_debug_lsu_enable
+  io.dmem.cf_dcache_blocksize := io.core.cf_dcache_blocksize
 
   // defaults
-  io.dmem.brupdate         := io.core.brupdate
+  io.dmem.brupdate       := io.core.brupdate
   io.dmem.exception      := io.core.exception
   io.dmem.rob_head_idx   := io.core.rob_head_idx
   io.dmem.rob_pnr_idx    := io.core.rob_pnr_idx
@@ -751,6 +780,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val dmem_req = Wire(Vec(memWidth, Valid(new BoomDCacheReq)))
   io.dmem.req.valid := dmem_req.map(_.valid).reduce(_||_)
   io.dmem.req.bits  := dmem_req
+
+  for (w <- 0 until memWidth) {
+    when (io.dmem.req.valid && (io.dmem.req.bits(w).bits.addr === 0.U) && io.core.cf_debug_lsu_enable) {
+        printf("[LSU] lsu out valid and dmem.req.bits(%d).bits.addr - 0x%x\n", w.U, io.dmem.req.bits(w).bits.addr)
+    }
+  }
   val dmem_req_fire = widthMap(w => dmem_req(w).valid && io.dmem.req.fire)
 
   val s0_executing_loads = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B)))
@@ -1227,6 +1262,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // TODO encapsulate this in an age-based  priority-encoder
   //   val l_idx = AgePriorityEncoder((Vec(Vec.tabulate(numLdqEntries)(i => failed_loads(i) && i.U >= laq_head)
   //   ++ failed_loads)).asUInt)
+
   val temp_bits = (VecInit(VecInit.tabulate(numLdqEntries)(i =>
     failed_loads(i) && i.U >= ldq_head) ++ failed_loads)).asUInt
   val l_idx = PriorityEncoder(temp_bits)
@@ -1648,7 +1684,6 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   live_store_mask := next_live_store_mask &
                     ~(st_brkilled_mask.asUInt) &
                     ~(st_exc_killed_mask.asUInt)
-
 
 }
 
