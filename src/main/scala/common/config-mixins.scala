@@ -287,7 +287,7 @@ class WithNMegaBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends C
           tileParams = BoomTileParams(
             core = BoomCoreParams(
               fetchWidth = 8,
-              decodeWidth = 4,
+              decodeWidth = 4, 
               numRobEntries = 128,
               issueParams = Seq(
                 IssueParams(issueWidth=2, numEntries=24, iqType=IQT_MEM.litValue, dispatchWidth=4),
@@ -298,7 +298,7 @@ class WithNMegaBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends C
               numLdqEntries = 32,
               numStqEntries = 32,
               maxBrCount = 20,
-              numFetchBufferEntries = 32,
+              numFetchBufferEntries = 64, // increased from 32
               enablePrefetching = true,
               ftq = FtqParameters(nEntries=40),
               nPerfCounters = 29, // corefuzzing
@@ -345,6 +345,7 @@ class WithNGigaBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends C
               numLdqEntries = 32,
               numStqEntries = 32,
               maxBrCount = 20,
+              // alex - just testing if possible
               numFetchBufferEntries = 40, // keep this as a multiple of 5 to avoid issues.
               enablePrefetching = true,
               numDCacheBanks = 1,

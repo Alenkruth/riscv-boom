@@ -291,7 +291,16 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   // val cf_debug_log = Output(Bool())
   // for the fuzzycore. cf_tage_to_gshare is an output because the bundle gets flipped for 
   // some reason in the BoomFrontendBundle class.
+
+  // val reconfigure_bpd = Output(Bool())
+
+  // for corefuzzing - reconfigureFP is ouput bc bundle gets flipped
+  // from alex
+  val reconfigureFB_rows_b0 = Output(Bool())
+  val reconfigureFB_rows_b1 = Output(Bool())
+  
   val cf_bpd_tage_to_gshare = Output(Bool())
+
 }
 
 /**
@@ -929,6 +938,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     Mux(f4_sfb_valid, f4_sfb_mask(fetchWidth-1,0), 0.U(fetchWidth.W)) |
     f4.io.deq.bits.shadowed_mask.asUInt
   ).asBools
+
+  // value from associated CSR for corefuzzing - alex
+  fb.io.reconfigureFB_rows_b0 := io.cpu.reconfigureFB_rows_b0
+  fb.io.reconfigureFB_rows_b1 := io.cpu.reconfigureFB_rows_b1
 
 
   ftq.io.enq.valid          := f4.io.deq.valid && fb.io.enq.ready && !f4_delay

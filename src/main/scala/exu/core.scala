@@ -294,6 +294,16 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   // printf("[CORE] dcacheCSR - 0x%x 0x%x 0x%x 0x%x \n", custom_csrs.cf_dcache_set_conf, custom_csrs.cf_dcache_way_conf, custom_csrs.cf_dcache_size_conf, custom_csrs.cf_dcache_repl_conf)
 
+  // for corefuzzing, assigning CSR output to frontend for reconfigureFB
+  io.ifu.reconfigureFB_rows_b0 := custom_csrs.reconfigureFB_rows_b0
+  io.ifu.reconfigureFB_rows_b1 := custom_csrs.reconfigureFB_rows_b1
+
+  // for corefuzzing, CSR outputs for ldq and stq lengths
+  io.lsu.reconfigure_stq_b1 := custom_csrs.reconfig_stq_b1
+  io.lsu.reconfigure_stq_b0 := custom_csrs.reconfig_stq_b0
+  io.lsu.reconfigure_ldq_b1 := custom_csrs.reconfig_ldq_b1
+  io.lsu.reconfigure_ldq_b0 := custom_csrs.reconfig_ldq_b0
+
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
   val icache_blocked = false.B
   csr.io.counters foreach { c => c.inc := RegNext(perfEvents.evaluate(c.eventSel)) }
