@@ -22,8 +22,7 @@ import freechips.rocketchip.rocket.{MStatus, BP, BreakpointUnit}
 import boom.v4.common._
 import boom.v4.util.{BoolToChar, MaskUpper}
 
-// This file has been modified to implement a CSR that modifies 
-// the number of rows used in the fetch buffer - Alex, CoreFuzzing
+
 
 /**
  * Bundle that is made up of converted MicroOps from the Fetch Bundle
@@ -52,15 +51,9 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     // Was the pipeline redirected? Clear/reset the fetchbuffer.
     val clear = Input(Bool())
 
-    // adding for corefuzzing - alex
-    val reconfigureFB_rows_b0 = Input(Bool())
-    val reconfigureFB_rows_b1 = Input(Bool())
   })
 
-  // original
   require (numEntries > fetchWidth)
-  // modified for smallest num of entries used
-  // require (numEntries/4 >= fetchWidth)
   require (numEntries % coreWidth == 0)
   val numRows = numEntries / coreWidth
 
@@ -68,47 +61,10 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   ram.suggestName("fb_uop_ram")
   val deq_vec = Wire(Vec(numRows, Vec(coreWidth, new MicroOp)))
 
-  val head = RegInit(1.U(numRows.W)) 
+  val head = RegInit(1.U(numRows.W))
   val tail = RegInit(1.U(numEntries.W))
 
   val maybe_full = RegInit(false.B)
-
-  // fetch-buffer size fuzzing for CoreFuzzing project - alex
-  // for Mega Boom:
-  // decode width --> core width = 4
-  // numFetchBufferEntries = 32
-  // standard numRows = 32/4 = 8
-  // four numrows reconfigurations: 4, 8, 12, 16
-    // 0 --> 0.25*numRows = 2
-    // 1 --> 0.5*numRows = 4
-    // 2 --> 0.75*numRows = 6
-    // 3 --> numRows = 8
-
-
-  // registers for debugging - alex, corefuzzing
-  val rowsUsed = Mux(io.reconfigureFB_rows_b1, Mux(io.reconfigureFB_rows_b0, (numRows).U, (3*(numRows/4)).U), Mux(io.reconfigureFB_rows_b0, (numRows/2).U, (numRows/4).U))
-  dontTouch(rowsUsed)
-  val rowNum_tail = Reg(UInt(5.W))
-  val rowNum_head = Reg(UInt(5.W))
-  dontTouch(rowNum_tail)
-  dontTouch(rowNum_head)
-
-
-  // used ChatGPT to write these switch statements (head and tail) for debugging - alex, corefuzzing
-  // for numRows = 16
-  for (i <- 0 until numRows) {
-    when ((head & (0x00000001.U << (i)).asUInt) =/= 0.U) {
-      rowNum_head := i.U
-    }
-  }
-  
-  // switch statements got out of control for tail - condensed with for loop
-  // for numRows = 16 and coreWidth = 4
-  for (i <- 0 until 16) {
-    when ((tail & (0x000000000000000F.U << (i * 4)).asUInt) =/= 0.U) {
-      rowNum_tail := i.U
-    }
-  }
 
   //-------------------------------------------------------------
   // **** Enqueue Uops ****
@@ -117,39 +73,10 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // Step 2: Generate one-hot write indices.
   // Step 3: Write MicroOps into the RAM.
 
-  // adjusting rotate left function to account for varying buffer dimensions - corefuzzing, alex
   def rotateLeft(in: UInt, k: Int) = {
     val n = in.getWidth
-    val tail_rotate = Wire(UInt(n.W))
-    when (io.reconfigureFB_rows_b1) {
-      when(io.reconfigureFB_rows_b0){
-        // numRows
-        tail_rotate := Cat(in(n-k-1,0), in(n-1, n-k))
-      }
-      .otherwise{
-        // 0.75*numRows
-        tail_rotate := Cat(0.U((n/4).W), in((3*n/4)-k-1,0), in((3*n/4)-1, (3*n/4)-k))
-      }
-    }
-    .otherwise {
-      when(io.reconfigureFB_rows_b0){
-        // 0.5*numRows
-        tail_rotate := Cat(0.U((n/2).W), in((n/2)-k-1,0), in((n/2)-1, (n/2)-k))
-      }
-      .otherwise{
-        // 0.25*numRows
-        tail_rotate := Cat(0.U((3*n/4).W), in((n/4)-k-1,0), in((n/4)-1, (n/4)-k))
-      }
-    }   
-    // return result - if hot bit got cut off by reconfiguration, reset to bit 0
-    Mux(tail_rotate.orR, tail_rotate, 1.U(n.W))
+    Cat(in(n-k-1,0), in(n-1, n-k))
   }
-
-  // original function
-  // def rotateLeft(in: UInt, k: Int) = {
-  //   val n = in.getWidth
-  //   Cat(in(n-k-1,0), in(n-1, n-k))
-  // }
 
   // this mechanism is fine as long as the rotations are done with respect with the current buffer dimensions
   // adjusments to rotateLeft should correct the functionality - alex, corefuzzing
@@ -205,47 +132,15 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // Step 2. Generate one-hot write indices.
   val enq_idxs = Wire(Vec(fetchWidth, UInt(numEntries.W)))
 
-  // adjusted inc function for corefuzzing - alex
-  // this now uses only a percentage of the available space in the buffer based on the fetch buffer CSR
   def inc(ptr: UInt) = {
-    val n = ptr.getWidth
-    val tail_rotate = Wire(UInt(n.W))
-    when (io.reconfigureFB_rows_b1) {
-      when(io.reconfigureFB_rows_b0){
-        // numRows
-        tail_rotate := Cat(ptr(n-2,0), ptr(n-1))
-      }
-      .otherwise{
-        // 0.75*numRows
-        tail_rotate := Cat(0.U((n/4).W), ptr((3*n/4)-2,0), ptr((3*n/4)-1))
-      }
-    }
-    .otherwise {
-      when(io.reconfigureFB_rows_b0){
-        // 0.5*numRows
-        tail_rotate := Cat(0.U((n/2).W), ptr((n/2)-2,0), ptr((n/2)-1))
-      }
-      .otherwise{
-        // 0.25*numRows
-        tail_rotate := Cat(0.U((3*n/4).W), ptr((n/4)-2,0), ptr((n/4)-1))
-      }
-    }   
-    // return result - if hot bit got cut off by reconfiguration, reset to bit 0
-    Mux(tail_rotate.orR, tail_rotate, 1.U(n.W))
+     val n = ptr.getWidth
+     Cat(ptr(n-2,0), ptr(n-1))
   }
-
-  // original function:
-  // def inc(ptr: UInt) = {
-  //   val n = ptr.getWidth
-  //   Cat(ptr(n-2,0), ptr(n-1))
-  // }
 
   var enq_idx = tail
   for (i <- 0 until fetchWidth) {
     enq_idxs(i) := enq_idx
     enq_idx = Mux(in_mask(i), inc(enq_idx), enq_idx)
-    // original line - modified for corefuzzing - alex
-    // enq_idx = Mux(in_mask(i), inc(enq_idx), enq_idx)
   }
 
   // Step 3: Write MicroOps into the RAM.
@@ -253,8 +148,6 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     for (j <- 0 until numEntries) {
       when (do_enq && in_mask(i) && enq_idxs(i)(j)) {
         ram(j) := in_uops(i)
-        // for debugging: printing ram index for every enqueue - alex
-        printf(p"($rowsUsed, $coreWidth, enq, $j), ")
       }
     }
   }
@@ -263,7 +156,6 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // **** Dequeue Uops ****
   //-------------------------------------------------------------
 
-  // doesn't need modification for varying buffer dimensions because head and tail are rotated appropriately - alex, corefuzzing
   val tail_collisions = VecInit((0 until numEntries).map(i =>
                           head(i/coreWidth) && (!maybe_full || (i % coreWidth != 0).B))).asUInt & tail
   val slot_will_hit_tail = (0 until numRows).map(i => tail_collisions((i+1)*coreWidth-1, i*coreWidth)).reduce(_|_)
@@ -286,7 +178,6 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // **** Update State ****
   //-------------------------------------------------------------
 
-  // rotating enq_idx appropriately for the given buffer dimensions results in a properly rotated tail - alex, corefuzzing
   when (do_enq) {
     tail := enq_idx
     when (in_mask.reduce(_||_)) {
@@ -294,12 +185,9 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     }
   }
 
-  // modifying inc() function to account for varying buffer dimensions resuls in properly rotated head - alex, corefuzzing
   when (do_deq) {
     head := inc(head)
     maybe_full := false.B
-    // debugging: printing the row index for each dequeue - alex
-    printf(p"($rowsUsed, deq, $rowNum_head), ")
   }
 
   when (io.clear) {
