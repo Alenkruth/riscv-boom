@@ -252,7 +252,7 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     val init = BigInt(0) // default: 16B
     Some(CustomCSR(cacheBlockSizeCSRIdCF, mask, Some(init)))
   }
-  def cf_dcache_blocksize = getOrElse(cacheBlockSizeCSRCF, _.value(0), false.B)
+  def cf_dcache_blocksize_conf = getOrElse(cacheBlockSizeCSRCF, _.value(0), false.B)
   // def dcache_blocksize = boom.common.decodeOneHot(dcache_blocksize_csr_val & 0x3.U, boom.common.DCacheReconfOptions.blockSizeOptions)
 
   override def debugCSRCF = {
