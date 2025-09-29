@@ -294,7 +294,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   io.lsu.cf_dcache_way_conf := custom_csrs.cf_dcache_way_conf
   io.lsu.cf_dcache_size_conf := custom_csrs.cf_dcache_size_conf
   io.lsu.cf_dcache_repl_conf := custom_csrs.cf_dcache_repl_conf
-  io.lsu.cf_dcache_blocksize := custom_csrs.cf_dcache_blocksize
+  io.lsu.cf_dcache_blocksize_conf := custom_csrs.cf_dcache_blocksize_conf
 
   // getting the rob entries from the CSR
   rob.io.cf_rob_entries := custom_csrs.cf_rob_entries 

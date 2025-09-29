@@ -108,7 +108,7 @@ with CoreFuzzingConstants
   val cf_dcache_way_conf = Output(UInt(dcacheParamsWidthCF.W))
   val cf_dcache_size_conf = Output(UInt(dcacheParamsWidthCF.W))
   val cf_dcache_repl_conf = Output(UInt(dcacheParamsWidthCF.W))
-  val cf_dcache_blocksize = Output(Bool())
+  val cf_dcache_blocksize_conf = Output(Bool())
 
   val perf = Input(new Bundle {
     val acquire = Bool()
@@ -169,7 +169,7 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   val cf_dcache_way_conf = Input(UInt(dcacheParamsWidthCF.W))
   val cf_dcache_size_conf = Input(UInt(dcacheParamsWidthCF.W))
   val cf_dcache_repl_conf = Input(UInt(dcacheParamsWidthCF.W))
-  val cf_dcache_blocksize = Input(Bool())
+  val cf_dcache_blocksize_conf = Input(Bool())
 
   val perf        = Output(new Bundle {
     val acquire = Bool()
@@ -774,7 +774,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   io.dmem.cf_dcache_size_conf := io.core.cf_dcache_size_conf
   io.dmem.cf_dcache_repl_conf := io.core.cf_dcache_repl_conf
   io.dmem.cf_debug_dcache_enable := io.core.cf_debug_dcache_enable && io.core.cf_debug_lsu_enable
-  io.dmem.cf_dcache_blocksize := io.core.cf_dcache_blocksize
+  io.dmem.cf_dcache_blocksize_conf := io.core.cf_dcache_blocksize_conf
 
   // defaults
   io.dmem.brupdate       := io.core.brupdate
