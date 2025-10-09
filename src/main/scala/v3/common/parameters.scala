@@ -168,25 +168,25 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   }
 
   // second CSR - fetch_bufferCSR
-  override def fetch_bufferCSR = {
+  override def fetchBufferCSRCF = {
     val mask = BigInt(1 << 1 | 1 << 0) // bits 1 and 0 for numRows reconfiguration
     val init = BigInt(1 << 1 | 1 << 0) // at initialization
-    Some(CustomCSR(fetch_bufferCSRId, mask, Some(init)))
+    Some(CustomCSR(fetchBufferCSRIdCF, mask, Some(init)))
   }
 
   // load/store queue CSR
-  override def ldq_stq_CSR = {
+  override def ldqStqCSRCF = {
     val mask = BigInt(1 << 3 | 1 << 2 | 1 << 1 | 1 << 0) // for right now, 2 bits (<<2) for stq length reconfig, 2 bits (<<0) for ldq len
     val init = BigInt(1 << 3 | 1 << 2 | 1 << 1 | 1 << 0) // at initialization
-    Some(CustomCSR(ldq_stq_CSRId, mask, Some(init)))
+    Some(CustomCSR(ldqStqCSRIdCF, mask, Some(init)))
   }
 
-  def reconfig_stq_b1 = getOrElse(ldq_stq_CSR, _.value(3), true.B)
-  def reconfig_stq_b0 = getOrElse(ldq_stq_CSR, _.value(2), true.B)
-  def reconfig_ldq_b1 = getOrElse(ldq_stq_CSR, _.value(1), true.B)
-  def reconfig_ldq_b0 = getOrElse(ldq_stq_CSR, _.value(0), true.B)
-  def reconfigureFB_rows_b0 = getOrElse(fetch_bufferCSR, _.value(0), true.B)
-  def reconfigureFB_rows_b1 = getOrElse(fetch_bufferCSR, _.value(1), true.B)
+  def reconfig_stq_b1 = getOrElse(ldqStqCSRCF, _.value(3), true.B)
+  def reconfig_stq_b0 = getOrElse(ldqStqCSRCF, _.value(2), true.B)
+  def reconfig_ldq_b1 = getOrElse(ldqStqCSRCF, _.value(1), true.B)
+  def reconfig_ldq_b0 = getOrElse(ldqStqCSRCF, _.value(0), true.B)
+  def reconfigureFB_rows_b0 = getOrElse(fetchBufferCSRCF, _.value(0), true.B)
+  def reconfigureFB_rows_b1 = getOrElse(fetchBufferCSRCF, _.value(1), true.B)
   // def reconfigureBPD = getOrElse(configureCSR, _.value(2), true.B)  
   
   def cf_bpd_tage_to_gshare = getOrElse(bpdCSRCF, _.value(2), true.B)  

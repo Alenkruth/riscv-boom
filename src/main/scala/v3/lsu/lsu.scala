@@ -178,10 +178,10 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   })
 
   // for corefuzzing - reconfigure is ouput bc bundle gets flipped
-  val reconfigure_stq_b1 = Output(Bool())
-  val reconfigure_stq_b0 = Output(Bool())
-  val reconfigure_ldq_b1 = Output(Bool())
-  val reconfigure_ldq_b0 = Output(Bool())
+  val reconfigure_stq_b1 = Input(Bool())
+  val reconfigure_stq_b0 = Input(Bool())
+  val reconfigure_ldq_b1 = Input(Bool())
+  val reconfigure_ldq_b0 = Input(Bool())
 }
 
 class LSUIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)

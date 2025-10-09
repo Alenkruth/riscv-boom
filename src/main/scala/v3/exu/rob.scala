@@ -235,6 +235,7 @@ class Rob(
   // TODO - Add this assertion in fuzzer to remove the extra logic generation
   assert(entryCount % coreWidth.U === 0.U, "ROB entryCount must be a multiple of coreWidth")
   assert(cf_rob_rows <= numRobRows.U, "cf_rob_rows exceeds loop bound")
+  assert(cf_rob_rows =/= 0.U, "cf_rob_rows is zero")
 
   //commit entries at the head, and unwind exceptions from the tail
   val rob_head     = RegInit(0.U(log2Ceil(numRobRows).W))

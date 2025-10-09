@@ -154,12 +154,32 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   val cf_secret_propagation   = Bool()      // set when the micro-op is in the dependence chain of originating in a secret
   val cf_secret_transmission  = Bool()      // set when a secret dependent micro-op makes a update to a stateful unit
 
+  val cf_op_count_id = UInt(uopIDCounterWidthCF.W) // counts the number of active micro-ops. Count is incremented when it the micro-op is created with a counter. 
+                                 // counter wraps around at 255. It is fine because the maximum number of uops currently supported in 130. Even if we 
+                                 // increase this number, we can increase the width of the counter.
+  val cf_taint_module_id_1 = UInt(moduleCountCF.W) // keeps track of modules where transmission happened
+  val cf_taint_type_1 = UInt(taintTypeCf.W) // keeps track of which taint was set first
+  val cf_taint_op_count_1 = UInt(uopIDCounterWidthCF.W) // keeps track of the uop count when the first taint was set
+
+  val cf_taint_module_id_2 = UInt(moduleCountCF.W) // keeps track of modules where transmission happened
+  val cf_taint_type_2 = UInt(taintTypeCf.W) // keeps track of which taint was set first
+  val cf_taint_op_count_2 = UInt(uopIDCounterWidthCF.W) // keeps track of the uop count when the first taint was set
+
+  val cf_taint_module_id_3 = UInt(moduleCountCF.W) // keeps track of modules where transmission happened
+  val cf_taint_type_3 = UInt(taintTypeCf.W) // keeps track of which taint was set first
+  val cf_taint_op_count_3 = UInt(uopIDCounterWidthCF.W) // keeps track of the uop count when the first taint was set
+
   override def toPrintable: Printable = {
     val cf_info = Cat(cf_domain_id, cf_speculated, cf_attacker_influence, cf_secret_access, cf_secret_propagation, cf_secret_transmission)
+    val cf_taint = Cat(cf_taint_module_id_1, cf_taint_type_1, cf_taint_op_count_1, cf_taint_module_id_2, cf_taint_type_2, cf_taint_op_count_2, cf_taint_module_id_3, cf_taint_type_3, cf_taint_op_count_3)
+    
     cf"UOP Code is $uopc " +
+    cf"UOP running count is $cf_op_count_id " +
     cf"PC is $debug_pc " +
     cf"IQ type $iq_type FU type $fu_code " +
-    cf"is branch $is_br, is taken $taken \n" 
+    cf"is branch $is_br, is taken $taken " +
+    cf"cf info is $cf_info " +
+    cf"cf taint info $cf_taint \n"
   }
 
   // Do we allocate a branch tag for this?

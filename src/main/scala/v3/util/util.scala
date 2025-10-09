@@ -25,7 +25,7 @@ import boom.v3.exu.{BrUpdateInfo}
 
 // test imports
 //import freechips.rocketchip.rocket.constants.CoreFuzzingConstants
-import boom.common._
+import boom.v3.common._
 /**
  * Object to XOR fold a input register of fullLength into a compressedLength.
  */
@@ -213,7 +213,7 @@ object WrapInc
   // "n" is the number of increments, so we wrap at n-1.
   // this is a dynamic version that would be synthesized to HW
   def apply(value: UInt, n: UInt): UInt = {
-    assert(n === 0.U, "n in WrapInc/WrapDec cannot be zero")
+    assert(n =/= 0.U, "n in WrapInc/WrapDec cannot be zero")
     // isPow2 is only defined for Int and bigInt. We will use bit manip to ID if n is a power of 2.
     // when ((n & n-1.U) === 0.U) {
     //   //(value + 1.U)(log2Ceil(n)-1,0)
@@ -254,7 +254,7 @@ object WrapDec
   // "n" is the number of increments, so we wrap at n-1.
   // dynamic version that would be synthesized to HW
   def apply(value: UInt, n: UInt): UInt = {
-    assert(n === 0.U, "n in WrapInc/WrapDec cannot be zero")
+    assert(n =/= 0.U, "n in WrapInc/WrapDec cannot be zero")
 
     val isPow2 = (n & n-1.U) === 0.U
     val shouldWrap = (value === 0.U)

@@ -167,14 +167,15 @@ class WithNSmallGShareBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) ex
             icache = Some(
               ICacheParams(rowBits = 64, nSets=64, nWays=4, fetchBytes=2*4)
             ),
-            hartId = i + idOffset
+            tileId = i + idOffset
           ),
           crossingParams = RocketCrossingParams()
         )
       } ++ prev
     }
-    case SystemBusKey => up(SystemBusKey, site).copy(beatBytes = 8)
-    case XLen => 64
+    // case SystemBusKey => up(SystemBusKey, site).copy(beatBytes = 8)
+    //case XLen => 64
+    case NumTiles => up(NumTiles) + n
   })
 )
 
@@ -407,13 +408,14 @@ class WithNCFGigaBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends
             icache = Some(
               ICacheParams(rowBits = 128, nSets=64, nWays=8, fetchBytes=4*4)
             ),
-            hartId = i + idOffset
+            tileId = i + idOffset
           ),
           crossingParams = RocketCrossingParams()
         )
       } ++ prev
     }
-    case XLen => 64
+    case NumTiles => up(NumTiles) + n
+    // case XLen => 64
   })
 )
 

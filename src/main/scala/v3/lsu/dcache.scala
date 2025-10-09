@@ -20,7 +20,7 @@ import boom.v3.common._
 import boom.v3.exu.BrUpdateInfo
 import boom.v3.util.{IsKilledByBranch, GetNewBrMask, BranchKillableQueue, IsOlder, UpdateBrMask, AgePriorityEncoder, WrapInc, Transpose} 
 
-import boom.util.{BoomCoreStringPrefix}
+import boom.v3.util.{BoomCoreStringPrefix}
 
 // import test
 // import freechips.rocketchip.rocket.constants.CoreFuzzingConstants
@@ -311,8 +311,10 @@ class BoomL1DataReadReqCF(implicit p: Parameters) extends BoomBundle()(p) {
 // core fuzzing specific AbstractBoomDataArray definition.
 abstract class AbstractBoomDataArrayCF(implicit p:Parameters) extends BoomModule with HasL1HellaCacheParameters {
   val io = IO(new BoomBundle {
-    val read  = Input(Vec(memWidth, Valid(new L1DataReadReqCF)))
-    val write = Input(Valid(new L1DataWriteReqCF))
+    // val read  = Input(Vec(memWidth, Valid(new L1DataReadReqCF)))
+    val read = Input(Vec(memWidth, Valid(new L1DataReadReq))) // test
+    // val write = Input(Valid(new L1DataWriteReqCF))
+    val write = Input(Valid(new L1DataWriteReq)) //test
     val resp  = Output(Vec(memWidth, Vec(nWays, Bits(encRowBits.W))))
     val nacks = Output(Vec(memWidth, Bool()))
     val cf_debug_dcache_enable = Input(Bool())
@@ -511,47 +513,47 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   }
   
   // === Dynamic DCache Reconfiguration Support ===
-  val active_sets = io.lsu.cf_dcache_set_conf
-  val active_ways = io.lsu.cf_dcache_way_conf
-  val active_size = io.lsu.cf_dcache_size_conf
-  val active_repl = io.lsu.cf_dcache_repl_conf
-  val active_blocksize = io.lsu.cf_dcache_blocksize_conf // 16 or 8
+  // val active_sets = io.lsu.cf_dcache_set_conf
+  // val active_ways = io.lsu.cf_dcache_way_conf
+  // val active_size = io.lsu.cf_dcache_size_conf
+  // val active_repl = io.lsu.cf_dcache_repl_conf
+  // val active_blocksize = io.lsu.cf_dcache_blocksize_conf // 16 or 8
 
-  val setBits = log2Ceil(active_sets)
-  val wayBits = log2Ceil(active_ways)
-  val offsetBits = log2Ceil(active_blocksize)
-  val tagBits = paddrBits - setBits - offsetBits
+  // val setBits = log2Ceil(active_sets)
+  // val wayBits = log2Ceil(active_ways)
+  // val offsetBits = log2Ceil(active_blocksize)
+  // val tagBits = paddrBits - setBits - offsetBits
 
   // Helper functions for dynamic address partitioning
   // Mask set index to active sets
   // Mask tag to active tag bits
   // These are used for meta/data array accesses
 
-  def getSetIdx(addr: UInt): UInt = (addr >> offsetBits) & ((1.U << setBits) - 1.U)
-  def getTag(addr: UInt): UInt = addr >> (setBits + offsetBits)
+  // def getSetIdx(addr: UInt): UInt = (addr >> offsetBits) & ((1.U << setBits) - 1.U)
+  // def getTag(addr: UInt): UInt = addr >> (setBits + offsetBits)
 
-  def maskAddr(addr: UInt): UInt = {
-    val mask = ((1L << (setBits + wayBits + offsetBits)) - 1).U
-    addr & mask
-  }
+  // def maskAddr(addr: UInt): UInt = {
+  //   val mask = ((1L << (setBits + wayBits + offsetBits)) - 1).U
+  //   addr & mask
+  // }
 
   // Print when config changes
-  val prev_sets = RegInit(active_sets)
-  val prev_ways = RegInit(active_ways)
-  val prev_size = RegInit(active_size)
-  val prev_repl = RegInit(active_repl)
-  val prev_blocksize = RegInit(active_blocksize)
-  when (active_sets =/= prev_sets || active_ways =/= prev_ways || active_size =/= prev_size || active_repl =/= prev_repl) {
-    printf("[DCACHE] Reconfigured: sets=%d ways=%d size=%d repl=%d\n", active_sets, active_ways, active_size, active_repl)
-    prev_sets := active_sets
-    prev_ways := active_ways
-    prev_size := active_size
-    prev_repl := active_repl
-  }
-  when (active_blocksize =/= prev_blocksize) {
-    printf("[DCACHE] Block size changed: %d -> %d\n", prev_blocksize, active_blocksize)
-    prev_blocksize := active_blocksize
-  }
+  // val prev_sets = RegInit(active_sets)
+  // val prev_ways = RegInit(active_ways)
+  // val prev_size = RegInit(active_size)
+  // val prev_repl = RegInit(active_repl)
+  // val prev_blocksize = RegInit(active_blocksize)
+  // when (active_sets =/= prev_sets || active_ways =/= prev_ways || active_size =/= prev_size || active_repl =/= prev_repl) {
+  //   printf("[DCACHE] Reconfigured: sets=%d ways=%d size=%d repl=%d\n", active_sets, active_ways, active_size, active_repl)
+  //   prev_sets := active_sets
+  //   prev_ways := active_ways
+  //   prev_size := active_size
+  //   prev_repl := active_repl
+  // }
+  // when (active_blocksize =/= prev_blocksize) {
+  //   printf("[DCACHE] Block size changed: %d -> %d\n", prev_blocksize, active_blocksize)
+  //   prev_blocksize := active_blocksize
+  // }
 
   val t_replay :: t_probe :: t_wb :: t_mshr_meta_read :: t_lsu :: t_prefetch :: Nil = Enum(6)
 
@@ -609,17 +611,17 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   data.io.write.valid := dataWriteArb.io.out.fire
   // assigning the wires individually to add the tag insertion
   // corefuzzing - ak
-  data.io.write.bits.addr := dataWriteArb.io.out.bits.addr
+  //data.io.write.bits.addr := dataWriteArb.io.out.bits.addr
   // dcache_address_checker.io.in := dataWriteArb.io.out.bits.addr
   // data.io.write.bits.data := Cat(dcache_address_checker.io.out, 
-  data.io.write.bits.data := dataWriteArb.io.out.bits.data // (encDataBits-1, 0))
+  //data.io.write.bits.data := dataWriteArb.io.out.bits.data // (encDataBits-1, 0))
   //printf("\nTag value %x\n", dcache_address_checker.io.out)
   //printf("\nTag concatenated with the data value %x\n", Cat(dcache_address_checker.io.out, dataWriteArb.io.out.bits.data))
-  data.io.write.bits.wmask := dataWriteArb.io.out.bits.wmask
-  data.io.write.bits.way_en := dataWriteArb.io.out.bits.way_en
+  //data.io.write.bits.wmask := dataWriteArb.io.out.bits.wmask
+  //data.io.write.bits.way_en := dataWriteArb.io.out.bits.way_en
   // data.io.write.bits.p := dataWriteArb.io.out.bits.p
 
-  // data.io.write.bits  := dataWriteArb.io.out.bits
+  data.io.write.bits  := dataWriteArb.io.out.bits
   dataWriteArb.io.out.ready := true.B
 
   // ------------
@@ -639,12 +641,12 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   // original address to the writeback unit.
   for (w <- 0 until memWidth) {
     // Tag read for new requests
-    metaReadArb.io.in(4).bits.req(w).idx    := getSetIdx(io.lsu.req.bits(w).bits.addr)
+    metaReadArb.io.in(4).bits.req(w).idx    := io.lsu.req.bits(w).bits.addr >> blockOffBits //getSetIdx(io.lsu.req.bits(w).bits.addr)
     metaReadArb.io.in(4).bits.req(w).way_en := DontCare
-    metaReadArb.io.in(4).bits.req(w).tag    := getTag(io.lsu.req.bits(w).bits.addr)
+    metaReadArb.io.in(4).bits.req(w).tag    := DontCare // getTag(io.lsu.req.bits(w).bits.addr)
     // Data read for new requests
     dataReadArb.io.in(2).bits.valid(w)      := io.lsu.req.bits(w).valid
-    dataReadArb.io.in(2).bits.req(w).addr   := maskAddr(io.lsu.req.bits(w).bits.addr)
+    dataReadArb.io.in(2).bits.req(w).addr   := io.lsu.req.bits(w).bits.addr // maskAddr(io.lsu.req.bits(w).bits.addr)
     dataReadArb.io.in(2).bits.req(w).way_en := ~0.U(nWays.W)
   }
 
@@ -659,12 +661,12 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   mshrs.io.replay.ready    := metaReadArb.io.in(0).ready && dataReadArb.io.in(0).ready
   // Tag read for MSHR replays
   metaReadArb.io.in(0).valid              := mshrs.io.replay.valid
-  metaReadArb.io.in(0).bits.req(0).idx    := getSetIdx(mshrs.io.replay.bits.addr)
+  metaReadArb.io.in(0).bits.req(0).idx    := mshrs.io.replay.bits.addr >> blockOffBits // getSetIdx(mshrs.io.replay.bits.addr)
   metaReadArb.io.in(0).bits.req(0).way_en := DontCare
-  metaReadArb.io.in(0).bits.req(0).tag    := getTag(mshrs.io.replay.bits.addr)
+  metaReadArb.io.in(0).bits.req(0).tag    := DontCare // getTag(mshrs.io.replay.bits.addr)
   // Data read for MSHR replays
   dataReadArb.io.in(0).valid              := mshrs.io.replay.valid
-  dataReadArb.io.in(0).bits.req(0).addr   := maskAddr(mshrs.io.replay.bits.addr)
+  dataReadArb.io.in(0).bits.req(0).addr   := mshrs.io.replay.bits.addr // maskAddr(mshrs.io.replay.bits.addr)
   dataReadArb.io.in(0).bits.req(0).way_en := mshrs.io.replay.bits.way_en
   dataReadArb.io.in(0).bits.valid         := widthMap(w => (w == 0).B)
 
@@ -673,13 +675,14 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
 val mshr_read_req = Wire(Vec(memWidth, new BoomDCacheReq))
 mshr_read_req             := DontCare
 mshr_read_req(0).uop      := NullMicroOp
-mshr_read_req(0).addr     := Cat(mshrs.io.meta_read.bits.tag, mshrs.io.meta_read.bits.idx) << offsetBits
+mshr_read_req(0).addr     := Cat(mshrs.io.meta_read.bits.tag, mshrs.io.meta_read.bits.idx) << blockOffBits
 mshr_read_req(0).data     := DontCare
 mshr_read_req(0).is_hella := false.B
 metaReadArb.io.in(3).valid       := mshrs.io.meta_read.valid
-metaReadArb.io.in(3).bits.req(0).idx := getSetIdx(mshr_read_req(0).addr)
-metaReadArb.io.in(3).bits.req(0).way_en := DontCare
-metaReadArb.io.in(3).bits.req(0).tag := getTag(mshr_read_req(0).addr)
+metaReadArb.io.in(3).bits.req(0)        := mshrs.io.meta_read.bits
+// metaReadArb.io.in(3).bits.req(0).idx := getSetIdx(mshr_read_req(0).addr)
+// metaReadArb.io.in(3).bits.req(0).way_en := DontCare
+// metaReadArb.io.in(3).bits.req(0).tag := getTag(mshr_read_req(0).addr)
 mshrs.io.meta_read.ready         := metaReadArb.io.in(3).ready
 
 // -----------
@@ -693,14 +696,16 @@ wb_req(0).data     := DontCare
 wb_req(0).is_hella := false.B
 // Tag read for write-back
 metaReadArb.io.in(2).valid        := wb.io.meta_read.valid
-metaReadArb.io.in(2).bits.req(0).idx := getSetIdx(wb_req(0).addr)
-metaReadArb.io.in(2).bits.req(0).way_en := DontCare
-metaReadArb.io.in(2).bits.req(0).tag := getTag(wb_req(0).addr)
+metaReadArb.io.in(2).bits.req(0)  := wb.io.meta_read.bits
+// metaReadArb.io.in(2).bits.req(0).idx := getSetIdx(wb_req(0).addr)
+// metaReadArb.io.in(2).bits.req(0).way_en := DontCare
+// metaReadArb.io.in(2).bits.req(0).tag := getTag(wb_req(0).addr)
 wb.io.meta_read.ready := metaReadArb.io.in(2).ready && dataReadArb.io.in(1).ready
 // Data read for write-back
 dataReadArb.io.in(1).valid        := wb.io.data_req.valid
-dataReadArb.io.in(1).bits.req(0).addr := maskAddr(wb_req(0).addr)
-dataReadArb.io.in(1).bits.req(0).way_en := wb.io.data_req.bits.way_en
+dataReadArb.io.in(1).bits.req(0)  := wb.io.data_req.bits
+//dataReadArb.io.in(1).bits.req(0).addr := maskAddr(wb_req(0).addr)
+//dataReadArb.io.in(1).bits.req(0).way_en := wb.io.data_req.bits.way_en
 dataReadArb.io.in(1).bits.valid   := widthMap(w => (w == 0).B)
 wb.io.data_req.ready  := metaReadArb.io.in(2).ready && dataReadArb.io.in(1).ready
 assert(!(wb.io.meta_read.fire ^ wb.io.data_req.fire))
@@ -711,14 +716,15 @@ val prober_fire  = prober.io.meta_read.fire
 val prober_req   = Wire(Vec(memWidth, new BoomDCacheReq))
 prober_req             := DontCare
 prober_req(0).uop      := NullMicroOp
-prober_req(0).addr     := Cat(prober.io.meta_read.bits.tag, prober.io.meta_read.bits.idx) << offsetBits
+prober_req(0).addr     := Cat(prober.io.meta_read.bits.tag, prober.io.meta_read.bits.idx) << blockOffBits// offsetBits
 prober_req(0).data     := DontCare
 prober_req(0).is_hella := false.B
 // Tag read for prober
 metaReadArb.io.in(1).valid       := prober.io.meta_read.valid
-metaReadArb.io.in(1).bits.req(0).idx := getSetIdx(prober_req(0).addr)
-metaReadArb.io.in(1).bits.req(0).way_en := DontCare
-metaReadArb.io.in(1).bits.req(0).tag := getTag(prober_req(0).addr)
+metaReadArb.io.in(1).bits.req(0) := prober.io.meta_read.bits
+//metaReadArb.io.in(1).bits.req(0).idx := getSetIdx(prober_req(0).addr)
+//metaReadArb.io.in(1).bits.req(0).way_en := DontCare
+// metaReadArb.io.in(1).bits.req(0).tag := getTag(prober_req(0).addr)
 prober.io.meta_read.ready := metaReadArb.io.in(1).ready
 // Prober does not need to read data array
 
@@ -730,9 +736,9 @@ prefetch_req    := DontCare
 prefetch_req(0) := mshrs.io.prefetch.bits
 // Tag read for prefetch
 metaReadArb.io.in(5).valid              := mshrs.io.prefetch.valid
-metaReadArb.io.in(5).bits.req(0).idx    := getSetIdx(mshrs.io.prefetch.bits.addr)
+metaReadArb.io.in(5).bits.req(0).idx    := mshrs.io.prefetch.bits.addr >> blockOffBits // getSetIdx(mshrs.io.prefetch.bits.addr)
 metaReadArb.io.in(5).bits.req(0).way_en := DontCare
-metaReadArb.io.in(5).bits.req(0).tag    := getTag(mshrs.io.prefetch.bits.addr)
+metaReadArb.io.in(5).bits.req(0).tag    := DontCare // getTag(mshrs.io.prefetch.bits.addr)
 mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
 // Prefetch does not need to read data array
 
