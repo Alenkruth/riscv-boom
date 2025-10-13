@@ -43,6 +43,7 @@ class FetchBufferResp(implicit p: Parameters) extends BoomBundle
 class FetchBuffer(implicit p: Parameters) extends BoomModule
   with HasBoomCoreParameters
   with HasBoomFrontendParameters
+  with CoreFuzzingConstants
 {
   val numEntries = numFetchBufferEntries
   val io = IO(new BoomBundle {
