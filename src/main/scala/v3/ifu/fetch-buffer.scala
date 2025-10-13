@@ -165,6 +165,15 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   val in_mask = Wire(Vec(fetchWidth, Bool()))
   val in_uops = Wire(Vec(fetchWidth, new MicroOp()))
 
+  // corefuzzing - ak
+  // Running counter for CoreFuzzing uop IDs. This register holds the
+  // next ID to assign for the first newly-created micro-op on an
+  // enqueue. It is uopIDCounterWidthCF wide and will wrap naturally
+  // on overflow. We update this register when we actually commit an
+  // enqueue (see when (do_enq) below).
+  val uopCount = RegInit(0.U(uopIDCounterWidthCF.W))
+  dontTouch(uopCount)
+
   // Step 1: Convert FetchPacket into a vector of MicroOps.
   for (b <- 0 until nBanks) {
     for (w <- 0 until bankWidth) {
@@ -200,6 +209,25 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
 
       in_uops(i).debug_fsrc     := io.enq.bits.fsrc
     }
+  }
+
+  // corefuzzing
+  // Assign cf_op_count_id for each created micro-op.
+  //
+  // Because multiple micro-ops are created in parallel (up to
+  // `fetchWidth`), we compute for each micro-op an offset equal to
+  // the number of valid micro-ops that appear before it in the
+  // current fetch packet. We use PopCount on the prefix of
+  // `in_mask` to compute this prefix-count. The uop's cf_op_count_id
+  // is then (uopCount + prefix_count). This guarantees that the
+  // created micro-ops receive consecutive IDs in program order even
+  // though they are formed in parallel. The addition wraps naturally
+  // to the configured width `uopIDCounterWidthCF`.
+  for (i <- 0 until fetchWidth) {
+    val priorValids = if (i == 0) 0.U else PopCount(in_mask.slice(0, i)).asUInt
+    // Resize priorValids to the counter width before adding
+    val id = (uopCount + priorValids)(uopIDCounterWidthCF - 1, 0)
+    in_uops(i).cf_op_count_id := id
   }
 
   // Step 2. Generate one-hot write indices.
@@ -286,6 +314,13 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     when (in_mask.reduce(_||_)) {
       maybe_full := true.B
     }
+    // corefuzzing
+    // Increment the running uop counter by the number of micro-ops
+    // actually enqueued in this cycle. We use PopCount on
+    // `in_mask` to count them. This update happens only when the
+    // enqueue actually fires (do_enq), so the counter remains stable
+    // otherwise.
+    uopCount := uopCount + PopCount(in_mask).asUInt
   }
 
   // modifying inc() function to account for varying buffer dimensions resuls in properly rotated head - alex, corefuzzing
