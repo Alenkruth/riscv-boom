@@ -19,6 +19,9 @@ import chisel3.util._
 import org.chipsalliance.cde.config.{Parameters}
 import freechips.rocketchip.rocket.{MStatus, BP, BreakpointUnit}
 
+// for Corefuzzing
+import freechips.rocketchip.util._
+
 import boom.v3.common._
 import boom.v3.util.{BoolToChar, MaskUpper}
 
