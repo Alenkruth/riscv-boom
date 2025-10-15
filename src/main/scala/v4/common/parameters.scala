@@ -119,7 +119,10 @@ case class BoomCoreParams(
   /* debug stuff */
   enableCommitLogPrintf: Boolean = false,
   enableBranchPrintf: Boolean = false,
-  enableMemtracePrintf: Boolean = false
+  enableMemtracePrintf: Boolean = false,
+
+  /* enableConservativeSNI: speculative non-interference */
+  enableConservativeSNI: Boolean = false
 
 // DOC include end: BOOM Parameters
 ) extends freechips.rocketchip.tile.CoreParams
@@ -134,12 +137,11 @@ case class BoomCoreParams(
   val nPTECacheEntries = 0
   val useHypervisor = false
   val jumpInFrontend: Boolean = false // unused in boom
-  val useBitManip = false
-  val useBitManipCrypto = false
-  val useCryptoNIST = false
-  val useCryptoSM = false
   val traceHasWdata = trace
   val useConditionalZero = false
+  val useZba = true
+  val useZbb = true
+  val useZbs = true
 
   override def customCSRs(implicit p: Parameters) = new BoomCustomCSRs
 }
@@ -321,6 +323,9 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val dcacheSinglePorted = boomParams.dcacheSinglePorted
   val enableBankedFPFreelist = boomParams.enableBankedFPFreelist
   val enableBPDHPMs = boomParams.enableBPDHPMs
+
+  val enableConservativeSNI = boomParams.enableConservativeSNI
+
 
   //************************************
   // Implicitly calculated constants

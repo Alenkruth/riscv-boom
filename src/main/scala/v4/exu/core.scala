@@ -36,7 +36,7 @@ import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.rocket.Instructions._
 import freechips.rocketchip.rocket.{Causes, PRV, CSR, CSRs, TracedInstruction}
-import freechips.rocketchip.tile.{HasFPUParameters, TraceBundle}
+import freechips.rocketchip.tile.{HasFPUParameters, TraceBundle, CustomCSR}
 import freechips.rocketchip.util.{Str, UIntIsOneOf, CoreMonitorBundle, PlusArg}
 import freechips.rocketchip.devices.tilelink.{PLICConsts, CLINTConsts}
 
@@ -47,17 +47,18 @@ import boom.v4.util._
 /**
  * Top level core object that connects the Frontend to the rest of the pipeline.
  */
-class BoomCore()(implicit p: Parameters) extends BoomModule
+class BoomCore(roccCSRs: Seq[Seq[CustomCSR]])(implicit p: Parameters) extends BoomModule
   with HasBoomFrontendParameters // TODO: Don't add this trait
   with HasFPUParameters
 {
+  val nTotalRoCCCSRs = roccCSRs.flatten.size
   val io = IO(new freechips.rocketchip.tile.CoreBundle
   {
     val hartid = Input(UInt(hartIdLen.W))
     val interrupts = Input(new freechips.rocketchip.rocket.CoreInterrupts(false))
     val ifu = new boom.v4.ifu.BoomFrontendIO
     val ptw = Flipped(new freechips.rocketchip.rocket.DatapathPTWIO())
-    val rocc = Flipped(new freechips.rocketchip.tile.RoCCCoreIO())
+    val rocc = Flipped(new freechips.rocketchip.tile.RoCCCoreIO(nTotalRoCCCSRs))
     val lsu = Flipped(new boom.v4.lsu.LSUCoreIO)
     val ptw_tlb = new freechips.rocketchip.rocket.TLBPTWIO()
     val trace = Output(new TraceBundle)
@@ -277,11 +278,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     new freechips.rocketchip.rocket.EventSet((mask, hits) => (mask & hits).orR, Seq(
 //      ("I$ blocked",                        () => icache_blocked),
       ("nop",                               () => false.B),
-      // ("branch misprediction",              () => br_unit.brinfo.mispredict),
-      // ("control-flow target misprediction", () => br_unit.brinfo.mispredict &&
-      //                                             br_unit.brinfo.cfi_type === CFI_JALR),
-      ("flush",                             () => rob.io.flush.valid)
-      //("branch resolved",                   () => br_unit.brinfo.valid)
+      ("branch misprediction",              () => b2.mispredict),
+      ("control-flow target misprediction", () => b2.mispredict &&
+                                                  b2.cfi_type === CFI_JALR),
+      ("flush",                             () => rob.io.flush.valid),
+// ("branch resolved",                   () => b2.valid)
     )),
 
     new freechips.rocketchip.rocket.EventSet((mask, hits) => (mask & hits).orR, Seq(
@@ -291,7 +292,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       ("ITLB miss",   () => io.ifu.perf.tlbMiss),
       ("DTLB miss",   () => io.lsu.perf.tlbMiss),
       ("L2 TLB miss", () => io.ptw.perf.l2miss)))))
-  val csr = Module(new freechips.rocketchip.rocket.CSRFile(perfEvents, boomParams.customCSRs.decls))
+  val csr = Module(new freechips.rocketchip.rocket.CSRFile(perfEvents, boomParams.customCSRs.decls, roccCSRs.flatten))
   csr.io.inst foreach { c => c := DontCare }
   csr.io.rocc_interrupt := io.rocc.interrupt
   csr.io.gva := DontCare
@@ -1025,6 +1026,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     iss_unit.io.child_rebusys := alu_exe_units.map(_.io_child_rebusy).reduce(_|_)
 
     iss_unit.io.wakeup_ports := int_wakeups
+
+    iss_unit.io.rob_pnr_idx := rob.io.rob_pnr_idx
+    iss_unit.io.rob_head    := rob.io.rob_head_idx
   }
 
   mem_iss_unit.io.squash_grant := (
