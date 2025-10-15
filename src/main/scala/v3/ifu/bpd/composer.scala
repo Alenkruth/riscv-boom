@@ -30,13 +30,18 @@ class ComposedBranchPredictorBank(implicit p: Parameters) extends BranchPredicto
     if (c.metaSz > 0) {
       metas = (metas << c.metaSz) | c.io.f3_meta(c.metaSz-1,0)
     }
+    
     meta_sz = meta_sz + c.metaSz
+    
+    // addition for the fuzzycore project - AK
+    c.io.cf_bpd_tage_to_gshare := io.cf_bpd_tage_to_gshare
+  
   }
   require(meta_sz < bpdMaxMetaLength)
   io.f3_meta := metas
 
 
-  var update_meta = io.update.bits.meta
+ var update_meta = io.update.bits.meta
   for (c <- components.reverse) {
     c.io.update := io.update
     c.io.update.bits.meta := update_meta

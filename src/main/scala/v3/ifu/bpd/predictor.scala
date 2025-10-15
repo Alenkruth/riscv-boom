@@ -154,6 +154,9 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
     val f3_fire = Input(Bool())
 
     val update = Input(Valid(new BranchPredictionBankUpdate))
+
+    // added for the fuzzycore project - AK
+    val cf_bpd_tage_to_gshare = Input(Bool()) // signal from the custom CSR to reconfigure to gshare.
   })
   io.resp := io.resp_in(0)
 
@@ -209,6 +212,9 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
 
     // Update
     val update = Input(Valid(new BranchPredictionUpdate))
+
+    // adding for core fuzzing - AK
+    val cf_bpd_tage_to_gshare = Input(Bool())
   })
 
   var total_memsize = 0
@@ -240,6 +246,10 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     banked_predictors(0).io.f1_lhist := banked_lhist_providers(0).io.f1_lhist
 
     banked_predictors(0).io.resp_in(0)           := (0.U).asTypeOf(new BranchPredictionBankResponse)
+
+    // adding for the fuzzycore project - AK
+    banked_predictors(0).io.cf_bpd_tage_to_gshare := io.cf_bpd_tage_to_gshare
+
   } else {
     require(nBanks == 2)
 
@@ -248,6 +258,10 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
 
     banked_predictors(0).io.f1_lhist := banked_lhist_providers(0).io.f1_lhist
     banked_predictors(1).io.f1_lhist := banked_lhist_providers(1).io.f1_lhist
+
+    // adding for fuzzycore - AK
+    banked_predictors(0).io.cf_bpd_tage_to_gshare := io.cf_bpd_tage_to_gshare
+    banked_predictors(1).io.cf_bpd_tage_to_gshare := io.cf_bpd_tage_to_gshare
 
     when (bank(io.f0_req.bits.pc) === 0.U) {
       banked_lhist_providers(0).io.f0_valid := io.f0_req.valid

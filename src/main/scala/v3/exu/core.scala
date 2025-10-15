@@ -37,7 +37,7 @@ import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.rocket.Instructions._
 import freechips.rocketchip.tile.{TraceBundle}
 import freechips.rocketchip.rocket.{Causes, PRV, TracedInstruction}
-import freechips.rocketchip.util.{Str, UIntIsOneOf, CoreMonitorBundle}
+import freechips.rocketchip.util.{Str, UIntIsOneOf, CoreMonitorBundle, CoreFuzzingConstants}
 import freechips.rocketchip.devices.tilelink.{PLICConsts, CLINTConsts}
 
 import boom.v3.common._
@@ -143,6 +143,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val rob              = Module(new Rob(
                            numIrfWritePorts + numFpWakeupPorts, // +memWidth for ll writebacks
                            numFpWakeupPorts))
+  
   // Used to wakeup registers in rename and issue. ROB needs to listen to something else.
   val int_iss_wakeups  = Wire(Vec(numIntIssueWakeupPorts, Valid(new ExeUnitResp(xLen))))
   val int_ren_wakeups  = Wire(Vec(numIntRenameWakeupPorts, Valid(new ExeUnitResp(xLen))))
@@ -278,6 +279,38 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   (custom_csrs.csrs zip csr.io.customCSRs).map { case (lhs, rhs) => lhs <> rhs }
 
+  // for the fuzzycore project - AK
+  // flag to print the debug log
+  io.lsu.cf_debug_lsu_enable := custom_csrs.cf_debug_lsu_enable && custom_csrs.cf_debug_enable
+  io.lsu.cf_debug_dcache_enable := custom_csrs.cf_debug_dcache_enable
+
+  rob.io.cf_debug_rob_enable := custom_csrs.cf_debug_rob_enable && custom_csrs.cf_debug_enable
+  // io.ifu.cf_debug_log := custom_csrs.cf_debug_log
+
+  // Assigning the CSR's output to the cf_tage_to_gshare signal in the frontend.
+  io.ifu.cf_bpd_tage_to_gshare := custom_csrs.cf_bpd_tage_to_gshare
+  // Assigning the dcache reconfiguration flags to the lsu
+  io.lsu.cf_dcache_set_conf := custom_csrs.cf_dcache_set_conf
+  io.lsu.cf_dcache_way_conf := custom_csrs.cf_dcache_way_conf
+  io.lsu.cf_dcache_size_conf := custom_csrs.cf_dcache_size_conf
+  io.lsu.cf_dcache_repl_conf := custom_csrs.cf_dcache_repl_conf
+  io.lsu.cf_dcache_blocksize_conf := custom_csrs.cf_dcache_blocksize_conf
+
+  // getting the rob entries from the CSR
+  rob.io.cf_rob_entries := custom_csrs.cf_rob_entries 
+
+  // printf("[CORE] dcacheCSR - 0x%x 0x%x 0x%x 0x%x \n", custom_csrs.cf_dcache_set_conf, custom_csrs.cf_dcache_way_conf, custom_csrs.cf_dcache_size_conf, custom_csrs.cf_dcache_repl_conf)
+
+  // for corefuzzing, assigning CSR output to frontend for reconfigureFB
+  io.ifu.reconfigureFB_rows_b0 := custom_csrs.reconfigureFB_rows_b0
+  io.ifu.reconfigureFB_rows_b1 := custom_csrs.reconfigureFB_rows_b1
+
+  // for corefuzzing, CSR outputs for ldq and stq lengths
+  io.lsu.reconfigure_stq_b1 := custom_csrs.reconfig_stq_b1
+  io.lsu.reconfigure_stq_b0 := custom_csrs.reconfig_stq_b0
+  io.lsu.reconfigure_ldq_b1 := custom_csrs.reconfig_ldq_b1
+  io.lsu.reconfigure_ldq_b0 := custom_csrs.reconfig_ldq_b0
+
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
   val icache_blocked = false.B
   csr.io.counters foreach { c => c.inc := RegNext(perfEvents.evaluate(c.eventSel)) }
@@ -368,7 +401,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     + BoomCoreStringPrefix(
         "Using FPU Unit?       : " + usingFPU.toString,
         "Using FDivSqrt?       : " + usingFDivSqrt.toString,
-        "Using VM?             : " + usingVM.toString) + "\n")
+        "Using VM?             : " + usingVM.toString) + "\n") 
 
   //-------------------------------------------------------------
   //-------------------------------------------------------------

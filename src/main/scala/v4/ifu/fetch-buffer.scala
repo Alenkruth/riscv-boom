@@ -22,6 +22,8 @@ import freechips.rocketchip.rocket.{MStatus, BP, BreakpointUnit}
 import boom.v4.common._
 import boom.v4.util.{BoolToChar, MaskUpper}
 
+
+
 /**
  * Bundle that is made up of converted MicroOps from the Fetch Bundle
  * input to the Fetch Buffer. This is handed to the Decode stage.
@@ -48,6 +50,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
 
     // Was the pipeline redirected? Clear/reset the fetchbuffer.
     val clear = Input(Bool())
+
   })
 
   require (numEntries > fetchWidth)
@@ -75,6 +78,8 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     Cat(in(n-k-1,0), in(n-1, n-k))
   }
 
+  // this mechanism is fine as long as the rotations are done with respect with the current buffer dimensions
+  // adjusments to rotateLeft should correct the functionality - alex, corefuzzing
   val might_hit_head = (1 until fetchWidth).map(k => VecInit(rotateLeft(tail, k).asBools.zipWithIndex.filter
     {case (e,i) => i % coreWidth == 0}.map {case (e,i) => e}).asUInt).map(tail => head & tail).reduce(_|_).orR
   val at_head = (VecInit(tail.asBools.zipWithIndex.filter {case (e,i) => i % coreWidth == 0}
@@ -128,8 +133,8 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   val enq_idxs = Wire(Vec(fetchWidth, UInt(numEntries.W)))
 
   def inc(ptr: UInt) = {
-    val n = ptr.getWidth
-    Cat(ptr(n-2,0), ptr(n-1))
+     val n = ptr.getWidth
+     Cat(ptr(n-2,0), ptr(n-1))
   }
 
   var enq_idx = tail

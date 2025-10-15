@@ -94,7 +94,6 @@ object GetPropertyByHartId
   }
 }
 
-
 /**
  * Main ICache module
  *
@@ -120,8 +119,6 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   // cycle).
   val refillsToOneBank = (2*tl_out.d.bits.data.getWidth == wordBits)
 
-
-
   val s0_valid = io.req.fire
   val s0_vaddr = io.req.bits.addr
 
@@ -130,7 +127,6 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val s1_hit = s1_tag_hit.reduce(_||_)
   val s2_valid = RegNext(s1_valid && !io.s1_kill)
   val s2_hit = RegNext(s1_hit)
-
 
   val invalidated = Reg(Bool())
   val refill_valid = RegInit(false.B)
@@ -147,8 +143,10 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val refill_done = refill_one_beat && d_done
   tl_out.d.ready := true.B
   require (edge_out.manager.minLatency > 0)
-
-  val repl_way = if (isDM) 0.U else LFSR(16, refill_fire)(log2Ceil(nWays)-1,0)
+  val replacer_LRU = outer.icacheParams.replacement_LRU
+  val replacer_RAND = outer.icacheParams.replacement_RAND
+  // replace truw with config CSR flag
+  val repl_way = if (isDM) 0.U else ( if (true) replacer_LRU.way else replacer_RAND.way) // if (isDM) 0.U else LFSR(16, refill_fire)(log2Ceil(nWays)-1,0)
 
   val tag_array = SyncReadMem(nSets, Vec(nWays, UInt(tagBits.W)))
   val tag_rdata = tag_array.read(s0_vaddr(untagBits-1, blockOffBits), !refill_done && s0_valid)
@@ -343,7 +341,9 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     "Fetch bytes   : " + cacheParams.fetchBytes,
     "Block bytes   : " + (1 << blockOffBits),
     "Row bytes     : " + rowBytes,
+    "Block Bytes   : " + outer.icacheParams.blockBytes,
     "Word bits     : " + wordBits,
+    "RamDepth      : " + ramDepth,
     "Sets          : " + nSets,
     "Ways          : " + nWays,
     "Refill cycles : " + refillCycles,

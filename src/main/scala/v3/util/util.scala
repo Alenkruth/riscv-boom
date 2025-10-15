@@ -23,6 +23,9 @@ import freechips.rocketchip.tile.{TileKey}
 import boom.v3.common.{MicroOp}
 import boom.v3.exu.{BrUpdateInfo}
 
+// test imports
+//import freechips.rocketchip.rocket.constants.CoreFuzzingConstants
+import boom.v3.common._
 /**
  * Object to XOR fold a input register of fullLength into a compressedLength.
  */
@@ -206,6 +209,30 @@ object WrapInc
       Mux(wrap, 0.U, value + 1.U)
     }
   }
+
+  // "n" is the number of increments, so we wrap at n-1.
+  // this is a dynamic version that would be synthesized to HW
+  def apply(value: UInt, n: UInt): UInt = {
+    assert(n =/= 0.U, "n in WrapInc/WrapDec cannot be zero")
+    // isPow2 is only defined for Int and bigInt. We will use bit manip to ID if n is a power of 2.
+    // when ((n & n-1.U) === 0.U) {
+    //   //(value + 1.U)(log2Ceil(n)-1,0)
+    //   // https://stackoverflow.com/questions/60394862/taking-log2ceil-of-uint
+    //   // log2ceil is not built for synthesis, I.e it is defined only for Int and BigInt.
+    //   // so we use a priority encoder to get the most significant "set" bit.
+    //   // priority encoder picks the smallest lsb set. so we reverse the bits.
+    //   // likewise, chisel does not support dynamic splicing of bits. So we use a mask
+    //   (value + 1.U) & ((1.U << PriorityEncoder(Reverse(n))) - 1.U) 
+    // } .otherwise {
+    //   def wrap = (value === (n-1.U))
+    //   Mux(wrap, 0.U, value + 1.U)
+    // }
+    val isPow2 = (n & n-1.U) === 0.U
+    val shouldWrap = (value === (n-1.U))
+    val notPow2Val =  Mux(shouldWrap, 0.U, value + 1.U)
+
+    Mux(isPow2, (value + 1.U) & ((1.U << PriorityEncoder(Reverse(n))) - 1.U), notPow2Val)  
+  } 
 }
 
 /**
@@ -222,6 +249,25 @@ object WrapDec
       val wrap = (value === 0.U)
       Mux(wrap, (n-1).U, value - 1.U)
     }
+  }
+  
+  // "n" is the number of increments, so we wrap at n-1.
+  // dynamic version that would be synthesized to HW
+  def apply(value: UInt, n: UInt): UInt = {
+    assert(n =/= 0.U, "n in WrapInc/WrapDec cannot be zero")
+
+    val isPow2 = (n & n-1.U) === 0.U
+    val shouldWrap = (value === 0.U)
+    val notPow2Val = Mux(shouldWrap, (n-1.U), value - 1.U)
+
+    Mux(isPow2, (value - 1.U) & (1.U << (PriorityEncoder(Reverse(n))) - 1.U), notPow2Val)
+    
+    // if (isPow2(n)) {
+    //   (value - 1.U)(log2Ceil(n)-1,0)
+    // } else {
+    //   val wrap = (value === 0.U)
+    //   Mux(wrap, (n-1).U, value - 1.U)
+    // }
   }
 }
 
@@ -533,6 +579,56 @@ class BranchKillableQueue[T <: boom.v3.common.HasBoomUOP](gen: T, entries: Int, 
                         entries.asUInt + ptr_diff, ptr_diff))
   }
 }
+
+// objects used for CoreFuzzing
+
+/* commented the object out because it does not synthesize. Not sure if that is 
+ * how it is
+ */
+
+/*object AddressPrivilegeTagSet extends boom.common.constants.CoreFuzzingConstants
+{
+  //Object to check the current PC and then set the privilege bit.
+  def apply(pc: UInt): UInt = {
+    val ret = Wire(UInt(IFT_BITS.W))
+    //val start = Reg(UInt(48.W))
+    //val end = Reg(UInt(48.W))
+    //start := IFT_PROTECTED_START
+    //end := IFT_PROTECTED_END
+    ret := 0.U(IFT_BITS.W)
+    printf("\nObject PC is 0x%x\n", pc)
+    // when ((pc >= 0x080001060.S(48.W).asUInt) && (pc <= 0x080001080.S(48.W).asUInt)) {
+    // when ((pc >= start) && (pc <= end)){
+    when ((pc >= IFT_PROTECTED_START.S(48.W).asUInt) && (pc <= IFT_PROTECTED_END.S(48.W).asUInt)) {
+      ret := 1.U(IFT_BITS.W)
+      printf("\n Inside the when\n")
+    }
+    ret
+  }
+}*/
+
+// module to check the address range and return true or false to set the bit.
+// This module can be extended to check the privilege level and whatever we 
+// care about.
+
+/*class AddressChecker (implicit p: org.chipsalliance.cde.config.Parameters)
+  extends BoomModule()(p) 
+  with CoreFuzzingConstants
+{
+  val io = IO(new Bundle{
+      val in  = Input(UInt(coreMaxAddrBits.W))
+      val out = Output(UInt(IFT_BITS.W))
+  })
+
+  // printf("\nObject PC is 0x%x\n", io.in)
+  
+  when ((io.in >= IFT_PROTECTED_START.U(coreMaxAddrBits.W)) && (io.in <= IFT_PROTECTED_END.U(coreMaxAddrBits.W))) {
+      io.out := 1.U(IFT_BITS.W)
+      // printf("\n Inside the when\n")
+  } .otherwise {
+      io.out := 0.U(IFT_BITS.W)
+  }
+}*/
 
 // ------------------------------------------
 // Printf helper functions

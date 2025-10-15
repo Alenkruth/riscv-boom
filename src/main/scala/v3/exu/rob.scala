@@ -44,6 +44,7 @@ class RobIo(
   val numWakeupPorts: Int,
   val numFpuPorts: Int
   )(implicit p: Parameters)  extends BoomBundle
+  with CoreFuzzingConstants
 {
   // Decode Stage
   // (Allocate, write instruction to ROB).
@@ -110,6 +111,10 @@ class RobIo(
 
 
   val debug_tsc = Input(UInt(xLen.W))
+
+  // corefuzzing changes
+  val cf_debug_rob_enable = Input(Bool())
+  val cf_rob_entries = Input(UInt(log2Ceil(robEntryOptions.length).W))
 }
 
 /**
@@ -212,12 +217,25 @@ class Rob(
   val numWakeupPorts: Int,
   val numFpuPorts: Int
   )(implicit p: Parameters) extends BoomModule
+  with CoreFuzzingConstants
 {
   val io = IO(new RobIo(numWakeupPorts, numFpuPorts))
 
   // ROB Finite State Machine
   val s_reset :: s_normal :: s_rollback :: s_wait_till_empty :: Nil = Enum(4)
   val rob_state = RegInit(s_reset)
+
+  // corefuzzing values
+  val optionsVec = VecInit(robEntryOptions.map(_.U))
+  def entryCount = optionsVec(io.cf_rob_entries)
+
+  // Make sure entryCount is a multiple of coreWidth ALWAYS
+  def cf_rob_rows = entryCount/coreWidth.U
+
+  // TODO - Add this assertion in fuzzer to remove the extra logic generation
+  assert(entryCount % coreWidth.U === 0.U, "ROB entryCount must be a multiple of coreWidth")
+  assert(cf_rob_rows <= numRobRows.U, "cf_rob_rows exceeds loop bound")
+  assert(cf_rob_rows =/= 0.U, "cf_rob_rows is zero")
 
   //commit entries at the head, and unwind exceptions from the tail
   val rob_head     = RegInit(0.U(log2Ceil(numRobRows).W))
@@ -249,6 +267,9 @@ class Rob(
   val rob_head_uses_stq   = Wire(Vec(coreWidth, Bool()))
   val rob_head_uses_ldq   = Wire(Vec(coreWidth, Bool()))
   val rob_head_fflags     = Wire(Vec(coreWidth, UInt(freechips.rocketchip.tile.FPConstants.FLAGS_SZ.W)))
+
+  // for core fuzzing
+  val cf_rob_head_uop     = Wire(Vec(coreWidth, new MicroOp()))
 
   val exception_thrown = Wire(Bool())
 
@@ -442,9 +463,11 @@ class Rob(
     if (enableCommitMapTable) {
       when (RegNext(exception_thrown)) {
         for (i <- 0 until numRobRows) {
-          rob_val(i) := false.B
-          rob_bsy(i) := false.B
-          rob_uop(i).debug_inst := BUBBLE
+          when(i.U < cf_rob_rows) {
+            rob_val(i) := false.B
+            rob_bsy(i) := false.B
+            rob_uop(i).debug_inst := BUBBLE
+          }
         }
       }
     }
@@ -452,16 +475,18 @@ class Rob(
     // -----------------------------------------------
     // Kill speculated entries on branch mispredict
     for (i <- 0 until numRobRows) {
-      val br_mask = rob_uop(i).br_mask
+      when(i.U < cf_rob_rows) {
+        val br_mask = rob_uop(i).br_mask
 
-      //kill instruction if mispredict & br mask match
-      when (IsKilledByBranch(io.brupdate, br_mask))
-      {
-        rob_val(i) := false.B
-        rob_uop(i.U).debug_inst := BUBBLE
-      } .elsewhen (rob_val(i)) {
-        // clear speculation bit even on correct speculation
-        rob_uop(i).br_mask := GetNewBrMask(io.brupdate, br_mask)
+        //kill instruction if mispredict & br mask match
+        when (IsKilledByBranch(io.brupdate, br_mask))
+        {
+          rob_val(i) := false.B
+          rob_uop(i.U).debug_inst := BUBBLE
+        } .elsewhen (rob_val(i)) {
+          // clear speculation bit even on correct speculation
+          rob_uop(i).br_mask := GetNewBrMask(io.brupdate, br_mask)
+        }
       }
     }
 
@@ -488,11 +513,18 @@ class Rob(
     rob_head_uses_stq(w) := rob_uop(rob_head).uses_stq
     rob_head_uses_ldq(w) := rob_uop(rob_head).uses_ldq
 
+    // -------------------------------------------------
+    // CoreFuzzing outputs
+    cf_rob_head_uop(w)   := rob_uop(rob_head)
+    
     //------------------------------------------------
     // Invalid entries are safe; thrown exceptions are unsafe.
     for (i <- 0 until numRobRows) {
-      rob_unsafe_masked((i << log2Ceil(coreWidth)) + w) := rob_val(i) && (rob_unsafe(i) || rob_exception(i))
+      when(i.U < cf_rob_rows) {
+        rob_unsafe_masked((i << log2Ceil(coreWidth)) + w) := rob_val(i) && (rob_unsafe(i) || rob_exception(i))
+      }
     }
+
     // Read unsafe status of PNR row.
     rob_pnr_unsafe(w) := rob_val(rob_pnr) && (rob_unsafe(rob_pnr) || rob_exception(rob_pnr))
 
@@ -695,7 +727,19 @@ class Rob(
     !(r_partial_row && rob_head === rob_tail && !maybe_full)
 
   when (finished_committing_row) {
-    rob_head     := WrapInc(rob_head, numRobRows)
+    when (io.cf_debug_rob_enable)
+    {
+      for (i <- 0 until coreWidth)
+      {
+        val cf_uop_info = cf_rob_head_uop(i)
+        printf(cf"[ROB] Finshed committing instruction Entry $i" + 
+              cf" in Row $rob_head " + 
+              cf" Info -  $cf_uop_info \n"
+              )
+      }
+    }
+    // rob_head     := WrapInc(rob_head, numRobRows)
+    rob_head := WrapInc(rob_head, cf_rob_rows)
     rob_head_lsb := 0.U
     rob_deq      := true.B
   } .otherwise {
@@ -732,7 +776,8 @@ class Rob(
       rob_pnr     := rob_head
       rob_pnr_lsb := PriorityEncoder(io.enq_valids)
     } .elsewhen (safe_to_inc && do_inc_row) {
-      rob_pnr     := WrapInc(rob_pnr, numRobRows)
+      // rob_pnr     := WrapInc(rob_pnr, io.rob_size_rows)
+      rob_pnr := WrapInc(rob_pnr, cf_rob_rows)
       rob_pnr_lsb := 0.U
     } .elsewhen (safe_to_inc && (rob_pnr =/= rob_tail || (full && !pnr_maybe_at_tail))) {
       rob_pnr_lsb := PriorityEncoder(rob_pnr_unsafe)
@@ -758,17 +803,20 @@ class Rob(
 
   when (rob_state === s_rollback && (rob_tail =/= rob_head || maybe_full)) {
     // Rollback a row
-    rob_tail     := WrapDec(rob_tail, numRobRows)
+    // rob_tail     := WrapDec(rob_tail, numRobRows)
+    rob_tail    := WrapDec(rob_tail, cf_rob_rows)
     rob_tail_lsb := (coreWidth-1).U
     rob_deq := true.B
   } .elsewhen (rob_state === s_rollback && (rob_tail === rob_head) && !maybe_full) {
     // Rollback an entry
     rob_tail_lsb := rob_head_lsb
   } .elsewhen (io.brupdate.b2.mispredict) {
-    rob_tail     := WrapInc(GetRowIdx(io.brupdate.b2.uop.rob_idx), numRobRows)
+    // rob_tail     := WrapInc(GetRowIdx(io.brupdate.b2.uop.rob_idx), numRobRows)
+    rob_tail     := WrapInc(GetRowIdx(io.brupdate.b2.uop.rob_idx), cf_rob_rows)
     rob_tail_lsb := 0.U
   } .elsewhen (io.enq_valids.asUInt =/= 0.U && !io.enq_partial_stall) {
-    rob_tail     := WrapInc(rob_tail, numRobRows)
+    // rob_tail     := WrapInc(rob_tail, numRobRows)
+    rob_tail     := WrapInc(rob_tail, cf_rob_rows)
     rob_tail_lsb := 0.U
     rob_enq      := true.B
   } .elsewhen (io.enq_valids.asUInt =/= 0.U && io.enq_partial_stall) {

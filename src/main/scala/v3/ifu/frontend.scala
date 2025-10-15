@@ -285,6 +285,16 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   val flush_icache = Output(Bool())
 
   val perf = Input(new FrontendPerfEvents)
+
+  // wire with the flag to enable debug log printing 
+  // val cf_debug_log = Output(Bool())
+  // for the fuzzycore. cf_tage_to_gshare is an output because the bundle gets flipped for 
+  // some reason in the BoomFrontendBundle class.
+
+  val cf_bpd_tage_to_gshare = Output(Bool())
+  // for corefuzzing - reconfigureFP is ouput bc bundle gets flipped
+  val reconfigureFB_rows_b0 = Output(Bool())
+  val reconfigureFB_rows_b1 = Output(Bool())
 }
 
 /**
@@ -371,6 +381,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   bpd.io.f0_req.valid      := s0_valid
   bpd.io.f0_req.bits.pc    := s0_vpc
   bpd.io.f0_req.bits.ghist := s0_ghist
+
+  // Value from reconfigure CSR - AK
+  // for the fuzzycore. 
+  bpd.io.cf_bpd_tage_to_gshare := io.cpu.cf_bpd_tage_to_gshare
 
   // --------------------------------------------------------
   // **** ICache Access (F1) ****
@@ -918,6 +932,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     f4.io.deq.bits.shadowed_mask.asUInt
   ).asBools
 
+  // value from associated CSR for corefuzzing - alex
+  fb.io.reconfigureFB_rows_b0 := io.cpu.reconfigureFB_rows_b0
+  fb.io.reconfigureFB_rows_b1 := io.cpu.reconfigureFB_rows_b1
+
 
   ftq.io.enq.valid          := f4.io.deq.valid && fb.io.enq.ready && !f4_delay
   ftq.io.enq.bits           := f4.io.deq.bits
@@ -942,7 +960,29 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // -------------------------------------------------------
 
   io.cpu.fetchpacket <> fb.io.deq
+  // the output from the fetch buffer is connected to the output of the frontend
+  // these microops will be used down the line by the decoder, dispatcher and so on,
+
   io.cpu.get_pc <> ftq.io.get_ftq_pc
+
+  // set the privilege bit for IF tracking
+  // for (i <- 0 until coreWidth) {
+  //   val address_checker = Module(new AddressChecker)
+  //  address_checker.io.in := fb.io.deq.bits.uops(i).bits.debug_pc
+  //  io.cpu.fetchpacket.bits.uops(i).bits.privilege_tag := address_checker.io.out
+
+  // }
+
+  // val test = Wire(UInt(1.W))
+  // test := io.cpu.fetchpacket.bits.uops(0).bits.privilege_tag;
+  //  Trying to print the PCs in the Current Fetch Packet
+  // for (i <- 0 until coreWidth) {
+      // printf("\nThe (coreWidth index - %d ) PC of current Microop is 0x%x \n", i.asUInt, fb.io.deq.bits.uops(i).bits.debug_pc)
+      // printf("\nThe privilege bit is - %d\n", test)//io.cpu.fetchpacket.bits.uops(i).bits.privilege_tag)
+      // we use .bits multiple times because the deq is a decoupledIO
+      // and then once we get into that, MicroOp class is created as a ValidIO.
+  // }
+
   ftq.io.deq := io.cpu.commit
   ftq.io.brupdate := io.cpu.brupdate
 

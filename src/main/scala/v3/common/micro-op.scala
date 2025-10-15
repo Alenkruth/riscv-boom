@@ -14,6 +14,9 @@ package boom.v3.common
 import chisel3._
 import chisel3.util._
 
+// for Corefuzzing
+import freechips.rocketchip.util._
+
 import org.chipsalliance.cde.config.Parameters
 
 import boom.v3.exu.FUConstants
@@ -32,6 +35,7 @@ abstract trait HasBoomUOP extends BoomBundle
 class MicroOp(implicit p: Parameters) extends BoomBundle
   with freechips.rocketchip.rocket.constants.MemoryOpConstants
   with freechips.rocketchip.rocket.constants.ScalarOpConstants
+  with CoreFuzzingConstants // for CoreFuzzing
 {
   val uopc             = UInt(UOPC_SZ.W)       // micro-op code
   val inst             = UInt(32.W)
@@ -82,7 +86,7 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   val prs1             = UInt(maxPregSz.W)
   val prs2             = UInt(maxPregSz.W)
   val prs3             = UInt(maxPregSz.W)
-  val ppred            = UInt(log2Ceil(ftqSz).W)
+  val ppred            = UInt(log2Ceil(ftqSz).W) // PP ready?
 
   val prs1_busy        = Bool()
   val prs2_busy        = Bool()
@@ -140,6 +144,43 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   val debug_fsrc       = UInt(BSRC_SZ.W)
   // What prediction structure provides the prediction TO this op
   val debug_tsrc       = UInt(BSRC_SZ.W)
+
+  // Corefuzzing - IFT tags for every micro-op
+  // adding the tag to the Microp to let it propagate through the pipeline once created
+  val cf_domain_id            = UInt(iftTagWidth.W)
+  val cf_speculated           = Bool()      // set when the micro-op is speculatively issued
+  val cf_attacker_influence   = Bool()      // set when the micro-op is either fetched/dispatched based on an attacker/secret dependent thread/micro-op
+  val cf_secret_access        = Bool()      // set when the micro-op accesses a secret
+  val cf_secret_propagation   = Bool()      // set when the micro-op is in the dependence chain of originating in a secret
+  val cf_secret_transmission  = Bool()      // set when a secret dependent micro-op makes a update to a stateful unit
+
+  val cf_op_count_id = UInt(uopIDCounterWidthCF.W) // counts the number of active micro-ops. Count is incremented when it the micro-op is created with a counter. 
+                                 // counter wraps around at 255. It is fine because the maximum number of uops currently supported in 130. Even if we 
+                                 // increase this number, we can increase the width of the counter.
+  val cf_taint_module_id_1 = UInt(moduleCountCF.W) // keeps track of modules where transmission happened
+  val cf_taint_type_1 = UInt(taintTypeCf.W) // keeps track of which taint was set first
+  val cf_taint_op_count_1 = UInt(uopIDCounterWidthCF.W) // keeps track of the uop count when the first taint was set
+
+  val cf_taint_module_id_2 = UInt(moduleCountCF.W) // keeps track of modules where transmission happened
+  val cf_taint_type_2 = UInt(taintTypeCf.W) // keeps track of which taint was set first
+  val cf_taint_op_count_2 = UInt(uopIDCounterWidthCF.W) // keeps track of the uop count when the first taint was set
+
+  val cf_taint_module_id_3 = UInt(moduleCountCF.W) // keeps track of modules where transmission happened
+  val cf_taint_type_3 = UInt(taintTypeCf.W) // keeps track of which taint was set first
+  val cf_taint_op_count_3 = UInt(uopIDCounterWidthCF.W) // keeps track of the uop count when the first taint was set
+
+  override def toPrintable: Printable = {
+    val cf_info = Cat(cf_domain_id, cf_speculated, cf_attacker_influence, cf_secret_access, cf_secret_propagation, cf_secret_transmission)
+    val cf_taint = Cat(cf_taint_module_id_1, cf_taint_type_1, cf_taint_op_count_1, cf_taint_module_id_2, cf_taint_type_2, cf_taint_op_count_2, cf_taint_module_id_3, cf_taint_type_3, cf_taint_op_count_3)
+    
+    cf"UOP Code is $uopc " +
+    cf"UOP running count is $cf_op_count_id " +
+    cf"PC is $debug_pc " +
+    cf"IQ type $iq_type FU type $fu_code " +
+    cf"is branch $is_br, is taken $taken " +
+    cf"cf info is $cf_info " +
+    cf"cf taint info $cf_taint \n"
+  }
 
   // Do we allocate a branch tag for this?
   // SFB branches don't get a mask, they get a predicate bit
