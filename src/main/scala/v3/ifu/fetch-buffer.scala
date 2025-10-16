@@ -121,33 +121,74 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // Step 2: Generate one-hot write indices.
   // Step 3: Write MicroOps into the RAM.
 
-  // adjusting rotate left function to account for varying buffer dimensions - corefuzzing, alex
+
+  // adding safe splice logic to fix indices going below zero
+  def safeSlice(in: UInt, high: Int, low: Int): UInt = {
+    val h = math.max(high, 0)
+    val l = math.max(low, 0)
+    if (h >= l) in(h, l) else 0.U
+  }
+  
   def rotateLeft(in: UInt, k: Int) = {
     val n = in.getWidth
     val tail_rotate = Wire(UInt(n.W))
-    when (io.reconfigureFB_rows_b1) {
-      when(io.reconfigureFB_rows_b0){
-        // numRows
-        tail_rotate := Cat(in(n-k-1,0), in(n-1, n-k))
+  
+    when(io.reconfigureFB_rows_b1) {
+      when(io.reconfigureFB_rows_b0) {
+        tail_rotate := Cat(in(n - k - 1, 0), in(n - 1, n - k))
+      } .otherwise {
+        val seg = n / 4 * 3
+        tail_rotate := Cat(
+          0.U((n / 4).W),
+          safeSlice(in, (3 * n / 4) - k - 1, 0),
+          safeSlice(in, (3 * n / 4) - 1, (3 * n / 4) - k)
+        )
       }
-      .otherwise{
-        // 0.75*numRows
-        tail_rotate := Cat(0.U((n/4).W), in((3*n/4)-k-1,0), in((3*n/4)-1, (3*n/4)-k))
+    } .otherwise {
+      when(io.reconfigureFB_rows_b0) {
+        tail_rotate := Cat(
+          0.U((n / 2).W),
+          safeSlice(in, (n / 2) - k - 1, 0),
+          safeSlice(in, (n / 2) - 1, (n / 2) - k)
+        )
+      } .otherwise {
+        tail_rotate := Cat(
+          0.U((3 * n / 4).W),
+          safeSlice(in, (n / 4) - k - 1, 0),
+          safeSlice(in, (n / 4) - 1, (n / 4) - k)
+        )
       }
     }
-    .otherwise {
-      when(io.reconfigureFB_rows_b0){
-        // 0.5*numRows
-        tail_rotate := Cat(0.U((n/2).W), in((n/2)-k-1,0), in((n/2)-1, (n/2)-k))
-      }
-      .otherwise{
-        // 0.25*numRows
-        tail_rotate := Cat(0.U((3*n/4).W), in((n/4)-k-1,0), in((n/4)-1, (n/4)-k))
-      }
-    }   
-    // return result - if hot bit got cut off by reconfiguration, reset to bit 0
     Mux(tail_rotate.orR, tail_rotate, 1.U(n.W))
   }
+
+  // adjusting rotate left function to account for varying buffer dimensions - corefuzzing, alex
+  // def rotateLeft(in: UInt, k: Int) = {
+  //   val n = in.getWidth
+  //   val tail_rotate = Wire(UInt(n.W))
+  //   when (io.reconfigureFB_rows_b1) {
+  //     when(io.reconfigureFB_rows_b0){
+  //       // numRows
+  //       tail_rotate := Cat(in(n-k-1,0), in(n-1, n-k))
+  //     }
+  //     .otherwise{
+  //       // 0.75*numRows
+  //       tail_rotate := Cat(0.U((n/4).W), in((3*n/4)-k-1,0), in((3*n/4)-1, (3*n/4)-k))
+  //     }
+  //   }
+  //   .otherwise {
+  //     when(io.reconfigureFB_rows_b0){
+  //       // 0.5*numRows
+  //       tail_rotate := Cat(0.U((n/2).W), in((n/2)-k-1,0), in((n/2)-1, (n/2)-k))
+  //     }
+  //     .otherwise{
+  //       // 0.25*numRows
+  //       tail_rotate := Cat(0.U((3*n/4).W), in((n/4)-k-1,0), in((n/4)-1, (n/4)-k))
+  //     }
+  //   }   
+  //   // return result - if hot bit got cut off by reconfiguration, reset to bit 0
+  //   Mux(tail_rotate.orR, tail_rotate, 1.U(n.W))
+  // }
 
   // original function
   // def rotateLeft(in: UInt, k: Int) = {
