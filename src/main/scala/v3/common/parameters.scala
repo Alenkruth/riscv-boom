@@ -293,6 +293,15 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   // val options = robEntryOptions.map(_.U)
   // val entryCount = options.zipWithIndex.map { case (size, idx) => Mux(robCSRVal(idx), size.U, 0.U) }.reduce(_ | _)
   // def cf_rob_rows = entryCount / coreWidth.U
+  // quiesce csr
+
+  override def chillCSRCF = {
+    val mask = BigInt(0x1)
+    val init = BigInt(0 << 0) // the core need not be quiesced at init.
+    Some(CustomCSR(chillCSRIdCF, mask, Some(init)))
+  }
+
+  def cf_chill = getOrElse(chillCSRCF, _.value(0), false.B)
 
   override def decls: Seq[CustomCSR] = super.decls :+ marchid
 
