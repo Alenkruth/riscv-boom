@@ -295,6 +295,10 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   // for corefuzzing - reconfigureFP is ouput bc bundle gets flipped
   val reconfigureFB_rows_b0 = Output(Bool())
   val reconfigureFB_rows_b1 = Output(Bool())
+
+  // for corefuzzing
+  // Control signal from core to allow or block new fetches (quiesce)
+  val allow_fetch       = Output(Bool())
 }
 
 /**
@@ -375,7 +379,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_tsrc    := BSRC_C
   }
 
-  icache.io.req.valid     := s0_valid
+  // for corefuzzing
+  // icache.io.req.valid := s0_valid
+  icache.io.req.valid     := s0_valid && io.cpu.allow_fetch
   icache.io.req.bits.addr := s0_vpc
 
   bpd.io.f0_req.valid      := s0_valid

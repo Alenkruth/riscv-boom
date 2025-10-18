@@ -169,6 +169,7 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   val cf_taint_type_3 = UInt(taintTypeCf.W) // keeps track of which taint was set first
   val cf_taint_op_count_3 = UInt(uopIDCounterWidthCF.W) // keeps track of the uop count when the first taint was set
 
+  val cf_single_step          = Bool()      // set when the micro-op is single-stepped (quiesce mode)
   override def toPrintable: Printable = {
     val cf_info = Cat(cf_domain_id, cf_speculated, cf_attacker_influence, cf_secret_access, cf_secret_propagation, cf_secret_transmission)
     val cf_taint = Cat(cf_taint_module_id_1, cf_taint_type_1, cf_taint_op_count_1, cf_taint_module_id_2, cf_taint_type_2, cf_taint_op_count_2, cf_taint_module_id_3, cf_taint_type_3, cf_taint_op_count_3)

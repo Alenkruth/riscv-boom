@@ -126,6 +126,11 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   val dis_ldq_idx = Output(Vec(coreWidth, UInt(ldqAddrSz.W)))
   val dis_stq_idx = Output(Vec(coreWidth, UInt(stqAddrSz.W)))
 
+  // corefuzzing
+  // Status signals for pipeline draining
+  val queues_empty    = Output(Bool()) // Both LDQ and STQ empty
+  val no_pending_mem  = Output(Bool()) // No outstanding memory requests
+
   val ldq_full    = Output(Vec(coreWidth, Bool()))
   val stq_full    = Output(Vec(coreWidth, Bool()))
 
@@ -160,6 +165,11 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
 
   val tsc_reg     = Input(UInt())
 
+  // Queue state for corefuzzing quiescing
+  // val queues_empty = Output(Bool()) // Indicates both LDQ and STQ are empty
+  // val no_pending_mem = Output(Bool()) // No outstanding D$ requests
+  
+  
   // flag to print debug log
   val cf_debug_lsu_enable = Input(Bool())
 
@@ -1693,6 +1703,22 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                     ~(st_brkilled_mask.asUInt) &
                     ~(st_exc_killed_mask.asUInt)
 
+  // for corefuzzing
+  //-------------------------------------------------------------
+  // Queue Empty Signals (for pipeline drain)
+  
+  // LDQ empty when head pointer equals tail pointer
+  val ldq_empty = ldq_head === ldq_tail
+
+  // STQ empty when commit head pointer equals tail pointer 
+  val stq_empty = stq_commit_head === stq_tail
+
+  // Queues empty when both LDQ and STQ are empty
+  io.core.queues_empty := ldq_empty && stq_empty
+  // this could be in a better place, but okay
+  // No pending memory when we have drained LSU queues and no in-flight requests
+  io.core.no_pending_mem := io.core.queues_empty && !io.dmem.req.valid
+  // 
 }
 
 /**

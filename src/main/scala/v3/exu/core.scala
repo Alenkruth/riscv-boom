@@ -311,8 +311,50 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   io.lsu.reconfigure_ldq_b1 := custom_csrs.reconfig_ldq_b1
   io.lsu.reconfigure_ldq_b0 := custom_csrs.reconfig_ldq_b0
 
+  // corefuzzing
+  // Quiescing control signals
+  val cf_quiesce_core = Wire(Bool())
+  val pipeline_drained = Wire(Bool())
+  // Stricter pipeline drain: check fetch buffer and decode stage
+  val fetch_buffer_empty = !io.ifu.fetchpacket.valid
+  val decode_stage_empty = !dec_valids.reduce(_||_)
+  val pipeline_drained_strict = rob.io.empty && io.lsu.queues_empty && io.lsu.no_pending_mem && fetch_buffer_empty && decode_stage_empty
+  
+  // Track when we've fetched a cache line in single-step mode
+  val single_step_fetch_pending = RegInit(false.B)
+  when (cf_quiesce_core && !pipeline_drained_strict && fetch_buffer_empty && io.ifu.fetchpacket.valid) {
+    single_step_fetch_pending := true.B
+  }.elsewhen (!cf_quiesce_core || pipeline_drained_strict) {
+    single_step_fetch_pending := false.B
+  }
+  
+  // Only allow fetch when:
+  // 1. Not in quiesce mode, OR
+  // 2. In quiesce mode AND pipeline is drained AND we haven't fetched a pending cache line
+  val allow_fetch = !cf_quiesce_core || (cf_quiesce_core && pipeline_drained_strict && !single_step_fetch_pending)
+
+  // Connect quiesce control from CSR
+  // cf_quiesce_core := customCSRs.cf_chill
+  
+  // for corefuzzing, quiescing the pipeline to enable reconfiguration
+  cf_quiesce_core := custom_csrs.cf_chill
+
+  // Determine if pipeline is drained by checking ROB empty and LSU status
+  pipeline_drained := pipeline_drained_strict
+
+  // Allow fetch only when not quiescing or when pipeline drained and stepping
+  io.ifu.allow_fetch := allow_fetch
+
+  // Debug prints
+  when (cf_quiesce_core && !pipeline_drained) {
+    printf("[QMODE] Quiescing active - frontend stalled, draining pipeline\n") 
+  }
+  when (cf_quiesce_core && pipeline_drained) {
+    printf("[QMODE] Pipeline drained - entering single-step mode\n")
+  } 
+
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
-  val icache_blocked = false.B
+  val icache_blocked = false.B 
   csr.io.counters foreach { c => c.inc := RegNext(perfEvents.evaluate(c.eventSel)) }
 
   //****************************************
@@ -537,10 +579,17 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   //-------------------------------------------------------------
   // Decoders
 
+  val single_step_active = cf_quiesce_core && pipeline_drained 
+  // Propagate cf_single_step flag: set for all uops in fetch group during single-step
+  val uop_with_step = Wire(Vec(coreWidth, new MicroOp()))
+  
   for (w <- 0 until coreWidth) {
     dec_valids(w)                      := io.ifu.fetchpacket.valid && dec_fbundle.uops(w).valid &&
-                                          !dec_finished_mask(w)
-    decode_units(w).io.enq.uop         := dec_fbundle.uops(w).bits
+                      !dec_finished_mask(w)
+  //  decode_units(w).io.wq.uop := dec_fbundle.uops(w).bits
+    uop_with_step(w) := dec_fbundle.uops(w).bits
+    uop_with_step(w).cf_single_step := single_step_active
+    decode_units(w).io.enq.uop         := uop_with_step(w)
     decode_units(w).io.status          := csr.io.status
     decode_units(w).io.csr_decode      <> csr.io.decode(w)
     decode_units(w).io.interrupt       := csr.io.interrupt
@@ -678,8 +727,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
    */
   for (w <- 0 until coreWidth) {
     val i_uop   = rename_stage.io.ren2_uops(w)
-    val f_uop   = if (usingFPU) fp_rename_stage.io.ren2_uops(w) else NullMicroOp
-    val p_uop   = if (enableSFBOpt) pred_rename_stage.io.ren2_uops(w) else NullMicroOp
+    val f_uop   = if (usingFPU) fp_rename_stage.io.ren2_uops(w) else NullMicroOp()
+    val p_uop   = if (enableSFBOpt) pred_rename_stage.io.ren2_uops(w) else NullMicroOp()
     val f_stall = if (usingFPU) fp_rename_stage.io.ren_stalls(w) else false.B
     val p_stall = if (enableSFBOpt) pred_rename_stage.io.ren_stalls(w) else false.B
 
@@ -1393,6 +1442,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
           priv,
           Sext(rob.io.commit.uops(w).debug_pc(vaddrBits-1,0), xLen))
         printf_inst(rob.io.commit.uops(w))
+        // corefuzzing
+        // Print single-step flag for debug
+        when (rob.io.commit.uops(w).cf_single_step) {
+          printf(" [SSTEP]")
+        }
         when (rob.io.commit.uops(w).dst_rtype === RT_FIX && rob.io.commit.uops(w).ldst =/= 0.U) {
           printf(" x%d 0x%x\n",
             rob.io.commit.uops(w).ldst,
