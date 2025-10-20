@@ -64,10 +64,10 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   })
 
   // original
-  require (numEntries > fetchWidth)
+  require (numEntries > fetchWidth, "fetchbuffer.numEntries <= core.fetchwidth")
   // modified for smallest num of entries used
   // require (numEntries/4 >= fetchWidth)
-  require (numEntries % coreWidth == 0)
+  require (numEntries % coreWidth == 0, "fetchbuffer.numEntries % corewidth needs to be zero, my friend")
   val numRows = numEntries / coreWidth
 
   val ram = Reg(Vec(numEntries, new MicroOp))
