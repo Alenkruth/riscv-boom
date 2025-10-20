@@ -225,11 +225,28 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   assert (!((brupdate.b1.mispredict_mask =/= 0.U || brupdate.b2.mispredict)
     && rob.io.commit.rollback), "Can't have a mispredict during rollback.")
 
+  // corefuzzing
+  // When we detect a mispredict, print a short summary line identifying the branch
+  // that caused the flush. This prints before we propagate `brupdate` into the
+  // frontend and other modules so it's shown ahead of the per-module speculative dumps.
+  when (b2.mispredict) {
+    // Print: PC, inst, cfi_type, br_tag, rob_idx, taken, jalr_target (if any)
+    printf("[SPECULATIVE][MISPREDICT] pc=0x%x inst=0x%x cfi=%d br_tag=%d rob_idx=%d taken=%d target=0x%x\n",
+      Sext.apply(oldest_mispredict.uop.debug_pc(vaddrBits-1,0), xLen),
+      oldest_mispredict.uop.debug_inst,
+      oldest_mispredict.cfi_type,
+      oldest_mispredict.uop.br_tag,
+      oldest_mispredict.uop.rob_idx,
+      oldest_mispredict.taken,
+      b2.jalr_target)
+  }
+
   io.ifu.brupdate := brupdate
 
   for (eu <- exe_units) {
     eu.io.brupdate := brupdate
   }
+
 
   if (usingFPU) {
     fp_pipeline.io.brupdate := brupdate
@@ -304,6 +321,17 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // for corefuzzing, assigning CSR output to frontend for reconfigureFB
   io.ifu.reconfigureFB_rows_b0 := custom_csrs.reconfigureFB_rows_b0
   io.ifu.reconfigureFB_rows_b1 := custom_csrs.reconfigureFB_rows_b1
+  // corefuzizng// corefuzizng// corefuzizng// corefuzizng
+  // Wire cf_debug enables into frontend and core modules
+  io.ifu.cf_debug_frontend_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_frontend_enable
+
+  // Propagate core-level debug enables to rename and issue units
+  rename_stage.io.cf_debug_rename_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable
+  fp_rename_stage.io.cf_debug_rename_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable
+  pred_rename_stage.io.cf_debug_rename_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable
+
+  mem_iss_unit.io.cf_debug_issue_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable
+  int_iss_unit.io.cf_debug_issue_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable
 
   // for corefuzzing, CSR outputs for ldq and stq lengths
   io.lsu.reconfigure_stq_b1 := custom_csrs.reconfig_stq_b1
@@ -356,6 +384,19 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
   val icache_blocked = false.B 
   csr.io.counters foreach { c => c.inc := RegNext(perfEvents.evaluate(c.eventSel)) }
+  
+  // corefuzzing
+  // Drive EXU debug enable into all execution units from CSRs
+  for (eu <- exe_units) {
+    eu.io.cf_debug_exu_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable
+  }
+
+    // corefuzzing
+  // Wire FP pipeline cf_debug gates when FPU is enabled
+  if (usingFPU) {
+    fp_pipeline.io.cf_debug_exu_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable
+    fp_pipeline.io.cf_debug_issue_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable
+  }
 
   //****************************************
   // Time Stamp Counter & Retired Instruction Counter
@@ -579,7 +620,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   //-------------------------------------------------------------
   // Decoders
 
-  val single_step_active = cf_quiesce_core && pipeline_drained 
+  val single_step_active = cf_quiesce_core // && pipeline_drained - pipeline would not be drained when there is an instruction being executed
   // Propagate cf_single_step flag: set for all uops in fetch group during single-step
   val uop_with_step = Wire(Vec(coreWidth, new MicroOp()))
   
@@ -596,6 +637,16 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     decode_units(w).io.interrupt_cause := csr.io.interrupt_cause
 
     dec_uops(w) := decode_units(w).io.deq.uop
+  }
+  // corefuzzing
+  // Non-destructive speculative logging for Decode stage: if a decoded uop
+  // will be killed by the current branch update, print it using the
+  // canonical commit-log format prefixed with [SPECULATIVE][DECODE].
+    for (w <- 0 until coreWidth) {
+    when (dec_valids(w) && IsKilledByBranch(brupdate, dec_uops(w))) {
+      // Gate decode speculative prints with global debug enable + core enable
+      SpeculativePrintf.dump("DECODE", Sext.apply(dec_uops(w).debug_pc(vaddrBits-1,0), xLen), dec_uops(w).debug_inst, dec_uops(w).is_rvc, custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable)
+    }
   }
 
   //-------------------------------------------------------------

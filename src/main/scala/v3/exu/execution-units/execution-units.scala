@@ -123,7 +123,7 @@ class ExecutionUnits(val fpu: Boolean)(implicit val p: Parameters) extends HasBo
         hasMul         = is_nth(2),
         hasDiv         = is_nth(3),
         hasIfpu        = is_nth(4) && usingFPU))
-      exe_units += alu_exe_unit
+  exe_units += alu_exe_unit
     }
   } else {
     val fp_width = issueParams.find(_.iqType == IQT_FP.litValue).get.issueWidth

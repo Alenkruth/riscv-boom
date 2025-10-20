@@ -61,6 +61,8 @@ abstract class AbstractRenameStage(
     val ren_stalls = Output(Vec(plWidth, Bool()))
 
     val kill = Input(Bool())
+    // corefuzzing: gate for speculative rename prints
+    val cf_debug_rename_enable = Input(Bool())
 
     val dec_fire  = Input(Vec(plWidth, Bool())) // will commit state updates
     val dec_uops  = Input(Vec(plWidth, new MicroOp()))
@@ -125,6 +127,11 @@ abstract class AbstractRenameStage(
     next_uop := r_uop
 
     when (io.kill) {
+      // corefuzzing
+      // Non-destructive speculative logging: if we are killing a valid ren2 uop, print it
+      when (r_valid) {
+  SpeculativePrintf.dump("RENAME", Sext.apply(r_uop.debug_pc(vaddrBits-1,0), xLen), r_uop.debug_inst, r_uop.is_rvc, io.cf_debug_rename_enable)
+      }
       r_valid := false.B
     } .elsewhen (ren2_ready) {
       r_valid := ren1_fire(w)

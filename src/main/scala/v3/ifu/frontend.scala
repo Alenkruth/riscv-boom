@@ -296,6 +296,9 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   val reconfigureFB_rows_b0 = Output(Bool())
   val reconfigureFB_rows_b1 = Output(Bool())
 
+  // corefuzzing: gate to enable speculative prints in frontend modules
+  val cf_debug_frontend_enable = Output(Bool())
+
   // for corefuzzing
   // Control signal from core to allow or block new fetches (quiesce)
   val allow_fetch       = Output(Bool())
@@ -880,6 +883,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   val fb  = Module(new FetchBuffer)
   val ftq = Module(new FetchTargetQueue)
+  // corefuzzing
+  // Wire frontend cf_debug gate into fetch buffer and FTQ
+  fb.io.cf_debug_fetchbuf_enable := io.cpu.cf_debug_frontend_enable
+  ftq.io.cf_debug_ftq_enable := io.cpu.cf_debug_frontend_enable
 
   // When we mispredict, we need to repair
 

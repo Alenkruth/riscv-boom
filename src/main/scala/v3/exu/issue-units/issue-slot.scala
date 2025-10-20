@@ -41,6 +41,8 @@ class IssueSlotIO(val numWakeupPorts: Int)(implicit p: Parameters) extends BoomB
   val kill          = Input(Bool()) // pipeline flush
   val clear         = Input(Bool()) // entry being moved elsewhere (not mutually exclusive with grant)
   val ldspec_miss   = Input(Bool()) // Previous cycle's speculative load wakeup was mispredicted.
+  // corefuzzing: gate for speculative issue-slot prints
+  val cf_debug_issue_enable = Input(Bool())
 
   val wakeup_ports  = Flipped(Vec(numWakeupPorts, Valid(new IqWakeup(maxPregSz))))
   val pred_wakeup_port = Flipped(Valid(UInt(log2Ceil(ftqSz).W)))
@@ -99,7 +101,7 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
   val next_p1_poisoned = Mux(io.in_uop.valid, io.in_uop.bits.iw_p1_poisoned, p1_poisoned)
   val next_p2_poisoned = Mux(io.in_uop.valid, io.in_uop.bits.iw_p2_poisoned, p2_poisoned)
 
-  val slot_uop = RegInit(NullMicroOp)
+  val slot_uop = RegInit(NullMicroOp())
   val next_uop = Mux(io.in_uop.valid, io.in_uop.bits, slot_uop)
 
   //-----------------------------------------------------------------------------
@@ -228,7 +230,20 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
 
   // was this micro-op killed by a branch? if yes, we can't let it be valid if
   // we compact it into an other entry
+  // Non-destructive speculative logging: print any slot that will be killed by a branch
+  // corefuzzing
   when (IsKilledByBranch(io.brupdate, slot_uop)) {
+    // Print only if the slot currently holds a valid uop
+    when (is_valid) {
+      // Match commit log format from exu/core.scala but tag as speculative
+  SpeculativePrintf.dump("ISSUE", Sext.apply(slot_uop.debug_pc(vaddrBits-1,0), xLen), slot_uop.debug_inst, slot_uop.is_rvc, io.cf_debug_issue_enable)
+      when (slot_uop.dst_rtype === RT_FIX && slot_uop.ldst =/= 0.U) {
+        // No writeback data available at issue-slot; print a placeholder 0
+        printf(" x%d 0x%x\n", slot_uop.ldst, 0.U)
+      } .elsewhen (slot_uop.dst_rtype === RT_FLT) {
+        printf(" f%d 0x%x\n", slot_uop.ldst, 0.U)
+      }
+    }
     next_state := s_invalid
   }
 

@@ -53,6 +53,9 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
 
     val debug_tsc_reg    = Input(UInt(width=xLen.W))
     val debug_wb_wdata   = Output(Vec(numWakeupPorts, UInt((fLen+1).W)))
+    // corefuzzing: runtime gates for speculative logging
+    val cf_debug_exu_enable = Input(Bool())
+    val cf_debug_issue_enable = Input(Bool())
   })
 
   //**********************************
@@ -91,6 +94,8 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
   issue_unit.io.tsc_reg := io.debug_tsc_reg
   issue_unit.io.brupdate := io.brupdate
   issue_unit.io.flush_pipeline := io.flush_pipeline
+  // propagate corefuzzing cf_debug gate into FP issue unit
+  issue_unit.io.cf_debug_issue_enable := io.cf_debug_issue_enable
   // Don't support ld-hit speculation to FP window.
   for (w <- 0 until memWidth) {
     issue_unit.io.spec_ld_wakeup(w).valid := false.B
@@ -156,6 +161,10 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
   //-------------------------------------------------------------
 
   exe_units.map(_.io.brupdate := io.brupdate)
+  // propagate cf_debug enable into all FP execution units
+  for (eu <- exe_units) {
+    eu.io.cf_debug_exu_enable := io.cf_debug_exu_enable
+  }
 
   for ((ex,w) <- exe_units.withFilter(_.readsFrf).map(x=>x).zipWithIndex) {
     ex.io.req <> fregister_read.io.exe_reqs(w)

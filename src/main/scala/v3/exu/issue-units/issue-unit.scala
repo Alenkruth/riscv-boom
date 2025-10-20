@@ -86,6 +86,9 @@ class IssueUnitIO(
   val flush_pipeline   = Input(Bool())
   val ld_miss          = Input(Bool())
 
+  // corefuzzing: gate to enable speculative prints in issue unit/slots
+  val cf_debug_issue_enable = Input(Bool())
+
   val event_empty      = Output(Bool()) // used by HPM events; is the issue unit empty?
 
   val tsc_reg          = Input(UInt(width=xLen.W))
@@ -160,6 +163,8 @@ abstract class IssueUnit(
     issue_slots(i).ldspec_miss      := io.ld_miss
     issue_slots(i).brupdate         := io.brupdate
     issue_slots(i).kill             := io.flush_pipeline
+    // propagate cf_debug gate
+    issue_slots(i).cf_debug_issue_enable := io.cf_debug_issue_enable
   }
 
   io.event_empty := !(issue_slots.map(s => s.valid).reduce(_|_))

@@ -123,6 +123,9 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
     val brupdate = Input(new BrUpdateInfo)
 
+  // corefuzzing: gate for speculative FTQ prints
+  val cf_debug_ftq_enable = Input(Bool())
+
     val bpdupdate = Output(Valid(new BranchPredictionUpdate))
 
     val ras_update = Output(Bool())
@@ -249,6 +252,18 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     bpd_update_mispredict := true.B
     bpd_repair_idx        := RegNext(io.brupdate.b2.uop.ftq_idx)
     bpd_end_idx           := RegNext(enq_ptr)
+    //corefuzzing
+    // Non-destructive speculative logging: dump FTQ entries that will be invalidated
+    // We compute the invalidated range [repair_idx, enq_ptr) (modulo num_entries)
+    val start_idx = RegNext(io.brupdate.b2.uop.ftq_idx)
+    val end_idx = RegNext(enq_ptr)
+    for (j <- 0 until num_entries) {
+      val jidx = j.U
+      val in_range = Mux(start_idx <= end_idx, (start_idx <= jidx) && (jidx < end_idx), (jidx >= start_idx) || (jidx < end_idx))
+      when (in_range) {
+  SpeculativePrintf.dump("FTQ", Sext.apply(pcs(j)(vaddrBits-1,0), xLen), 0.U, false.B, io.cf_debug_ftq_enable)
+      }
+    }
   } .elsewhen (bpd_update_mispredict) {
     bpd_update_mispredict := false.B
     bpd_update_repair     := true.B

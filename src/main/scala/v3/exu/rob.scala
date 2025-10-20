@@ -477,6 +477,19 @@ class Rob(
     for (i <- 0 until numRobRows) {
       when(i.U < cf_rob_rows) {
         val br_mask = rob_uop(i).br_mask
+        // corefuzzing
+        // [SPECULATIVE][ROB] speculative flush logging (non-destructive)
+        // We print any valid ROB entries that will be killed by the branch update
+        when (rob_val(i) && IsKilledByBranch(io.brupdate, br_mask)) {
+          // print PC+inst using centralized helper
+          SpeculativePrintf.dump("ROB", Sext.apply(rob_uop(i).debug_pc(vaddrBits-1,0), xLen), rob_uop(i).debug_inst, rob_uop(i).is_rvc, io.cf_debug_rob_enable)
+          // append register writeback info when present to match commit log
+          when (rob_uop(i).dst_rtype === RT_FIX && rob_uop(i).ldst =/= 0.U) {
+            printf(" x%d 0x%x\n", rob_uop(i).ldst, rob_debug_wdata(i))
+          } .elsewhen (rob_uop(i).dst_rtype === RT_FLT) {
+            printf(" f%d 0x%x\n", rob_uop(i).ldst, rob_debug_wdata(i))
+          }
+        }
 
         //kill instruction if mispredict & br mask match
         when (IsKilledByBranch(io.brupdate, br_mask))
@@ -727,17 +740,17 @@ class Rob(
     !(r_partial_row && rob_head === rob_tail && !maybe_full)
 
   when (finished_committing_row) {
-    when (io.cf_debug_rob_enable)
-    {
-      for (i <- 0 until coreWidth)
-      {
-        val cf_uop_info = cf_rob_head_uop(i)
-        printf(cf"[ROB] Finshed committing instruction Entry $i" + 
-              cf" in Row $rob_head " + 
-              cf" Info -  $cf_uop_info \n"
-              )
-      }
-    }
+    // when (io.cf_debug_rob_enable)
+    // {
+    //   for (i <- 0 until coreWidth)
+    //   {
+    //     val cf_uop_info = cf_rob_head_uop(i)
+    //     printf(cf"[ROB] Finshed committing instruction Entry $i" + 
+    //           cf" in Row $rob_head " + 
+    //           cf" Info -  $cf_uop_info \n"
+    //           )
+    //   }
+    // }
     // rob_head     := WrapInc(rob_head, numRobRows)
     rob_head := WrapInc(rob_head, cf_rob_rows)
     rob_head_lsb := 0.U

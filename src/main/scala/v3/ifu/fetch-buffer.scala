@@ -23,7 +23,8 @@ import freechips.rocketchip.rocket.{MStatus, BP, BreakpointUnit}
 import freechips.rocketchip.util._
 
 import boom.v3.common._
-import boom.v3.util.{BoolToChar, MaskUpper}
+import boom.v3.util.{BoolToChar, MaskUpper, Sext, SpeculativePrintf}
+// imports for corefuzzing
 
 // This file has been modified to implement a CSR that modifies 
 // the number of rows used in the fetch buffer - Alex, CoreFuzzing
@@ -52,6 +53,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   val io = IO(new BoomBundle {
     val enq = Flipped(Decoupled(new FetchBundle()))
     val deq = new DecoupledIO(new FetchBufferResp())
+    val cf_debug_fetchbuf_enable = Input(Bool())
 
     // Was the pipeline redirected? Clear/reset the fetchbuffer.
     val clear = Input(Bool())
@@ -321,7 +323,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
       when (do_enq && in_mask(i) && enq_idxs(i)(j)) {
         ram(j) := in_uops(i)
         // for debugging: printing ram index for every enqueue - alex
-        printf(p"($rowsUsed, $coreWidth, enq, $j), ")
+        // printf(p"($rowsUsed, $coreWidth, enq, $j), ")
       }
     }
   }
@@ -373,10 +375,17 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     head := inc(head)
     maybe_full := false.B
     // debugging: printing the row index for each dequeue - alex
-    printf(p"($rowsUsed, deq, $rowNum_head), ")
+    // printf(p"($rowsUsed, deq, $rowNum_head), ")
   }
 
   when (io.clear) {
+    // Before clearing, non-destructively dump all current entries in RAM
+    // that are plausibly valid. We iterate through every entry and print
+    // its PC + inst using the common speculative print helper.
+    for (i <- 0 until numEntries) {
+      SpeculativePrintf.dump("FETCHBUF", Sext.apply(ram(i).debug_pc(vaddrBits-1,0), xLen), ram(i).debug_inst, ram(i).is_rvc, io.cf_debug_fetchbuf_enable)
+    }
+
     head := 1.U
     tail := 1.U
     maybe_full := false.B

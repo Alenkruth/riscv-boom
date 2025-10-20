@@ -85,7 +85,7 @@ class WithRationalBoomTiles extends Config((site, here, up) => {
 class WithNSmallBooms(n: Int = 1) extends Config(
   new WithTAGELBPD ++ // Default to TAGE-L BPD
   new WithBoomCommitLogPrintf ++
-  new WithBoomBranchPrintf ++
+  // new WithBoomBranchPrintf ++
   new Config((site, here, up) => {
     case TilesLocated(InSubsystem) => {
       val prev = up(TilesLocated(InSubsystem), site)

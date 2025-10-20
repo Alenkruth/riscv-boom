@@ -51,7 +51,10 @@ import freechips.rocketchip.util.{Str, CoreFuzzingConstants}
 
 import boom.v3.common._
 import boom.v3.exu.{BrUpdateInfo, Exception, FuncUnitResp, CommitSignals, ExeUnitResp}
-import boom.v3.util.{BoolToChar, AgePriorityEncoder, IsKilledByBranch, GetNewBrMask, WrapInc, IsOlder, UpdateBrMask}
+
+// fore corefuzzing - SpeculativePRintf and Sext
+import boom.v3.util.{BoolToChar, AgePriorityEncoder, IsKilledByBranch, GetNewBrMask, WrapInc, IsOlder, UpdateBrMask, SpeculativePrintf}
+import boom.v3.util.Sext
 
 class LSUExeIO(implicit p: Parameters) extends BoomBundle()(p)
 {
@@ -631,14 +634,14 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     "SFENCE through hella interface not supported")
 
   val exe_tlb_uop = widthMap(w =>
-                    Mux(will_fire_load_incoming (w) ||
-                        will_fire_stad_incoming (w) ||
-                        will_fire_sta_incoming  (w) ||
-                        will_fire_sfence        (w)  , exe_req(w).bits.uop,
-                    Mux(will_fire_load_retry    (w)  , ldq_retry_e.bits.uop,
-                    Mux(will_fire_sta_retry     (w)  , stq_retry_e.bits.uop,
-                    Mux(will_fire_hella_incoming(w)  , NullMicroOp,
-                                                       NullMicroOp)))))
+          Mux(will_fire_load_incoming (w) ||
+            will_fire_stad_incoming (w) ||
+            will_fire_sta_incoming  (w) ||
+            will_fire_sfence        (w)  , exe_req(w).bits.uop,
+          Mux(will_fire_load_retry    (w)  , ldq_retry_e.bits.uop,
+          Mux(will_fire_sta_retry     (w)  , stq_retry_e.bits.uop,
+          Mux(will_fire_hella_incoming(w)  , NullMicroOp(),
+                             NullMicroOp())))))
 
   val exe_tlb_vaddr = widthMap(w =>
                     Mux(will_fire_load_incoming (w) ||
@@ -808,7 +811,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   for (w <- 0 until memWidth) {
     dmem_req(w).valid := false.B
-    dmem_req(w).bits.uop   := NullMicroOp
+  dmem_req(w).bits.uop   := NullMicroOp()
     dmem_req(w).bits.addr  := 0.U
     dmem_req(w).bits.data  := 0.U
     dmem_req(w).bits.is_hella := false.B
@@ -1079,7 +1082,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                      Mux(fired_release(w), RegNext(io.dmem.release.bits.address),
                                          mem_paddr(w))))
   val lcam_uop   = widthMap(w => Mux(do_st_search(w), mem_stq_e(w).bits.uop,
-                                 Mux(do_ld_search(w), mem_ldq_e(w).bits.uop, NullMicroOp)))
+                                 Mux(do_ld_search(w), mem_ldq_e(w).bits.uop, NullMicroOp())))
 
   val lcam_mask  = widthMap(w => GenByteMask(lcam_addr(w), lcam_uop(w).mem_size))
   val lcam_st_dep_mask = widthMap(w => mem_ldq_e(w).bits.st_dep_mask)
@@ -1459,8 +1462,23 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     {
       stq(i).bits.uop.br_mask := GetNewBrMask(io.core.brupdate, stq(i).bits.uop.br_mask)
 
+      // corefuzzing
+      // [SPECULATIVE][LSU] speculative flush logging -- non-destructive, see below for actual state clear
       when (IsKilledByBranch(io.core.brupdate, stq(i).bits.uop))
       {
+        // BEGIN speculative flush logging
+        // Only log uncommitted, valid stores that will be invalidated
+        when (!stq(i).bits.committed) {
+          // Printf block matches commit log format in exu/core.scala, with [SPECULATIVE][LSU] prefix
+          SpeculativePrintf.dump("LSU", Sext.apply(stq(i).bits.uop.debug_pc(vaddrBits-1,0), xLen), stq(i).bits.uop.debug_inst, stq(i).bits.uop.is_rvc, io.core.cf_debug_lsu_enable)
+          when (stq(i).bits.uop.dst_rtype === RT_FIX && stq(i).bits.uop.ldst =/= 0.U) {
+            printf(" x%d 0x%x\n", stq(i).bits.uop.ldst, stq(i).bits.debug_wb_data)
+          } .elsewhen (stq(i).bits.uop.dst_rtype === RT_FLT) {
+            printf(" f%d 0x%x\n", stq(i).bits.uop.ldst, stq(i).bits.debug_wb_data)
+          }
+        }
+        // END speculative flush logging
+        // Non-destructive: state clear remains as before
         stq(i).valid           := false.B
         stq(i).bits.addr.valid := false.B
         stq(i).bits.data.valid := false.B
@@ -1478,8 +1496,19 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     when (ldq(i).valid)
     {
       ldq(i).bits.uop.br_mask := GetNewBrMask(io.core.brupdate, ldq(i).bits.uop.br_mask)
+      // [SPECULATIVE][LSU] speculative flush logging -- non-destructive, see below for actual state clear
       when (IsKilledByBranch(io.core.brupdate, ldq(i).bits.uop))
       {
+        // BEGIN speculative flush logging
+        // Only log valid loads that will be invalidated
+        // Printf block matches commit log format in exu/core.scala, with [SPECULATIVE][LSU] prefix
+  SpeculativePrintf.dump("LSU", Sext.apply(ldq(i).bits.uop.debug_pc(vaddrBits-1,0), xLen), ldq(i).bits.uop.debug_inst, ldq(i).bits.uop.is_rvc, io.core.cf_debug_lsu_enable)
+        when (ldq(i).bits.uop.dst_rtype === RT_FIX && ldq(i).bits.uop.ldst =/= 0.U) {
+          printf(" x%d 0x%x\n", ldq(i).bits.uop.ldst, ldq(i).bits.debug_wb_data)
+        } .elsewhen (ldq(i).bits.uop.dst_rtype === RT_FLT) {
+          printf(" f%d 0x%x\n", ldq(i).bits.uop.ldst, ldq(i).bits.debug_wb_data)
+        }
+        // END speculative flush logging
         ldq(i).valid           := false.B
         ldq(i).bits.addr.valid := false.B
       }
@@ -1666,7 +1695,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         stq(i).valid           := false.B
         stq(i).bits.addr.valid := false.B
         stq(i).bits.data.valid := false.B
-        stq(i).bits.uop        := NullMicroOp
+  stq(i).bits.uop        := NullMicroOp()
       }
     }
       .otherwise // exception
@@ -1730,11 +1759,11 @@ object GenByteMask
    def apply(addr: UInt, size: UInt): UInt =
    {
       val mask = Wire(UInt(8.W))
-      mask := MuxCase(255.U(8.W), Array(
-                   (size === 0.U) -> (1.U(8.W) << addr(2,0)),
-                   (size === 1.U) -> (3.U(8.W) << (addr(2,1) << 1.U)),
-                   (size === 2.U) -> Mux(addr(2), 240.U(8.W), 15.U(8.W)),
-                   (size === 3.U) -> 255.U(8.W)))
+  mask := MuxCase(255.U(8.W), List(
+       (size === 0.U) -> (1.U(8.W) << addr(2,0)),
+       (size === 1.U) -> (3.U(8.W) << (addr(2,1) << 1.U)),
+       (size === 2.U) -> Mux(addr(2), 240.U(8.W), 15.U(8.W)),
+       (size === 3.U) -> 255.U(8.W)))
       mask
    }
 }

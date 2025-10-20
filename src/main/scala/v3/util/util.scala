@@ -307,6 +307,30 @@ object Sext
     else return Cat(Fill(length-x.getWidth, x(x.getWidth-1)), x)
   }
 }
+// corefuzzing
+/**
+ * Centralized helper to print speculative MicroOps in the same
+ * commit-log format and prefixed with "[SPECULATIVE][<UNIT>]".
+ *
+ * We intentionally keep the helper signature simple and hardware-friendly:
+ * callers should pass the already-sign-extended PC (as a UInt) along with
+ * the instruction bits and the rvc flag. This avoids pulling parameter
+ * state into this utility and keeps it usable from all call sites.
+ *
+ * Usage: SpeculativePrintf.dump("DECODE", Sext.apply(uop.debug_pc(vaddrBits-1,0), xLen), uop.debug_inst, uop.is_rvc, custom_csrs.cf_debug_enable)
+ */
+object SpeculativePrintf {
+  // enabled: a Bool that gates printing at runtime (wire this to custom_csrs.cf_debug_enable
+  // or to a per-module cf_debug_*_enable). This keeps the prints non-intrusive when
+  // debugging is disabled.
+  def dump(unit: String, pc_sext: UInt, inst: UInt, is_rvc: Bool, enabled: Bool): Unit = {
+    when (enabled) {
+      printf("[SPECULATIVE][" + unit + "] 0x%x ", pc_sext)
+      when (is_rvc) { printf("(0x%x)", inst(15,0)) } .otherwise { printf("(0x%x)", inst) }
+      printf("\n")
+    }
+  }
+}
 
 /**
  * Object to translate from BOOM's special "packed immediate" to a 32b signed immediate

@@ -185,6 +185,8 @@ abstract class FunctionalUnit(
     val bp = if (isMemAddrCalcUnit) Input(Vec(nBreakpoints, new BP)) else null
     val mcontext = if (isMemAddrCalcUnit) Input(UInt(coreParams.mcontextWidth.W)) else null
     val scontext = if (isMemAddrCalcUnit) Input(UInt(coreParams.scontextWidth.W)) else null
+  // corefuzzing: gate to enable speculative prints in functional units
+  val cf_debug_exu_enable = Input(Bool())
 
   })
 
@@ -232,6 +234,12 @@ abstract class PipelinedFunctionalUnit(
   // Pipelined functional unit is always ready.
   io.req.ready := true.B
 
+  // corefuzzing
+  // helper to dump uop directly (modules have xLen and vaddrBits in scope)
+  def dumpUop(unit: String, uop: MicroOp, enabled: Bool): Unit = {
+    SpeculativePrintf.dump(unit, Sext.apply(uop.debug_pc(vaddrBits-1,0), xLen), uop.debug_inst, uop.is_rvc, enabled)
+  }
+
   if (numStages > 0) {
     val r_valids = RegInit(VecInit(Seq.fill(numStages) { false.B }))
     val r_uops   = Reg(Vec(numStages, new MicroOp()))
@@ -240,12 +248,17 @@ abstract class PipelinedFunctionalUnit(
     r_valids(0) := io.req.valid && !IsKilledByBranch(io.brupdate, io.req.bits.uop) && !io.req.bits.kill
     r_uops(0)   := io.req.bits.uop
     r_uops(0).br_mask := GetNewBrMask(io.brupdate, io.req.bits.uop)
+    // corefuzzing
+    // If an incoming request is killed by a branch this cycle, non-destructively log it
+    when (io.req.valid && IsKilledByBranch(io.brupdate, io.req.bits.uop)) {
+      dumpUop("EXU", io.req.bits.uop, io.cf_debug_exu_enable)
+    }
 
     // handle middle of the pipeline
     for (i <- 1 until numStages) {
-      r_valids(i) := r_valids(i-1) && !IsKilledByBranch(io.brupdate, r_uops(i-1)) && !io.req.bits.kill
-      r_uops(i)   := r_uops(i-1)
-      r_uops(i).br_mask := GetNewBrMask(io.brupdate, r_uops(i-1))
+  r_valids(i) := r_valids(i-1) && !IsKilledByBranch(io.brupdate, r_uops(i-1)) && !io.req.bits.kill
+  r_uops(i)   := r_uops(i-1)
+  r_uops(i).br_mask := GetNewBrMask(io.brupdate, r_uops(i-1))
 
       if (numBypassStages > 0) {
         io.bypass(i-1).bits.uop := r_uops(i-1)
@@ -267,6 +280,13 @@ abstract class PipelinedFunctionalUnit(
         io.bypass(i).bits.uop := r_uops(i-1)
       }
     }
+    // corefuzzing
+    // Non-destructive logging for uops in pipeline stages that are being killed by a branch
+    for (i <- 0 until numStages) {
+      when (r_valids(i) && IsKilledByBranch(io.brupdate, r_uops(i))) {
+        dumpUop("EXU", r_uops(i), io.cf_debug_exu_enable)
+      }
+    }
   } else {
     require (numStages == 0)
     // pass req straight through to response
@@ -277,6 +297,12 @@ abstract class PipelinedFunctionalUnit(
     io.resp.bits.predicated := false.B
     io.resp.bits.uop := io.req.bits.uop
     io.resp.bits.uop.br_mask := GetNewBrMask(io.brupdate, io.req.bits.uop)
+
+    // corefuzzing
+    // Non-destructive logging for non-pipelined functional unit kills
+    when (io.req.valid && IsKilledByBranch(io.brupdate, io.req.bits.uop)) {
+      dumpUop("EXU", io.req.bits.uop, io.cf_debug_exu_enable)
+    }
   }
 }
 
@@ -576,6 +602,8 @@ class FPUUnit(implicit p: Parameters)
   fpu.io.req.bits.rs2_data := io.req.bits.rs2_data
   fpu.io.req.bits.rs3_data := io.req.bits.rs3_data
   fpu.io.req.bits.fcsr_rm  := io.fcsr_rm
+  // corefuzzing
+  fpu.io.cf_debug_exu_enable := io.cf_debug_exu_enable
 
   io.resp.bits.data              := fpu.io.resp.bits.data
   io.resp.bits.fflags.valid      := fpu.io.resp.bits.fflags.valid

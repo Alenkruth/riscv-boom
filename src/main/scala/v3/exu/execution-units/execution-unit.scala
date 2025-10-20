@@ -135,6 +135,8 @@ abstract class ExecutionUnit(
 
     // TODO move this out of ExecutionUnit
     val com_exception = if (hasMem || hasRocc) Input(Bool()) else null
+    // corefuzzing: gate to enable speculative prints inside functional units
+    val cf_debug_exu_enable = Input(Bool())
   })
 
   io.req.ready := false.B
@@ -286,6 +288,8 @@ class ALUExeUnit(
     alu.io.req.bits.pred_data := io.req.bits.pred_data
     alu.io.resp.ready := DontCare
     alu.io.brupdate := io.brupdate
+  // propagate corefuzzing debug enable into child functional unit
+  alu.io.cf_debug_exu_enable := io.cf_debug_exu_enable
 
     iresp_fu_units += alu
 
@@ -331,6 +335,8 @@ class ALUExeUnit(
     imul.io.req.bits.rs2_data := io.req.bits.rs2_data
     imul.io.req.bits.kill     := io.req.bits.kill
     imul.io.brupdate := io.brupdate
+    //corefuzzing
+  imul.io.cf_debug_exu_enable := io.cf_debug_exu_enable
     iresp_fu_units += imul
   }
 
@@ -341,6 +347,8 @@ class ALUExeUnit(
     ifpu.io.req.valid  := io.req.valid && io.req.bits.uop.fu_code_is(FU_I2F)
     ifpu.io.fcsr_rm    := io.fcsr_rm
     ifpu.io.brupdate   <> io.brupdate
+    // corefuzzing
+    ifpu.io.cf_debug_exu_enable := io.cf_debug_exu_enable
     ifpu.io.resp.ready := DontCare
 
     // buffer up results since we share write-port on integer regfile.
@@ -370,6 +378,8 @@ class ALUExeUnit(
     div.io.req.bits.rs1_data   := io.req.bits.rs1_data
     div.io.req.bits.rs2_data   := io.req.bits.rs2_data
     div.io.brupdate            := io.brupdate
+    // corefuzzing
+    div.io.cf_debug_exu_enable := io.cf_debug_exu_enable
     div.io.req.bits.kill       := io.req.bits.kill
 
     // share write port with the pipelined units
@@ -389,6 +399,8 @@ class ALUExeUnit(
     maddrcalc.io.req        <> io.req
     maddrcalc.io.req.valid  := io.req.valid && io.req.bits.uop.fu_code_is(FU_MEM)
     maddrcalc.io.brupdate     <> io.brupdate
+    // corefuzzing
+    maddrcalc.io.cf_debug_exu_enable := io.cf_debug_exu_enable
     maddrcalc.io.status     := io.status
     maddrcalc.io.bp         := io.bp
     maddrcalc.io.mcontext   := io.mcontext
@@ -486,6 +498,8 @@ class FPUExeUnit(
     fpu.io.req.bits.kill     := io.req.bits.kill
     fpu.io.fcsr_rm           := io.fcsr_rm
     fpu.io.brupdate          := io.brupdate
+    // corefuzzing
+    fpu.io.cf_debug_exu_enable := io.cf_debug_exu_enable
     fpu.io.resp.ready        := DontCare
     fpu_resp_val             := fpu.io.resp.valid
     fpu_resp_fflags          := fpu.io.resp.bits.fflags
@@ -509,6 +523,8 @@ class FPUExeUnit(
     fdivsqrt.io.req.bits.kill     := io.req.bits.kill
     fdivsqrt.io.fcsr_rm           := io.fcsr_rm
     fdivsqrt.io.brupdate          := io.brupdate
+    // corefuzzing
+    fdivsqrt.io.cf_debug_exu_enable := io.cf_debug_exu_enable
 
     // share write port with the pipelined units
     fdivsqrt.io.resp.ready := !(fu_units.map(_.io.resp.valid).reduce(_|_)) // TODO PERF will get blocked by fpiu.

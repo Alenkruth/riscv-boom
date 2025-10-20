@@ -172,6 +172,7 @@ class FPU(implicit p: Parameters) extends BoomModule with tile.HasFPUParameters
   val io = IO(new Bundle {
     val req = Flipped(new ValidIO(new FpuReq))
     val resp = new ValidIO(new ExeUnitResp(65))
+    val cf_debug_exu_enable = Input(Bool())
   })
   io.resp.bits := DontCare
 
