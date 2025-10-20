@@ -374,12 +374,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   io.ifu.allow_fetch := allow_fetch
 
   // Debug prints
-  when (cf_quiesce_core && !pipeline_drained) {
-    printf("[QMODE] Quiescing active - frontend stalled, draining pipeline\n") 
-  }
-  when (cf_quiesce_core && pipeline_drained) {
-    printf("[QMODE] Pipeline drained - entering single-step mode\n")
-  } 
+  // when (cf_quiesce_core && !pipeline_drained) {
+  //   printf("[QMODE] Quiescing active - frontend stalled, draining pipeline\n") 
+  // }
+  // when (cf_quiesce_core && pipeline_drained) {
+  //   printf("[QMODE] Pipeline drained - entering single-step mode\n")
+  // } 
 
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
   val icache_blocked = false.B 

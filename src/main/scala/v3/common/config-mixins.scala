@@ -373,8 +373,9 @@ class WithNGigaBooms(n: Int = 1) extends Config(
 /**
  * 5-wide BOOM for coreFuzzing.
   */
-class WithNCFGigaBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends Config(
+class WithFuzzingBoom(n: Int = 1, overrideIdOffset: Option[Int] = None) extends Config(
   new WithTAGELBPD ++ // Default to TAGE-L BPD
+  new WithBoomCommitLogPrintf ++ // Enable commit logging for fuzzing and spike diff
   new Config((site, here, up) => {
     case TilesLocated(InSubsystem) => {
       val prev = up(TilesLocated(InSubsystem), site)
@@ -385,20 +386,20 @@ class WithNCFGigaBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends
             core = BoomCoreParams(
               fetchWidth = 8,
               decodeWidth = 5,
-              numRobEntries = 130,
+              numRobEntries = 300,
               issueParams = Seq(
                 IssueParams(issueWidth=2, numEntries=24, iqType=IQT_MEM.litValue, dispatchWidth=5),
                 IssueParams(issueWidth=5, numEntries=40, iqType=IQT_INT.litValue, dispatchWidth=5),
                 IssueParams(issueWidth=2, numEntries=32, iqType=IQT_FP.litValue , dispatchWidth=5)),
-              numIntPhysRegisters = 128,
-              numFpPhysRegisters = 128,
-              numLdqEntries = 32,
-              numStqEntries = 32,
-              maxBrCount = 20,
-              numFetchBufferEntries = 40, // keep this as a multiple of 5 to avoid issues.
+              numIntPhysRegisters = 256,
+              numFpPhysRegisters = 256,
+              numLdqEntries = 64,
+              numStqEntries = 64,
+              maxBrCount = 40,
+              numFetchBufferEntries = 80, // keep this as a multiple of 5 to avoid issues.
               enablePrefetching = true,
               numDCacheBanks = 1,
-              ftq = FtqParameters(nEntries=40),
+              ftq = FtqParameters(nEntries=100),
               nPerfCounters = 29,
               fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true))
             ),
