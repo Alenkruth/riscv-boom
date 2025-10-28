@@ -18,6 +18,7 @@ import freechips.rocketchip.devices.tilelink.{BootROMParams, CLINTParams, PLICPa
 import boom.v3.ifu._
 import boom.v3.exu._
 import boom.v3.lsu._
+import os.write.over
 
 /**
  * Default BOOM core parameters
@@ -303,6 +304,54 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
 
   def cf_chill = getOrElse(chillCSRCF, _.value(0), false.B)
 
+  override def attackerAddrStartCSRCF = {
+    val mask = BigInt(0x7FFFFFFF)
+    val init = BigInt(0x0) // the default value is 0x0 here 
+    // the idea is that the program will write the offset of 
+    // the attacker start address offset from the base address (0x80000000)
+    Some(CustomCSR(attackerAddrStartCSRIdCF, mask, Some(init)))
+  }
+
+  override def attackerAddrEndCSRCF = {
+    val mask = BigInt(0x7FFFFFFF)
+    val init = BigInt(0x0) // the default value is 0x0 here 
+    // the idea is that the program will write the offset of 
+    // the attacker end address offset from the base address (0x80000000)
+    // Question: do we need this offset to be from the start address?? probably not. I don't think we 
+    // currently model such a large attacker code region
+    Some(CustomCSR(attackerAddrEndCSRIdCF, mask, Some(init)))
+  }
+
+  def cf_attacker_start_addr = 0x80000000.U + getOrElse(attackerAddrStartCSRCF, _.value, 0.U)
+  def cf_attacker_end_addr = 0x80000000.U + getOrElse(attackerAddrEndCSRCF, _.value, 0.U)
+
+  override def secretAddrStartCSRCF = {
+    val mask = BigInt(0x7FFFFFFF)
+    val init = BigInt(0x0) // the default value is 0x0 here 
+    // the idea is that the program will write the offset of 
+    // the secret start address offset from the base address (0x80000000)
+    Some(CustomCSR(secretAddrStartCSRIdCF, mask, Some(init)))
+  }
+
+  override def secretAddrEndCSRCF = {
+    val mask = BigInt(0x7FFFFFFF)
+    val init = BigInt(0x0) // the default value is 0x0 here 
+    // the idea is that the program will write the offset of 
+    // the secret end address offset from the base address (0x80000000)
+    Some(CustomCSR(secretAddrEndCSRIdCF, mask, Some(init)))
+  }
+
+  def cf_secret_start_addr = 0x80000000.U + getOrElse(secretAddrStartCSRCF, _.value, 0.U)
+  def cf_secret_end_addr = 0x80000000.U + getOrElse(secretAddrEndCSRCF, _.value, 0.U)
+
+  override def attackStageCSRCF = {
+    val mask = BigInt(0x3) // two bits bit 0 - attack start indicator. Bit 1 - start secret access tagging
+    val init = BigInt(0x0)
+    Some(CustomCSR(attackStageCSRIdCF, mask, Some(init)))
+  }
+
+  def cf_start_attack = getOrElse(attackStageCSRCF, _.value(0), false.B)
+  def cf_start_secret_tagging = getOrElse(attackStageCSRCF, _.value(1), false.B)
   override def decls: Seq[CustomCSR] = super.decls :+ marchid
 
   def cf_debug_enable = getOrElse(debugCSRCF, _.value(0), true.B)
