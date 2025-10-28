@@ -157,6 +157,8 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   val cf_op_count_id = UInt(uopIDCounterWidthCF.W) // counts the number of active micro-ops. Count is incremented when it the micro-op is created with a counter. 
                                  // counter wraps around at 255. It is fine because the maximum number of uops currently supported in 130. Even if we 
                                  // increase this number, we can increase the width of the counter.
+  // the taint module acts like a FIFO style queue. The oldest to modify the op woiuld be in module_id_1 and the latest in module_id_5
+
   val cf_taint_module_id_1 = UInt(moduleCountCF.W) // keeps track of modules where transmission happened
   val cf_taint_type_1 = UInt(taintTypeCf.W) // keeps track of which taint was set first
   val cf_taint_op_count_1 = UInt(uopIDCounterWidthCF.W) // keeps track of the uop count when the first taint was set
@@ -169,7 +171,41 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   val cf_taint_type_3 = UInt(taintTypeCf.W) // keeps track of which taint was set first
   val cf_taint_op_count_3 = UInt(uopIDCounterWidthCF.W) // keeps track of the uop count when the first taint was set
 
-  val cf_single_step          = Bool()      // set when the micro-op is single-stepped (quiesce mode)
+  val cf_taint_module_id_4 = UInt(moduleCountCF.W) // keeps track of modules where transmission happened
+  val cf_taint_type_4 = UInt(taintTypeCf.W) // keeps track of which taint was set first
+  val cf_taint_op_count_4 = UInt(uopIDCounterWidthCF.W) // keeps track of the uop count when the first taint was set
+
+  val cf_taint_module_id_5 = UInt(moduleCountCF.W) // keeps track of modules where transmission happened
+  val cf_taint_type_5 = UInt(taintTypeCf.W) // keeps track of which taint was set first
+  val cf_taint_op_count_5 = UInt(uopIDCounterWidthCF.W) // keeps track of the uop count when the first taint was set
+
+  // the predispatch taint module acts like a FIFO style queuefor all the modules that 
+  // the uop resided in before being dispatched.
+  // This is because, once the uop is dispatched, a copy of the uop would be in the rob and another in the Functional units/queues
+  // where they get operated upon. The uops eventually converge back during writeback.
+  // The oldest to modify the op woiuld be in module_id_1 and the latest in module_id_5
+
+  val cf_predis_taint_module_id_1 = UInt(moduleCountCF.W) // keeps track of modules where transmission happened
+  val cf_predis_taint_type_1 = UInt(taintTypeCf.W) // keeps track of which taint was set first
+  val cf_predis_taint_op_count_1 = UInt(uopIDCounterWidthCF.W) // keeps track of the uop count when the first taint was set
+
+  val cf_predis_taint_module_id_2 = UInt(moduleCountCF.W) // keeps track of modules where transmission happened
+  val cf_predis_taint_type_2 = UInt(taintTypeCf.W) // keeps track of which taint was set first
+  val cf_predis_taint_op_count_2 = UInt(uopIDCounterWidthCF.W) // keeps track of the uop count when the first taint was set
+
+  val cf_predis_taint_module_id_3 = UInt(moduleCountCF.W) // keeps track of modules where transmission happened
+  val cf_predis_taint_type_3 = UInt(taintTypeCf.W) // keeps track of which taint was set first
+  val cf_predis_taint_op_count_3 = UInt(uopIDCounterWidthCF.W) // keeps track of the uop count when the first taint was set
+
+  val cf_predis_taint_module_id_4 = UInt(moduleCountCF.W) // keeps track of modules where transmission happened
+  val cf_predis_taint_type_4 = UInt(taintTypeCf.W) // keeps track of which taint was set first
+  val cf_predis_taint_op_count_4 = UInt(uopIDCounterWidthCF.W) // keeps track of the uop count when the first taint was set
+
+  val cf_predis_taint_module_id_5 = UInt(moduleCountCF.W) // keeps track of modules where transmission happened
+  val cf_predis_taint_type_5 = UInt(taintTypeCf.W) // keeps track of which taint was set first
+  val cf_predis_taint_op_count_5 = UInt(uopIDCounterWidthCF.W) // keeps track of the uop count when the first taint was set
+  val cf_single_step          = Bool()      // set when the micro-op is single-stepped (quiesce mode) 
+
   override def toPrintable: Printable = {
     val cf_info = Cat(cf_domain_id, cf_speculated, cf_attacker_influence, cf_secret_access, cf_secret_propagation, cf_secret_transmission)
     val cf_taint = Cat(cf_taint_module_id_1, cf_taint_type_1, cf_taint_op_count_1, cf_taint_module_id_2, cf_taint_type_2, cf_taint_op_count_2, cf_taint_module_id_3, cf_taint_type_3, cf_taint_op_count_3)

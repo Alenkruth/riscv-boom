@@ -20,12 +20,14 @@ import freechips.rocketchip.tile
 
 import boom.v3.exu.FUConstants._
 import boom.v3.common._
-import boom.v3.util.{BoomCoreStringPrefix}
+import boom.v3.util.{BoomCoreStringPrefix, appendModuleTag}
+import freechips.rocketchip.util._
 
 /**
  * Top level datapath that wraps the floating point issue window, regfile, and arithmetic units.
  */
 class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUParameters
+  with CoreFuzzingConstants
 {
   val fpIssueParams = issueParams.find(_.iqType == IQT_FP.litValue).get
   val dispatchWidth = fpIssueParams.dispatchWidth
@@ -108,10 +110,21 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
   //-------------------------------------------------------------
   // **** Dispatch Stage ****
   //-------------------------------------------------------------
-
   // Input (Dispatch)
+  // Wrap the incoming Decoupled `io.dis_uops` with a local wire so we can
+  // append the FP-issue-queue module tag (`fpissqTagCF`) at the point the
+  // micro-op enters the FP issue unit. This preserves the semantic that the
+  // tag is recorded when the uop "enters" the module without changing the
+  // original handshake behavior.
   for (w <- 0 until dispatchWidth) {
-    issue_unit.io.dis_uops(w) <> io.dis_uops(w)
+    val dis_wire = Wire(Decoupled(new MicroOp))
+    dis_wire.bits  := io.dis_uops(w).bits
+    dis_wire.valid := io.dis_uops(w).valid
+    io.dis_uops(w).ready := dis_wire.ready
+    // Append FP issue queue tag when the micro-op is presented to the FP
+    // issue unit. This is combinational and cheap; it does not add cycles.
+    appendModuleTag(fpissqTagCF.U, dis_wire.bits)
+    issue_unit.io.dis_uops(w) <> dis_wire
   }
 
   //-------------------------------------------------------------
@@ -234,12 +247,24 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
   //-------------------------------------------------------------
 
   io.wakeups(0).valid := ll_wbarb.io.out.valid
-  io.wakeups(0).bits := ll_wbarb.io.out.bits
+  // io.wakeups(0).bits := ll_wbarb.io.out.bits
+  // corefuzzing - this could be overkill. Once the tag is appended 
+  // at frf rename, it should be preserved through writeback.
+  // Ensure the wakeup carries the FRF writeback tag so the ROB receives
+  // the tagged micro-op on writeback.
+  val ll_out_bits = WireInit(ll_wbarb.io.out.bits)
+  // ll_out_bits.uop.appendModuleTag(frfTagCF)
+  io.wakeups(0).bits := ll_out_bits
   ll_wbarb.io.out.ready := true.B
 
   w_cnt = 1
   for (i <- 1 until memWidth) {
+    // probably-overkill
+    // mem writebacks -> append FRF tag before presenting as a wakeup
+    // val mem_wb = WireInit(io.ll_wports(i).bits)
+    // mem_wb.uop.appendModuleTag(frfTagCF)
     io.wakeups(w_cnt) := io.ll_wports(i)
+    io.wakeups(w_cnt).bits := io.ll_wports(i).bits//mem_wb
     io.wakeups(w_cnt).bits.data := recode(io.ll_wports(i).bits.data,
       io.ll_wports(i).bits.uop.mem_size =/= 2.U)
     w_cnt += 1
@@ -249,8 +274,11 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
       val exe_resp = eu.io.fresp
       val wb_uop = eu.io.fresp.bits.uop
       val wport = io.wakeups(w_cnt)
+      // Append FRF tag for FPU writebacks so the tag is carried to ROB
+      // val fpu_wb_bits = WireInit(exe_resp.bits)
+      // fpu_wb_bits.uop.appendModuleTag(frfTagCF)
       wport.valid := exe_resp.valid && wb_uop.dst_rtype === RT_FLT
-      wport.bits := exe_resp.bits
+      wport.bits := exe_resp.bits //fpu_wb_bits
 
       w_cnt += 1
 

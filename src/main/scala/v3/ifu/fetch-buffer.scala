@@ -23,7 +23,7 @@ import freechips.rocketchip.rocket.{MStatus, BP, BreakpointUnit}
 import freechips.rocketchip.util._
 
 import boom.v3.common._
-import boom.v3.util.{BoolToChar, MaskUpper, Sext, SpeculativePrintf}
+import boom.v3.util.{BoolToChar, MaskUpper, Sext, SpeculativePrintf, appendModuleTag}
 // imports for corefuzzing
 
 // This file has been modified to implement a CSR that modifies 
@@ -275,6 +275,34 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     // Resize priorValids to the counter width before adding
     val id = (uopCount + priorValids)(uopIDCounterWidthCF - 1, 0)
     in_uops(i).cf_op_count_id := id
+  }
+
+  // corefuzzing
+  // Append module tag for fetch-buffer to each newly created micro-op.
+  // What changed: call the MicroOp helper `appendModuleTag` to push the
+  // fetch-buffer's tag into slot 1 and shift older tags down.
+  // Why: mark that these micro-ops have passed through the fetch-buffer
+  // module. This operation is combinational and cheap; it does not add
+  // pipeline cycles and can be done in parallel with other stage work.
+  // might be unneccessary
+  // Append tags for upstream IFU modules (FTQ, ICache/ITLB), then stamp FetchBuffer
+  // Order: older -> newer. appendModuleTag pushes the new tag into slot1, so
+  // call older-module tags first and the current module last so cf_taint_module_id_1
+  // reflects the most recent module (FetchBuffer).
+  for (i <- 0 until fetchWidth) {
+    // FTQ: the frontend previously assigned ftq_idx (ftq participated before FB)
+    appendModuleTag(ftqTagCF.U, in_uops(i))
+
+    // I-TLB vs ICache: if a fetch had an I-TLB page fault / access exception, mark
+    // it as passing through the ITLB; otherwise mark as coming from the ICache.
+    when (io.enq.bits.xcpt_pf_if || io.enq.bits.xcpt_ae_if) {
+      appendModuleTag(itlbTagCF.U, in_uops(i))
+    } .otherwise {
+      appendModuleTag(icacheTagCF.U, in_uops(i))
+    }
+
+    // Finally mark FetchBuffer itself as the most-recent module.
+    appendModuleTag(fbTagCF.U, in_uops(i))
   }
 
   // Step 2. Generate one-hot write indices.

@@ -50,6 +50,7 @@ import boom.v3.util._
  */
 class BoomCore()(implicit p: Parameters) extends BoomModule
   with HasBoomFrontendParameters // TODO: Don't add this trait
+  with CoreFuzzingConstants
 {
   val io = IO(new Bundle {
     val hartid = Input(UInt(hartIdLen.W))
@@ -1286,7 +1287,14 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   for (i <- 0 until exe_units.length) {
     if (exe_units(i).writesIrf) {
       val wbresp = exe_units(i).io.iresp
-      val wbpdst = wbresp.bits.uop.pdst
+      // do we need this though? 
+      // is there a chance for the uop in the rob to wait for a port?
+      // Make a local copy of the uop so we can append an IRF writeback tag
+      //val wbresp_uop_copy = WireInit(wbresp.bits.uop)
+      //when (wbresp.valid && wbresp.bits.uop.rf_wen) {
+      //  wbresp_uop_copy.appendModuleTag(irfTagCF)
+      //}
+      val wbpdst = wbresp.bits.uop.pdst//wbresp_uop_copy.pdst
       val wbdata = wbresp.bits.data
 
       def wbIsValid(rtype: UInt) =

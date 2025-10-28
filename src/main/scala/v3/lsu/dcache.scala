@@ -20,7 +20,7 @@ import boom.v3.common._
 import boom.v3.exu.BrUpdateInfo
 import boom.v3.util.{IsKilledByBranch, GetNewBrMask, BranchKillableQueue, IsOlder, UpdateBrMask, AgePriorityEncoder, WrapInc, Transpose} 
 
-import boom.v3.util.{BoomCoreStringPrefix}
+import boom.v3.util.{BoomCoreStringPrefix, appendModuleTag}
 
 // import test
 // import freechips.rocketchip.rocket.constants.CoreFuzzingConstants
@@ -493,6 +493,7 @@ class BoomDCacheBundle(implicit p: Parameters, edge: TLEdgeOut) extends BoomBund
 class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModuleImp(outer)
   with HasL1HellaCacheParameters
   with HasBoomCoreParameters
+  with freechips.rocketchip.util.CoreFuzzingConstants
 {
   implicit val edge = outer.node.edges.out(0)
   val (tl_out, _) = outer.node.out(0)
@@ -999,13 +1000,26 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   val cache_resp   = Wire(Vec(memWidth, Valid(new BoomDCacheResp)))
   for (w <- 0 until memWidth) {
     cache_resp(w).valid         := s2_valid(w) && s2_send_resp(w)
-    cache_resp(w).bits.uop      := s2_req(w).uop
+    // corefuzzing
+    // Make a local copy of the uop so we can append the DCache tag safely
+    val cache_uop = WireInit(s2_req(w).uop)
+    appendModuleTag(dcacheTagCF.U, cache_uop)
+    cache_resp(w).bits.uop      := cache_uop
     cache_resp(w).bits.data     := loadgen(w).data | s2_sc_fail
     cache_resp(w).bits.is_hella := s2_req(w).is_hella
   }
 
   val uncache_resp = Wire(Valid(new BoomDCacheResp))
+  // corefuzzing
+  // mshr responses also get the dcache tag appended
+  // todo- tag the secrets as well
+  // Copy MSHR response and tag it as coming from the DCache/MSHR path before
+  // presenting it to the LSU. This ensures the writeback path carries the
+  // dcacheTagCF into the ROB.
   uncache_resp.bits     := mshrs.io.resp.bits
+  when (mshrs.io.resp.valid) {
+    appendModuleTag(dcacheTagCF.U, uncache_resp.bits.uop)
+  }
   uncache_resp.valid    := mshrs.io.resp.valid
   mshrs.io.resp.ready := !(cache_resp.map(_.valid).reduce(_&&_)) // We can backpressure the MSHRs, but not cache hits
 

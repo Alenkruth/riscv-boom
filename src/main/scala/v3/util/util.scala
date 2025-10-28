@@ -307,30 +307,6 @@ object Sext
     else return Cat(Fill(length-x.getWidth, x(x.getWidth-1)), x)
   }
 }
-// corefuzzing
-/**
- * Centralized helper to print speculative MicroOps in the same
- * commit-log format and prefixed with "[SPECULATIVE][<UNIT>]".
- *
- * We intentionally keep the helper signature simple and hardware-friendly:
- * callers should pass the already-sign-extended PC (as a UInt) along with
- * the instruction bits and the rvc flag. This avoids pulling parameter
- * state into this utility and keeps it usable from all call sites.
- *
- * Usage: SpeculativePrintf.dump("DECODE", Sext.apply(uop.debug_pc(vaddrBits-1,0), xLen), uop.debug_inst, uop.is_rvc, custom_csrs.cf_debug_enable)
- */
-object SpeculativePrintf {
-  // enabled: a Bool that gates printing at runtime (wire this to custom_csrs.cf_debug_enable
-  // or to a per-module cf_debug_*_enable). This keeps the prints non-intrusive when
-  // debugging is disabled.
-  def dump(unit: String, pc_sext: UInt, inst: UInt, is_rvc: Bool, enabled: Bool): Unit = {
-    when (enabled) {
-      printf("[SPECULATIVE][" + unit + "] 0x%x ", pc_sext)
-      when (is_rvc) { printf("(0x%x)", inst(15,0)) } .otherwise { printf("(0x%x)", inst) }
-      printf("\n")
-    }
-  }
-}
 
 /**
  * Object to translate from BOOM's special "packed immediate" to a 32b signed immediate
@@ -604,56 +580,6 @@ class BranchKillableQueue[T <: boom.v3.common.HasBoomUOP](gen: T, entries: Int, 
   }
 }
 
-// objects used for CoreFuzzing
-
-/* commented the object out because it does not synthesize. Not sure if that is 
- * how it is
- */
-
-/*object AddressPrivilegeTagSet extends boom.common.constants.CoreFuzzingConstants
-{
-  //Object to check the current PC and then set the privilege bit.
-  def apply(pc: UInt): UInt = {
-    val ret = Wire(UInt(IFT_BITS.W))
-    //val start = Reg(UInt(48.W))
-    //val end = Reg(UInt(48.W))
-    //start := IFT_PROTECTED_START
-    //end := IFT_PROTECTED_END
-    ret := 0.U(IFT_BITS.W)
-    printf("\nObject PC is 0x%x\n", pc)
-    // when ((pc >= 0x080001060.S(48.W).asUInt) && (pc <= 0x080001080.S(48.W).asUInt)) {
-    // when ((pc >= start) && (pc <= end)){
-    when ((pc >= IFT_PROTECTED_START.S(48.W).asUInt) && (pc <= IFT_PROTECTED_END.S(48.W).asUInt)) {
-      ret := 1.U(IFT_BITS.W)
-      printf("\n Inside the when\n")
-    }
-    ret
-  }
-}*/
-
-// module to check the address range and return true or false to set the bit.
-// This module can be extended to check the privilege level and whatever we 
-// care about.
-
-/*class AddressChecker (implicit p: org.chipsalliance.cde.config.Parameters)
-  extends BoomModule()(p) 
-  with CoreFuzzingConstants
-{
-  val io = IO(new Bundle{
-      val in  = Input(UInt(coreMaxAddrBits.W))
-      val out = Output(UInt(IFT_BITS.W))
-  })
-
-  // printf("\nObject PC is 0x%x\n", io.in)
-  
-  when ((io.in >= IFT_PROTECTED_START.U(coreMaxAddrBits.W)) && (io.in <= IFT_PROTECTED_END.U(coreMaxAddrBits.W))) {
-      io.out := 1.U(IFT_BITS.W)
-      // printf("\n Inside the when\n")
-  } .otherwise {
-      io.out := 0.U(IFT_BITS.W)
-  }
-}*/
-
 // ------------------------------------------
 // Printf helper functions
 // ------------------------------------------
@@ -774,5 +700,93 @@ object BoomCoreStringPrefix
   def apply(strs: String*)(implicit p: Parameters) = {
     val prefix = "[C" + s"${p(TileKey).tileId}" + "] "
     strs.map(str => prefix + str + "\n").mkString("")
+  }
+}
+
+// corefuzzing 
+// todo - support >3 taints! I think 5 would be good.
+// ------------------------------------------------------------------
+// Module tag helper
+//
+// What was changed:
+// - Added `appendModuleTag(newTag: UInt)` to shift the existing three
+//   tag slots and insert `newTag` as the most-recent tag (cf_taint_module_id_1).
+// Why:
+// - To let pipeline modules efficiently append their module tag to each
+//   micro-op as it enters the module. Implemented as an in-place
+//   combinational shift so it does not add pipeline cycles.
+// How it affects pipeline tag propagation:
+// - Modules can call `uop.appendModuleTag(myTag)` when a uop enters the
+//   stage. The helper preserves temporal order (most recent -> oldest)
+//   by shifting 1->2, 2->3 and writing newTag->1. This hardcoded 3-slot
+//   structure is resource-friendly and timing-friendly for FPGA targets.
+object appendModuleTag{
+  def apply(newTag: UInt, uop: MicroOp): MicroOp = {
+    // NOTE: This method performs combinational updates to the fields of the
+    // MicroOp. It assumes the surrounding uop object is a Wire or Reg that
+    // can be assigned to. Use at the point where a uop enters a module.
+    val old1 = uop.cf_taint_module_id_1
+    val old2 = uop.cf_taint_module_id_2
+    val old3 = uop.cf_taint_module_id_3
+    val old4 = uop.cf_taint_module_id_4
+    // Shift existing tags down (1 -> 2, 2 -> 3) and insert newTag into 1
+    uop.cf_taint_module_id_5 := old4
+    uop.cf_taint_module_id_4 := old3
+    uop.cf_taint_module_id_3 := old2
+    uop.cf_taint_module_id_2 := old1
+    uop.cf_taint_module_id_1 := newTag
+
+    // this method returns something because of the LSU thing (lines 970 - 1018)
+    uop
+  }
+}
+
+// swap predispatch rob module tags and copy tags from wb-uop
+object updateROBModuleTags{
+  def apply(wbuop: MicroOp, robuop: MicroOp): Unit = {
+    val predis1 = robuop.cf_taint_module_id_1
+    val predis2 = robuop.cf_taint_module_id_2
+    val predis3 = robuop.cf_taint_module_id_3
+    val predis4 = robuop.cf_taint_module_id_4
+    val predis5 = robuop.cf_taint_module_id_5
+
+    // swap tags within rob-uop
+    robuop.cf_predis_taint_module_id_1 := predis1
+    robuop.cf_predis_taint_module_id_2 := predis2
+    robuop.cf_predis_taint_module_id_3 := predis3
+    robuop.cf_predis_taint_module_id_4 := predis4
+    robuop.cf_predis_taint_module_id_5 := predis5
+
+    // copy tags from wb-uop to rob-uop
+    robuop.cf_taint_module_id_1 := wbuop.cf_taint_module_id_1
+    robuop.cf_taint_module_id_2 := wbuop.cf_taint_module_id_2
+    robuop.cf_taint_module_id_3 := wbuop.cf_taint_module_id_3
+    robuop.cf_taint_module_id_4 := wbuop.cf_taint_module_id_4
+    robuop.cf_taint_module_id_5 := wbuop.cf_taint_module_id_5
+  }
+}
+
+// corefuzzing
+/**
+ * Centralized helper to print speculative MicroOps in the same
+ * commit-log format and prefixed with "[SPECULATIVE][<UNIT>]".
+ *
+ * We intentionally keep the helper signature simple and hardware-friendly:
+ * callers should pass the already-sign-extended PC (as a UInt) along with
+ * the instruction bits and the rvc flag. This avoids pulling parameter
+ * state into this utility and keeps it usable from all call sites.
+ *
+ * Usage: SpeculativePrintf.dump("DECODE", Sext.apply(uop.debug_pc(vaddrBits-1,0), xLen), uop.debug_inst, uop.is_rvc, custom_csrs.cf_debug_enable)
+ */
+object SpeculativePrintf {
+  // enabled: a Bool that gates printing at runtime (wire this to custom_csrs.cf_debug_enable
+  // or to a per-module cf_debug_*_enable). This keeps the prints non-intrusive when
+  // debugging is disabled.
+  def dump(unit: String, pc_sext: UInt, inst: UInt, is_rvc: Bool, enabled: Bool): Unit = {
+    when (enabled) {
+      printf("[SPECULATIVE][" + unit + "] 0x%x ", pc_sext)
+      when (is_rvc) { printf("(0x%x)", inst(15,0)) } .otherwise { printf("(0x%x)", inst) }
+      printf("\n")
+    }
   }
 }

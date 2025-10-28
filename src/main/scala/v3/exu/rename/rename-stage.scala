@@ -24,6 +24,8 @@ import org.chipsalliance.cde.config.Parameters
 
 import boom.v3.common._
 import boom.v3.util._
+// CoreFuzzing constants (module tag ids)
+import freechips.rocketchip.util._
 
 /**
  * IO bundle to interface with the Register Rename logic
@@ -56,6 +58,7 @@ abstract class AbstractRenameStage(
   numPhysRegs: Int,
   numWbPorts: Int)
   (implicit p: Parameters) extends BoomModule
+  with CoreFuzzingConstants
 {
   val io = IO(new Bundle {
     val ren_stalls = Output(Vec(plWidth, Bool()))
@@ -173,6 +176,8 @@ class RenameStage(
 {
   val pregSz = log2Ceil(numPhysRegs)
   val rtype = if (float) RT_FLT else RT_FIX
+  // corefuzzing - setting up float/integer specific flags at compile time
+  val moduleTagCF = if (float) frfTagCF else irfTagCF
 
   //-------------------------------------------------------------
   // Helper Functions
@@ -272,12 +277,21 @@ class RenameStage(
   ren2_alloc_reqs zip rbk_valids.reverse zip remap_reqs map {
     case ((a,r),rr) => rr.valid := a || r}
 
+  // corefuzzing - add regfile tags to the uop
+  for (w <- 0 until plWidth) {
+    // Tag the uop on entry to the rename stage with the integer register
+    // file tag. We append combinationally so there is no additional cycle
+    // penalty; this records that the micro-op has entered the rename
+    // register-file related logic.  
+    appendModuleTag(moduleTagCF.U, ren1_uops(w))
+  }
+
   // Hook up inputs.
   maptable.io.map_reqs    := map_reqs
   maptable.io.remap_reqs  := remap_reqs
   maptable.io.ren_br_tags := ren2_br_tags
   maptable.io.brupdate      := io.brupdate
-  maptable.io.rollback    := io.rollback
+  maptable.io.rollback    := io.rollback 
 
   // Maptable outputs.
   for ((uop, w) <- ren1_uops.zipWithIndex) {

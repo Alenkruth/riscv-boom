@@ -54,7 +54,7 @@ import boom.v3.exu.{BrUpdateInfo, Exception, FuncUnitResp, CommitSignals, ExeUni
 
 // fore corefuzzing - SpeculativePRintf and Sext
 import boom.v3.util.{BoolToChar, AgePriorityEncoder, IsKilledByBranch, GetNewBrMask, WrapInc, IsOlder, UpdateBrMask, SpeculativePrintf}
-import boom.v3.util.Sext
+import boom.v3.util.{Sext, appendModuleTag}
 
 class LSUExeIO(implicit p: Parameters) extends BoomBundle()(p)
 {
@@ -241,6 +241,7 @@ class STQEntry(implicit p: Parameters) extends BoomBundle()(p)
 
 class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   with rocket.HasL1HellaCacheParameters
+  with CoreFuzzingConstants
 {
   val io = IO(new LSUIO)
   io.hellacache := DontCare
@@ -687,6 +688,13 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                                       false.B))
   for (w <- 0 until memWidth) {
     dtlb.io.req(w).valid            := exe_tlb_valid(w)
+    // corefuzzing
+    // Tag the micro-op as it enters the DTLB so later stages / writeback
+    // will know the uop visited the DTLB. This is combinational and cheap.
+    when (dtlb.io.req(w).valid) {
+      //exe_tlb_uop(w).appendModuleTag(dtlbTagCF)
+      appendModuleTag(dtlbTagCF.U, exe_tlb_uop(w))
+    }
     dtlb.io.req(w).bits.vaddr       := exe_tlb_vaddr(w)
     dtlb.io.req(w).bits.size        := exe_size(w)
     dtlb.io.req(w).bits.cmd         := exe_cmd(w)
@@ -960,12 +968,54 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val fired_hella_incoming = RegNext(will_fire_hella_incoming)
   val fired_hella_wakeup   = RegNext(will_fire_hella_wakeup)
 
-  val mem_incoming_uop     = RegNext(widthMap(w => UpdateBrMask(io.core.brupdate, exe_req(w).bits.uop)))
-  val mem_ldq_incoming_e   = RegNext(widthMap(w => UpdateBrMask(io.core.brupdate, ldq_incoming_e(w))))
-  val mem_stq_incoming_e   = RegNext(widthMap(w => UpdateBrMask(io.core.brupdate, stq_incoming_e(w))))
-  val mem_ldq_wakeup_e     = RegNext(UpdateBrMask(io.core.brupdate, ldq_wakeup_e))
-  val mem_ldq_retry_e      = RegNext(UpdateBrMask(io.core.brupdate, ldq_retry_e))
-  val mem_stq_retry_e      = RegNext(UpdateBrMask(io.core.brupdate, stq_retry_e))
+  // corefuzzing changes
+  // Tag micro-ops when they enter the memory subsystem/queues.
+  // We append a memory-issuing queue tag so the uop history records
+  // passage through the LSU's dispatch/issue logic.
+  // Build temporary maps, append tags explicitly, then register them with RegNext.
+  // this might not be necessary. We can probalby get away with modifying the entries in place
+  // the tempv might actually hurt usage
+  val mem_incoming_uop_w = widthMap(w => {
+    val tmp: MicroOp = UpdateBrMask(io.core.brupdate, exe_req(w).bits.uop)
+    appendModuleTag(memissqTagCF.U, tmp)
+    // tmp
+  })
+  val mem_incoming_uop = RegNext(mem_incoming_uop_w)
+
+  val mem_ldq_incoming_e_w = widthMap(w => {
+    val tmpv: Valid[LDQEntry] = UpdateBrMask(io.core.brupdate, ldq_incoming_e(w))
+    when (tmpv.valid) { appendModuleTag(ldqTagCF.U, tmpv.bits.uop) }
+    tmpv
+  })
+  val mem_ldq_incoming_e = RegNext(mem_ldq_incoming_e_w)
+
+  val mem_stq_incoming_e_w = widthMap(w => {
+    val tmpv: Valid[STQEntry] = UpdateBrMask(io.core.brupdate, stq_incoming_e(w))
+    when (tmpv.valid) { appendModuleTag(stqTagCF.U, tmpv.bits.uop) }
+    tmpv
+  })
+  val mem_stq_incoming_e = RegNext(mem_stq_incoming_e_w)
+
+  val mem_ldq_wakeup_e_w = {
+    val tmpv: Valid[LDQEntry] = UpdateBrMask(io.core.brupdate, ldq_wakeup_e)
+    when (tmpv.valid) { appendModuleTag(ldqTagCF.U, tmpv.bits.uop) }
+    tmpv
+  }
+  val mem_ldq_wakeup_e = RegNext(mem_ldq_wakeup_e_w)
+
+  val mem_ldq_retry_e_w = {
+    val tmpv: Valid[LDQEntry] = UpdateBrMask(io.core.brupdate, ldq_retry_e)
+    when (tmpv.valid) { appendModuleTag(ldqTagCF.U, tmpv.bits.uop) }
+    tmpv
+  }
+  val mem_ldq_retry_e = RegNext(mem_ldq_retry_e_w)
+
+  val mem_stq_retry_e_w = {
+    val tmpv: Valid[STQEntry] = UpdateBrMask(io.core.brupdate, stq_retry_e)
+    when (tmpv.valid) { appendModuleTag(stqTagCF.U, tmpv.bits.uop) }
+    tmpv
+  }
+  val mem_stq_retry_e = RegNext(mem_stq_retry_e_w)
   val mem_ldq_e            = widthMap(w =>
                              Mux(fired_load_incoming(w), mem_ldq_incoming_e(w),
                              Mux(fired_load_retry   (w), mem_ldq_retry_e,

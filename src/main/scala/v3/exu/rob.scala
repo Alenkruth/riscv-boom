@@ -346,7 +346,13 @@ class Rob(
       rob_bsy(rob_tail)       := !(io.enq_uops(w).is_fence ||
                                    io.enq_uops(w).is_fencei)
       rob_unsafe(rob_tail)    := io.enq_uops(w).unsafe
-      rob_uop(rob_tail)       := io.enq_uops(w)
+      // corefuzzing
+      // Tag the uop on enqueue into the ROB. Use a temporary Wire to
+      // append the tag before committing into the ROB register file so
+      // we don't inadvertently overwrite fields via multiple assignments.
+      val enq_tagged_uop = WireInit(io.enq_uops(w))
+      appendModuleTag(robTagCF.U, enq_tagged_uop)
+      rob_uop(rob_tail)       := enq_tagged_uop
       rob_exception(rob_tail) := io.enq_uops(w).exception
       rob_predicated(rob_tail)   := false.B
       rob_fflags(w)(rob_tail)    := 0.U
@@ -365,6 +371,33 @@ class Rob(
       val wb_uop = wb_resp.bits.uop
       val row_idx = GetRowIdx(wb_uop.rob_idx)
       when (wb_resp.valid && MatchBank(GetBankIdx(wb_uop.rob_idx))) {
+        // corefuzzing
+        // ORIGINAL: only clear busy/unsafe/predicated flags on writeback
+        // rob_bsy(row_idx)      := false.B
+        // rob_unsafe(row_idx)   := false.B
+        // rob_predicated(row_idx)  := wb_resp.bits.predicated
+
+        // todo - store the tags before wback update in a second three tag setup?
+        // this would give us pre-dispatch tags and post-dispatch tags
+        // UPDATED: also update the ROB's stored MicroOp with the writeback
+        // MicroOp. This ensures that any tags appended to the MicroOp in
+        // other units (for example, DCache, LSU, or issue queue tracking)
+        // are propagated into the ROB's copy immediately when the unit
+        // completes and writes back. Use a temporary WireInit to avoid
+        // inadvertent multiple-driver ordering issues and make the
+        // update explicit.
+        // val wb_uop_copy = WireInit(wb_resp.bits.uop)
+        // Preserve existing ROB-side exception flag if the ROB already has it
+        // set - don't let a writeback clear an exception bit unintentionally.
+        // wb_uop_copy.exception := rob_exception(row_idx) || wb_uop_copy.exception
+        // rob_uop(row_idx) := wb_uop_copy
+
+        // the above code does too many things that I do not need. 
+        // upon a valid writeback, I want to update the rob_uop with the module tags 
+        // wb_uop. The following line should achieve that.
+        updateROBModuleTags(wb_uop, rob_uop(row_idx))
+
+        // Now update bookkeeping flags as before.
         rob_bsy(row_idx)      := false.B
         rob_unsafe(row_idx)   := false.B
         rob_predicated(row_idx)  := wb_resp.bits.predicated

@@ -19,6 +19,8 @@ import freechips.rocketchip.util.Str
 
 import FUConstants._
 import boom.v3.common._
+import boom.v3.util.{appendModuleTag}
+import freechips.rocketchip.util._
 
 /**
  * Specific type of issue unit
@@ -31,10 +33,28 @@ class IssueUnitCollapsing(
   numWakeupPorts: Int)
   (implicit p: Parameters)
   extends IssueUnit(params.numEntries, params.issueWidth, numWakeupPorts, params.iqType, params.dispatchWidth)
+  with CoreFuzzingConstants
 {
+  // corefuzzing
+  // values obtained from IQType trait in consts.scala
+  // val moduleTagCF = params.iqType match {
+  //   case 4.U => fpissqTagCF
+  //   case 2.U => memissqTagCF
+  //   case 1.U => intissqTagCF
+  // }
+  val moduleTagCF = if (params.iqType == BigInt(4)) {
+    // FP issue queue tag
+    fpissqTagCF
+  } else if (params.iqType == BigInt(2)) {
+    // MEM issue queue tag
+    memissqTagCF
+  } else {
+    // INT issue queue tag
+    intissqTagCF
+  }
+
   //-------------------------------------------------------------
   // Figure out how much to shift entries by
-
   val maxShift = dispatchWidth
   val vacants = issue_slots.map(s => !(s.valid)) ++ io.dis_uops.map(_.valid).map(!_.asBool)
   val shamts_oh = Array.fill(numIssueSlots+dispatchWidth) {Wire(UInt(width=maxShift.W))}
@@ -67,6 +87,11 @@ class IssueUnitCollapsing(
   for (i <- 0 until numIssueSlots) {
     issue_slots(i).in_uop.valid := false.B
     issue_slots(i).in_uop.bits  := uops(i+1)
+    // corefuzzing
+    // Append issue-queue tag when a uop is slid into an issue slot (entry
+    // to the issue queue). This preserves a record that the uop has
+    // entered the integer issue queue logic.
+    appendModuleTag(intissqTagCF.U, issue_slots(i).in_uop.bits)
     for (j <- 1 to maxShift by 1) {
       when (shamts_oh(i+j) === (1 << (j-1)).U) {
         issue_slots(i).in_uop.valid := will_be_valid(i+j)
@@ -119,6 +144,11 @@ class IssueUnitCollapsing(
         issue_slots(i).grant := true.B
         io.iss_valids(w) := true.B
         io.iss_uops(w) := issue_slots(i).uop
+        // probably not necessary. Hence commented.
+        // Tag the micro-op as it leaves the issue queue and is issued to an
+        // execution unit. Keeping the append combinational avoids extra
+        // cycles; it simply records passage through the issue queue.
+        // io.iss_uops(w).appendModuleTag(intissqTagCF)
       }
       val was_port_issued_yet = port_issued(w)
       port_issued(w) = (requests(i) && !uop_issued && can_allocate) | port_issued(w)
