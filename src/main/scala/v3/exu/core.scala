@@ -646,7 +646,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     for (w <- 0 until coreWidth) {
     when (dec_valids(w) && IsKilledByBranch(brupdate, dec_uops(w))) {
       // Gate decode speculative prints with global debug enable + core enable
-      SpeculativePrintf.dump("DECODE", Sext.apply(dec_uops(w).debug_pc(vaddrBits-1,0), xLen), dec_uops(w).debug_inst, dec_uops(w).is_rvc, custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable)
+  // Modified: use the new SpeculativePrintf.dump overload that accepts a MicroOp
+  // Old call (kept as comment for traceability):
+  // SpeculativePrintf.dump("DECODE", Sext.apply(dec_uops(w).debug_pc(vaddrBits-1,0), xLen), dec_uops(w).debug_inst, dec_uops(w).is_rvc, custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable)
+  SpeculativePrintf.dump("DECODE", Sext.apply(dec_uops(w).debug_pc(vaddrBits-1,0), xLen), dec_uops(w).debug_inst, dec_uops(w).is_rvc, custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable, dec_uops(w))
     }
   }
 
@@ -1497,6 +1500,16 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       }
 
       when (rob.io.commit.arch_valids(w)) {
+        // ---------------------------------------------------------------------
+        // BEGIN MOD: Commit logging extended for core-fuzzing (cf_*) fields
+        // ---------------------------------------------------------------------
+        // NOTE: The original printf lines are preserved below, but commented
+        // out to keep a record of the previous behavior. We now print the
+        // standard fields followed by a compact summary of all `cf_*`
+        // (corefuzzing) MicroOp fields available at commit time.
+        //
+        // Old code (commented):
+        /*
         printf("%d 0x%x ",
           priv,
           Sext(rob.io.commit.uops(w).debug_pc(vaddrBits-1,0), xLen))
@@ -1506,6 +1519,52 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
         when (rob.io.commit.uops(w).cf_single_step) {
           printf(" [SSTEP]")
         }
+        */
+
+        // New: print the original minimal info first
+        printf("%d 0x%x ",
+          priv,
+          Sext(rob.io.commit.uops(w).debug_pc(vaddrBits-1,0), xLen))
+        printf_inst(rob.io.commit.uops(w))
+
+        // New: Print corefuzzing fields. This prints a compact, human-
+        // readable summary containing domain, speculation/attacker/secret
+        // flags, op count, single-step, taint modules (up to 5), and the
+        // predispatch taint queue (up to 5). Each taint entry is shown as
+        // module:type:opcount. If some fields are zero, they will print as
+        // zeros.
+        printf(" CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d) ",
+          rob.io.commit.uops(w).cf_domain_id,
+          rob.io.commit.uops(w).cf_speculated,
+          rob.io.commit.uops(w).cf_attacker_influence,
+          rob.io.commit.uops(w).cf_secret_access,
+          rob.io.commit.uops(w).cf_secret_propagation,
+          rob.io.commit.uops(w).cf_secret_transmission,
+          rob.io.commit.uops(w).cf_op_count_id)
+
+        // Print the single-step marker separately (preserves prior visible tag)
+        when (rob.io.commit.uops(w).cf_single_step) {
+          printf("[SSTEP] ")
+        }
+
+        // Print up to 5 taint-module entries in a compact array form
+        // printf("TAINTS=[%d:%d:%d,%d:%d:%d,%d:%d:%d,%d:%d:%d,%d:%d:%d] ",
+        //   rob.io.commit.uops(w).cf_taint_module_id_1, rob.io.commit.uops(w).cf_taint_type_1, rob.io.commit.uops(w).cf_taint_op_count_1,
+        //   rob.io.commit.uops(w).cf_taint_module_id_2, rob.io.commit.uops(w).cf_taint_type_2, rob.io.commit.uops(w).cf_taint_op_count_2,
+        //   rob.io.commit.uops(w).cf_taint_module_id_3, rob.io.commit.uops(w).cf_taint_type_3, rob.io.commit.uops(w).cf_taint_op_count_3,
+        //   rob.io.commit.uops(w).cf_taint_module_id_4, rob.io.commit.uops(w).cf_taint_type_4, rob.io.commit.uops(w).cf_taint_op_count_4,
+        //   rob.io.commit.uops(w).cf_taint_module_id_5, rob.io.commit.uops(w).cf_taint_type_5, rob.io.commit.uops(w).cf_taint_op_count_5)
+
+        // // Print up to 5 pre-dispatch taint entries (FIFO of where the uop resided
+        // // prior to dispatch). Same compact format as above.
+        // printf("PREDIS=[%d:%d:%d,%d:%d:%d,%d:%d:%d,%d:%d:%d,%d:%d:%d] ",
+        //   rob.io.commit.uops(w).cf_predis_taint_module_id_1, rob.io.commit.uops(w).cf_predis_taint_type_1, rob.io.commit.uops(w).cf_predis_taint_op_count_1,
+        //   rob.io.commit.uops(w).cf_predis_taint_module_id_2, rob.io.commit.uops(w).cf_predis_taint_type_2, rob.io.commit.uops(w).cf_predis_taint_op_count_2,
+        //   rob.io.commit.uops(w).cf_predis_taint_module_id_3, rob.io.commit.uops(w).cf_predis_taint_type_3, rob.io.commit.uops(w).cf_predis_taint_op_count_3,
+        //   rob.io.commit.uops(w).cf_predis_taint_module_id_4, rob.io.commit.uops(w).cf_predis_taint_type_4, rob.io.commit.uops(w).cf_predis_taint_op_count_4,
+        //   rob.io.commit.uops(w).cf_predis_taint_module_id_5, rob.io.commit.uops(w).cf_predis_taint_type_5, rob.io.commit.uops(w).cf_predis_taint_op_count_5)
+        // END MOD: commit CF prints
+        // ---------------------------------------------------------------------
         when (rob.io.commit.uops(w).dst_rtype === RT_FIX && rob.io.commit.uops(w).ldst =/= 0.U) {
           printf(" x%d 0x%x\n",
             rob.io.commit.uops(w).ldst,

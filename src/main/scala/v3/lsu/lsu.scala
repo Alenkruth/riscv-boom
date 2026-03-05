@@ -686,15 +686,21 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val exe_kill   = widthMap(w =>
                    Mux(will_fire_hella_incoming(w)  , io.hellacache.s1_kill,
                                                       false.B))
+  
+  // val exe_tlb_uop_tagged = Wire(Vec(memWidth, new MicroOp()))
   for (w <- 0 until memWidth) {
     dtlb.io.req(w).valid            := exe_tlb_valid(w)
     // corefuzzing
     // Tag the micro-op as it enters the DTLB so later stages / writeback
     // will know the uop visited the DTLB. This is combinational and cheap.
-    when (dtlb.io.req(w).valid) {
-      //exe_tlb_uop(w).appendModuleTag(dtlbTagCF)
-      appendModuleTag(dtlbTagCF.U, exe_tlb_uop(w))
-    }
+    // when (dtlb.io.req(w).valid && exe_tlb_uop(w).cf_taint_module_id_1 =/= dtlbTagCF.U) {
+    //   //exe_tlb_uop(w).appendModuleTag(dtlbTagCF)
+    //   exe_tlb_uop_tagged(w) := appendModuleTag(dtlbTagCF.U, exe_tlb_uop(w))
+    // }
+    // .otherwise {
+    //   exe_tlb_uop_tagged(w) := exe_tlb_uop(w)
+    // }
+
     dtlb.io.req(w).bits.vaddr       := exe_tlb_vaddr(w)
     dtlb.io.req(w).bits.size        := exe_size(w)
     dtlb.io.req(w).bits.cmd         := exe_cmd(w)
@@ -975,47 +981,94 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // Build temporary maps, append tags explicitly, then register them with RegNext.
   // this might not be necessary. We can probalby get away with modifying the entries in place
   // the tempv might actually hurt usage
-  val mem_incoming_uop_w = widthMap(w => {
-    val tmp: MicroOp = UpdateBrMask(io.core.brupdate, exe_req(w).bits.uop)
-    appendModuleTag(memissqTagCF.U, tmp)
-    // tmp
-  })
-  val mem_incoming_uop = RegNext(mem_incoming_uop_w)
+  // val mem_incoming_uop_w = widthMap(w => {
+  //   val tmp = Wire(new MicroOp())
+  //   // val tmp: MicroOp = UpdateBrMask(io.core.brupdate, exe_req(w).bits.uop)
+  //   // Append the mem-issuing-queue tag only when this request is actually
+  //   // scheduled to fire into the memory subsystem. This prevents repeated
+  //   // tagging when the temporary uop value is constructed but not enqueued.
+  //   when (will_fire_load_incoming(w) || will_fire_stad_incoming(w) || will_fire_sta_incoming(w) ||
+  //         will_fire_sfence(w) || will_fire_load_retry(w) || will_fire_sta_retry(w) ||
+  //         will_fire_hella_incoming(w) && exe_req(w).bits.uop.cf_taint_module_id_1 =/= memissqTagCF.U) {
+  //     tmp := UpdateBrMask(io.core.brupdate, appendModuleTag(memissqTagCF.U, exe_req(w).bits.uop))
+  //   }
+  //   .otherwise{
+  //     tmp := UpdateBrMask(io.core.brupdate, exe_req(w).bits.uop)
+  //   }
+  //   tmp
+  // })
+  // val mem_incoming_uop = RegNext(mem_incoming_uop_w)
 
-  val mem_ldq_incoming_e_w = widthMap(w => {
-    val tmpv: Valid[LDQEntry] = UpdateBrMask(io.core.brupdate, ldq_incoming_e(w))
-    when (tmpv.valid) { appendModuleTag(ldqTagCF.U, tmpv.bits.uop) }
-    tmpv
-  })
-  val mem_ldq_incoming_e = RegNext(mem_ldq_incoming_e_w)
+  // val mem_ldq_incoming_e_w = widthMap(w => {
+  //   // val tmp = new Valid(new LDQEntry)
+  //   // when (ldq_incoming_e(w).valid && will_fire_load_incoming(w) && ldq_incoming_e(w).bits.uop.cf_taint_module_id_1 =/= ldqTagCF.U) {
+  //   //   tmp.bits.uop := ldq_incoming_e(w).bits
+  //   // }
+  //   // val tmpv: Valid[LDQEntry] = UpdateBrMask(io.core.brupdate, ldq_incoming_e(w))
+  //   val tmpv = Wire(new Valid(new LDQEntry))
+  //   // Only tag when the LDQ entry is actually being inserted (will_fire)
+  //   when (ldq_incoming_e(w).valid && will_fire_load_incoming(w) && ldq_incoming_e(w).bits.uop.cf_taint_module_id_1 =/= ldqTagCF.U) {
+  //     tmpv := UpdateBrMask(io.core.brupdate, appendModuleTag(ldqTagCF.U, ldq_incoming_e(w)))
+  //   }
+  //   .otherwise {
+  //     tmpv := UpdateBrMask(io.core.brupdate, ldq_incoming_e(w))
+  //   }
+  //   tmpv
+  // })
+  // val mem_ldq_incoming_e = RegNext(mem_ldq_incoming_e_w)
 
-  val mem_stq_incoming_e_w = widthMap(w => {
-    val tmpv: Valid[STQEntry] = UpdateBrMask(io.core.brupdate, stq_incoming_e(w))
-    when (tmpv.valid) { appendModuleTag(stqTagCF.U, tmpv.bits.uop) }
-    tmpv
-  })
-  val mem_stq_incoming_e = RegNext(mem_stq_incoming_e_w)
+  // val mem_stq_incoming_e_w = widthMap(w => {
+  //   val tmpv = Wire(new Valid(new STQEntry))
+  //   // val tmpv: Valid[STQEntry] = UpdateBrMask(io.core.brupdate, stq_incoming_e(w))
+  //   // Only tag when the STQ entry is actually being inserted (will_fire)
+  //   when (stq_incoming_e(w).valid && (will_fire_stad_incoming(w) || will_fire_sta_incoming(w)) && stq_incoming_e(w).bits.uop.cf_taint_module_id_1 =/= stqTagCF.U) { 
+  //     tmpv := UpdateBrMask(io.core.brupdate, appendModuleTag(stqTagCF.U, stq_incoming_e(w))) 
+  //   }
+  //   .otherwise {
+  //     tmpv := UpdateBrMask(io.core.brupdate, stq_incoming_e(w))
+  //   }
+  //   tmpv
+  // })
+  // val mem_stq_incoming_e = RegNext(mem_stq_incoming_e_w)
 
-  val mem_ldq_wakeup_e_w = {
-    val tmpv: Valid[LDQEntry] = UpdateBrMask(io.core.brupdate, ldq_wakeup_e)
-    when (tmpv.valid) { appendModuleTag(ldqTagCF.U, tmpv.bits.uop) }
-    tmpv
-  }
-  val mem_ldq_wakeup_e = RegNext(mem_ldq_wakeup_e_w)
+  val mem_incoming_uop = RegNext(widthMap(w => UpdateBrMask(io.core.brupdate, exe_req(w).bits.uop)))
+  val mem_ldq_incoming_e = RegNext(widthMap(w => UpdateBrMask(io.core.brupdate, ldq_incoming_e(w))))
+  val mem_stq_incoming_e = RegNext(widthMap(w => UpdateBrMask(io.core.brupdate, stq_incoming_e(w))))
+  val mem_ldq_wakeup_e     = RegNext(UpdateBrMask(io.core.brupdate, ldq_wakeup_e))
+  val mem_ldq_retry_e      = RegNext(UpdateBrMask(io.core.brupdate, ldq_retry_e))
+  val mem_stq_retry_e      = RegNext(UpdateBrMask(io.core.brupdate, stq_retry_e))
+  
+  // not tagging the uop on retries and wakeups but we count them
+  // val mem_ldq_wakeup_e_w = {
+  //   val tmpv = WireInit(ldq_wakeup_e)
+  //   // Tag LDQ wakeups -- keep existing behavior: append when valid.
+  //   when (ldq_wakeup_e.valid) { 
+  //     tmpv.bits.uop.cf_count_ldq_wakeups := ldq_wakeup_e.bits.uop.cf_count_ldq_wakeups + 1.U }
+  //   tmpv
+  // }
+  // val mem_ldq_wakeup_e = RegNext(mem_ldq_wakeup_e_w)
 
-  val mem_ldq_retry_e_w = {
-    val tmpv: Valid[LDQEntry] = UpdateBrMask(io.core.brupdate, ldq_retry_e)
-    when (tmpv.valid) { appendModuleTag(ldqTagCF.U, tmpv.bits.uop) }
-    tmpv
-  }
-  val mem_ldq_retry_e = RegNext(mem_ldq_retry_e_w)
+  // val mem_ldq_retry_e_w = {
+  //   val tmpv = WireInit(ldq_retry_e)
+  // // Tag LDQ retries -- keep existing behavior: append when valid.
+  //   when (ldq_retry_e.valid) { 
+  //     tmpv.bits.uop.cf_count_ldq_stq_retries := ldq_retry_e.bits.uop.cf_count_ldq_stq_retries + 1.U
+  //     // appendModuleTag(ldqTagCF.U, tmpv.bits.uop) 
+  //   }
+  //   tmpv
+  // }
+  // val mem_ldq_retry_e = RegNext(mem_ldq_retry_e_w)
 
-  val mem_stq_retry_e_w = {
-    val tmpv: Valid[STQEntry] = UpdateBrMask(io.core.brupdate, stq_retry_e)
-    when (tmpv.valid) { appendModuleTag(stqTagCF.U, tmpv.bits.uop) }
-    tmpv
-  }
-  val mem_stq_retry_e = RegNext(mem_stq_retry_e_w)
+  // val mem_stq_retry_e_w = {
+  //   // val tmpv: Valid[STQEntry] = UpdateBrMask(io.core.brupdate, stq_retry_e)
+  //   val tmpv = WireInit(stq_retry_e)
+  //   // Tag STQ retries -- keep existing behavior: append when valid.
+  //   when (stq_retry_e.valid) { 
+  //     tmpv.bits.uop.cf_count_ldq_stq_retries := stq_retry_e.bits.uop.cf_count_ldq_stq_retries + 1.U 
+  //   }
+  //   tmpv
+  // }
+  // val mem_stq_retry_e = RegNext(mem_stq_retry_e_w)
   val mem_ldq_e            = widthMap(w =>
                              Mux(fired_load_incoming(w), mem_ldq_incoming_e(w),
                              Mux(fired_load_retry   (w), mem_ldq_retry_e,
@@ -1520,7 +1573,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         // Only log uncommitted, valid stores that will be invalidated
         when (!stq(i).bits.committed) {
           // Printf block matches commit log format in exu/core.scala, with [SPECULATIVE][LSU] prefix
-          SpeculativePrintf.dump("LSU", Sext.apply(stq(i).bits.uop.debug_pc(vaddrBits-1,0), xLen), stq(i).bits.uop.debug_inst, stq(i).bits.uop.is_rvc, io.core.cf_debug_lsu_enable)
+          // Modified: use new overload to include MicroOp (`stq(i).bits.uop`) so cf_* fields are printed
+          // Old call (kept for reference):
+          // SpeculativePrintf.dump("LSU", Sext.apply(stq(i).bits.uop.debug_pc(vaddrBits-1,0), xLen), stq(i).bits.uop.debug_inst, stq(i).bits.uop.is_rvc, io.core.cf_debug_lsu_enable)
+          SpeculativePrintf.dump("LSU", Sext.apply(stq(i).bits.uop.debug_pc(vaddrBits-1,0), xLen), stq(i).bits.uop.debug_inst, stq(i).bits.uop.is_rvc, io.core.cf_debug_lsu_enable, stq(i).bits.uop)
           when (stq(i).bits.uop.dst_rtype === RT_FIX && stq(i).bits.uop.ldst =/= 0.U) {
             printf(" x%d 0x%x\n", stq(i).bits.uop.ldst, stq(i).bits.debug_wb_data)
           } .elsewhen (stq(i).bits.uop.dst_rtype === RT_FLT) {
@@ -1552,7 +1608,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         // BEGIN speculative flush logging
         // Only log valid loads that will be invalidated
         // Printf block matches commit log format in exu/core.scala, with [SPECULATIVE][LSU] prefix
-  SpeculativePrintf.dump("LSU", Sext.apply(ldq(i).bits.uop.debug_pc(vaddrBits-1,0), xLen), ldq(i).bits.uop.debug_inst, ldq(i).bits.uop.is_rvc, io.core.cf_debug_lsu_enable)
+  // Modified: use new overload that accepts MicroOp to print cf_* fields
+  // Old call (kept for traceability):
+  // SpeculativePrintf.dump("LSU", Sext.apply(ldq(i).bits.uop.debug_pc(vaddrBits-1,0), xLen), ldq(i).bits.uop.debug_inst, ldq(i).bits.uop.is_rvc, io.core.cf_debug_lsu_enable)
+  SpeculativePrintf.dump("LSU", Sext.apply(ldq(i).bits.uop.debug_pc(vaddrBits-1,0), xLen), ldq(i).bits.uop.debug_inst, ldq(i).bits.uop.is_rvc, io.core.cf_debug_lsu_enable, ldq(i).bits.uop)
         when (ldq(i).bits.uop.dst_rtype === RT_FIX && ldq(i).bits.uop.ldst =/= 0.U) {
           printf(" x%d 0x%x\n", ldq(i).bits.uop.ldst, ldq(i).bits.debug_wb_data)
         } .elsewhen (ldq(i).bits.uop.dst_rtype === RT_FLT) {

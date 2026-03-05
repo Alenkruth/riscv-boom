@@ -237,7 +237,10 @@ abstract class PipelinedFunctionalUnit(
   // corefuzzing
   // helper to dump uop directly (modules have xLen and vaddrBits in scope)
   def dumpUop(unit: String, uop: MicroOp, enabled: Bool): Unit = {
-    SpeculativePrintf.dump(unit, Sext.apply(uop.debug_pc(vaddrBits-1,0), xLen), uop.debug_inst, uop.is_rvc, enabled)
+    // Modified: call new overload that accepts MicroOp to include cf_* fields in dumps
+    // Old call (kept for traceability):
+    // SpeculativePrintf.dump(unit, Sext.apply(uop.debug_pc(vaddrBits-1,0), xLen), uop.debug_inst, uop.is_rvc, enabled)
+    SpeculativePrintf.dump(unit, Sext.apply(uop.debug_pc(vaddrBits-1,0), xLen), uop.debug_inst, uop.is_rvc, enabled, uop)
   }
 
   if (numStages > 0) {

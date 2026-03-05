@@ -1001,10 +1001,27 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   for (w <- 0 until memWidth) {
     cache_resp(w).valid         := s2_valid(w) && s2_send_resp(w)
     // corefuzzing
-    // Make a local copy of the uop so we can append the DCache tag safely
-    val cache_uop = WireInit(s2_req(w).uop)
-    appendModuleTag(dcacheTagCF.U, cache_uop)
-    cache_resp(w).bits.uop      := cache_uop
+    // Capture the uop into a registered value before tagging to avoid
+    // creating combinational cycles between the request path and the
+    // tag-update logic. We append the dcache tag on the registered copy
+    // when the response was valid in the previous cycle (RegNext on
+    // the valid/send conditions). This moves tagging to a stable, non-
+    // combinational value while still preserving an "on-entry" semantics
+    // (captured at response time).
+    // val cache_uop_reg = RegNext(s2_req(w).uop)
+    // val cache_uop_tagged = WireInit(s2_req(w).uop)
+    // val cache_uop_copy = Wire(new MicroOp)
+    // cache_uop_copy := s2_req(w).uop
+    // val cache_uop_tagged = Wire(new MicroOp)
+    // // when (RegNext(s2_valid(w) && s2_send_resp(w))) {
+    // when (s2_valid(w) && s2_send_resp(w) && s2_req(w).uop.cf_taint_module_id_1 =/= dcacheTagCF.U) {
+    //   // cache_resp(w).bits.uop := appendModuleTag(dcacheTagCF.U, cache_uop_reg) //s2_req(w).uop)
+    //   cache_uop_tagged := appendModuleTag(dcacheTagCF.U, s2_req(w).uop)
+    // }
+    // .otherwise {
+    //   cache_uop_tagged := s2_req(w).uop
+    // }
+    cache_resp(w).bits.uop      := s2_req(w).uop // cache_uop_tagged
     cache_resp(w).bits.data     := loadgen(w).data | s2_sc_fail
     cache_resp(w).bits.is_hella := s2_req(w).is_hella
   }
@@ -1016,10 +1033,20 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // Copy MSHR response and tag it as coming from the DCache/MSHR path before
   // presenting it to the LSU. This ensures the writeback path carries the
   // dcacheTagCF into the ROB.
+  // uncache_resp.bits     := mshrs.io.resp.bits
+  // Register and tag MSHR response uop to avoid combinational cycles
+  // val uncache_uop_reg = RegNext(mshrs.io.resp.bits.uop)
+  // val uncache_uop_tagged = Wire(new MicroOp)
+  // when (mshrs.io.resp.valid && mshrs.io.resp.bits.uop.cf_taint_module_id_1 =/= dcacheTagCF.U) {
+  //   uncache_uop_tagged := appendModuleTag(dcacheTagCF.U, mshrs.io.resp.bits.uop)
+  //   // appendModuleTag(dcacheTagCF.U, )
+  // }
+  // .otherwise {
+  //   uncache_uop_tagged := mshrs.io.resp.bits.uop
+  // }
+
+  // uncache_resp.bits.uop := mshrs.io.resp.bits.uop // uncache_uop_tagged
   uncache_resp.bits     := mshrs.io.resp.bits
-  when (mshrs.io.resp.valid) {
-    appendModuleTag(dcacheTagCF.U, uncache_resp.bits.uop)
-  }
   uncache_resp.valid    := mshrs.io.resp.valid
   mshrs.io.resp.ready := !(cache_resp.map(_.valid).reduce(_&&_)) // We can backpressure the MSHRs, but not cache hits
 

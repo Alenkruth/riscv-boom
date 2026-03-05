@@ -26,6 +26,7 @@ import boom.v3.common._
 import boom.v3.util._
 // CoreFuzzing constants (module tag ids)
 import freechips.rocketchip.util._
+import freechips.rocketchip.regmapper.RegField.r
 
 /**
  * IO bundle to interface with the Register Rename logic
@@ -118,6 +119,7 @@ abstract class AbstractRenameStage(
   // pipeline registers
 
   for (w <- 0 until plWidth) {
+    // why don't we tag the uops here as they enter the rename stage?
     ren1_fire(w)          := io.dec_fire(w)
     ren1_uops(w)          := io.dec_uops(w)
   }
@@ -133,8 +135,11 @@ abstract class AbstractRenameStage(
       // corefuzzing
       // Non-destructive speculative logging: if we are killing a valid ren2 uop, print it
       when (r_valid) {
-  SpeculativePrintf.dump("RENAME", Sext.apply(r_uop.debug_pc(vaddrBits-1,0), xLen), r_uop.debug_inst, r_uop.is_rvc, io.cf_debug_rename_enable)
-      }
+        // Modified: use new SpeculativePrintf.dump overload to include the MicroOp (r_uop)
+        // Old call (kept for traceability):
+        // SpeculativePrintf.dump("RENAME", Sext.apply(r_uop.debug_pc(vaddrBits-1,0), xLen), r_uop.debug_inst, r_uop.is_rvc, io.cf_debug_rename_enable)
+        SpeculativePrintf.dump("RENAME", Sext.apply(r_uop.debug_pc(vaddrBits-1,0), xLen), r_uop.debug_inst, r_uop.is_rvc, io.cf_debug_rename_enable, r_uop)
+          }
       r_valid := false.B
     } .elsewhen (ren2_ready) {
       r_valid := ren1_fire(w)
@@ -277,14 +282,25 @@ class RenameStage(
   ren2_alloc_reqs zip rbk_valids.reverse zip remap_reqs map {
     case ((a,r),rr) => rr.valid := a || r}
 
-  // corefuzzing - add regfile tags to the uop
-  for (w <- 0 until plWidth) {
-    // Tag the uop on entry to the rename stage with the integer register
-    // file tag. We append combinationally so there is no additional cycle
-    // penalty; this records that the micro-op has entered the rename
-    // register-file related logic.  
-    appendModuleTag(moduleTagCF.U, ren1_uops(w))
-  }
+  // val ren1_uops_tagged = Wire(Vec(plWidth, new MicroOp))
+  // // corefuzzing - add regfile tags to the uop
+  // for (w <- 0 until plWidth) {
+  //   // Tag the uop on entry to the rename stage with the integer register
+  //   // file tag. We append combinationally so there is no additional cycle
+  //   // penalty; this records that the micro-op has entered the rename
+  //   // register-file related logic.  
+  //   // Only append the module tag when the uop actually enters the rename
+  //   // stage (i.e., on the decode->rename handshake). Use the ren1_fire
+  //   // signal which indicates the uop is being presented to rename.
+  //   // val uop_tagged = Wire(new MicroOp)
+  //   // uop_tagged := ren1_uops(w)
+  //   // when (ren1_fire(w) && ren1_uops(w).cf_taint_module_id_1 =/= moduleTagCF.U) {
+  //   //   ren1_uops_tagged(w) := appendModuleTag(moduleTagCF.U, ren1_uops(w))
+  //   // }
+  //   // .otherwise {
+  //   //   ren1_uops_tagged(w) := ren1_uops(w)
+  //   // }
+  // }
 
   // Hook up inputs.
   maptable.io.map_reqs    := map_reqs

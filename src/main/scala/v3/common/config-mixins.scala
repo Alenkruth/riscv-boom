@@ -371,6 +371,55 @@ class WithNGigaBooms(n: Int = 1) extends Config(
 )
 
 /**
+ * 8-wide BOOM.
+ */
+class WithNTeraBooms(n: Int = 1) extends Config(
+  new WithTAGELBPD ++ // Default to TAGE-L BPD
+  new Config((site, here, up) => {
+    case TilesLocated(InSubsystem) => {
+      val prev = up(TilesLocated(InSubsystem), site)
+      val idOffset = up(NumTiles)
+      (0 until n).map { i =>
+        BoomTileAttachParams(
+          tileParams = BoomTileParams(
+            core = BoomCoreParams(
+              fetchWidth = 8,
+              decodeWidth = 8,
+              numRobEntries = 512,
+              issueParams = Seq(
+                IssueParams(issueWidth=2, numEntries=24, iqType=IQT_MEM.litValue, dispatchWidth=8),
+                IssueParams(issueWidth=5, numEntries=40, iqType=IQT_INT.litValue, dispatchWidth=8),
+                IssueParams(issueWidth=2, numEntries=32, iqType=IQT_FP.litValue , dispatchWidth=8)),
+              numIntPhysRegisters = 256,
+              numFpPhysRegisters = 256,
+              numLdqEntries = 64,
+              numStqEntries = 64,
+              maxBrCount = 40,
+              // alex - just testing if possible
+              numFetchBufferEntries = 80, // keep this as a multiple of 5 to avoid issues.
+              enablePrefetching = true,
+              numDCacheBanks = 1,
+              ftq = FtqParameters(nEntries=100),
+              nPerfCounters = 29,
+              fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true))
+            ),
+            dcache = Some(
+              DCacheParams(rowBits = 128, nSets=64, nWays=8, nMSHRs=8, nTLBWays=32)
+            ),
+            icache = Some(
+              ICacheParams(rowBits = 128, nSets=64, nWays=8, fetchBytes=4*4)
+            ),
+            tileId = i + idOffset
+          ),
+          crossingParams = RocketCrossingParams()
+        )
+      } ++ prev
+    }
+    case NumTiles => up(NumTiles) + n
+  })
+)
+
+/**
  * 5-wide BOOM for coreFuzzing.
   */
 class WithFuzzingBoom(n: Int = 1, overrideIdOffset: Option[Int] = None) extends Config(

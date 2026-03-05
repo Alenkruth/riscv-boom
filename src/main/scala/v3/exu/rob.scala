@@ -350,9 +350,14 @@ class Rob(
       // Tag the uop on enqueue into the ROB. Use a temporary Wire to
       // append the tag before committing into the ROB register file so
       // we don't inadvertently overwrite fields via multiple assignments.
-      val enq_tagged_uop = WireInit(io.enq_uops(w))
-      appendModuleTag(robTagCF.U, enq_tagged_uop)
-      rob_uop(rob_tail)       := enq_tagged_uop
+      // val enq_tagged_uop = Wire(new MicroOp) // WireInit(io.enq_uops(w))
+      // when (io.enq_uops(w).cf_taint_module_id_1 =/= robTagCF.U) {
+      //   enq_tagged_uop :=  appendModuleTag(robTagCF.U, io.enq_uops(w))
+      // } .otherwise {
+      //  enq_tagged_uop := io.enq_uops(w)
+      // }
+      // appendModuleTag(robTagCF.U, enq_tagged_uop)
+      rob_uop(rob_tail)       := io.enq_uops(w)
       rob_exception(rob_tail) := io.enq_uops(w).exception
       rob_predicated(rob_tail)   := false.B
       rob_fflags(w)(rob_tail)    := 0.U
@@ -395,7 +400,7 @@ class Rob(
         // the above code does too many things that I do not need. 
         // upon a valid writeback, I want to update the rob_uop with the module tags 
         // wb_uop. The following line should achieve that.
-        updateROBModuleTags(wb_uop, rob_uop(row_idx))
+        // updateROBModuleTags(wb_uop, rob_uop(row_idx))
 
         // Now update bookkeeping flags as before.
         rob_bsy(row_idx)      := false.B
@@ -515,7 +520,10 @@ class Rob(
         // We print any valid ROB entries that will be killed by the branch update
         when (rob_val(i) && IsKilledByBranch(io.brupdate, br_mask)) {
           // print PC+inst using centralized helper
-          SpeculativePrintf.dump("ROB", Sext.apply(rob_uop(i).debug_pc(vaddrBits-1,0), xLen), rob_uop(i).debug_inst, rob_uop(i).is_rvc, io.cf_debug_rob_enable)
+          // Modified: call the new overload that accepts the MicroOp so cf_* fields are emitted
+          // Old call (kept for reference):
+          // SpeculativePrintf.dump("ROB", Sext.apply(rob_uop(i).debug_pc(vaddrBits-1,0), xLen), rob_uop(i).debug_inst, rob_uop(i).is_rvc, io.cf_debug_rob_enable)
+          SpeculativePrintf.dump("ROB", Sext.apply(rob_uop(i).debug_pc(vaddrBits-1,0), xLen), rob_uop(i).debug_inst, rob_uop(i).is_rvc, io.cf_debug_rob_enable, rob_uop(i))
           // append register writeback info when present to match commit log
           when (rob_uop(i).dst_rtype === RT_FIX && rob_uop(i).ldst =/= 0.U) {
             printf(" x%d 0x%x\n", rob_uop(i).ldst, rob_debug_wdata(i))

@@ -720,51 +720,90 @@ object BoomCoreStringPrefix
 //   stage. The helper preserves temporal order (most recent -> oldest)
 //   by shifting 1->2, 2->3 and writing newTag->1. This hardcoded 3-slot
 //   structure is resource-friendly and timing-friendly for FPGA targets.
-object appendModuleTag{
-  def apply(newTag: UInt, uop: MicroOp): MicroOp = {
-    // NOTE: This method performs combinational updates to the fields of the
-    // MicroOp. It assumes the surrounding uop object is a Wire or Reg that
-    // can be assigned to. Use at the point where a uop enters a module.
-    val old1 = uop.cf_taint_module_id_1
-    val old2 = uop.cf_taint_module_id_2
-    val old3 = uop.cf_taint_module_id_3
-    val old4 = uop.cf_taint_module_id_4
-    // Shift existing tags down (1 -> 2, 2 -> 3) and insert newTag into 1
-    uop.cf_taint_module_id_5 := old4
-    uop.cf_taint_module_id_4 := old3
-    uop.cf_taint_module_id_3 := old2
-    uop.cf_taint_module_id_2 := old1
-    uop.cf_taint_module_id_1 := newTag
-
-    // this method returns something because of the LSU thing (lines 970 - 1018)
-    uop
-  }
-}
-
-// swap predispatch rob module tags and copy tags from wb-uop
-object updateROBModuleTags{
-  def apply(wbuop: MicroOp, robuop: MicroOp): Unit = {
-    val predis1 = robuop.cf_taint_module_id_1
-    val predis2 = robuop.cf_taint_module_id_2
-    val predis3 = robuop.cf_taint_module_id_3
-    val predis4 = robuop.cf_taint_module_id_4
-    val predis5 = robuop.cf_taint_module_id_5
-
-    // swap tags within rob-uop
-    robuop.cf_predis_taint_module_id_1 := predis1
-    robuop.cf_predis_taint_module_id_2 := predis2
-    robuop.cf_predis_taint_module_id_3 := predis3
-    robuop.cf_predis_taint_module_id_4 := predis4
-    robuop.cf_predis_taint_module_id_5 := predis5
-
-    // copy tags from wb-uop to rob-uop
-    robuop.cf_taint_module_id_1 := wbuop.cf_taint_module_id_1
-    robuop.cf_taint_module_id_2 := wbuop.cf_taint_module_id_2
-    robuop.cf_taint_module_id_3 := wbuop.cf_taint_module_id_3
-    robuop.cf_taint_module_id_4 := wbuop.cf_taint_module_id_4
-    robuop.cf_taint_module_id_5 := wbuop.cf_taint_module_id_5
-  }
-}
+object appendModuleTag{}
+//   def apply(newTag: UInt, uop: MicroOp)(implicit p: Parameters): MicroOp = {
+//     // NOTE: Instead of mutating the passed-in `uop` (which may be a port/IO
+//     // from another module), create a local Wire copy and perform the
+//     // combinational updates on that copy. Returning a fresh Wire prevents
+//     // illegal cross-module writes (Chisel will otherwise attempt to drive
+//     // upstream module IOs) and avoids FIRRTL connection errors.
+//     val out = Wire(new MicroOp())
+//     // out := uop
+// 
+//     // Avoid repeatedly shifting the same module tag every cycle. If a
+//     // module calls `appendModuleTag` every cycle with the same `newTag` the
+//     // MicroOp's tag FIFO would be shifted repeatedly, producing many copies
+//     // of the same tag. To prevent this, only perform the shift when
+//     // `newTag` is non-zero and different from the current most-recent tag
+//     // in our local copy (`out.cf_taint_module_id_1`). This makes the
+//     // operation idempotent for repeated calls with the same tag and ensures
+//     // that tags are only appended when a unit *actually* appends one.
+//     // when ((newTag =/= 0.U) && (newTag =/= uop.cf_taint_module_id_1)) {
+//     when (newTag =/= 0.U && newTag =/= uop.cf_taint_module_id_1) {
+//       val old1 = uop.cf_taint_module_id_1
+//       val old2 = uop.cf_taint_module_id_2
+//       val old3 = uop.cf_taint_module_id_3
+//       val old4 = uop.cf_taint_module_id_4
+//       // Shift existing tags down (1 -> 2, 2 -> 3, etc.) and insert newTag into 1
+//       out.cf_taint_module_id_5 := old4
+//       out.cf_taint_module_id_4 := old3
+//       out.cf_taint_module_id_3 := old2
+//       out.cf_taint_module_id_2 := old1
+//       out.cf_taint_module_id_1 := newTag
+//     }
+//     .otherwise{
+//       out := uop
+//     }
+// 
+//     // Return the possibly-updated local copy
+//     out
+//   }
+//   // -------------------------------------------------------------
+//   // Bundle containing a uop (e.g., HasBoomUOP)
+//   // -------------------------------------------------------------
+//   def apply[T <: boom.v3.common.HasBoomUOP](newTag: UInt, bundle: T)(implicit p: Parameters): T = {
+//     val out = Wire(bundle.cloneType)
+//     out := bundle
+//     out.uop := apply(newTag, bundle.uop)  // reuse MicroOp version
+//     out
+//   }
+// 
+//   // -------------------------------------------------------------
+//   // Valid[T <: HasBoomUOP] bundle
+//   // -------------------------------------------------------------
+//   def apply[T <: boom.v3.common.HasBoomUOP](newTag: UInt, bundle: Valid[T])(implicit p: Parameters): Valid[T] = {
+//     val out = Wire(bundle.cloneType)
+//     out := bundle
+//     out.bits.uop := apply(newTag, bundle.bits.uop) // reuse MicroOp version
+//     out.valid := bundle.valid
+//     out
+//   }
+// }
+// 
+// // swap predispatch rob module tags and copy tags from wb-uop
+// object updateROBModuleTags{
+//   def apply(wbuop: MicroOp, robuop: MicroOp): Unit = {
+//     val predis1 = robuop.cf_taint_module_id_1
+//     val predis2 = robuop.cf_taint_module_id_2
+//     val predis3 = robuop.cf_taint_module_id_3
+//     val predis4 = robuop.cf_taint_module_id_4
+//     val predis5 = robuop.cf_taint_module_id_5
+// 
+//     // swap tags within rob-uop
+//     robuop.cf_predis_taint_module_id_1 := predis1
+//     robuop.cf_predis_taint_module_id_2 := predis2
+//     robuop.cf_predis_taint_module_id_3 := predis3
+//     robuop.cf_predis_taint_module_id_4 := predis4
+//     robuop.cf_predis_taint_module_id_5 := predis5
+// 
+//     // copy tags from wb-uop to rob-uop
+//     robuop.cf_taint_module_id_1 := wbuop.cf_taint_module_id_1
+//     robuop.cf_taint_module_id_2 := wbuop.cf_taint_module_id_2
+//     robuop.cf_taint_module_id_3 := wbuop.cf_taint_module_id_3
+//     robuop.cf_taint_module_id_4 := wbuop.cf_taint_module_id_4
+//     robuop.cf_taint_module_id_5 := wbuop.cf_taint_module_id_5
+//   }
+// }
 
 // corefuzzing
 /**
@@ -782,10 +821,56 @@ object SpeculativePrintf {
   // enabled: a Bool that gates printing at runtime (wire this to custom_csrs.cf_debug_enable
   // or to a per-module cf_debug_*_enable). This keeps the prints non-intrusive when
   // debugging is disabled.
+  // ------------------------------------------------------------------
+  // ORIGINAL: Simple speculative printf (kept for compatibility)
+  // We comment the original body for traceability and keep the same
+  // public signature so existing call sites continue to work. The
+  // new overload below accepts a `MicroOp` and prints `cf_*` fields.
+  // ------------------------------------------------------------------
   def dump(unit: String, pc_sext: UInt, inst: UInt, is_rvc: Bool, enabled: Bool): Unit = {
+    // Original behavior preserved
     when (enabled) {
       printf("[SPECULATIVE][" + unit + "] 0x%x ", pc_sext)
       when (is_rvc) { printf("(0x%x)", inst(15,0)) } .otherwise { printf("(0x%x)", inst) }
+      printf("\n")
+    }
+  }
+
+  // NEW: Overloaded dump that prints core-fuzzing (cf_*) MicroOp fields
+  // This keeps the hardware-friendly signature while allowing callers
+  // that have access to the `MicroOp` to emit richer debugging info.
+  def dump(unit: String, pc_sext: UInt, inst: UInt, is_rvc: Bool, enabled: Bool, uop: MicroOp): Unit = {
+    when (enabled) {
+      // Print the original speculative header and instruction
+      printf("[SPECULATIVE][" + unit + "] 0x%x ", pc_sext)
+      when (is_rvc) { printf("(0x%x)", inst(15,0)) } .otherwise { printf("(0x%x)", inst) }
+
+      // Print core-fuzzing metadata (compact form)
+      printf(" CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d) ",
+        uop.cf_domain_id,
+        uop.cf_speculated,
+        uop.cf_attacker_influence,
+        uop.cf_secret_access,
+        uop.cf_secret_propagation,
+        uop.cf_secret_transmission,
+        uop.cf_op_count_id)
+
+      // when (uop.cf_single_step) { printf("[SSTEP] ") }
+
+      // printf("TAINTS=[%d:%d:%d,%d:%d:%d,%d:%d:%d,%d:%d:%d,%d:%d:%d] ",
+      //   uop.cf_taint_module_id_1, uop.cf_taint_type_1, uop.cf_taint_op_count_1,
+      //   uop.cf_taint_module_id_2, uop.cf_taint_type_2, uop.cf_taint_op_count_2,
+      //   uop.cf_taint_module_id_3, uop.cf_taint_type_3, uop.cf_taint_op_count_3,
+      //   uop.cf_taint_module_id_4, uop.cf_taint_type_4, uop.cf_taint_op_count_4,
+      //   uop.cf_taint_module_id_5, uop.cf_taint_type_5, uop.cf_taint_op_count_5)
+
+      // printf("PREDIS=[%d:%d:%d,%d:%d:%d,%d:%d:%d,%d:%d:%d,%d:%d:%d] ",
+      //   uop.cf_predis_taint_module_id_1, uop.cf_predis_taint_type_1, uop.cf_predis_taint_op_count_1,
+      //   uop.cf_predis_taint_module_id_2, uop.cf_predis_taint_type_2, uop.cf_predis_taint_op_count_2,
+      //   uop.cf_predis_taint_module_id_3, uop.cf_predis_taint_type_3, uop.cf_predis_taint_op_count_3,
+      //   uop.cf_predis_taint_module_id_4, uop.cf_predis_taint_type_4, uop.cf_predis_taint_op_count_4,
+      //   uop.cf_predis_taint_module_id_5, uop.cf_predis_taint_type_5, uop.cf_predis_taint_op_count_5)
+
       printf("\n")
     }
   }

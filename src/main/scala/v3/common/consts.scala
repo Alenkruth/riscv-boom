@@ -291,10 +291,49 @@ trait ScalarOpConstants
     // What changed: explicitly set cf taint module id fields to 0.
     // Why: prevents garbage/DontCare values in tag slots when uops are
     // created/copied (helps keep tag propagation consistent).
-    uop.cf_taint_module_id_1 := 0.U
-    uop.cf_taint_module_id_2 := 0.U
-    uop.cf_taint_module_id_3 := 0.U
+    // uop.cf_taint_module_id_1 := 0.U
+    // uop.cf_taint_module_id_2 := 0.U
+    // uop.cf_taint_module_id_3 := 0.U
     uop
+  }
+
+  def NullShadow()(implicit p: Parameters): boom.v3.common.Shadow ={
+    val uopshadow = Wire(new boom.v3.common.Shadow)
+    uopshadow := DontCare
+    // Initialize CoreFuzzing shadow tag fields to 0
+    uopshadow.cf_taint_module_id_1 := 0.U
+    uopshadow.cf_taint_module_id_2 := 0.U
+    uopshadow.cf_taint_module_id_3 := 0.U
+    uopshadow.cf_taint_module_id_4 := 0.U
+    uopshadow.cf_taint_module_id_5 := 0.U
+    uopshadow.cf_taint_type_1      := 0.U
+    uopshadow.cf_taint_type_2      := 0.U
+    uopshadow.cf_taint_type_3      := 0.U
+    uopshadow.cf_taint_type_4      := 0.U
+    uopshadow.cf_taint_type_5      := 0.U
+    uopshadow.cf_taint_op_count_1  := 0.U
+    uopshadow.cf_taint_op_count_2  := 0.U
+    uopshadow.cf_taint_op_count_3  := 0.U
+    uopshadow.cf_taint_op_count_4  := 0.U
+    uopshadow.cf_taint_op_count_5  := 0.U 
+    uopshadow.cf_predis_taint_module_id_1 := 0.U
+    uopshadow.cf_predis_taint_module_id_2 := 0.U
+    uopshadow.cf_predis_taint_module_id_3 := 0.U
+    uopshadow.cf_predis_taint_module_id_4 := 0.U
+    uopshadow.cf_predis_taint_module_id_5 := 0.U
+    uopshadow.cf_predis_taint_type_1      := 0.U
+    uopshadow.cf_predis_taint_type_2      := 0.U
+    uopshadow.cf_predis_taint_type_3      := 0.U
+    uopshadow.cf_predis_taint_type_4      := 0.U
+    uopshadow.cf_predis_taint_type_5      := 0.U
+    uopshadow.cf_predis_taint_op_count_1  := 0.U
+    uopshadow.cf_predis_taint_op_count_2  := 0.U
+    uopshadow.cf_predis_taint_op_count_3  := 0.U
+    uopshadow.cf_predis_taint_op_count_4  := 0.U
+    uopshadow.cf_predis_taint_op_count_5  := 0.U
+    uopshadow.cf_count_ldq_stq_retries  := 0.U
+    uopshadow.cf_count_ldq_wakeups      := 0.U
+    uopshadow
   }
 }
 

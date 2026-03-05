@@ -236,7 +236,10 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
     // Print only if the slot currently holds a valid uop
     when (is_valid) {
       // Match commit log format from exu/core.scala but tag as speculative
-  SpeculativePrintf.dump("ISSUE", Sext.apply(slot_uop.debug_pc(vaddrBits-1,0), xLen), slot_uop.debug_inst, slot_uop.is_rvc, io.cf_debug_issue_enable)
+    // Modified: use new overload to include MicroOp so cf_* fields are printed
+    // Old call (kept for reference):
+    // SpeculativePrintf.dump("ISSUE", Sext.apply(slot_uop.debug_pc(vaddrBits-1,0), xLen), slot_uop.debug_inst, slot_uop.is_rvc, io.cf_debug_issue_enable)
+    SpeculativePrintf.dump("ISSUE", Sext.apply(slot_uop.debug_pc(vaddrBits-1,0), xLen), slot_uop.debug_inst, slot_uop.is_rvc, io.cf_debug_issue_enable, slot_uop)
       when (slot_uop.dst_rtype === RT_FIX && slot_uop.ldst =/= 0.U) {
         // No writeback data available at issue-slot; print a placeholder 0
         printf(" x%d 0x%x\n", slot_uop.ldst, 0.U)

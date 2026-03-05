@@ -154,9 +154,52 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   val cf_secret_propagation   = Bool()      // set when the micro-op is in the dependence chain of originating in a secret
   val cf_secret_transmission  = Bool()      // set when a secret dependent micro-op makes a update to a stateful unit
 
+  // Corefuzzing - IFT tags for every micro-op shadow
   val cf_op_count_id = UInt(uopIDCounterWidthCF.W) // counts the number of active micro-ops. Count is incremented when it the micro-op is created with a counter. 
-                                 // counter wraps around at 255. It is fine because the maximum number of uops currently supported in 130. Even if we 
-                                 // increase this number, we can increase the width of the counter.
+                               // counter wraps around at 255. It is fine because the maximum number of uops currently supported in 130. Even if we 
+                               // increase this number, we can increase the width of the counter.
+
+  val cf_single_step          = Bool()      // set when the micro-op is single-stepped (quiesce mode) 
+
+  // Do we allocate a branch tag for this?
+  // SFB branches don't get a mask, they get a predicate bit
+  def allocate_brtag   = (is_br && !is_sfb) || is_jalr
+
+  // Does this register write-back
+  def rf_wen           = dst_rtype =/= RT_X
+
+  // Is it possible for this uop to misspeculate, preventing the commit of subsequent uops?
+  def unsafe           = uses_ldq || (uses_stq && !is_fence) || is_br || is_jalr
+
+  def fu_code_is(_fu: UInt) = (fu_code & _fu) =/= 0.U
+
+  override def toPrintable: Printable = {
+    val cf_info = Cat(cf_domain_id, cf_speculated, cf_attacker_influence, cf_secret_access, cf_secret_propagation, cf_secret_transmission)
+    // val cf_taint = Cat(cf_taint_module_id_1, cf_taint_type_1, cf_taint_op_count_1, cf_taint_module_id_2, cf_taint_type_2, cf_taint_op_count_2, cf_taint_module_id_3, cf_taint_type_3, cf_taint_op_count_3)
+    
+    cf"UOP Code is $uopc " +
+    cf"UOP running count is $cf_op_count_id " +
+    cf"PC is $debug_pc " +
+    cf"IQ type $iq_type FU type $fu_code " +
+    cf"is branch $is_br, is taken $taken " +
+    cf"cf info is $cf_info " +
+    cf"cf taint info cf_taint \n"
+  }
+}
+
+
+/**
+ * Extension to BoomBundle to add the IFT shadow MicroOp
+ */
+abstract trait HasShadowUOP extends BoomBundle
+{
+  val uopshadow = new Shadow()
+}
+
+
+class Shadow(implicit p: Parameters) extends BoomBundle
+  with CoreFuzzingConstants
+{
   // the taint module acts like a FIFO style queue. The oldest to modify the op woiuld be in module_id_1 and the latest in module_id_5
 
   val cf_taint_module_id_1 = UInt(moduleCountCF.W) // keeps track of modules where transmission happened
@@ -204,33 +247,12 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   val cf_predis_taint_module_id_5 = UInt(moduleCountCF.W) // keeps track of modules where transmission happened
   val cf_predis_taint_type_5 = UInt(taintTypeCf.W) // keeps track of which taint was set first
   val cf_predis_taint_op_count_5 = UInt(uopIDCounterWidthCF.W) // keeps track of the uop count when the first taint was set
-  val cf_single_step          = Bool()      // set when the micro-op is single-stepped (quiesce mode) 
-
-  override def toPrintable: Printable = {
-    val cf_info = Cat(cf_domain_id, cf_speculated, cf_attacker_influence, cf_secret_access, cf_secret_propagation, cf_secret_transmission)
-    val cf_taint = Cat(cf_taint_module_id_1, cf_taint_type_1, cf_taint_op_count_1, cf_taint_module_id_2, cf_taint_type_2, cf_taint_op_count_2, cf_taint_module_id_3, cf_taint_type_3, cf_taint_op_count_3)
-    
-    cf"UOP Code is $uopc " +
-    cf"UOP running count is $cf_op_count_id " +
-    cf"PC is $debug_pc " +
-    cf"IQ type $iq_type FU type $fu_code " +
-    cf"is branch $is_br, is taken $taken " +
-    cf"cf info is $cf_info " +
-    cf"cf taint info $cf_taint \n"
-  }
-
-  // Do we allocate a branch tag for this?
-  // SFB branches don't get a mask, they get a predicate bit
-  def allocate_brtag   = (is_br && !is_sfb) || is_jalr
-
-  // Does this register write-back
-  def rf_wen           = dst_rtype =/= RT_X
-
-  // Is it possible for this uop to misspeculate, preventing the commit of subsequent uops?
-  def unsafe           = uses_ldq || (uses_stq && !is_fence) || is_br || is_jalr
-
-  def fu_code_is(_fu: UInt) = (fu_code & _fu) =/= 0.U
+  
+  // UInts to store the number of load and store wakeups and retries
+  val cf_count_ldq_wakeups      = UInt(3.W)
+  val cf_count_ldq_stq_retries  = UInt(3.W)
 }
+
 
 /**
  * Control signals within a MicroOp

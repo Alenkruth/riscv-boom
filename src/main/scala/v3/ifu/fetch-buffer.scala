@@ -289,20 +289,26 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // Order: older -> newer. appendModuleTag pushes the new tag into slot1, so
   // call older-module tags first and the current module last so cf_taint_module_id_1
   // reflects the most recent module (FetchBuffer).
+  // val in_uops_tagged = Wire(Vec(fetchWidth, new MicroOp()))
   for (i <- 0 until fetchWidth) {
     // FTQ: the frontend previously assigned ftq_idx (ftq participated before FB)
-    appendModuleTag(ftqTagCF.U, in_uops(i))
+    // appendModuleTag(ftqTagCF.U, in_uops(i))
 
-    // I-TLB vs ICache: if a fetch had an I-TLB page fault / access exception, mark
-    // it as passing through the ITLB; otherwise mark as coming from the ICache.
-    when (io.enq.bits.xcpt_pf_if || io.enq.bits.xcpt_ae_if) {
-      appendModuleTag(itlbTagCF.U, in_uops(i))
-    } .otherwise {
-      appendModuleTag(icacheTagCF.U, in_uops(i))
-    }
+    // // I-TLB vs ICache: if a fetch had an I-TLB page fault / access exception, mark
+    // // it as passing through the ITLB; otherwise mark as coming from the ICache.
+    // when (io.enq.bits.xcpt_pf_if || io.enq.bits.xcpt_ae_if) {
+    //   appendModuleTag(itlbTagCF.U, in_uops(i))
+    // } .otherwise {
+    //   appendModuleTag(icacheTagCF.U, in_uops(i))
+    // }
 
     // Finally mark FetchBuffer itself as the most-recent module.
-    appendModuleTag(fbTagCF.U, in_uops(i))
+    //when (in_uops(i).cf_taint_module_id_1 =/= fbTagCF.U) {
+    // in_uops_tagged(i) := appendModuleTag(fbTagCF.U, in_uops(i))
+    //} .otherwise {
+    //  in_uops_tagged(i) := in_uops(i)
+    // }
+    // appendModuleTag(fbTagCF.U, in_uops(i))
   }
 
   // Step 2. Generate one-hot write indices.
@@ -349,7 +355,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   for (i <- 0 until fetchWidth) {
     for (j <- 0 until numEntries) {
       when (do_enq && in_mask(i) && enq_idxs(i)(j)) {
-        ram(j) := in_uops(i)
+        ram(j) := in_uops(i) // in_uops_tagged(i)
         // for debugging: printing ram index for every enqueue - alex
         // printf(p"($rowsUsed, $coreWidth, enq, $j), ")
       }
@@ -411,7 +417,10 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     // that are plausibly valid. We iterate through every entry and print
     // its PC + inst using the common speculative print helper.
     for (i <- 0 until numEntries) {
-      SpeculativePrintf.dump("FETCHBUF", Sext.apply(ram(i).debug_pc(vaddrBits-1,0), xLen), ram(i).debug_inst, ram(i).is_rvc, io.cf_debug_fetchbuf_enable)
+  // Modified: include MicroOp `ram(i)` to print cf_* metadata when enabled
+  // Old call (kept as comment):
+  // SpeculativePrintf.dump("FETCHBUF", Sext.apply(ram(i).debug_pc(vaddrBits-1,0), xLen), ram(i).debug_inst, ram(i).is_rvc, io.cf_debug_fetchbuf_enable)
+  SpeculativePrintf.dump("FETCHBUF", Sext.apply(ram(i).debug_pc(vaddrBits-1,0), xLen), ram(i).debug_inst, ram(i).is_rvc, io.cf_debug_fetchbuf_enable, ram(i))
     }
 
     head := 1.U

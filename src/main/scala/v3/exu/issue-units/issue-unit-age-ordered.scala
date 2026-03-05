@@ -85,17 +85,23 @@ class IssueUnitCollapsing(
 
   val uops = issue_slots.map(s=>s.out_uop) ++ dis_uops.map(s=>s)
   for (i <- 0 until numIssueSlots) {
-    issue_slots(i).in_uop.valid := false.B
-    issue_slots(i).in_uop.bits  := uops(i+1)
-    // corefuzzing
-    // Append issue-queue tag when a uop is slid into an issue slot (entry
-    // to the issue queue). This preserves a record that the uop has
-    // entered the integer issue queue logic.
-    appendModuleTag(intissqTagCF.U, issue_slots(i).in_uop.bits)
+  issue_slots(i).in_uop.valid := false.B
+  issue_slots(i).in_uop.bits  := uops(i+1)
     for (j <- 1 to maxShift by 1) {
       when (shamts_oh(i+j) === (1 << (j-1)).U) {
         issue_slots(i).in_uop.valid := will_be_valid(i+j)
         issue_slots(i).in_uop.bits  := uops(i+j)
+        // Only append the issue-queue tag when the slot was previously
+        // invalid and will become valid (i.e., the uop is entering the
+        // issue slot). This prevents repeated appends while the uop is
+        // resident in the slot.
+        // val uop_tagged = Wire(new MicroOp)
+        // when (will_be_valid(i+j) && !issue_slots(i).valid && uops(i+j).cf_taint_module_id_1 =/= intissqTagCF.U) {
+        //   issue_slots(i).in_uop.bits := appendModuleTag(intissqTagCF.U, uops(i+j))
+        // }
+        // .otherwise {
+        //   issue_slots(i).in_uop.bits  := uops(i+j)
+        // }
       }
     }
     issue_slots(i).clear        := shamts_oh(i) =/= 0.U

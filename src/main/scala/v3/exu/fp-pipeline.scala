@@ -117,14 +117,25 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
   // tag is recorded when the uop "enters" the module without changing the
   // original handshake behavior.
   for (w <- 0 until dispatchWidth) {
-    val dis_wire = Wire(Decoupled(new MicroOp))
-    dis_wire.bits  := io.dis_uops(w).bits
-    dis_wire.valid := io.dis_uops(w).valid
-    io.dis_uops(w).ready := dis_wire.ready
+    // val dis_wire = Wire(Decoupled(new MicroOp))   
     // Append FP issue queue tag when the micro-op is presented to the FP
-    // issue unit. This is combinational and cheap; it does not add cycles.
-    appendModuleTag(fpissqTagCF.U, dis_wire.bits)
-    issue_unit.io.dis_uops(w) <> dis_wire
+    // issue unit (on the handshake fire). Using the `.fire` condition
+    // ensures the tag is recorded only once when the uop actually enters
+    // the downstream FP issue unit.
+    //when (io.dis_uops(w).fire && io.dis_uops(w).bits.cf_taint_module_id_1 =/= fpissqTagCF.U) {
+    //  dis_wire.bits := appendModuleTag(fpissqTagCF.U, io.dis_uops(w).bits)
+    //  dis_wire.valid := io.dis_uops(w).valid
+    //} .otherwise {
+    //  dis_wire.bits := io.dis_uops(w).bits
+    //  dis_wire.valid := io.dis_uops(w).valid
+    //}
+    // dis_wire.bits := io.dis_uops(w).bits
+    // dis_wire.valid := io.dis_uops(w).valid
+    // appendModuleTag(fpissqTagCF.U, dis_wire.bits) }
+    // dis_wire.bits  := io.dis_uops(w).bits
+    // dis_wire.valid := io.dis_uops(w).valid
+    // io.dis_uops(w).ready := dis_wire.ready
+    issue_unit.io.dis_uops(w) <> io.dis_uops(w)// dis_wire
   }
 
   //-------------------------------------------------------------
