@@ -286,14 +286,17 @@ trait ScalarOpConstants
     cs.is_std      := false.B
 
     uop.ctrl := cs
-    // Initialize CoreFuzzing tag fields to 0 for a null uop so tags are
-    // deterministic when a MicroOp is created from a NullMicroOp template.
-    // What changed: explicitly set cf taint module id fields to 0.
-    // Why: prevents garbage/DontCare values in tag slots when uops are
-    // created/copied (helps keep tag propagation consistent).
-    // uop.cf_taint_module_id_1 := 0.U
-    // uop.cf_taint_module_id_2 := 0.U
-    // uop.cf_taint_module_id_3 := 0.U
+    // Initialize all CoreFuzzing IFT fields to deterministic zero values
+    uop.cf_domain_id            := 0.U
+    uop.cf_speculated           := false.B
+    uop.cf_attacker_influence   := false.B
+    uop.cf_secret_access        := false.B
+    uop.cf_secret_propagation   := false.B
+    uop.cf_secret_transmission  := false.B
+    uop.cf_op_count_id          := 0.U
+    uop.cf_single_step          := false.B
+    uop.cf_fu_bitmap            := 0.U
+    uop.cf_influencer_uop_count := 0.U
     uop
   }
 

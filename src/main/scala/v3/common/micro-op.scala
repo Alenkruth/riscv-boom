@@ -159,7 +159,12 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
                                // counter wraps around at 255. It is fine because the maximum number of uops currently supported in 130. Even if we 
                                // increase this number, we can increase the width of the counter.
 
-  val cf_single_step          = Bool()      // set when the micro-op is single-stepped (quiesce mode) 
+  val cf_single_step          = Bool()      // set when the micro-op is single-stepped (quiesce mode)
+
+  // Bitmap of all pipeline modules this uop has visited (one bit per module, see CoreFuzzingConstants)
+  val cf_fu_bitmap            = UInt(numModules.W)
+  // op_count_id of the secret uop that caused cf_attacker_influence to be set on this uop
+  val cf_influencer_uop_count = UInt(uopIDCounterWidthCF.W)
 
   // Do we allocate a branch tag for this?
   // SFB branches don't get a mask, they get a predicate bit
