@@ -720,7 +720,14 @@ object BoomCoreStringPrefix
 //   stage. The helper preserves temporal order (most recent -> oldest)
 //   by shifting 1->2, 2->3 and writing newTag->1. This hardcoded 3-slot
 //   structure is resource-friendly and timing-friendly for FPGA targets.
-object appendModuleTag{}
+object appendModuleTag {
+  // Set one bit in cf_fu_bitmap for the given module. Hardware cost: single OR gate.
+  def apply(moduleTag: UInt, uop: boom.v3.common.MicroOp)(implicit p: Parameters): boom.v3.common.MicroOp = {
+    val out = WireInit(uop)
+    out.cf_fu_bitmap := uop.cf_fu_bitmap | (1.U << moduleTag)
+    out
+  }
+}
 //   def apply(newTag: UInt, uop: MicroOp)(implicit p: Parameters): MicroOp = {
 //     // NOTE: Instead of mutating the passed-in `uop` (which may be a port/IO
 //     // from another module), create a local Wire copy and perform the
