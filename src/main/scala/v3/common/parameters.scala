@@ -322,8 +322,8 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     Some(CustomCSR(attackerAddrEndCSRIdCF, mask, Some(init)))
   }
 
-  def cf_attacker_start_addr = 0x80000000.U + getOrElse(attackerAddrStartCSRCF, _.value, 0.U)
-  def cf_attacker_end_addr = 0x80000000.U + getOrElse(attackerAddrEndCSRCF, _.value, 0.U)
+  def cf_attacker_start_addr = 0x80000000L.U(32.W) + getOrElse(attackerAddrStartCSRCF, _.value, 0.U)
+  def cf_attacker_end_addr = 0x80000000L.U(32.W) + getOrElse(attackerAddrEndCSRCF, _.value, 0.U)
 
   override def secretAddrStartCSRCF = {
     val mask = BigInt(0x7FFFFFFF)
@@ -341,8 +341,8 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     Some(CustomCSR(secretAddrEndCSRIdCF, mask, Some(init)))
   }
 
-  def cf_secret_start_addr = 0x80000000.U + getOrElse(secretAddrStartCSRCF, _.value, 0.U)
-  def cf_secret_end_addr = 0x80000000.U + getOrElse(secretAddrEndCSRCF, _.value, 0.U)
+  def cf_secret_start_addr = 0x80000000L.U(32.W) + getOrElse(secretAddrStartCSRCF, _.value, 0.U)
+  def cf_secret_end_addr = 0x80000000L.U(32.W) + getOrElse(secretAddrEndCSRCF, _.value, 0.U)
 
   override def attackStageCSRCF = {
     val mask = BigInt(0x3) // two bits bit 0 - attack start indicator. Bit 1 - start secret access tagging
