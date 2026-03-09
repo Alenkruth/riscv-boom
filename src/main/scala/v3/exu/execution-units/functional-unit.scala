@@ -164,6 +164,7 @@ abstract class FunctionalUnit(
   val isMemAddrCalcUnit: Boolean = false,
   val needsFcsr: Boolean = false)
   (implicit p: Parameters) extends BoomModule
+  with CoreFuzzingConstants
 {
   val io = IO(new Bundle {
     val req    = Flipped(new DecoupledIO(new FuncUnitReq(dataWidth)))
@@ -247,10 +248,40 @@ abstract class PipelinedFunctionalUnit(
     val r_valids = RegInit(VecInit(Seq.fill(numStages) { false.B }))
     val r_uops   = Reg(Vec(numStages, new MicroOp()))
 
+    // corefuzzing: per-stage secret-instruction tracking for coexistence detection
+    // secret = victim domain (cf_domain_id === 0)
+    val secret_in_stage       = RegInit(VecInit(Seq.fill(numStages) { false.B }))
+    val secret_uopcount_stage = RegInit(VecInit(Seq.fill(numStages) { 0.U(uopIDCounterWidthCF.W) }))
+
     // handle incoming request
     r_valids(0) := io.req.valid && !IsKilledByBranch(io.brupdate, io.req.bits.uop) && !io.req.bits.kill
     r_uops(0)   := io.req.bits.uop
     r_uops(0).br_mask := GetNewBrMask(io.brupdate, io.req.bits.uop)
+
+    // corefuzzing: set the FU bitmap bit and detect attacker-secret coexistence at stage 0
+    {
+      val fu = io.req.bits.uop.fu_code
+      val newBit = MuxCase(0.U(numModules.W), Seq(
+        ((fu & FU_ALU) =/= 0.U)                                           -> (1.U << aluTagCF.U),
+        ((fu & FU_MUL) =/= 0.U)                                           -> (1.U << mulTagCF.U),
+        ((fu & FU_DIV) =/= 0.U)                                           -> (1.U << divTagCF.U),
+        ((fu & (FU_FPU | FU_FDV | FU_I2F | FU_F2I)) =/= 0.U)             -> (1.U << fpuTagCF.U),
+        ((fu & FU_CSR) =/= 0.U)                                           -> (1.U << csrTagCF.U)
+      ))
+      when (io.req.valid && !IsKilledByBranch(io.brupdate, io.req.bits.uop) && !io.req.bits.kill) {
+        r_uops(0).cf_fu_bitmap := io.req.bits.uop.cf_fu_bitmap | newBit
+        // If this is an attacker instruction and a secret instruction occupies stage 0, record influence
+        when (io.req.bits.uop.cf_domain_id === 1.U && secret_in_stage(0)) {
+          r_uops(0).cf_attacker_influence   := true.B
+          r_uops(0).cf_influencer_uop_count := secret_uopcount_stage(0)
+        }
+      }
+      // Update stage-0 secret tracking for next cycle
+      secret_in_stage(0)       := io.req.valid && !IsKilledByBranch(io.brupdate, io.req.bits.uop) &&
+                                   !io.req.bits.kill && (io.req.bits.uop.cf_domain_id === 0.U)
+      secret_uopcount_stage(0) := io.req.bits.uop.cf_op_count_id
+    }
+
     // corefuzzing
     // If an incoming request is killed by a branch this cycle, non-destructively log it
     when (io.req.valid && IsKilledByBranch(io.brupdate, io.req.bits.uop)) {
@@ -262,6 +293,15 @@ abstract class PipelinedFunctionalUnit(
   r_valids(i) := r_valids(i-1) && !IsKilledByBranch(io.brupdate, r_uops(i-1)) && !io.req.bits.kill
   r_uops(i)   := r_uops(i-1)
   r_uops(i).br_mask := GetNewBrMask(io.brupdate, r_uops(i-1))
+
+      // corefuzzing: propagate secret tracking and detect coexistence at intermediate stages
+      val alive_i = r_valids(i-1) && !IsKilledByBranch(io.brupdate, r_uops(i-1)) && !io.req.bits.kill
+      when (alive_i && r_uops(i-1).cf_domain_id === 1.U && secret_in_stage(i)) {
+        r_uops(i).cf_attacker_influence   := true.B
+        r_uops(i).cf_influencer_uop_count := secret_uopcount_stage(i)
+      }
+      secret_in_stage(i)       := alive_i && (r_uops(i-1).cf_domain_id === 0.U)
+      secret_uopcount_stage(i) := r_uops(i-1).cf_op_count_id
 
       if (numBypassStages > 0) {
         io.bypass(i-1).bits.uop := r_uops(i-1)
