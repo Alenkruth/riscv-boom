@@ -313,6 +313,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   io.lsu.cf_dcache_size_conf := custom_csrs.cf_dcache_size_conf
   io.lsu.cf_dcache_repl_conf := custom_csrs.cf_dcache_repl_conf
   io.lsu.cf_dcache_blocksize_conf := custom_csrs.cf_dcache_blocksize_conf
+  // corefuzzing: wire secret address CSRs into LSU for cf_secret_access detection
+  io.lsu.cf_secret_start_addr := custom_csrs.cf_secret_start_addr
+  io.lsu.cf_secret_end_addr   := custom_csrs.cf_secret_end_addr
 
   // getting the rob entries from the CSR
   rob.io.cf_rob_entries := custom_csrs.cf_rob_entries 
@@ -858,6 +861,19 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     // Dispatching instructions request load/store queue entries when they can proceed.
     dis_uops(w).ldq_idx := io.lsu.dis_ldq_idx(w)
     dis_uops(w).stq_idx := io.lsu.dis_stq_idx(w)
+  }
+
+  //-------------------------------------------------------------
+  // corefuzzing: Set IFT fields at dispatch time
+  // cf_domain_id: 1 if PC is in attacker address range (from CSR), 0 otherwise
+  // cf_speculated: true if any branch is unresolved in the branch mask
+  for (w <- 0 until coreWidth) {
+    val pc = dis_uops(w).debug_pc
+    val in_attacker_range = (pc >= custom_csrs.cf_attacker_start_addr) &&
+                            (pc <= custom_csrs.cf_attacker_end_addr) &&
+                            (custom_csrs.cf_attacker_end_addr =/= custom_csrs.cf_attacker_start_addr)
+    dis_uops(w).cf_domain_id  := in_attacker_range.asUInt(1.W)
+    dis_uops(w).cf_speculated := dis_uops(w).br_mask =/= 0.U
   }
 
   //-------------------------------------------------------------
@@ -1547,22 +1563,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
           printf("[SSTEP] ")
         }
 
-        // Print up to 5 taint-module entries in a compact array form
-        // printf("TAINTS=[%d:%d:%d,%d:%d:%d,%d:%d:%d,%d:%d:%d,%d:%d:%d] ",
-        //   rob.io.commit.uops(w).cf_taint_module_id_1, rob.io.commit.uops(w).cf_taint_type_1, rob.io.commit.uops(w).cf_taint_op_count_1,
-        //   rob.io.commit.uops(w).cf_taint_module_id_2, rob.io.commit.uops(w).cf_taint_type_2, rob.io.commit.uops(w).cf_taint_op_count_2,
-        //   rob.io.commit.uops(w).cf_taint_module_id_3, rob.io.commit.uops(w).cf_taint_type_3, rob.io.commit.uops(w).cf_taint_op_count_3,
-        //   rob.io.commit.uops(w).cf_taint_module_id_4, rob.io.commit.uops(w).cf_taint_type_4, rob.io.commit.uops(w).cf_taint_op_count_4,
-        //   rob.io.commit.uops(w).cf_taint_module_id_5, rob.io.commit.uops(w).cf_taint_type_5, rob.io.commit.uops(w).cf_taint_op_count_5)
-
-        // // Print up to 5 pre-dispatch taint entries (FIFO of where the uop resided
-        // // prior to dispatch). Same compact format as above.
-        // printf("PREDIS=[%d:%d:%d,%d:%d:%d,%d:%d:%d,%d:%d:%d,%d:%d:%d] ",
-        //   rob.io.commit.uops(w).cf_predis_taint_module_id_1, rob.io.commit.uops(w).cf_predis_taint_type_1, rob.io.commit.uops(w).cf_predis_taint_op_count_1,
-        //   rob.io.commit.uops(w).cf_predis_taint_module_id_2, rob.io.commit.uops(w).cf_predis_taint_type_2, rob.io.commit.uops(w).cf_predis_taint_op_count_2,
-        //   rob.io.commit.uops(w).cf_predis_taint_module_id_3, rob.io.commit.uops(w).cf_predis_taint_type_3, rob.io.commit.uops(w).cf_predis_taint_op_count_3,
-        //   rob.io.commit.uops(w).cf_predis_taint_module_id_4, rob.io.commit.uops(w).cf_predis_taint_type_4, rob.io.commit.uops(w).cf_predis_taint_op_count_4,
-        //   rob.io.commit.uops(w).cf_predis_taint_module_id_5, rob.io.commit.uops(w).cf_predis_taint_type_5, rob.io.commit.uops(w).cf_predis_taint_op_count_5)
+        // Print module bitmap (which pipeline units this uop visited) and influencer uop count
+        printf("FU=0x%x INFL=%d",
+          rob.io.commit.uops(w).cf_fu_bitmap,
+          rob.io.commit.uops(w).cf_influencer_uop_count)
         // END MOD: commit CF prints
         // ---------------------------------------------------------------------
         when (rob.io.commit.uops(w).dst_rtype === RT_FIX && rob.io.commit.uops(w).ldst =/= 0.U) {
