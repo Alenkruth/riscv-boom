@@ -277,38 +277,20 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     in_uops(i).cf_op_count_id := id
   }
 
-  // corefuzzing
-  // Append module tag for fetch-buffer to each newly created micro-op.
-  // What changed: call the MicroOp helper `appendModuleTag` to push the
-  // fetch-buffer's tag into slot 1 and shift older tags down.
-  // Why: mark that these micro-ops have passed through the fetch-buffer
-  // module. This operation is combinational and cheap; it does not add
-  // pipeline cycles and can be done in parallel with other stage work.
-  // might be unneccessary
-  // Append tags for upstream IFU modules (FTQ, ICache/ITLB), then stamp FetchBuffer
-  // Order: older -> newer. appendModuleTag pushes the new tag into slot1, so
-  // call older-module tags first and the current module last so cf_taint_module_id_1
-  // reflects the most recent module (FetchBuffer).
-  // val in_uops_tagged = Wire(Vec(fetchWidth, new MicroOp()))
+  // corefuzzing: Initialize all IFT cf_* fields for each newly created micro-op.
+  // cf_fu_bitmap gets the fbTagCF bit set to mark this uop passed through the fetch buffer.
+  // All other cf_* fields are zeroed here; they are set later in the pipeline
+  // (domain_id and speculated at dispatch, secret flags in LSU/DCache).
   for (i <- 0 until fetchWidth) {
-    // FTQ: the frontend previously assigned ftq_idx (ftq participated before FB)
-    // appendModuleTag(ftqTagCF.U, in_uops(i))
-
-    // // I-TLB vs ICache: if a fetch had an I-TLB page fault / access exception, mark
-    // // it as passing through the ITLB; otherwise mark as coming from the ICache.
-    // when (io.enq.bits.xcpt_pf_if || io.enq.bits.xcpt_ae_if) {
-    //   appendModuleTag(itlbTagCF.U, in_uops(i))
-    // } .otherwise {
-    //   appendModuleTag(icacheTagCF.U, in_uops(i))
-    // }
-
-    // Finally mark FetchBuffer itself as the most-recent module.
-    //when (in_uops(i).cf_taint_module_id_1 =/= fbTagCF.U) {
-    // in_uops_tagged(i) := appendModuleTag(fbTagCF.U, in_uops(i))
-    //} .otherwise {
-    //  in_uops_tagged(i) := in_uops(i)
-    // }
-    // appendModuleTag(fbTagCF.U, in_uops(i))
+    in_uops(i).cf_fu_bitmap            := (1.U << fbTagCF.U)
+    in_uops(i).cf_domain_id            := 0.U
+    in_uops(i).cf_speculated           := false.B
+    in_uops(i).cf_attacker_influence   := false.B
+    in_uops(i).cf_secret_access        := false.B
+    in_uops(i).cf_secret_propagation   := false.B
+    in_uops(i).cf_secret_transmission  := false.B
+    in_uops(i).cf_single_step          := false.B
+    in_uops(i).cf_influencer_uop_count := 0.U
   }
 
   // Step 2. Generate one-hot write indices.
