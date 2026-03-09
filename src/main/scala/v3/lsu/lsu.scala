@@ -195,6 +195,10 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   val reconfigure_stq_b0 = Input(Bool())
   val reconfigure_ldq_b1 = Input(Bool())
   val reconfigure_ldq_b0 = Input(Bool())
+
+  // corefuzzing: secret address range from CSRs for cf_secret_access detection
+  val cf_secret_start_addr = Input(UInt(coreMaxAddrBits.W))
+  val cf_secret_end_addr   = Input(UInt(coreMaxAddrBits.W))
 }
 
 class LSUIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
@@ -345,6 +349,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     {
       ldq(ld_enq_idx).valid                := true.B
       ldq(ld_enq_idx).bits.uop             := io.core.dis_uops(w).bits
+      // corefuzzing: stamp ldqTagCF into cf_fu_bitmap at LDQ enqueue
+      ldq(ld_enq_idx).bits.uop.cf_fu_bitmap := io.core.dis_uops(w).bits.cf_fu_bitmap | (1.U << ldqTagCF.U)
       ldq(ld_enq_idx).bits.youngest_stq_idx  := st_enq_idx
       ldq(ld_enq_idx).bits.st_dep_mask     := next_live_store_mask
 
@@ -362,6 +368,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     {
       stq(st_enq_idx).valid           := true.B
       stq(st_enq_idx).bits.uop        := io.core.dis_uops(w).bits
+      // corefuzzing: stamp stqTagCF into cf_fu_bitmap at STQ enqueue
+      stq(st_enq_idx).bits.uop.cf_fu_bitmap := io.core.dis_uops(w).bits.cf_fu_bitmap | (1.U << stqTagCF.U)
       stq(st_enq_idx).bits.addr.valid := false.B
       stq(st_enq_idx).bits.data.valid := false.B
       stq(st_enq_idx).bits.committed  := false.B
@@ -766,6 +774,18 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                         exe_tlb_vaddr(w)(corePgIdxBits-1,0)))
   val exe_tlb_uncacheable = widthMap(w => !(dtlb.io.resp(w).cacheable))
 
+  // corefuzzing: uop copies with dtlbTagCF bit set and cf_secret_access detected via physical address
+  val exe_tlb_uop_cf = Wire(Vec(memWidth, new MicroOp()))
+  for (w <- 0 until memWidth) {
+    exe_tlb_uop_cf(w) := exe_tlb_uop(w)
+    exe_tlb_uop_cf(w).cf_fu_bitmap := exe_tlb_uop(w).cf_fu_bitmap | (1.U << dtlbTagCF.U)
+    val secret_range_valid = io.core.cf_secret_end_addr =/= io.core.cf_secret_start_addr
+    val in_secret = secret_range_valid &&
+                    (exe_tlb_paddr(w) >= io.core.cf_secret_start_addr) &&
+                    (exe_tlb_paddr(w) <= io.core.cf_secret_end_addr)
+    exe_tlb_uop_cf(w).cf_secret_access := exe_tlb_uop(w).cf_secret_access || in_secret
+  }
+
   for (w <- 0 until memWidth) {
     assert (exe_tlb_paddr(w) === dtlb.io.resp(w).paddr || exe_req(w).bits.sfence.valid, "[lsu] paddrs should match.")
 
@@ -835,14 +855,14 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     when (will_fire_load_incoming(w)) {
       dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w)
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
-      dmem_req(w).bits.uop   := exe_tlb_uop(w)
+      dmem_req(w).bits.uop   := exe_tlb_uop_cf(w) // corefuzzing: use IFT-tagged uop
 
       s0_executing_loads(ldq_incoming_idx(w)) := dmem_req_fire(w)
       assert(!ldq_incoming_e(w).bits.executed)
     } .elsewhen (will_fire_load_retry(w)) {
       dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w)
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
-      dmem_req(w).bits.uop   := exe_tlb_uop(w)
+      dmem_req(w).bits.uop   := exe_tlb_uop_cf(w) // corefuzzing: use IFT-tagged uop
 
       s0_executing_loads(ldq_retry_idx) := dmem_req_fire(w)
       assert(!ldq_retry_e.bits.executed)
