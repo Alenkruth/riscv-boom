@@ -872,7 +872,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     val in_attacker_range = (pc >= custom_csrs.cf_attacker_start_addr) &&
                             (pc <= custom_csrs.cf_attacker_end_addr) &&
                             (custom_csrs.cf_attacker_end_addr =/= custom_csrs.cf_attacker_start_addr)
-    dis_uops(w).cf_domain_id  := in_attacker_range.asUInt(1.W)
+    dis_uops(w).cf_domain_id  := in_attacker_range.asUInt
     dis_uops(w).cf_speculated := dis_uops(w).br_mask =/= 0.U
   }
 
