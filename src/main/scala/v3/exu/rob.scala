@@ -346,18 +346,9 @@ class Rob(
       rob_bsy(rob_tail)       := !(io.enq_uops(w).is_fence ||
                                    io.enq_uops(w).is_fencei)
       rob_unsafe(rob_tail)    := io.enq_uops(w).unsafe
-      // corefuzzing
-      // Tag the uop on enqueue into the ROB. Use a temporary Wire to
-      // append the tag before committing into the ROB register file so
-      // we don't inadvertently overwrite fields via multiple assignments.
-      // val enq_tagged_uop = Wire(new MicroOp) // WireInit(io.enq_uops(w))
-      // when (io.enq_uops(w).cf_taint_module_id_1 =/= robTagCF.U) {
-      //   enq_tagged_uop :=  appendModuleTag(robTagCF.U, io.enq_uops(w))
-      // } .otherwise {
-      //  enq_tagged_uop := io.enq_uops(w)
-      // }
-      // appendModuleTag(robTagCF.U, enq_tagged_uop)
+      // corefuzzing: stamp robTagCF bit into cf_fu_bitmap at enqueue
       rob_uop(rob_tail)       := io.enq_uops(w)
+      rob_uop(rob_tail).cf_fu_bitmap := io.enq_uops(w).cf_fu_bitmap | (1.U << robTagCF.U)
       rob_exception(rob_tail) := io.enq_uops(w).exception
       rob_predicated(rob_tail)   := false.B
       rob_fflags(w)(rob_tail)    := 0.U
@@ -598,6 +589,22 @@ class Rob(
       val rob_idx = io.wb_resps(i).bits.uop.rob_idx
       when (io.debug_wb_valids(i) && MatchBank(GetBankIdx(rob_idx))) {
         rob_debug_wdata(GetRowIdx(rob_idx)) := io.debug_wb_wdata(i)
+      }
+      // corefuzzing: merge cf_fu_bitmap bits and attacker-influence info from the functional unit
+      when (io.wb_resps(i).valid && MatchBank(GetBankIdx(rob_idx))) {
+        rob_uop(GetRowIdx(rob_idx)).cf_fu_bitmap :=
+          rob_uop(GetRowIdx(rob_idx)).cf_fu_bitmap | io.wb_resps(i).bits.uop.cf_fu_bitmap
+        when (io.wb_resps(i).bits.uop.cf_attacker_influence) {
+          rob_uop(GetRowIdx(rob_idx)).cf_attacker_influence   := true.B
+          rob_uop(GetRowIdx(rob_idx)).cf_influencer_uop_count :=
+            io.wb_resps(i).bits.uop.cf_influencer_uop_count
+        }
+        when (io.wb_resps(i).bits.uop.cf_secret_access) {
+          rob_uop(GetRowIdx(rob_idx)).cf_secret_access := true.B
+        }
+        when (io.wb_resps(i).bits.uop.cf_secret_transmission) {
+          rob_uop(GetRowIdx(rob_idx)).cf_secret_transmission := true.B
+        }
       }
       val temp_uop = rob_uop(GetRowIdx(rob_idx))
 
