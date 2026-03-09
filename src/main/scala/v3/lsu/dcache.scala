@@ -1021,32 +1021,23 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     // .otherwise {
     //   cache_uop_tagged := s2_req(w).uop
     // }
-    cache_resp(w).bits.uop      := s2_req(w).uop // cache_uop_tagged
+    // corefuzzing: stamp dcacheTagCF bit and detect secret transmission
+    cache_resp(w).bits.uop              := s2_req(w).uop
+    cache_resp(w).bits.uop.cf_fu_bitmap := s2_req(w).uop.cf_fu_bitmap | (1.U << dcacheTagCF.U)
+    // A secret-access uop that misses the cache updates cache state — mark as secret_transmission
+    when (s2_req(w).uop.cf_secret_access && !s2_hit(w)) {
+      cache_resp(w).bits.uop.cf_secret_transmission := true.B
+    }
     cache_resp(w).bits.data     := loadgen(w).data | s2_sc_fail
     cache_resp(w).bits.is_hella := s2_req(w).is_hella
   }
 
   val uncache_resp = Wire(Valid(new BoomDCacheResp))
-  // corefuzzing
-  // mshr responses also get the dcache tag appended
-  // todo- tag the secrets as well
-  // Copy MSHR response and tag it as coming from the DCache/MSHR path before
-  // presenting it to the LSU. This ensures the writeback path carries the
-  // dcacheTagCF into the ROB.
-  // uncache_resp.bits     := mshrs.io.resp.bits
-  // Register and tag MSHR response uop to avoid combinational cycles
-  // val uncache_uop_reg = RegNext(mshrs.io.resp.bits.uop)
-  // val uncache_uop_tagged = Wire(new MicroOp)
-  // when (mshrs.io.resp.valid && mshrs.io.resp.bits.uop.cf_taint_module_id_1 =/= dcacheTagCF.U) {
-  //   uncache_uop_tagged := appendModuleTag(dcacheTagCF.U, mshrs.io.resp.bits.uop)
-  //   // appendModuleTag(dcacheTagCF.U, )
-  // }
-  // .otherwise {
-  //   uncache_uop_tagged := mshrs.io.resp.bits.uop
-  // }
-
-  // uncache_resp.bits.uop := mshrs.io.resp.bits.uop // uncache_uop_tagged
-  uncache_resp.bits     := mshrs.io.resp.bits
+  // corefuzzing: stamp dcacheTagCF into MSHR (miss) responses and mark secret_transmission
+  uncache_resp.bits                     := mshrs.io.resp.bits
+  uncache_resp.bits.uop.cf_fu_bitmap    := mshrs.io.resp.bits.uop.cf_fu_bitmap | (1.U << dcacheTagCF.U)
+  // MSHR completion = cache miss filled from memory; any secret access here is a transmission
+  uncache_resp.bits.uop.cf_secret_transmission := mshrs.io.resp.bits.uop.cf_secret_access
   uncache_resp.valid    := mshrs.io.resp.valid
   mshrs.io.resp.ready := !(cache_resp.map(_.valid).reduce(_&&_)) // We can backpressure the MSHRs, but not cache hits
 
