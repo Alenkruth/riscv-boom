@@ -54,7 +54,7 @@ import boom.v3.exu.{BrUpdateInfo, Exception, FuncUnitResp, CommitSignals, ExeUni
 
 // fore corefuzzing - SpeculativePRintf and Sext
 import boom.v3.util.{BoolToChar, AgePriorityEncoder, IsKilledByBranch, GetNewBrMask, WrapInc, IsOlder, UpdateBrMask, SpeculativePrintf}
-import boom.v3.util.{Sext, appendModuleTag}
+import boom.v3.util.{Sext, appendModuleTag, addInfluencer}
 
 class LSUExeIO(implicit p: Parameters) extends BoomBundle()(p)
 {
@@ -136,6 +136,9 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
 
   val ldq_full    = Output(Vec(coreWidth, Bool()))
   val stq_full    = Output(Vec(coreWidth, Bool()))
+  // corefuzzing: op_count of head entry for stall attribution
+  val ldq_head_op_count = Output(UInt(uopIDCounterWidthCF.W))
+  val stq_head_op_count = Output(UInt(uopIDCounterWidthCF.W))
 
   val fp_stdata   = Flipped(Decoupled(new ExeUnitResp(fLen)))
 
@@ -392,6 +395,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   ldq_tail := ld_enq_idx
   stq_tail := st_enq_idx
+
+  // corefuzzing: expose head entry op_count for stall attribution
+  io.core.ldq_head_op_count := Mux(ldq(ldq_head).valid, ldq(ldq_head).bits.uop.cf_op_count_id, 0.U)
+  io.core.stq_head_op_count := Mux(stq(stq_head).valid, stq(stq_head).bits.uop.cf_op_count_id, 0.U)
 
   io.dmem.force_order   := io.core.fence_dmem
   io.core.fencei_rdy    := !stq_nonempty && io.dmem.ordered
@@ -715,6 +722,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     dtlb.io.req(w).bits.passthrough := exe_passthr(w)
     dtlb.io.req(w).bits.v           := io.ptw.status.v
     dtlb.io.req(w).bits.prv         := io.ptw.status.prv
+    // corefuzzing: pass domain of requesting uop to DTLB
+    dtlb.io.req_domain(w)           := exe_tlb_uop(w).cf_domain_id
   }
   dtlb.io.kill                      := exe_kill.reduce(_||_)
   dtlb.io.sfence                    := exe_sfence
@@ -775,15 +784,23 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val exe_tlb_uncacheable = widthMap(w => !(dtlb.io.resp(w).cacheable))
 
   // corefuzzing: uop copies with dtlbTagCF bit set and cf_secret_access detected via physical address
+  // Two-stage wire pattern avoids combinational cycle: Stage 1 = base mods, Stage 2 = influencer.
   val exe_tlb_uop_cf = Wire(Vec(memWidth, new MicroOp()))
   for (w <- 0 until memWidth) {
-    exe_tlb_uop_cf(w) := exe_tlb_uop(w)
-    exe_tlb_uop_cf(w).cf_fu_bitmap := exe_tlb_uop(w).cf_fu_bitmap | (1.U << dtlbTagCF.U)
+    // Stage 1: bitmap + secret_access, based on exe_tlb_uop (register-backed, no feedback)
+    val uop_tlb_base = WireInit(exe_tlb_uop(w))
+    uop_tlb_base.cf_fu_bitmap := exe_tlb_uop(w).cf_fu_bitmap | (1.U << dtlbTagCF.U)
     val secret_range_valid = io.core.cf_secret_end_addr =/= io.core.cf_secret_start_addr
     val in_secret = secret_range_valid &&
                     (exe_tlb_paddr(w) >= io.core.cf_secret_start_addr) &&
                     (exe_tlb_paddr(w) <= io.core.cf_secret_end_addr)
-    exe_tlb_uop_cf(w).cf_secret_access := exe_tlb_uop(w).cf_secret_access || in_secret
+    uop_tlb_base.cf_secret_access := exe_tlb_uop(w).cf_secret_access || in_secret
+    // Stage 2: DTLB domain mismatch → INFL_DTLB_STATE (reads uop_tlb_base, writes uop_tlb_final)
+    val uop_tlb_final = WireInit(uop_tlb_base)
+    when (dtlb.io.resp_domain_mismatch(w)) {
+      uop_tlb_final := addInfluencer(uop_tlb_base, 0.U, INFL_DTLB_STATE.U)
+    }
+    exe_tlb_uop_cf(w) := uop_tlb_final
   }
 
   for (w <- 0 until memWidth) {
@@ -1285,6 +1302,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           ((l_forward_stq_idx =/= lcam_stq_idx(w)) && forwarded_is_older)) { // If the load forwarded from us, we might be ok
           ldq(i).bits.order_fail := true.B
           failed_loads(i)        := true.B
+          // corefuzzing: cross-domain memory ordering violation
+          when (stq(lcam_stq_idx(w)).bits.uop.cf_domain_id =/= l_bits.uop.cf_domain_id) {
+            ldq(i).bits.uop := addInfluencer(l_bits.uop, stq(lcam_stq_idx(w)).bits.uop.cf_op_count_id, INFL_MEM_ORDER.U)
+          }
         }
       } .elsewhen (do_ld_search(w)            &&
                    l_valid                    &&
@@ -1299,6 +1320,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                 l_bits.observed) {        // Its only a ordering failure if the cache line was observed between the younger load and us
             ldq(i).bits.order_fail := true.B
             failed_loads(i)        := true.B
+            // corefuzzing: cross-domain LD-LD ordering violation (the searcher's store from other domain)
+            when (lcam_uop(w).cf_domain_id =/= l_bits.uop.cf_domain_id) {
+              ldq(i).bits.uop := addInfluencer(l_bits.uop, lcam_uop(w).cf_op_count_id, INFL_MEM_ORDER.U)
+            }
           }
         } .elsewhen (lcam_ldq_idx(w) =/= i.U) {
           // The load is older, and either it hasn't executed, it was nacked, or it is ignoring its response
@@ -1492,8 +1517,28 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         val send_iresp = ldq(ldq_idx).bits.uop.dst_rtype === RT_FIX
         val send_fresp = ldq(ldq_idx).bits.uop.dst_rtype === RT_FLT
 
-        io.core.exe(w).iresp.bits.uop  := ldq(ldq_idx).bits.uop
-        io.core.exe(w).fresp.bits.uop  := ldq(ldq_idx).bits.uop
+        // corefuzzing: merge CF fields from response UOP (which went through TLB+dcache pipeline
+        // accumulating INFL_DTLB_STATE and INFL_CACHE_EVICTION) into the canonical LDQ base UOP.
+        val ldq_base_cf = ldq(ldq_idx).bits.uop
+        val resp_cf     = io.dmem.resp(w).bits.uop
+        val merged_base_cf = WireInit(ldq_base_cf)
+        merged_base_cf.cf_fu_bitmap          := ldq_base_cf.cf_fu_bitmap | resp_cf.cf_fu_bitmap
+        merged_base_cf.cf_secret_access      := ldq_base_cf.cf_secret_access || resp_cf.cf_secret_access
+        merged_base_cf.cf_secret_transmission := ldq_base_cf.cf_secret_transmission || resp_cf.cf_secret_transmission
+        var cf_chain: MicroOp = merged_base_cf
+        for (i <- 0 until numInfluencerSlotsCF) {
+          val cf_next = WireInit(cf_chain)
+          when (resp_cf.cf_influencer_list(i).valid) {
+            cf_next := addInfluencer(cf_chain,
+              resp_cf.cf_influencer_list(i).op_count,
+              resp_cf.cf_influencer_list(i).infl_type)
+          }
+          cf_chain = cf_next
+        }
+        val dmem_resp_uop_cf = cf_chain
+
+        io.core.exe(w).iresp.bits.uop  := dmem_resp_uop_cf
+        io.core.exe(w).fresp.bits.uop  := dmem_resp_uop_cf
         io.core.exe(w).iresp.valid     := send_iresp
         io.core.exe(w).iresp.bits.data := io.dmem.resp(w).bits.data
         io.core.exe(w).fresp.valid     := send_fresp
@@ -1540,10 +1585,16 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                 wb_forward_ld_addr(w),
                                 storegen.data, false.B, coreDataBytes)
 
-      io.core.exe(w).iresp.valid := (forward_uop.dst_rtype === RT_FIX) && data_ready && live
-      io.core.exe(w).fresp.valid := (forward_uop.dst_rtype === RT_FLT) && data_ready && live
-      io.core.exe(w).iresp.bits.uop  := forward_uop
-      io.core.exe(w).fresp.bits.uop  := forward_uop
+      // corefuzzing: STL forwarding cross-domain influencer
+      val fwd_uop_cf = WireInit(forward_uop)
+      when (data_ready && live && (forward_uop.cf_domain_id =/= stq_e.bits.uop.cf_domain_id)) {
+        fwd_uop_cf := addInfluencer(forward_uop, stq_e.bits.uop.cf_op_count_id, INFL_STL_FORWARD.U)
+      }
+
+      io.core.exe(w).iresp.valid := (fwd_uop_cf.dst_rtype === RT_FIX) && data_ready && live
+      io.core.exe(w).fresp.valid := (fwd_uop_cf.dst_rtype === RT_FLT) && data_ready && live
+      io.core.exe(w).iresp.bits.uop  := fwd_uop_cf
+      io.core.exe(w).fresp.bits.uop  := fwd_uop_cf
       io.core.exe(w).iresp.bits.data := loadgen.data
       io.core.exe(w).fresp.bits.data := loadgen.data
 

@@ -14,7 +14,9 @@ import boom.v3.common._
 import boom.v3.exu.{BrResolutionInfo, Exception, FuncUnitResp, CommitSignals}
 import boom.v3.util.{BoolToChar, AgePriorityEncoder, IsKilledByBranch, GetNewBrMask, WrapInc, IsOlder, UpdateBrMask}
 
-class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p) {
+class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
+  with freechips.rocketchip.util.CoreFuzzingConstants
+{
   require(!instruction)
   val io = IO(new Bundle {
     val req = Flipped(Vec(memWidth, Decoupled(new TLBReq(lgMaxSize))))
@@ -23,6 +25,9 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
     val sfence = Input(Valid(new SFenceReq))
     val ptw = new TLBPTWIO
     val kill = Input(Bool())
+    // corefuzzing: domain tracking
+    val req_domain          = Input(Vec(memWidth, UInt(1.W)))
+    val resp_domain_mismatch = Output(Vec(memWidth, Bool()))
   })
   io.ptw := DontCare
   io.resp := DontCare
@@ -135,6 +140,12 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   val r_sectored_hit_addr = Reg(UInt(log2Ceil(sectored_entries.size).W))
   val r_sectored_hit = Reg(Bool())
 
+  // corefuzzing: domain shadow arrays (parallel to TLB entry arrays)
+  val r_refill_domain        = RegInit(0.U(1.W))
+  val sectored_domain        = RegInit(VecInit(Seq.fill(sectored_entries.size)(0.U(1.W))))
+  val superpage_domain       = RegInit(VecInit(Seq.fill(superpage_entries.size)(0.U(1.W))))
+  val special_domain         = special_entry.map(_ => RegInit(0.U(1.W)))
+
   val priv = if (instruction) io.ptw.status.prv else io.ptw.status.dprv
   val priv_s = priv(0)
   val priv_uses_vm = priv <= PRV.S.U
@@ -197,15 +208,21 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
 
     when (special_entry.nonEmpty.B && !io.ptw.resp.bits.homogeneous) {
       special_entry.foreach(_.insert(r_refill_tag, io.ptw.resp.bits.level, newEntry))
+      // corefuzzing: write domain to special_domain
+      special_domain.foreach(_ := r_refill_domain)
     }.elsewhen (io.ptw.resp.bits.level < (pgLevels-1).U) {
       for ((e, i) <- superpage_entries.zipWithIndex) when (r_superpage_repl_addr === i.U) {
         e.insert(r_refill_tag, io.ptw.resp.bits.level, newEntry)
+        // corefuzzing: write domain to superpage_domain
+        superpage_domain(i) := r_refill_domain
       }
     }.otherwise {
       val waddr = Mux(r_sectored_hit, r_sectored_hit_addr, r_sectored_repl_addr)
       for ((e, i) <- sectored_entries.zipWithIndex) when (waddr === i.U) {
         when (!r_sectored_hit) { e.invalidate() }
         e.insert(r_refill_tag, 0.U, newEntry)
+        // corefuzzing: write domain to sectored_domain
+        sectored_domain(i) := r_refill_domain
       }
     }
   }
@@ -308,6 +325,12 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
     io.resp(w).paddr := Cat(ppn(w), io.req(w).bits.vaddr(pgIdxBits-1, 0))
     io.resp(w).size := io.req(w).bits.size
     io.resp(w).cmd := io.req(w).bits.cmd
+
+    // corefuzzing: domain mismatch output
+    // Build all_domain parallel to all_entries for hit lookup
+    val all_domain = VecInit(sectored_domain ++ superpage_domain ++ special_domain.toSeq)
+    val hit_domain = Mux1H(hitsVec(w), all_domain)
+    io.resp_domain_mismatch(w) := io.req(w).valid && tlb_hit(w) && (hit_domain =/= io.req_domain(w))
   }
 
   io.ptw.req.valid := state === s_request
@@ -320,6 +343,8 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
       when (io.req(w).fire && tlb_miss(w) && state === s_ready) {
         state := s_request
         r_refill_tag := vpn(w)
+        // corefuzzing: capture domain of the miss-causing uop
+        r_refill_domain := io.req_domain(w)
 
         r_superpage_repl_addr := replacementEntry(superpage_entries, superpage_plru.way)
         r_sectored_repl_addr  := replacementEntry(sectored_entries, sectored_plru.way)
