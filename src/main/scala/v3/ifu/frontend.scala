@@ -39,6 +39,8 @@ class FrontendResp(implicit p: Parameters) extends BoomBundle()(p) {
   // tsrc provides the prediction TO this packet
   val fsrc = UInt(BSRC_SZ.W)
   val tsrc = UInt(BSRC_SZ.W)
+  // corefuzzing: ICache line was last refilled by a different domain
+  val icache_domain_mismatch = Bool()
 }
 
 class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
@@ -246,6 +248,10 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
   val fsrc    = UInt(BSRC_SZ.W)
   // Source of the prediction to this bundle
   val tsrc    = UInt(BSRC_SZ.W)
+
+  // corefuzzing: domain mismatch flags for IFT influencer injection
+  val icache_domain_mismatch = Bool()  // ICache line last filled by different domain
+  val ras_domain_mismatch    = Bool()  // RAS return addr pushed by different domain
 }
 
 
@@ -298,10 +304,16 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
 
   // corefuzzing: gate to enable speculative prints in frontend modules
   val cf_debug_frontend_enable = Output(Bool())
+  // corefuzzing: enable [FLUSH] logging in fetch buffer (same bit as ROB flush logging)
+  val cf_debug_rob_enable      = Output(Bool())
 
   // for corefuzzing
   // Control signal from core to allow or block new fetches (quiesce)
   val allow_fetch       = Output(Bool())
+
+  // corefuzzing: attacker address range for fetch-domain computation in frontend
+  val cf_attacker_start_addr = Output(UInt(vaddrBitsExtended.W))
+  val cf_attacker_end_addr   = Output(UInt(vaddrBitsExtended.W))
 }
 
 /**
@@ -423,6 +435,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   icache.io.s1_paddr := s1_ppc
   icache.io.s1_kill  := tlb.io.resp.miss || f1_clear
+
+  // corefuzzing: compute fetch domain (attacker=1, victim=0) based on s0_vpc vs CSR range
+  val s0_fetch_is_attacker = (io.cpu.cf_attacker_start_addr =/= 0.U) &&
+    (s0_vpc >= io.cpu.cf_attacker_start_addr) && (s0_vpc < io.cpu.cf_attacker_end_addr)
+  val s1_fetch_domain = RegNext(s0_fetch_is_attacker)
+  icache.io.s1_domain_id := s1_fetch_domain
 
   val f1_mask = fetchMask(s1_vpc)
   val f1_redirects = (0 until fetchWidth) map { i =>
@@ -558,6 +576,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3.io.enq.bits.xcpt := s2_tlb_resp
   f3.io.enq.bits.fsrc := s2_fsrc
   f3.io.enq.bits.tsrc := s2_tsrc
+  // corefuzzing: carry icache domain mismatch through the f3 queue
+  f3.io.enq.bits.icache_domain_mismatch := icache.io.resp.bits.icache_domain_mismatch
 
   // RAS takes a cycle to read
   val ras_read_idx = RegInit(0.U(log2Ceil(nRasEntries).W))
@@ -801,6 +821,17 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_fetch_bundle.cfi_idx.bits  := PriorityEncoder(f3_redirects)
 
   f3_fetch_bundle.ras_top := ras.io.read_addr
+
+  // corefuzzing: compute fetch domain at f3 for RAS/ICache mismatch detection
+  val f3_fetch_is_attacker = (io.cpu.cf_attacker_start_addr =/= 0.U) &&
+    (f3_imemresp.pc >= io.cpu.cf_attacker_start_addr) &&
+    (f3_imemresp.pc < io.cpu.cf_attacker_end_addr)
+  f3_fetch_bundle.icache_domain_mismatch := f3_imemresp.icache_domain_mismatch
+  // RAS domain mismatch: ret pops an addr pushed by a different domain
+  f3_fetch_bundle.ras_domain_mismatch := (
+    f3_fetch_bundle.cfi_is_ret && f3_fetch_bundle.cfi_idx.valid &&
+    (ras.io.read_domain =/= f3_fetch_is_attacker)
+  )
   // Redirect earlier stages only if the later stage
   // can consume this packet
 
@@ -825,10 +856,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   )
 
 
-  ras.io.write_valid := false.B
-  ras.io.write_addr  := f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
+  ras.io.write_valid  := false.B
+  ras.io.write_addr   := f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
     f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U)
-  ras.io.write_idx   := WrapInc(f3_fetch_bundle.ghist.ras_idx, nRasEntries)
+  ras.io.write_idx    := WrapInc(f3_fetch_bundle.ghist.ras_idx, nRasEntries)
+  // corefuzzing: record domain of the call that pushes to RAS
+  ras.io.write_domain := f3_fetch_is_attacker
 
 
   val f3_correct_f1_ghist = s1_ghist =/= f3_predicted_ghist && enableGHistStallRepair.B
@@ -886,6 +919,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // corefuzzing
   // Wire frontend cf_debug gate into fetch buffer and FTQ
   fb.io.cf_debug_fetchbuf_enable := io.cpu.cf_debug_frontend_enable
+  fb.io.brupdate                 := io.cpu.brupdate
+  fb.io.cf_debug_rob_enable      := io.cpu.cf_debug_rob_enable
   ftq.io.cf_debug_ftq_enable := io.cpu.cf_debug_frontend_enable
 
   // When we mispredict, we need to repair

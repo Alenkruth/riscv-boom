@@ -60,6 +60,8 @@ class ICacheResp(val outer: ICache) extends Bundle
   val data = UInt((outer.icacheParams.fetchBytes*8).W)
   val replay = Bool()
   val ae = Bool()
+  // corefuzzing: set when the cache line was last filled by a different domain fetch
+  val icache_domain_mismatch = Bool()
 }
 
 /**
@@ -78,6 +80,9 @@ class ICacheBundle(val outer: ICache) extends BoomBundle()(outer.p)
 
   val resp = Valid(new ICacheResp(outer))
   val invalidate = Input(Bool())
+
+  // corefuzzing: domain of s1 fetch PC (1=attacker, 0=victim), for domain mismatch detection
+  val s1_domain_id = Input(Bool())
 
   val perf = Output(new Bundle {
     val acquire = Bool()
@@ -159,9 +164,16 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     vb_array := vb_array.bitSet(Cat(repl_way, refill_idx), refill_done && !invalidated)
   }
 
+  // corefuzzing: per-set domain shadow — records whether the last refill into this set was
+  // triggered by an attacker-domain (1) or victim-domain (0) fetch.
+  val icache_set_domain = RegInit(VecInit(Seq.fill(nSets)(false.B)))
+  val refill_domain_reg = RegEnable(io.s1_domain_id, s1_valid && !(refill_valid || s2_miss))
+  when (refill_done) { icache_set_domain(refill_idx) := refill_domain_reg }
+
   when (io.invalidate) {
     vb_array := 0.U
     invalidated := true.B
+    icache_set_domain := VecInit(Seq.fill(nSets)(false.B))
   }
 
   val s2_dout   = Wire(Vec(nWays, UInt(wordBits.W)))
@@ -175,6 +187,12 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     s1_tag_hit(i) := s1_vb && tag === s1_tag
   }
   assert(PopCount(s1_tag_hit) <= 1.U || !s1_valid)
+
+  // corefuzzing: check if s1 hit set was last filled by a different domain
+  val s1_hit_idx     = io.s1_paddr(untagBits-1, blockOffBits)
+  val s1_set_domain  = icache_set_domain(s1_hit_idx)
+  val s1_domain_mismatch = s1_hit && (s1_set_domain =/= io.s1_domain_id)
+  val s2_domain_mismatch = RegNext(s1_domain_mismatch && !io.s1_kill)
 
   val ramDepth = if (refillsToOneBank && nBanks == 2) {
     nSets * refillCycles / 2
@@ -319,6 +337,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   io.resp.bits.ae := DontCare
   io.resp.bits.replay := DontCare
   io.resp.bits.data := s2_data
+  io.resp.bits.icache_domain_mismatch := s2_domain_mismatch
   io.resp.valid := s2_valid && s2_hit
 
   tl_out.a.valid := s2_miss && !refill_valid && !io.s2_kill

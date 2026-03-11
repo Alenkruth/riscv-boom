@@ -23,7 +23,9 @@ import freechips.rocketchip.rocket.{MStatus, BP, BreakpointUnit}
 import freechips.rocketchip.util._
 
 import boom.v3.common._
-import boom.v3.util.{BoolToChar, MaskUpper, Sext, SpeculativePrintf, appendModuleTag}
+import boom.v3.exu.{BrUpdateInfo}
+import boom.v3.util.{BoolToChar, MaskUpper, Sext, SpeculativePrintf, appendModuleTag, addInfluencer}
+import freechips.rocketchip.util.CoreFuzzingConstants
 // imports for corefuzzing
 
 // This file has been modified to implement a CSR that modifies 
@@ -54,6 +56,9 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     val enq = Flipped(Decoupled(new FetchBundle()))
     val deq = new DecoupledIO(new FetchBufferResp())
     val cf_debug_fetchbuf_enable = Input(Bool())
+    // corefuzzing: branch resolution info for [FLUSH] logging on clear
+    val brupdate            = Input(new BrUpdateInfo())
+    val cf_debug_rob_enable = Input(Bool())
 
     // Was the pipeline redirected? Clear/reset the fetchbuffer.
     val clear = Input(Bool())
@@ -290,7 +295,45 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     in_uops(i).cf_secret_propagation   := false.B
     in_uops(i).cf_secret_transmission  := false.B
     in_uops(i).cf_single_step          := false.B
-    in_uops(i).cf_influencer_uop_count := 0.U
+    in_uops(i).cf_influencer_list      := 0.U.asTypeOf(in_uops(i).cf_influencer_list)
+    in_uops(i).cf_infl_overflow        := false.B
+    in_uops(i).cf_src_tainted          := false.B
+    in_uops(i).cf_taint_producer_op    := 0.U
+  }
+
+  // corefuzzing: inject ICache and RAS domain mismatch influencers for all fetch-packet uops.
+  // Use explicit 0-valued base uop for influencer inputs to avoid circular Wire dependencies.
+  for (i <- 0 until fetchWidth) {
+    // base_uop copies in_uops(i) but overrides influencer fields with known-zero values,
+    // breaking any feedback from later assignments back into addInfluencer.
+    val base_uop = Wire(in_uops(i).cloneType)
+    base_uop := in_uops(i)
+    base_uop.cf_influencer_list := 0.U.asTypeOf(in_uops(i).cf_influencer_list)
+    base_uop.cf_infl_overflow   := false.B
+
+    // Chain: add ICACHE first, then RAS on top
+    val post_icache = addInfluencer(base_uop, 0.U, INFL_ICACHE_STATE.U)
+
+    val mid = Wire(in_uops(i).cloneType)
+    mid := base_uop
+    when (io.enq.bits.icache_domain_mismatch) {
+      mid.cf_influencer_list := post_icache.cf_influencer_list
+      mid.cf_infl_overflow   := post_icache.cf_infl_overflow
+    }
+
+    val post_ras = addInfluencer(mid, 0.U, INFL_RAS_STATE.U)
+
+    val final_list = Wire(in_uops(i).cf_influencer_list.cloneType)
+    val final_ovf  = Wire(Bool())
+    final_list := mid.cf_influencer_list
+    final_ovf  := mid.cf_infl_overflow
+    when (io.enq.bits.ras_domain_mismatch) {
+      final_list := post_ras.cf_influencer_list
+      final_ovf  := post_ras.cf_infl_overflow
+    }
+
+    in_uops(i).cf_influencer_list := final_list
+    in_uops(i).cf_infl_overflow   := final_ovf
   }
 
   // Step 2. Generate one-hot write indices.
@@ -395,14 +438,32 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   }
 
   when (io.clear) {
-    // Before clearing, non-destructively dump all current entries in RAM
-    // that are plausibly valid. We iterate through every entry and print
-    // its PC + inst using the common speculative print helper.
+    // corefuzzing: [FLUSH] logging for fetch-buffer entries discarded on pipeline redirect.
+    // When io.clear fires due to branch mispredict (brupdate.b2.mispredict), add
+    // INFL_PIPELINE_FLUSH to any cross-domain entry.
     for (i <- 0 until numEntries) {
-  // Modified: include MicroOp `ram(i)` to print cf_* metadata when enabled
-  // Old call (kept as comment):
-  // SpeculativePrintf.dump("FETCHBUF", Sext.apply(ram(i).debug_pc(vaddrBits-1,0), xLen), ram(i).debug_inst, ram(i).is_rvc, io.cf_debug_fetchbuf_enable)
-  SpeculativePrintf.dump("FETCHBUF", Sext.apply(ram(i).debug_pc(vaddrBits-1,0), xLen), ram(i).debug_inst, ram(i).is_rvc, io.cf_debug_fetchbuf_enable, ram(i))
+      when (io.cf_debug_rob_enable) {
+        val fb_fu_base = ram(i)
+        val fb_fu = WireInit(fb_fu_base)
+        when (io.brupdate.b2.mispredict &&
+              io.brupdate.b2.uop.cf_domain_id =/= fb_fu_base.cf_domain_id) {
+          fb_fu := addInfluencer(fb_fu_base,
+            io.brupdate.b2.uop.cf_op_count_id, INFL_PIPELINE_FLUSH.U)
+        }
+        printf("[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d) FU=0x%x OVF=%d INFL=[",
+          Sext.apply(fb_fu.debug_pc(vaddrBits-1,0), xLen), fb_fu.debug_inst,
+          fb_fu.cf_domain_id, fb_fu.cf_speculated, fb_fu.cf_attacker_influence,
+          fb_fu.cf_secret_access, fb_fu.cf_secret_propagation, fb_fu.cf_secret_transmission,
+          fb_fu.cf_op_count_id, fb_fu.cf_spec_branch_is_atk, fb_fu.cf_spec_branch_op_id,
+          fb_fu.cf_fu_bitmap, fb_fu.cf_infl_overflow)
+        for (k <- 0 until numInfluencerSlotsCF) {
+          when (fb_fu.cf_influencer_list(k).valid) {
+            printf("{oc=%d,ty=%d}", fb_fu.cf_influencer_list(k).op_count,
+              fb_fu.cf_influencer_list(k).infl_type)
+          }
+        }
+        printf("]\n")
+      }
     }
 
     head := 1.U
