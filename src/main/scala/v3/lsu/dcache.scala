@@ -20,7 +20,7 @@ import boom.v3.common._
 import boom.v3.exu.BrUpdateInfo
 import boom.v3.util.{IsKilledByBranch, GetNewBrMask, BranchKillableQueue, IsOlder, UpdateBrMask, AgePriorityEncoder, WrapInc, Transpose} 
 
-import boom.v3.util.{BoomCoreStringPrefix, appendModuleTag}
+import boom.v3.util.{BoomCoreStringPrefix, appendModuleTag, addInfluencer}
 
 // import test
 // import freechips.rocketchip.rocket.constants.CoreFuzzingConstants
@@ -998,6 +998,10 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   }
   // Mux between cache responses and uncache responses
   val cache_resp   = Wire(Vec(memWidth, Valid(new BoomDCacheResp)))
+  // corefuzzing: per-set domain table — tracks which domain last brought in a line per cache set
+  // Also tracks op_count of the filling instruction so it can be used as the influencer op_count.
+  val dcache_set_domain    = RegInit(VecInit(Seq.fill(nSets)(0.U(1.W))))
+  val dcache_set_op_count  = RegInit(VecInit(Seq.fill(nSets)(0.U(uopIDCounterWidthCF.W))))
   for (w <- 0 until memWidth) {
     cache_resp(w).valid         := s2_valid(w) && s2_send_resp(w)
     // corefuzzing
@@ -1021,15 +1025,37 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     // .otherwise {
     //   cache_uop_tagged := s2_req(w).uop
     // }
-    // corefuzzing: stamp dcacheTagCF bit and detect secret transmission
-    cache_resp(w).bits.uop              := s2_req(w).uop
-    cache_resp(w).bits.uop.cf_fu_bitmap := s2_req(w).uop.cf_fu_bitmap | (1.U << dcacheTagCF.U)
-    // A secret-access uop that misses the cache updates cache state — mark as secret_transmission
+    // corefuzzing: build the response uop in stages to avoid combinational cycles.
+    // Stage 1: start from s2_req uop, apply bitmap + secret_transmission
+    val uop_resp_base = WireInit(s2_req(w).uop)
+    uop_resp_base.cf_fu_bitmap := s2_req(w).uop.cf_fu_bitmap | (1.U << dcacheTagCF.U)
     when (s2_req(w).uop.cf_secret_access && !s2_hit(w)) {
-      cache_resp(w).bits.uop.cf_secret_transmission := true.B
+      uop_resp_base.cf_secret_transmission := true.B
     }
+    // Stage 2: conditionally apply INFL_CACHE_EVICTION for cross-domain hit.
+    // Only fires when a VICTIM (domain=0) hits a line last filled by ATTACKER (domain=1).
+    val uop_resp_final = WireInit(uop_resp_base)
+    when (s2_valid(w) && s2_hit(w) && s2_type === t_lsu && !s2_nack(w)) {
+      val hit_set    = s2_req(w).addr(untagBits-1, blockOffBits)
+      val line_dom   = dcache_set_domain(hit_set)
+      val line_oc    = dcache_set_op_count(hit_set)
+      val uop_dom    = s2_req(w).uop.cf_domain_id
+      // Victim (domain=0) hitting a line last filled by attacker (domain=1)
+      when (uop_dom === 0.U && line_dom === 1.U) {
+        uop_resp_final := addInfluencer(uop_resp_base, line_oc, INFL_CACHE_EVICTION.U)
+      }
+    }
+    cache_resp(w).bits.uop      := uop_resp_final
     cache_resp(w).bits.data     := loadgen(w).data | s2_sc_fail
     cache_resp(w).bits.is_hella := s2_req(w).is_hella
+
+    // At s2 LSU miss: record domain and op_count of the missing uop to the set it targets.
+    // This is used to identify the filling instruction when a victim later hits the line.
+    when (s2_valid(w) && !s2_hit(w) && s2_type === t_lsu && mshrs.io.req(w).fire) {
+      val miss_set = s2_req(w).addr(untagBits-1, blockOffBits)
+      dcache_set_domain(miss_set)   := s2_req(w).uop.cf_domain_id
+      dcache_set_op_count(miss_set) := s2_req(w).uop.cf_op_count_id
+    }
   }
 
   val uncache_resp = Wire(Valid(new BoomDCacheResp))
