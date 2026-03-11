@@ -296,7 +296,12 @@ trait ScalarOpConstants
     uop.cf_op_count_id          := 0.U
     uop.cf_single_step          := false.B
     uop.cf_fu_bitmap            := 0.U
-    uop.cf_influencer_uop_count := 0.U
+    uop.cf_influencer_list      := 0.U.asTypeOf(uop.cf_influencer_list)
+    uop.cf_infl_overflow        := false.B
+    uop.cf_src_tainted          := false.B
+    uop.cf_taint_producer_op    := 0.U
+    uop.cf_spec_branch_is_atk   := false.B
+    uop.cf_spec_branch_op_id    := 0.U
     uop
   }
 

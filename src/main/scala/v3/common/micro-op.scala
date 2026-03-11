@@ -30,6 +30,16 @@ abstract trait HasBoomUOP extends BoomBundle
 }
 
 /**
+ * One entry in the per-uop influencer list (IFT Phase 2).
+ * Records the op_count and influence type of a single cross-domain influence event.
+ */
+class InfluencerEntry(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
+  val valid     = Bool()
+  val op_count  = UInt(uopIDCounterWidthCF.W)  // 8 bits: op_count_id of the influencing uop
+  val infl_type = UInt(inflTypeWidthCF.W)       // 5 bits: influence type (INFL_*)
+}
+
+/**
  * MicroOp passing through the pipeline
  */
 class MicroOp(implicit p: Parameters) extends BoomBundle
@@ -163,8 +173,23 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
 
   // Bitmap of all pipeline modules this uop has visited (one bit per module, see CoreFuzzingConstants)
   val cf_fu_bitmap            = UInt(numModules.W)
-  // op_count_id of the secret uop that caused cf_attacker_influence to be set on this uop
-  val cf_influencer_uop_count = UInt(uopIDCounterWidthCF.W)
+
+  // IFT Phase 2: multi-slot influencer list (replaces cf_influencer_uop_count)
+  // Records up to numInfluencerSlotsCF cross-domain influence events
+  val cf_influencer_list      = Vec(numInfluencerSlotsCF, new InfluencerEntry)
+  val cf_infl_overflow        = Bool()   // set when >numInfluencerSlotsCF influencers occurred
+
+  // IFT Phase 2: register taint (set in rename; used at dispatch in core.scala)
+  val cf_src_tainted          = Bool()                       // any source preg tainted by attacker
+  val cf_taint_producer_op    = UInt(uopIDCounterWidthCF.W)  // op_count_id of the attacker writer
+
+  // IFT Phase 2: speculative-branch domain tracking (set at dispatch in core.scala)
+  // cf_spec_branch_is_atk: true if any outstanding branch in br_mask was from attacker domain.
+  //   Enables detecting victim ops fetched/executed under an attacker speculative branch.
+  // cf_spec_branch_op_id: cf_op_count_id of the first (lowest br_tag index) attacker-domain
+  //   branch under which this uop is speculated.  Zero when cf_spec_branch_is_atk=false.
+  val cf_spec_branch_is_atk   = Bool()
+  val cf_spec_branch_op_id    = UInt(uopIDCounterWidthCF.W)
 
   // Do we allocate a branch tag for this?
   // SFB branches don't get a mask, they get a predicate bit

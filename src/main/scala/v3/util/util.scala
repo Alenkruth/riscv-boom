@@ -812,6 +812,33 @@ object appendModuleTag {
 //   }
 // }
 
+// corefuzzing — IFT Phase 2
+/**
+ * Append one influencer entry to a uop's cf_influencer_list.
+ * Finds the first empty slot; if all full, sets cf_infl_overflow instead.
+ * Returns a modified Wire copy of the uop; the original is unchanged.
+ */
+object addInfluencer {
+  def apply(uop: boom.v3.common.MicroOp, op_count: UInt, infl_type: UInt)
+           (implicit p: Parameters): boom.v3.common.MicroOp = {
+    val out = WireInit(uop)
+    val slots = uop.cf_influencer_list
+    val empties = VecInit(slots.map(!_.valid))
+    val has_empty = empties.reduce(_ || _)
+    val first_empty = PriorityEncoder(empties)
+    when (!uop.cf_infl_overflow) {
+      when (has_empty) {
+        out.cf_influencer_list(first_empty).valid     := true.B
+        out.cf_influencer_list(first_empty).op_count  := op_count
+        out.cf_influencer_list(first_empty).infl_type := infl_type
+      } .otherwise {
+        out.cf_infl_overflow := true.B
+      }
+    }
+    out
+  }
+}
+
 // corefuzzing
 /**
  * Centralized helper to print speculative MicroOps in the same
