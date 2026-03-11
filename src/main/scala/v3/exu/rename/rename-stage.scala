@@ -131,15 +131,48 @@ abstract class AbstractRenameStage(
 
     next_uop := r_uop
 
+    // corefuzzing: [FLUSH] logging for ren2 uops killed by branch mispredict (happens every cycle
+    // when IsKilledByBranch fires, independent of io.kill which only fires on pipeline flush).
+    when (r_valid && IsKilledByBranch(io.brupdate, r_uop.br_mask) && io.cf_debug_rename_enable) {
+      val ren_fu_base = r_uop
+      val ren_fu = WireInit(ren_fu_base)
+      when (io.brupdate.b2.mispredict &&
+            io.brupdate.b2.uop.cf_domain_id =/= ren_fu_base.cf_domain_id) {
+        ren_fu := addInfluencer(ren_fu_base,
+          io.brupdate.b2.uop.cf_op_count_id, INFL_PIPELINE_FLUSH.U)
+      }
+      printf("[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d) FU=0x%x OVF=%d INFL=[",
+        Sext.apply(ren_fu.debug_pc(vaddrBits-1,0), xLen), ren_fu.debug_inst,
+        ren_fu.cf_domain_id, ren_fu.cf_speculated, ren_fu.cf_attacker_influence,
+        ren_fu.cf_secret_access, ren_fu.cf_secret_propagation, ren_fu.cf_secret_transmission,
+        ren_fu.cf_op_count_id, ren_fu.cf_spec_branch_is_atk, ren_fu.cf_spec_branch_op_id,
+        ren_fu.cf_fu_bitmap, ren_fu.cf_infl_overflow)
+      for (k <- 0 until numInfluencerSlotsCF) {
+        when (ren_fu.cf_influencer_list(k).valid) {
+          printf("{oc=%d,ty=%d}", ren_fu.cf_influencer_list(k).op_count,
+            ren_fu.cf_influencer_list(k).infl_type)
+        }
+      }
+      printf("]\n")
+    }
+
     when (io.kill) {
-      // corefuzzing
-      // Non-destructive speculative logging: if we are killing a valid ren2 uop, print it
-      when (r_valid) {
-        // Modified: use new SpeculativePrintf.dump overload to include the MicroOp (r_uop)
-        // Old call (kept for traceability):
-        // SpeculativePrintf.dump("RENAME", Sext.apply(r_uop.debug_pc(vaddrBits-1,0), xLen), r_uop.debug_inst, r_uop.is_rvc, io.cf_debug_rename_enable)
-        SpeculativePrintf.dump("RENAME", Sext.apply(r_uop.debug_pc(vaddrBits-1,0), xLen), r_uop.debug_inst, r_uop.is_rvc, io.cf_debug_rename_enable, r_uop)
+      // corefuzzing: [FLUSH] logging for ren2 uops killed by pipeline flush (exception/ROB flush).
+      when (r_valid && io.cf_debug_rename_enable) {
+        printf("[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d) FU=0x%x OVF=%d INFL=[",
+          Sext.apply(r_uop.debug_pc(vaddrBits-1,0), xLen), r_uop.debug_inst,
+          r_uop.cf_domain_id, r_uop.cf_speculated, r_uop.cf_attacker_influence,
+          r_uop.cf_secret_access, r_uop.cf_secret_propagation, r_uop.cf_secret_transmission,
+          r_uop.cf_op_count_id, r_uop.cf_spec_branch_is_atk, r_uop.cf_spec_branch_op_id,
+          r_uop.cf_fu_bitmap, r_uop.cf_infl_overflow)
+        for (k <- 0 until numInfluencerSlotsCF) {
+          when (r_uop.cf_influencer_list(k).valid) {
+            printf("{oc=%d,ty=%d}", r_uop.cf_influencer_list(k).op_count,
+              r_uop.cf_influencer_list(k).infl_type)
           }
+        }
+        printf("]\n")
+      }
       r_valid := false.B
     } .elsewhen (ren2_ready) {
       r_valid := ren1_fire(w)
@@ -364,6 +397,69 @@ class RenameStage(
     val valid = ren2_valids(w)
     assert (!(valid && busy.prs1_busy && rtype === RT_FIX && uop.lrs1 === 0.U), "[rename] x0 is busy??")
     assert (!(valid && busy.prs2_busy && rtype === RT_FIX && uop.lrs2 === 0.U), "[rename] x0 is busy??")
+  }
+
+  //-------------------------------------------------------------
+  // IFT Phase 2: Register Taint Table
+  // taint_table(preg) = 1: last writer was attacker domain (domain=1)
+  // producer_table(preg): op_count_id of that attacker writer
+  // taint_snaps: branch snapshots for rollback on misprediction
+
+  val taint_table    = RegInit(VecInit(Seq.fill(numPhysRegs)(false.B)))
+  val producer_table = Reg(Vec(numPhysRegs, UInt(uopIDCounterWidthCF.W)))
+  val taint_snaps    = Reg(Vec(maxBrCount, Vec(numPhysRegs, Bool())))
+
+  // -- Read taint for each ren2 uop's source physical registers --
+  for (w <- 0 until plWidth) {
+    val prs1_t = taint_table(ren2_uops(w).prs1)
+    val prs2_t = taint_table(ren2_uops(w).prs2)
+    val prs3_t = if (float) taint_table(ren2_uops(w).prs3) else false.B
+    val any_tainted = (prs1_t && (ren2_uops(w).lrs1_rtype === rtype)) ||
+                      (prs2_t && (ren2_uops(w).lrs2_rtype === rtype)) ||
+                      (prs3_t.asBool && ren2_uops(w).frs3_en)
+    ren2_uops(w).cf_src_tainted := any_tainted
+    ren2_uops(w).cf_taint_producer_op := MuxCase(0.U, Seq(
+      (prs1_t && (ren2_uops(w).lrs1_rtype === rtype)) -> producer_table(ren2_uops(w).prs1),
+      (prs2_t && (ren2_uops(w).lrs2_rtype === rtype)) -> producer_table(ren2_uops(w).prs2)
+    ) ++ (if (float) Seq((prs3_t.asBool && ren2_uops(w).frs3_en) -> producer_table(ren2_uops(w).prs3)) else Nil))
+  }
+
+  // -- Write taint at dispatch (ren2_fire = io.dis_fire) --
+  for (w <- 0 until plWidth) {
+    when (ren2_fire(w) && ren2_valids(w) && (ren2_uops(w).dst_rtype === rtype)) {
+      val should_taint = ren2_uops(w).cf_domain_id === 1.U || ren2_uops(w).cf_src_tainted
+      taint_table(ren2_uops(w).pdst)    := should_taint
+      producer_table(ren2_uops(w).pdst) := ren2_uops(w).cf_op_count_id
+    }
+  }
+
+  // -- Clear taint at commit (stale physical register freed) --
+  for (w <- 0 until plWidth) {
+    when (io.com_valids(w) && !io.rollback) {
+      taint_table(io.com_uops(w).stale_pdst) := false.B
+    }
+  }
+
+  // -- Branch snapshot: capture taint state after this dispatch group's allocations --
+  // Build post-dispatch taint state combinationally (chain-of-wires)
+  var taint_after_dispatch: Vec[Bool] = WireInit(taint_table)
+  for (w <- 0 until plWidth) {
+    val step_taint = WireInit(taint_after_dispatch)
+    when (ren2_fire(w) && ren2_valids(w) && (ren2_uops(w).dst_rtype === rtype)) {
+      step_taint(ren2_uops(w).pdst) :=
+        ren2_uops(w).cf_domain_id === 1.U || ren2_uops(w).cf_src_tainted
+    }
+    taint_after_dispatch = step_taint
+  }
+  for (w <- 0 until plWidth) {
+    when (ren2_fire(w) && ren2_uops(w).allocate_brtag) {
+      taint_snaps(ren2_uops(w).br_tag) := taint_after_dispatch
+    }
+  }
+
+  // -- Restore on branch mispredict (highest priority: overrides element writes above) --
+  when (io.brupdate.b2.mispredict) {
+    taint_table := taint_snaps(io.brupdate.b2.uop.br_tag)
   }
 
   //-------------------------------------------------------------

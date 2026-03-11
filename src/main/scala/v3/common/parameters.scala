@@ -274,7 +274,7 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
       1 << 3 | // core log is enabled at init
       1 << 4 | // rob log is enabled at init
       0 << 5 | // bpd log is disabled at init
-      0 << 6 // frontend logs are disabled at init
+      0 << 6   // frontend logs are disabled at init
     )
     Some(CustomCSR(debugCSRIdCF, mask, Some(init)))
   }

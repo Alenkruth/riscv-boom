@@ -272,8 +272,9 @@ abstract class PipelinedFunctionalUnit(
         r_uops(0).cf_fu_bitmap := io.req.bits.uop.cf_fu_bitmap | newBit
         // If this is an attacker instruction and a secret instruction occupies stage 0, record influence
         when (io.req.bits.uop.cf_domain_id === 1.U && secret_in_stage(0)) {
-          r_uops(0).cf_attacker_influence   := true.B
-          r_uops(0).cf_influencer_uop_count := secret_uopcount_stage(0)
+          val atk0 = WireInit(r_uops(0))
+          atk0.cf_attacker_influence := true.B
+          r_uops(0) := addInfluencer(atk0, secret_uopcount_stage(0), INFL_ISSUE_CONTENTION.U)
         }
       }
       // Update stage-0 secret tracking for next cycle
@@ -297,8 +298,9 @@ abstract class PipelinedFunctionalUnit(
       // corefuzzing: propagate secret tracking and detect coexistence at intermediate stages
       val alive_i = r_valids(i-1) && !IsKilledByBranch(io.brupdate, r_uops(i-1)) && !io.req.bits.kill
       when (alive_i && r_uops(i-1).cf_domain_id === 1.U && secret_in_stage(i)) {
-        r_uops(i).cf_attacker_influence   := true.B
-        r_uops(i).cf_influencer_uop_count := secret_uopcount_stage(i)
+        val atk_i = WireInit(r_uops(i))
+        atk_i.cf_attacker_influence := true.B
+        r_uops(i) := addInfluencer(atk_i, secret_uopcount_stage(i), INFL_ISSUE_CONTENTION.U)
       }
       secret_in_stage(i)       := alive_i && (r_uops(i-1).cf_domain_id === 0.U)
       secret_uopcount_stage(i) := r_uops(i-1).cf_op_count_id

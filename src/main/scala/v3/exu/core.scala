@@ -328,6 +328,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // corefuzizng// corefuzizng// corefuzizng// corefuzizng
   // Wire cf_debug enables into frontend and core modules
   io.ifu.cf_debug_frontend_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_frontend_enable
+  io.ifu.cf_debug_rob_enable      := custom_csrs.cf_debug_rob_enable && custom_csrs.cf_debug_enable
+  // corefuzzing: attacker range for ICache/RAS domain tracking in frontend
+  io.ifu.cf_attacker_start_addr   := custom_csrs.cf_attacker_start_addr
+  io.ifu.cf_attacker_end_addr     := custom_csrs.cf_attacker_end_addr
 
   // Propagate core-level debug enables to rename and issue units
   rename_stage.io.cf_debug_rename_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable
@@ -351,39 +355,45 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val fetch_buffer_empty = !io.ifu.fetchpacket.valid
   val decode_stage_empty = !dec_valids.reduce(_||_)
   val pipeline_drained_strict = rob.io.empty && io.lsu.queues_empty && io.lsu.no_pending_mem && fetch_buffer_empty && decode_stage_empty
-  
-  // Track when we've fetched a cache line in single-step mode
-  val single_step_fetch_pending = RegInit(false.B)
-  when (cf_quiesce_core && !pipeline_drained_strict && fetch_buffer_empty && io.ifu.fetchpacket.valid) {
-    single_step_fetch_pending := true.B
-  }.elsewhen (!cf_quiesce_core || pipeline_drained_strict) {
-    single_step_fetch_pending := false.B
-  }
-  
-  // Only allow fetch when:
-  // 1. Not in quiesce mode, OR
-  // 2. In quiesce mode AND pipeline is drained AND we haven't fetched a pending cache line
-  val allow_fetch = !cf_quiesce_core || (cf_quiesce_core && pipeline_drained_strict && !single_step_fetch_pending)
 
-  // Connect quiesce control from CSR
-  // cf_quiesce_core := customCSRs.cf_chill
-  
+  // 4-state FSM for quiesce (cf_chill) control
+  // QS_IDLE:      normal operation; fetch ungated
+  // QS_DRAINING:  cf_chill=1; block fetch; wait for pipeline to drain
+  // QS_FETCH:     pipeline drained; pulse allow_fetch for exactly ONE cycle
+  // QS_EXECUTING: packet entered pipeline; block fetch; wait for full drain
+  val QS_IDLE      = 0.U(2.W)
+  val QS_DRAINING  = 1.U(2.W)
+  val QS_FETCH     = 2.U(2.W)
+  val QS_EXECUTING = 3.U(2.W)
+  val qs_state = RegInit(QS_IDLE)
+
+  switch (qs_state) {
+    is (QS_IDLE) {
+      when (cf_quiesce_core) { qs_state := QS_DRAINING }
+    }
+    is (QS_DRAINING) {
+      when (!cf_quiesce_core)              { qs_state := QS_IDLE      }
+      .elsewhen (pipeline_drained_strict)  { qs_state := QS_FETCH     }
+    }
+    is (QS_FETCH) {
+      // Unconditionally advance; fetch packet now in flight
+      qs_state := QS_EXECUTING
+    }
+    is (QS_EXECUTING) {
+      when (!cf_quiesce_core)              { qs_state := QS_IDLE      }
+      .elsewhen (pipeline_drained_strict)  { qs_state := QS_FETCH     }
+    }
+  }
+
   // for corefuzzing, quiescing the pipeline to enable reconfiguration
   cf_quiesce_core := custom_csrs.cf_chill
 
   // Determine if pipeline is drained by checking ROB empty and LSU status
   pipeline_drained := pipeline_drained_strict
 
-  // Allow fetch only when not quiescing or when pipeline drained and stepping
+  // Allow fetch only in IDLE (normal) or during the one-cycle FETCH pulse
+  val allow_fetch = !cf_quiesce_core || (qs_state === QS_FETCH)
   io.ifu.allow_fetch := allow_fetch
-
-  // Debug prints
-  // when (cf_quiesce_core && !pipeline_drained) {
-  //   printf("[QMODE] Quiescing active - frontend stalled, draining pipeline\n") 
-  // }
-  // when (cf_quiesce_core && pipeline_drained) {
-  //   printf("[QMODE] Pipeline drained - entering single-step mode\n")
-  // } 
 
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
   val icache_blocked = false.B 
@@ -634,6 +644,13 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   //  decode_units(w).io.wq.uop := dec_fbundle.uops(w).bits
     uop_with_step(w) := dec_fbundle.uops(w).bits
     uop_with_step(w).cf_single_step := single_step_active
+    // corefuzzing: set cf_domain_id early so it propagates through rename pipeline registers
+    // (needed for taint table writes in rename-stage.scala at ren2/dispatch time)
+    val dec_pc = dec_fbundle.uops(w).bits.debug_pc
+    val dec_in_attacker_range = (dec_pc >= custom_csrs.cf_attacker_start_addr) &&
+                                (dec_pc <= custom_csrs.cf_attacker_end_addr) &&
+                                (custom_csrs.cf_attacker_end_addr =/= custom_csrs.cf_attacker_start_addr)
+    uop_with_step(w).cf_domain_id := dec_in_attacker_range.asUInt
     decode_units(w).io.enq.uop         := uop_with_step(w)
     decode_units(w).io.status          := csr.io.status
     decode_units(w).io.csr_decode      <> csr.io.decode(w)
@@ -642,17 +659,31 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
     dec_uops(w) := decode_units(w).io.deq.uop
   }
-  // corefuzzing
-  // Non-destructive speculative logging for Decode stage: if a decoded uop
-  // will be killed by the current branch update, print it using the
-  // canonical commit-log format prefixed with [SPECULATIVE][DECODE].
-    for (w <- 0 until coreWidth) {
-    when (dec_valids(w) && IsKilledByBranch(brupdate, dec_uops(w))) {
-      // Gate decode speculative prints with global debug enable + core enable
-  // Modified: use the new SpeculativePrintf.dump overload that accepts a MicroOp
-  // Old call (kept as comment for traceability):
-  // SpeculativePrintf.dump("DECODE", Sext.apply(dec_uops(w).debug_pc(vaddrBits-1,0), xLen), dec_uops(w).debug_inst, dec_uops(w).is_rvc, custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable)
-  SpeculativePrintf.dump("DECODE", Sext.apply(dec_uops(w).debug_pc(vaddrBits-1,0), xLen), dec_uops(w).debug_inst, dec_uops(w).is_rvc, custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable, dec_uops(w))
+  // corefuzzing: [FLUSH] logging for decode-stage uops killed by branch mispredict.
+  // Uses the same format as ROB's [FLUSH] log; gated by cf_debug_rob_enable.
+  for (w <- 0 until coreWidth) {
+    when (dec_valids(w) && IsKilledByBranch(brupdate, dec_uops(w)) &&
+          custom_csrs.cf_debug_rob_enable && custom_csrs.cf_debug_enable) {
+      val dec_fu_base = dec_uops(w)
+      val dec_fu = WireInit(dec_fu_base)
+      when (brupdate.b2.mispredict &&
+            brupdate.b2.uop.cf_domain_id =/= dec_fu_base.cf_domain_id) {
+        dec_fu := addInfluencer(dec_fu_base,
+          brupdate.b2.uop.cf_op_count_id, INFL_PIPELINE_FLUSH.U)
+      }
+      printf("[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d) FU=0x%x OVF=%d INFL=[",
+        Sext(dec_fu.debug_pc(vaddrBits-1,0), xLen), dec_fu.debug_inst,
+        dec_fu.cf_domain_id, dec_fu.cf_speculated, dec_fu.cf_attacker_influence,
+        dec_fu.cf_secret_access, dec_fu.cf_secret_propagation, dec_fu.cf_secret_transmission,
+        dec_fu.cf_op_count_id, dec_fu.cf_spec_branch_is_atk, dec_fu.cf_spec_branch_op_id,
+        dec_fu.cf_fu_bitmap, dec_fu.cf_infl_overflow)
+      for (k <- 0 until numInfluencerSlotsCF) {
+        when (dec_fu.cf_influencer_list(k).valid) {
+          printf("{oc=%d,ty=%d}", dec_fu.cf_influencer_list(k).op_count,
+            dec_fu.cf_influencer_list(k).infl_type)
+        }
+      }
+      printf("]\n")
     }
   }
 
@@ -745,6 +776,25 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   }
 
   branch_mask_full := dec_brmask_logic.io.is_full
+
+  // corefuzzing: branch-domain tracking table.
+  // When a branch/JALR is decoded and allocated a br_tag, record:
+  //   spec_branch_atk_table(br_tag) = 1 if that branch is in attacker domain
+  //   spec_branch_op_table(br_tag)  = cf_op_count_id of that branch
+  // This allows computing, at dispatch, whether a uop is speculated under an
+  // attacker-domain branch (cf_spec_branch_is_atk / cf_spec_branch_op_id).
+  // No rollback needed: stale entries are harmless because freed tags will be
+  // overwritten before they appear in any future uop's br_mask.
+  val spec_branch_atk_table = Reg(Vec(maxBrCount, Bool()))
+  val spec_branch_op_table  = Reg(Vec(maxBrCount, UInt(uopIDCounterWidthCF.W)))
+
+  for (w <- 0 until coreWidth) {
+    when (dec_fire(w) && dec_uops(w).allocate_brtag) {
+      val tag = dec_brmask_logic.io.br_tag(w)
+      spec_branch_atk_table(tag) := dec_uops(w).cf_domain_id =/= 0.U
+      spec_branch_op_table(tag)  := dec_uops(w).cf_op_count_id
+    }
+  }
 
   //-------------------------------------------------------------
   //-------------------------------------------------------------
@@ -874,6 +924,61 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
                             (custom_csrs.cf_attacker_end_addr =/= custom_csrs.cf_attacker_start_addr)
     dis_uops(w).cf_domain_id  := in_attacker_range.asUInt
     dis_uops(w).cf_speculated := dis_uops(w).br_mask =/= 0.U
+
+    // corefuzzing: determine whether any outstanding branch in br_mask is attacker-domain.
+    // Looks up spec_branch_atk_table for each set bit; takes the first (lowest br_tag) hit.
+    val br_atk_bits = VecInit((0 until maxBrCount).map(i =>
+      dis_uops(w).br_mask(i) && spec_branch_atk_table(i)))
+    dis_uops(w).cf_spec_branch_is_atk := br_atk_bits.reduce(_ || _)
+    dis_uops(w).cf_spec_branch_op_id  := Mux(
+      br_atk_bits.reduce(_ || _),
+      spec_branch_op_table(PriorityEncoder(br_atk_bits)),
+      0.U)
+  }
+
+  // corefuzzing: Unified dispatch influencer computation.
+  // Chains INFL_REG_DATAFLOW (taint), INFL_ROB_FULL, INFL_LDQ_FULL, INFL_STQ_FULL.
+  // All additions use rename_stage.io.ren2_uops(w) as the cycle-free base to avoid
+  // combinational loops that would arise from reading dis_uops(w) after writing it.
+  val dis_stall_was_rob = (0 until coreWidth).map(w =>
+    RegNext(dis_valids(w) && !dis_fire(w) && !rob.io.ready))
+  val dis_stall_was_ldq = (0 until coreWidth).map(w =>
+    RegNext(dis_valids(w) && !dis_fire(w) && io.lsu.ldq_full(w) && dis_uops(w).uses_ldq))
+  val dis_stall_was_stq = (0 until coreWidth).map(w =>
+    RegNext(dis_valids(w) && !dis_fire(w) && io.lsu.stq_full(w) && dis_uops(w).uses_stq))
+  for (w <- 0 until coreWidth) {
+    val pre = rename_stage.io.ren2_uops(w)  // cycle-free base
+    val is_tainted = dis_uops(w).cf_src_tainted && dis_uops(w).cf_domain_id === 0.U
+
+    // Step 1: INFL_REG_DATAFLOW (register taint)
+    val post1 = addInfluencer(pre, pre.cf_taint_producer_op, INFL_REG_DATAFLOW.U)
+    val list1 = Mux(is_tainted, post1.cf_influencer_list, pre.cf_influencer_list)
+    val ovf1  = Mux(is_tainted, post1.cf_infl_overflow,   pre.cf_infl_overflow)
+    when (is_tainted) { dis_uops(w).cf_secret_propagation := true.B }
+
+    // Step 2: INFL_ROB_FULL
+    val mid2 = Wire(pre.cloneType); mid2 := pre
+    mid2.cf_influencer_list := list1; mid2.cf_infl_overflow := ovf1
+    val post2 = addInfluencer(mid2, 0.U, INFL_ROB_FULL.U)
+    val list2 = Mux(dis_fire(w) && dis_stall_was_rob(w), post2.cf_influencer_list, list1)
+    val ovf2  = Mux(dis_fire(w) && dis_stall_was_rob(w), post2.cf_infl_overflow,   ovf1)
+
+    // Step 3: INFL_LDQ_FULL
+    val mid3 = Wire(pre.cloneType); mid3 := pre
+    mid3.cf_influencer_list := list2; mid3.cf_infl_overflow := ovf2
+    val post3 = addInfluencer(mid3, io.lsu.ldq_head_op_count, INFL_LDQ_FULL.U)
+    val list3 = Mux(dis_fire(w) && dis_stall_was_ldq(w), post3.cf_influencer_list, list2)
+    val ovf3  = Mux(dis_fire(w) && dis_stall_was_ldq(w), post3.cf_infl_overflow,   ovf2)
+
+    // Step 4: INFL_STQ_FULL
+    val mid4 = Wire(pre.cloneType); mid4 := pre
+    mid4.cf_influencer_list := list3; mid4.cf_infl_overflow := ovf3
+    val post4 = addInfluencer(mid4, io.lsu.stq_head_op_count, INFL_STQ_FULL.U)
+    val list4 = Mux(dis_fire(w) && dis_stall_was_stq(w), post4.cf_influencer_list, list3)
+    val ovf4  = Mux(dis_fire(w) && dis_stall_was_stq(w), post4.cf_infl_overflow,   ovf3)
+
+    dis_uops(w).cf_influencer_list := list4
+    dis_uops(w).cf_infl_overflow   := ovf4
   }
 
   //-------------------------------------------------------------
@@ -1549,24 +1654,34 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
         // predispatch taint queue (up to 5). Each taint entry is shown as
         // module:type:opcount. If some fields are zero, they will print as
         // zeros.
-        printf(" CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d) ",
+        printf(" CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d) ",
           rob.io.commit.uops(w).cf_domain_id,
           rob.io.commit.uops(w).cf_speculated,
           rob.io.commit.uops(w).cf_attacker_influence,
           rob.io.commit.uops(w).cf_secret_access,
           rob.io.commit.uops(w).cf_secret_propagation,
           rob.io.commit.uops(w).cf_secret_transmission,
-          rob.io.commit.uops(w).cf_op_count_id)
+          rob.io.commit.uops(w).cf_op_count_id,
+          rob.io.commit.uops(w).cf_spec_branch_is_atk,
+          rob.io.commit.uops(w).cf_spec_branch_op_id)
 
         // Print the single-step marker separately (preserves prior visible tag)
         when (rob.io.commit.uops(w).cf_single_step) {
           printf("[SSTEP] ")
         }
 
-        // Print module bitmap (which pipeline units this uop visited) and influencer uop count
-        printf("FU=0x%x INFL=%d",
+        // Print module bitmap and influencer list (IFT Phase 2 format)
+        printf("FU=0x%x OVF=%d INFL=[",
           rob.io.commit.uops(w).cf_fu_bitmap,
-          rob.io.commit.uops(w).cf_influencer_uop_count)
+          rob.io.commit.uops(w).cf_infl_overflow)
+        for (i <- 0 until numInfluencerSlotsCF) {
+          when (rob.io.commit.uops(w).cf_influencer_list(i).valid) {
+            printf("{oc=%d,ty=%d}",
+              rob.io.commit.uops(w).cf_influencer_list(i).op_count,
+              rob.io.commit.uops(w).cf_influencer_list(i).infl_type)
+          }
+        }
+        printf("]")
         // END MOD: commit CF prints
         // ---------------------------------------------------------------------
         when (rob.io.commit.uops(w).dst_rtype === RT_FIX && rob.io.commit.uops(w).ldst =/= 0.U) {

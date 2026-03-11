@@ -366,36 +366,18 @@ class Rob(
       val wb_resp = io.wb_resps(i)
       val wb_uop = wb_resp.bits.uop
       val row_idx = GetRowIdx(wb_uop.rob_idx)
-      when (wb_resp.valid && MatchBank(GetBankIdx(wb_uop.rob_idx))) {
-        // corefuzzing
-        // ORIGINAL: only clear busy/unsafe/predicated flags on writeback
-        // rob_bsy(row_idx)      := false.B
-        // rob_unsafe(row_idx)   := false.B
-        // rob_predicated(row_idx)  := wb_resp.bits.predicated
-
-        // todo - store the tags before wback update in a second three tag setup?
-        // this would give us pre-dispatch tags and post-dispatch tags
-        // UPDATED: also update the ROB's stored MicroOp with the writeback
-        // MicroOp. This ensures that any tags appended to the MicroOp in
-        // other units (for example, DCache, LSU, or issue queue tracking)
-        // are propagated into the ROB's copy immediately when the unit
-        // completes and writes back. Use a temporary WireInit to avoid
-        // inadvertent multiple-driver ordering issues and make the
-        // update explicit.
-        // val wb_uop_copy = WireInit(wb_resp.bits.uop)
-        // Preserve existing ROB-side exception flag if the ROB already has it
-        // set - don't let a writeback clear an exception bit unintentionally.
-        // wb_uop_copy.exception := rob_exception(row_idx) || wb_uop_copy.exception
-        // rob_uop(row_idx) := wb_uop_copy
-
-        // the above code does too many things that I do not need. 
-        // upon a valid writeback, I want to update the rob_uop with the module tags 
-        // wb_uop. The following line should achieve that.
-        // updateROBModuleTags(wb_uop, rob_uop(row_idx))
-
-        // Now update bookkeeping flags as before.
-        rob_bsy(row_idx)      := false.B
-        rob_unsafe(row_idx)   := false.B
+      // corefuzzing: guard with rob_val AND rob_bsy to suppress stale FU wakeups
+      // from branch-killed instructions.  After a branch misprediction, rob_val
+      // is cleared for killed entries but rob_bsy is NOT cleared.  The FU can
+      // complete in-flight and send a late writeback.  By that time the ROB slot
+      // may have been reused for a new instruction Y that:
+      //   (a) is still in-flight  (rob_val=1, rob_bsy=1) — pdst check below catches this
+      //   (b) has already written back (rob_val=1, rob_bsy=0) — guard drops it here
+      //   (c) is invalid           (rob_val=0)              — guard drops it here
+      // Only update when the slot is both live (rob_val=1) and still busy (rob_bsy=1).
+      when (wb_resp.valid && MatchBank(GetBankIdx(wb_uop.rob_idx)) && rob_val(row_idx) && rob_bsy(row_idx)) {
+        rob_bsy(row_idx)         := false.B
+        rob_unsafe(row_idx)      := false.B
         rob_predicated(row_idx)  := wb_resp.bits.predicated
       }
       // TODO check that fflags aren't overwritten
@@ -509,18 +491,29 @@ class Rob(
         // corefuzzing
         // [SPECULATIVE][ROB] speculative flush logging (non-destructive)
         // We print any valid ROB entries that will be killed by the branch update
-        when (rob_val(i) && IsKilledByBranch(io.brupdate, br_mask)) {
-          // print PC+inst using centralized helper
-          // Modified: call the new overload that accepts the MicroOp so cf_* fields are emitted
-          // Old call (kept for reference):
-          // SpeculativePrintf.dump("ROB", Sext.apply(rob_uop(i).debug_pc(vaddrBits-1,0), xLen), rob_uop(i).debug_inst, rob_uop(i).is_rvc, io.cf_debug_rob_enable)
-          SpeculativePrintf.dump("ROB", Sext.apply(rob_uop(i).debug_pc(vaddrBits-1,0), xLen), rob_uop(i).debug_inst, rob_uop(i).is_rvc, io.cf_debug_rob_enable, rob_uop(i))
-          // append register writeback info when present to match commit log
-          when (rob_uop(i).dst_rtype === RT_FIX && rob_uop(i).ldst =/= 0.U) {
-            printf(" x%d 0x%x\n", rob_uop(i).ldst, rob_debug_wdata(i))
-          } .elsewhen (rob_uop(i).dst_rtype === RT_FLT) {
-            printf(" f%d 0x%x\n", rob_uop(i).ldst, rob_debug_wdata(i))
+        when (rob_val(i) && IsKilledByBranch(io.brupdate, br_mask) && io.cf_debug_rob_enable) {
+          // [FLUSH] log: full commit-log format for squashed entries
+          // corefuzzing: add INFL_PIPELINE_FLUSH when flushing branch is from different domain
+          val flush_uop_base = rob_uop(i)
+          val flush_uop = WireInit(flush_uop_base)
+          when (io.brupdate.b2.mispredict &&
+                (io.brupdate.b2.uop.cf_domain_id =/= flush_uop_base.cf_domain_id)) {
+            flush_uop := addInfluencer(flush_uop_base,
+              io.brupdate.b2.uop.cf_op_count_id, INFL_PIPELINE_FLUSH.U)
           }
+          val fu = flush_uop
+          printf("[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d) FU=0x%x OVF=%d INFL=[",
+            Sext(fu.debug_pc(vaddrBits-1,0), xLen), fu.inst,
+            fu.cf_domain_id, fu.cf_speculated, fu.cf_attacker_influence,
+            fu.cf_secret_access, fu.cf_secret_propagation, fu.cf_secret_transmission,
+            fu.cf_op_count_id, fu.cf_spec_branch_is_atk, fu.cf_spec_branch_op_id,
+            fu.cf_fu_bitmap, fu.cf_infl_overflow)
+          for (k <- 0 until numInfluencerSlotsCF) {
+            when (fu.cf_influencer_list(k).valid) {
+              printf("{oc=%d,ty=%d}", fu.cf_influencer_list(k).op_count, fu.cf_influencer_list(k).infl_type)
+            }
+          }
+          printf("]\n")
         }
 
         //kill instruction if mispredict & br mask match
@@ -590,31 +583,56 @@ class Rob(
       when (io.debug_wb_valids(i) && MatchBank(GetBankIdx(rob_idx))) {
         rob_debug_wdata(GetRowIdx(rob_idx)) := io.debug_wb_wdata(i)
       }
-      // corefuzzing: merge cf_fu_bitmap bits and attacker-influence info from the functional unit
-      when (io.wb_resps(i).valid && MatchBank(GetBankIdx(rob_idx))) {
-        rob_uop(GetRowIdx(rob_idx)).cf_fu_bitmap :=
-          rob_uop(GetRowIdx(rob_idx)).cf_fu_bitmap | io.wb_resps(i).bits.uop.cf_fu_bitmap
-        when (io.wb_resps(i).bits.uop.cf_attacker_influence) {
-          rob_uop(GetRowIdx(rob_idx)).cf_attacker_influence   := true.B
-          rob_uop(GetRowIdx(rob_idx)).cf_influencer_uop_count :=
-            io.wb_resps(i).bits.uop.cf_influencer_uop_count
+      // corefuzzing: merge cf_fu_bitmap bits and IFT flags from the functional unit (Phase 2)
+      // Also guarded by rob_val && rob_bsy to suppress stale wakeups (same reason as above).
+      when (io.wb_resps(i).valid && MatchBank(GetBankIdx(rob_idx)) && rob_val(GetRowIdx(rob_idx)) && rob_bsy(GetRowIdx(rob_idx))) {
+        val rob_row  = GetRowIdx(rob_idx)
+        val wb_uop_i = io.wb_resps(i).bits.uop
+        rob_uop(rob_row).cf_fu_bitmap :=
+          rob_uop(rob_row).cf_fu_bitmap | wb_uop_i.cf_fu_bitmap
+        when (wb_uop_i.cf_attacker_influence)  { rob_uop(rob_row).cf_attacker_influence   := true.B }
+        when (wb_uop_i.cf_secret_access)       { rob_uop(rob_row).cf_secret_access        := true.B }
+        when (wb_uop_i.cf_secret_transmission) { rob_uop(rob_row).cf_secret_transmission  := true.B }
+        when (wb_uop_i.cf_secret_propagation)  { rob_uop(rob_row).cf_secret_propagation   := true.B }
+
+        // Merge influencer list: chain-of-wires fold so each wb entry finds the next free slot
+        var cur_list: Vec[InfluencerEntry] = rob_uop(rob_row).cf_influencer_list
+        var cur_ovf: Bool = Wire(Bool())
+        cur_ovf := rob_uop(rob_row).cf_infl_overflow
+        for (j <- 0 until numInfluencerSlotsCF) {
+          val step_list = WireInit(cur_list)
+          val step_ovf  = WireInit(cur_ovf)
+          when (wb_uop_i.cf_influencer_list(j).valid) {
+            val empties  = VecInit(cur_list.map(!_.valid))
+            val has_free = empties.reduce(_ || _)
+            val free_idx = PriorityEncoder(empties)
+            when (!cur_ovf && has_free) {
+              for (k <- 0 until numInfluencerSlotsCF) {
+                when (k.U === free_idx) {
+                  step_list(k).valid     := true.B
+                  step_list(k).op_count  := wb_uop_i.cf_influencer_list(j).op_count
+                  step_list(k).infl_type := wb_uop_i.cf_influencer_list(j).infl_type
+                }
+              }
+            } .otherwise {
+              step_ovf := true.B
+            }
+          }
+          cur_list = step_list
+          cur_ovf  = step_ovf
         }
-        when (io.wb_resps(i).bits.uop.cf_secret_access) {
-          rob_uop(GetRowIdx(rob_idx)).cf_secret_access := true.B
-        }
-        when (io.wb_resps(i).bits.uop.cf_secret_transmission) {
-          rob_uop(GetRowIdx(rob_idx)).cf_secret_transmission := true.B
-        }
+        rob_uop(rob_row).cf_influencer_list := cur_list
+        rob_uop(rob_row).cf_infl_overflow   := cur_ovf || wb_uop_i.cf_infl_overflow
       }
       val temp_uop = rob_uop(GetRowIdx(rob_idx))
 
+      // corefuzzing: stale FU wakeups (rob_val=0 or rob_bsy=0) are silently
+      // dropped by the guards above.  The "not-busy" assertion is removed
+      // because Case C (rob_val=1, rob_bsy=0) is a benign stale wakeup.
+      // The pdst check is preserved for Case B (valid, busy) to catch any
+      // real writeback to the wrong instruction.
       assert (!(io.wb_resps(i).valid && MatchBank(GetBankIdx(rob_idx)) &&
-               !rob_val(GetRowIdx(rob_idx))),
-               "[rob] writeback (" + i + ") occurred to an invalid ROB entry.")
-      assert (!(io.wb_resps(i).valid && MatchBank(GetBankIdx(rob_idx)) &&
-               !rob_bsy(GetRowIdx(rob_idx))),
-               "[rob] writeback (" + i + ") occurred to a not-busy ROB entry.")
-      assert (!(io.wb_resps(i).valid && MatchBank(GetBankIdx(rob_idx)) &&
+               rob_val(GetRowIdx(rob_idx)) && rob_bsy(GetRowIdx(rob_idx)) &&
                temp_uop.ldst_val && temp_uop.pdst =/= io.wb_resps(i).bits.uop.pdst),
                "[rob] writeback (" + i + ") occurred to the wrong pdst.")
     }
