@@ -37,6 +37,12 @@ class InfluencerEntry(implicit p: Parameters) extends BoomBundle with CoreFuzzin
   val valid     = Bool()
   val op_count  = UInt(uopIDCounterWidthCF.W)  // 8 bits: op_count_id of the influencing uop
   val infl_type = UInt(inflTypeWidthCF.W)       // 5 bits: influence type (INFL_*)
+  val is_atk    = Bool()   // influencer instruction was from attacker domain (domain=1)
+  val is_secret = Bool()   // influencer instruction had s_acc=1 or s_prop=1
+  // deny_count: for INFL_ISSUE_CONTENTION only — number of cycles this instruction was denied
+  // an issue port by a cross-domain instruction. 0 for all other influence types.
+  // Saturates at 15 (4-bit field). Tracked in issue slot, injected into ROB at issue time.
+  val deny_count = UInt(4.W)
 }
 
 /**
@@ -180,8 +186,10 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   val cf_infl_overflow        = Bool()   // set when >numInfluencerSlotsCF influencers occurred
 
   // IFT Phase 2: register taint (set in rename; used at dispatch in core.scala)
-  val cf_src_tainted          = Bool()                       // any source preg tainted by attacker
-  val cf_taint_producer_op    = UInt(uopIDCounterWidthCF.W)  // op_count_id of the attacker writer
+  val cf_src_tainted              = Bool()                       // any source preg tainted by attacker
+  val cf_taint_producer_op        = UInt(uopIDCounterWidthCF.W)  // op_count_id of the taint producer
+  val cf_taint_producer_is_atk    = Bool()   // taint producer was from attacker domain (domain=1)
+  val cf_taint_producer_is_secret = Bool()   // taint producer had s_acc=1 or s_prop=1
 
   // IFT Phase 2: speculative-branch domain tracking (set at dispatch in core.scala)
   // cf_spec_branch_is_atk: true if any outstanding branch in br_mask was from attacker domain.

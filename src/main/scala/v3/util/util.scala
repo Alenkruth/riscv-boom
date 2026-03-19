@@ -819,7 +819,9 @@ object appendModuleTag {
  * Returns a modified Wire copy of the uop; the original is unchanged.
  */
 object addInfluencer {
-  def apply(uop: boom.v3.common.MicroOp, op_count: UInt, infl_type: UInt)
+  def apply(uop: boom.v3.common.MicroOp, op_count: UInt, infl_type: UInt,
+            is_atk: Bool = false.B, is_secret: Bool = false.B,
+            deny_count: UInt = 0.U)
            (implicit p: Parameters): boom.v3.common.MicroOp = {
     val out = WireInit(uop)
     val slots = uop.cf_influencer_list
@@ -828,14 +830,56 @@ object addInfluencer {
     val first_empty = PriorityEncoder(empties)
     when (!uop.cf_infl_overflow) {
       when (has_empty) {
-        out.cf_influencer_list(first_empty).valid     := true.B
-        out.cf_influencer_list(first_empty).op_count  := op_count
-        out.cf_influencer_list(first_empty).infl_type := infl_type
+        out.cf_influencer_list(first_empty).valid      := true.B
+        out.cf_influencer_list(first_empty).op_count   := op_count
+        out.cf_influencer_list(first_empty).infl_type  := infl_type
+        out.cf_influencer_list(first_empty).is_atk     := is_atk
+        out.cf_influencer_list(first_empty).is_secret  := is_secret
+        out.cf_influencer_list(first_empty).deny_count := deny_count
+        // When adding an attacker-sourced influencer, set the atk flag on the influenced instruction
+        when (is_atk) { out.cf_attacker_influence := true.B }
       } .otherwise {
         out.cf_infl_overflow := true.B
       }
     }
     out
+  }
+}
+
+// corefuzzing: Compute a 24-bit INFL_FU bitmap from an influencer list.
+// Each set bit marks the pipeline module most responsible for that influence type.
+// Uses compile-time integer constants from CoreFuzzingConstants (stable, never changes).
+// Mapping: infl_type → module tag bit index (matching CoreFuzzingConstants values)
+object inflBitmapFromList {
+  // (infl_type_value → module_mask): compile-time Scala Int constants.
+  // Module bit numbers from CoreFuzzingConstants: icache=0,itlb=1,btb=4,bpd=5,ras=6,
+  // irf=9,frf=10,intissq=11,rob=14,ldq=15,stq=16,dtlb=17,dcache=18
+  private val mapping: Seq[(Int, Int)] = Seq(
+    0  -> (1 << 9),  // INFL_REG_DATAFLOW    → irf
+    1  -> (1 << 16), // INFL_STL_FORWARD     → stq
+    2  -> (1 << 11), // INFL_ISSUE_CONTENTION → intissq
+    3  -> (1 << 15), // INFL_MEM_HOL         → ldq
+    4  -> (1 << 9),  // INFL_REG_PRESSURE    → irf
+    5  -> (1 << 14), // INFL_ROB_FULL        → rob
+    6  -> (1 << 15), // INFL_LDQ_FULL        → ldq
+    7  -> (1 << 16), // INFL_STQ_FULL        → stq
+    8  -> (1 << 15), // INFL_MEM_ORDER       → ldq
+    9  -> (1 << 5),  // INFL_BPD_STATE       → bpd
+    10 -> (1 << 4),  // INFL_BTB_STATE       → btb
+    11 -> (1 << 6),  // INFL_RAS_STATE       → ras
+    12 -> (1 << 18), // INFL_CACHE_EVICTION  → dcache
+    13 -> (1 << 14), // INFL_PIPELINE_FLUSH  → rob
+    14 -> (1 << 17), // INFL_DTLB_STATE      → dtlb
+    15 -> (1 << 1),  // INFL_ITLB_STATE      → itlb
+    16 -> (1 << 0),  // INFL_ICACHE_STATE    → icache
+  )
+  def apply(infl_list: Vec[boom.v3.common.InfluencerEntry]): UInt = {
+    val per_slot = infl_list.map { slot =>
+      val mask = MuxLookup(slot.infl_type, 0.U(24.W))(
+        mapping.map { case (ty, m) => ty.U -> m.U(24.W) })
+      Mux(slot.valid, mask, 0.U(24.W))
+    }
+    per_slot.reduce(_ | _)
   }
 }
 
