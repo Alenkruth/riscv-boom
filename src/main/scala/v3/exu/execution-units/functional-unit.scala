@@ -248,11 +248,6 @@ abstract class PipelinedFunctionalUnit(
     val r_valids = RegInit(VecInit(Seq.fill(numStages) { false.B }))
     val r_uops   = Reg(Vec(numStages, new MicroOp()))
 
-    // corefuzzing: per-stage secret-instruction tracking for coexistence detection
-    // secret = victim domain (cf_domain_id === 0)
-    val secret_in_stage       = RegInit(VecInit(Seq.fill(numStages) { false.B }))
-    val secret_uopcount_stage = RegInit(VecInit(Seq.fill(numStages) { 0.U(uopIDCounterWidthCF.W) }))
-
     // handle incoming request
     r_valids(0) := io.req.valid && !IsKilledByBranch(io.brupdate, io.req.bits.uop) && !io.req.bits.kill
     r_uops(0)   := io.req.bits.uop
@@ -270,17 +265,7 @@ abstract class PipelinedFunctionalUnit(
       ))
       when (io.req.valid && !IsKilledByBranch(io.brupdate, io.req.bits.uop) && !io.req.bits.kill) {
         r_uops(0).cf_fu_bitmap := io.req.bits.uop.cf_fu_bitmap | newBit
-        // If this is an attacker instruction and a secret instruction occupies stage 0, record influence
-        when (io.req.bits.uop.cf_domain_id === 1.U && secret_in_stage(0)) {
-          val atk0 = WireInit(r_uops(0))
-          atk0.cf_attacker_influence := true.B
-          r_uops(0) := addInfluencer(atk0, secret_uopcount_stage(0), INFL_ISSUE_CONTENTION.U)
-        }
       }
-      // Update stage-0 secret tracking for next cycle
-      secret_in_stage(0)       := io.req.valid && !IsKilledByBranch(io.brupdate, io.req.bits.uop) &&
-                                   !io.req.bits.kill && (io.req.bits.uop.cf_domain_id === 0.U)
-      secret_uopcount_stage(0) := io.req.bits.uop.cf_op_count_id
     }
 
     // corefuzzing
@@ -294,16 +279,6 @@ abstract class PipelinedFunctionalUnit(
   r_valids(i) := r_valids(i-1) && !IsKilledByBranch(io.brupdate, r_uops(i-1)) && !io.req.bits.kill
   r_uops(i)   := r_uops(i-1)
   r_uops(i).br_mask := GetNewBrMask(io.brupdate, r_uops(i-1))
-
-      // corefuzzing: propagate secret tracking and detect coexistence at intermediate stages
-      val alive_i = r_valids(i-1) && !IsKilledByBranch(io.brupdate, r_uops(i-1)) && !io.req.bits.kill
-      when (alive_i && r_uops(i-1).cf_domain_id === 1.U && secret_in_stage(i)) {
-        val atk_i = WireInit(r_uops(i))
-        atk_i.cf_attacker_influence := true.B
-        r_uops(i) := addInfluencer(atk_i, secret_uopcount_stage(i), INFL_ISSUE_CONTENTION.U)
-      }
-      secret_in_stage(i)       := alive_i && (r_uops(i-1).cf_domain_id === 0.U)
-      secret_uopcount_stage(i) := r_uops(i-1).cf_op_count_id
 
       if (numBypassStages > 0) {
         io.bypass(i-1).bits.uop := r_uops(i-1)
@@ -762,6 +737,12 @@ class DivUnit(dataWidth: Int)(implicit p: Parameters)
   div.io.req.bits.in2 := io.req.bits.rs2_data
   div.io.req.bits.tag := DontCare
   io.req.ready        := div.io.req.ready
+
+  // Corefuzzing: OR in divTagCF when request is accepted (parent r_uop := io.req.bits.uop
+  // happens first; this second when-block wins on r_uop.cf_fu_bitmap)
+  when (io.req.fire) {
+    r_uop.cf_fu_bitmap := io.req.bits.uop.cf_fu_bitmap | (1.U << divTagCF.U)
+  }
 
   // handle pipeline kills and branch misspeculations
   div.io.kill         := this.do_kill
