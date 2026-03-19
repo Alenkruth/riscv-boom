@@ -420,7 +420,7 @@ class WithNTeraBooms(n: Int = 1) extends Config(
 )
 
 /**
- * 5-wide BOOM for coreFuzzing.
+ * 4-wide BOOM for coreFuzzing.
   */
 class WithFuzzingBoom(n: Int = 1, overrideIdOffset: Option[Int] = None) extends Config(
   new WithTAGELBPD ++ // Default to TAGE-L BPD
@@ -434,21 +434,21 @@ class WithFuzzingBoom(n: Int = 1, overrideIdOffset: Option[Int] = None) extends 
           tileParams = BoomTileParams(
             core = BoomCoreParams(
               fetchWidth = 8,
-              decodeWidth = 5,
-              numRobEntries = 300,
+              decodeWidth = 4,
+              numRobEntries = 256,
               issueParams = Seq(
-                IssueParams(issueWidth=2, numEntries=24, iqType=IQT_MEM.litValue, dispatchWidth=5),
-                IssueParams(issueWidth=5, numEntries=40, iqType=IQT_INT.litValue, dispatchWidth=5),
-                IssueParams(issueWidth=2, numEntries=32, iqType=IQT_FP.litValue , dispatchWidth=5)),
+                IssueParams(issueWidth=2, numEntries=24, iqType=IQT_MEM.litValue, dispatchWidth=4),
+                IssueParams(issueWidth=4, numEntries=40, iqType=IQT_INT.litValue, dispatchWidth=4),
+                IssueParams(issueWidth=2, numEntries=32, iqType=IQT_FP.litValue , dispatchWidth=4)),
               numIntPhysRegisters = 256,
               numFpPhysRegisters = 256,
               numLdqEntries = 64,
               numStqEntries = 64,
-              maxBrCount = 40,
-              numFetchBufferEntries = 80, // keep this as a multiple of 5 to avoid issues.
+              maxBrCount = 20,
+              numFetchBufferEntries = 64, // must be a multiple of coreWidth (4)
               enablePrefetching = true,
               numDCacheBanks = 1,
-              ftq = FtqParameters(nEntries=100),
+              ftq = FtqParameters(nEntries=40),
               nPerfCounters = 29,
               fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true))
             ),

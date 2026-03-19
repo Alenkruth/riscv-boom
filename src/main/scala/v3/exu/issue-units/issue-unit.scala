@@ -15,7 +15,7 @@ import chisel3._
 import chisel3.util._
 
 import org.chipsalliance.cde.config.Parameters
-import freechips.rocketchip.util.{Str}
+import freechips.rocketchip.util.{Str, CoreFuzzingConstants}
 
 import boom.v3.common._
 import boom.v3.exu.FUConstants._
@@ -34,6 +34,22 @@ case class IssueParams(
   numEntries: Int = 8,
   iqType: BigInt
 )
+
+// corefuzzing: bundle carrying per-cycle winner info to a losing issue slot
+class IssueContentionInfo(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
+  val winner_op_count = UInt(uopIDCounterWidthCF.W)
+  val winner_is_atk   = Bool()
+  val winner_is_sec   = Bool()
+}
+
+// corefuzzing: bundle sent from issue unit → ROB when a slot issues with accumulated contention
+class IssueContentionUpdate(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
+  val rob_idx         = UInt(robAddrSz.W)
+  val winner_op_count = UInt(uopIDCounterWidthCF.W)
+  val winner_is_atk   = Bool()
+  val winner_is_sec   = Bool()
+  val deny_count      = UInt(4.W)
+}
 
 /**
  * Constants for knowing about the status of a MicroOp
@@ -69,6 +85,7 @@ class IssueUnitIO(
   val numWakeupPorts: Int,
   val dispatchWidth: Int)
   (implicit p: Parameters) extends BoomBundle
+  with CoreFuzzingConstants
 {
   val dis_uops         = Vec(dispatchWidth, Flipped(Decoupled(new MicroOp)))
 
@@ -92,6 +109,9 @@ class IssueUnitIO(
   val event_empty      = Output(Bool()) // used by HPM events; is the issue unit empty?
 
   val tsc_reg          = Input(UInt(width=xLen.W))
+
+  // corefuzzing: per-port contention updates — fires when a slot issues and had accumulated cross-domain denial cycles
+  val cf_contention_upd = Output(Vec(issueWidth, Valid(new IssueContentionUpdate)))
 }
 
 /**
@@ -165,9 +185,17 @@ abstract class IssueUnit(
     issue_slots(i).kill             := io.flush_pipeline
     // propagate cf_debug gate
     issue_slots(i).cf_debug_issue_enable := io.cf_debug_issue_enable
+    // corefuzzing: default — no contention this cycle; subclass overrides in contention detection
+    issue_slots(i).cf_contend_in.valid := false.B
+    issue_slots(i).cf_contend_in.bits  := DontCare
   }
 
   io.event_empty := !(issue_slots.map(s => s.valid).reduce(_|_))
+  // corefuzzing: defaults — subclasses override with actual contention data
+  for (w <- 0 until issueWidth) {
+    io.cf_contention_upd(w).valid := false.B
+    io.cf_contention_upd(w).bits  := DontCare
+  }
 
   val count = PopCount(slots.map(_.io.valid))
   dontTouch(count)

@@ -185,8 +185,8 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   def reconfig_stq_b0 = getOrElse(ldqStqCSRCF, _.value(2), true.B)
   def reconfig_ldq_b1 = getOrElse(ldqStqCSRCF, _.value(1), true.B)
   def reconfig_ldq_b0 = getOrElse(ldqStqCSRCF, _.value(0), true.B)
-  def reconfigureFB_rows_b0 = getOrElse(fetchBufferCSRCF, _.value(0), true.B)
-  def reconfigureFB_rows_b1 = getOrElse(fetchBufferCSRCF, _.value(1), true.B)
+  def reconfigureFB_rows_b0 = true.B  // full FB mode until dynamic reconfiguration is implemented
+  def reconfigureFB_rows_b1 = true.B
   // def reconfigureBPD = getOrElse(configureCSR, _.value(2), true.B)  
   
   def cf_bpd_tage_to_gshare = getOrElse(bpdCSRCF, _.value(2), true.B)  

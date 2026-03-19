@@ -135,7 +135,8 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
     // dis_wire.bits  := io.dis_uops(w).bits
     // dis_wire.valid := io.dis_uops(w).valid
     // io.dis_uops(w).ready := dis_wire.ready
-    issue_unit.io.dis_uops(w) <> io.dis_uops(w)// dis_wire
+    issue_unit.io.dis_uops(w) <> io.dis_uops(w)
+    issue_unit.io.dis_uops(w).bits.cf_fu_bitmap := io.dis_uops(w).bits.cf_fu_bitmap | (1.U << fpissqTagCF.U)
   }
 
   //-------------------------------------------------------------
@@ -264,18 +265,16 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
   // Ensure the wakeup carries the FRF writeback tag so the ROB receives
   // the tagged micro-op on writeback.
   val ll_out_bits = WireInit(ll_wbarb.io.out.bits)
-  // ll_out_bits.uop.appendModuleTag(frfTagCF)
+  ll_out_bits.uop.cf_fu_bitmap := ll_wbarb.io.out.bits.uop.cf_fu_bitmap | (1.U << frfTagCF.U)
   io.wakeups(0).bits := ll_out_bits
   ll_wbarb.io.out.ready := true.B
 
   w_cnt = 1
   for (i <- 1 until memWidth) {
-    // probably-overkill
-    // mem writebacks -> append FRF tag before presenting as a wakeup
-    // val mem_wb = WireInit(io.ll_wports(i).bits)
-    // mem_wb.uop.appendModuleTag(frfTagCF)
+    val mem_wb = WireInit(io.ll_wports(i).bits)
+    mem_wb.uop.cf_fu_bitmap := io.ll_wports(i).bits.uop.cf_fu_bitmap | (1.U << frfTagCF.U)
     io.wakeups(w_cnt) := io.ll_wports(i)
-    io.wakeups(w_cnt).bits := io.ll_wports(i).bits//mem_wb
+    io.wakeups(w_cnt).bits := mem_wb
     io.wakeups(w_cnt).bits.data := recode(io.ll_wports(i).bits.data,
       io.ll_wports(i).bits.uop.mem_size =/= 2.U)
     w_cnt += 1
@@ -285,11 +284,10 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
       val exe_resp = eu.io.fresp
       val wb_uop = eu.io.fresp.bits.uop
       val wport = io.wakeups(w_cnt)
-      // Append FRF tag for FPU writebacks so the tag is carried to ROB
-      // val fpu_wb_bits = WireInit(exe_resp.bits)
-      // fpu_wb_bits.uop.appendModuleTag(frfTagCF)
+      val fpu_wb_bits = WireInit(exe_resp.bits)
+      fpu_wb_bits.uop.cf_fu_bitmap := exe_resp.bits.uop.cf_fu_bitmap | (1.U << frfTagCF.U)
       wport.valid := exe_resp.valid && wb_uop.dst_rtype === RT_FLT
-      wport.bits := exe_resp.bits //fpu_wb_bits
+      wport.bits := fpu_wb_bits
 
       w_cnt += 1
 

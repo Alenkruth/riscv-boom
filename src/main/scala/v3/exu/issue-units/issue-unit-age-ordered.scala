@@ -91,17 +91,8 @@ class IssueUnitCollapsing(
       when (shamts_oh(i+j) === (1 << (j-1)).U) {
         issue_slots(i).in_uop.valid := will_be_valid(i+j)
         issue_slots(i).in_uop.bits  := uops(i+j)
-        // Only append the issue-queue tag when the slot was previously
-        // invalid and will become valid (i.e., the uop is entering the
-        // issue slot). This prevents repeated appends while the uop is
-        // resident in the slot.
-        // val uop_tagged = Wire(new MicroOp)
-        // when (will_be_valid(i+j) && !issue_slots(i).valid && uops(i+j).cf_taint_module_id_1 =/= intissqTagCF.U) {
-        //   issue_slots(i).in_uop.bits := appendModuleTag(intissqTagCF.U, uops(i+j))
-        // }
-        // .otherwise {
-        //   issue_slots(i).in_uop.bits  := uops(i+j)
-        // }
+        // corefuzzing: stamp issue-queue bitmap bit when uop enters slot
+        issue_slots(i).in_uop.bits.cf_fu_bitmap := uops(i+j).cf_fu_bitmap | (1.U << moduleTagCF.U)
       }
     }
     issue_slots(i).clear        := shamts_oh(i) =/= 0.U
@@ -159,6 +150,61 @@ class IssueUnitCollapsing(
       val was_port_issued_yet = port_issued(w)
       port_issued(w) = (requests(i) && !uop_issued && can_allocate) | port_issued(w)
       uop_issued = (requests(i) && can_allocate && !was_port_issued_yet) | uop_issued
+    }
+  }
+
+  // corefuzzing: per-slot cross-domain issue contention detection
+  // Pass 1: for each port, identify losing slots from a different domain and fire cf_contend_in.
+  // All Bool computations are in the outer scope (not inside a when-block) so no Chisel scope
+  // escaping occurs when the Scala vars are updated.
+  // Scala-var priority ensures each slot fires cf_contend_in at most once per cycle (lowest port).
+  val already_denied = Array.fill(numIssueSlots)(WireInit(false.B))
+  for (w <- 0 until issueWidth) {
+    // Compute winner info unconditionally; gate with io.iss_valids(w) via AND.
+    val winner_domain = io.iss_uops(w).cf_domain_id
+    val winner_op     = io.iss_uops(w).cf_op_count_id
+    val winner_is_atk = io.iss_uops(w).cf_domain_id === 1.U
+    val winner_is_sec = io.iss_uops(w).cf_secret_access || io.iss_uops(w).cf_secret_propagation
+    for (i <- 0 until numIssueSlots) {
+      val can_use_port   = (issue_slots(i).uop.fu_code & io.fu_types(w)) =/= 0.U
+      // Gate with io.iss_valids(w) here — all signals are in the outer scope
+      val is_cross_loser = io.iss_valids(w) && requests(i) && !issue_slots(i).grant &&
+                           can_use_port && (issue_slots(i).uop.cf_domain_id =/= winner_domain)
+      when (is_cross_loser && !already_denied(i)) {
+        issue_slots(i).cf_contend_in.valid                    := true.B
+        issue_slots(i).cf_contend_in.bits.winner_op_count     := winner_op
+        issue_slots(i).cf_contend_in.bits.winner_is_atk       := winner_is_atk
+        issue_slots(i).cf_contend_in.bits.winner_is_sec       := winner_is_sec
+      }
+      already_denied(i) = already_denied(i) | is_cross_loser
+    }
+  }
+
+  // Pass 2: collect cf_contend_out from granted slots → output as per-port contention updates.
+  // Re-scan to find which slot was granted on which port (mirrors the grant loop above).
+  // Scala vars ensure priority (first matching slot per port wins).
+  val port_winner_idx = Array.fill(issueWidth)(WireInit(numIssueSlots.U(log2Ceil(numIssueSlots + 1).W)))
+  val port_assigned2  = Array.fill(issueWidth)(WireInit(false.B))
+  for (i <- 0 until numIssueSlots) {
+    var uop_seen2 = false.B
+    for (w <- 0 until issueWidth) {
+      val can_allocate2 = (issue_slots(i).uop.fu_code & io.fu_types(w)) =/= 0.U
+      when (requests(i) && !uop_seen2 && can_allocate2 && !port_assigned2(w)) {
+        port_winner_idx(w) := i.U
+      }
+      val was_port_assigned2 = port_assigned2(w)
+      port_assigned2(w) = port_assigned2(w) | (requests(i) && !uop_seen2 && can_allocate2)
+      uop_seen2 = uop_seen2 | (requests(i) && can_allocate2 && !was_port_assigned2)
+    }
+  }
+  for (w <- 0 until issueWidth) {
+    when (io.iss_valids(w)) {
+      for (i <- 0 until numIssueSlots) {
+        when (port_winner_idx(w) === i.U && issue_slots(i).cf_contend_out.valid) {
+          io.cf_contention_upd(w).valid := true.B
+          io.cf_contention_upd(w).bits  := issue_slots(i).cf_contend_out.bits
+        }
+      }
     }
   }
 }
