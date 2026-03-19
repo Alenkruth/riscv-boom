@@ -56,9 +56,14 @@ class RobIo(
 
   val xcpt_fetch_pc = Input(UInt(vaddrBitsExtended.W))
 
-  val rob_tail_idx = Output(UInt(robAddrSz.W))
-  val rob_pnr_idx  = Output(UInt(robAddrSz.W))
-  val rob_head_idx = Output(UInt(robAddrSz.W))
+  val rob_tail_idx       = Output(UInt(robAddrSz.W))
+  val rob_pnr_idx        = Output(UInt(robAddrSz.W))
+  val rob_head_idx       = Output(UInt(robAddrSz.W))
+  val rob_head_op_count  = Output(UInt(uopIDCounterWidthCF.W))
+  val rob_head_domain    = Output(UInt(1.W))   // cf_domain_id of ROB head entry
+  val rob_head_is_secret = Output(Bool())      // ROB head had s_acc=1 or s_prop=1
+  // corefuzzing: cycle-N mispredicting branch UOP (same cycle as b1.mispredict_mask)
+  val cf_mispredict_uop  = Input(Valid(new MicroOp))
 
   // Handle Branch Misspeculations
   val brupdate = Input(new BrUpdateInfo())
@@ -70,7 +75,11 @@ class RobIo(
 
   // Unbusying ports for stores.
   // +1 for fpstdata
-  val lsu_clr_bsy      = Input(Vec(memWidth + 1, Valid(UInt(robAddrSz.W))))
+  val lsu_clr_bsy           = Input(Vec(memWidth + 1, Valid(UInt(robAddrSz.W))))
+  // corefuzzing: accumulated cf_fu_bitmap from LSU (dtlb+dcache+stq bits) for store commit
+  val lsu_clr_bsy_cf_bitmap = Input(Vec(memWidth + 1, UInt(numModules.W)))
+  // corefuzzing: cf_secret_transmission for stores, from LSU
+  val lsu_clr_bsy_cf_stx    = Input(Vec(memWidth + 1, Bool()))
 
   // Port for unmarking loads/stores as speculation hazards..
   val lsu_clr_unsafe   = Input(Vec(memWidth, Valid(UInt(robAddrSz.W))))
@@ -111,6 +120,12 @@ class RobIo(
 
 
   val debug_tsc = Input(UInt(xLen.W))
+
+  // corefuzzing: issue contention update — fires from issue units when an instruction issues
+  // with accumulated cross-domain denial cycles; ROB applies addInfluencer to the entry.
+  // FP issue unit lives inside fp_pipeline (not in issue_units in core.scala), so only
+  // sum non-FP IQ widths. IQT_FP.litValue == BigInt(4).
+  val cf_issue_contention_upd = Input(Vec(issueParams.filter(_.iqType != BigInt(4)).map(_.issueWidth).sum, Valid(new IssueContentionUpdate)))
 
   // corefuzzing changes
   val cf_debug_rob_enable = Input(Bool())
@@ -389,11 +404,15 @@ class Rob(
     }
 
     // Stores have a separate method to clear busy bits
-    for (clr_rob_idx <- io.lsu_clr_bsy) {
+    for (((clr_rob_idx, cf_bmap), cf_stx) <- io.lsu_clr_bsy.zip(io.lsu_clr_bsy_cf_bitmap).zip(io.lsu_clr_bsy_cf_stx)) {
       when (clr_rob_idx.valid && MatchBank(GetBankIdx(clr_rob_idx.bits))) {
         val cidx = GetRowIdx(clr_rob_idx.bits)
         rob_bsy(cidx)    := false.B
         rob_unsafe(cidx) := false.B
+        // corefuzzing: merge accumulated store cf_fu_bitmap (stq+dtlb+dcache bits) into rob_uop
+        rob_uop(cidx).cf_fu_bitmap := rob_uop(cidx).cf_fu_bitmap | cf_bmap
+        // corefuzzing: set cf_secret_transmission if store writes secret-derived data to non-secret addr
+        when (cf_stx) { rob_uop(cidx).cf_secret_transmission := true.B }
         assert (rob_val(cidx) === true.B, "[rob] store writing back to invalid entry.")
         assert (rob_bsy(cidx) === true.B, "[rob] store writing back to a not-busy entry.")
       }
@@ -405,6 +424,22 @@ class Rob(
       }
     }
 
+    // corefuzzing: issue contention update — add INFL_ISSUE_CONTENTION influencer to the ROB entry
+    for (upd <- io.cf_issue_contention_upd) {
+      when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx))) {
+        val cidx = GetRowIdx(upd.bits.rob_idx)
+        when (rob_val(cidx)) {
+          val updated = addInfluencer(rob_uop(cidx), upd.bits.winner_op_count,
+            INFL_ISSUE_CONTENTION.U,
+            is_atk     = upd.bits.winner_is_atk,
+            is_secret  = upd.bits.winner_is_sec,
+            deny_count = upd.bits.deny_count)
+          rob_uop(cidx).cf_influencer_list := updated.cf_influencer_list
+          rob_uop(cidx).cf_infl_overflow   := updated.cf_infl_overflow
+          rob_uop(cidx).cf_attacker_influence := updated.cf_attacker_influence
+        }
+      }
+    }
 
     //-----------------------------------------------
     // Accruing fflags
@@ -494,26 +529,36 @@ class Rob(
         when (rob_val(i) && IsKilledByBranch(io.brupdate, br_mask) && io.cf_debug_rob_enable) {
           // [FLUSH] log: full commit-log format for squashed entries
           // corefuzzing: add INFL_PIPELINE_FLUSH when flushing branch is from different domain
+          // corefuzzing: single printf per entry — atomic in Verilator multi-threaded mode,
+          // preventing interleaving of header/influencer-loop/footer across threads.
           val flush_uop_base = rob_uop(i)
           val flush_uop = WireInit(flush_uop_base)
-          when (io.brupdate.b2.mispredict &&
-                (io.brupdate.b2.uop.cf_domain_id =/= flush_uop_base.cf_domain_id)) {
-            flush_uop := addInfluencer(flush_uop_base,
-              io.brupdate.b2.uop.cf_op_count_id, INFL_PIPELINE_FLUSH.U)
+          // corefuzzing: use cycle-N mispredict UOP (b2.mispredict fires 1 cycle after b1/kill)
+          when (io.cf_mispredict_uop.valid &&
+                (io.cf_mispredict_uop.bits.cf_domain_id =/= flush_uop_base.cf_domain_id)) {
+            val br_uop = io.cf_mispredict_uop.bits
+            flush_uop := addInfluencer(flush_uop_base, br_uop.cf_op_count_id, INFL_PIPELINE_FLUSH.U,
+              is_atk = br_uop.cf_domain_id === 1.U,
+              is_secret = br_uop.cf_secret_access || br_uop.cf_secret_propagation)
           }
           val fu = flush_uop
-          printf("[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d) FU=0x%x OVF=%d INFL=[",
+          val robFlushInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d,dc=%d}"}.mkString(" ")
+          val robFlushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d $robFlushInflFmt\n"
+          val robInflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
+            fu.cf_influencer_list(k).valid,
+            fu.cf_influencer_list(k).op_count,
+            fu.cf_influencer_list(k).infl_type,
+            fu.cf_influencer_list(k).is_atk,
+            fu.cf_influencer_list(k).is_secret,
+            fu.cf_influencer_list(k).deny_count
+          ))
+          printf(robFlushFmt, (Seq[Bits](
             Sext(fu.debug_pc(vaddrBits-1,0), xLen), fu.inst,
             fu.cf_domain_id, fu.cf_speculated, fu.cf_attacker_influence,
             fu.cf_secret_access, fu.cf_secret_propagation, fu.cf_secret_transmission,
             fu.cf_op_count_id, fu.cf_spec_branch_is_atk, fu.cf_spec_branch_op_id,
-            fu.cf_fu_bitmap, fu.cf_infl_overflow)
-          for (k <- 0 until numInfluencerSlotsCF) {
-            when (fu.cf_influencer_list(k).valid) {
-              printf("{oc=%d,ty=%d}", fu.cf_influencer_list(k).op_count, fu.cf_influencer_list(k).infl_type)
-            }
-          }
-          printf("]\n")
+            fu.cf_fu_bitmap, 3.U, inflBitmapFromList(fu.cf_influencer_list), fu.cf_infl_overflow
+          ) ++ robInflArgs): _*)
         }
 
         //kill instruction if mispredict & br mask match
@@ -609,9 +654,12 @@ class Rob(
             when (!cur_ovf && has_free) {
               for (k <- 0 until numInfluencerSlotsCF) {
                 when (k.U === free_idx) {
-                  step_list(k).valid     := true.B
-                  step_list(k).op_count  := wb_uop_i.cf_influencer_list(j).op_count
-                  step_list(k).infl_type := wb_uop_i.cf_influencer_list(j).infl_type
+                  step_list(k).valid      := true.B
+                  step_list(k).op_count   := wb_uop_i.cf_influencer_list(j).op_count
+                  step_list(k).infl_type  := wb_uop_i.cf_influencer_list(j).infl_type
+                  step_list(k).is_atk     := wb_uop_i.cf_influencer_list(j).is_atk
+                  step_list(k).is_secret  := wb_uop_i.cf_influencer_list(j).is_secret
+                  step_list(k).deny_count := wb_uop_i.cf_influencer_list(j).deny_count
                 }
               }
             } .otherwise {
@@ -923,9 +971,12 @@ class Rob(
   full       := rob_tail === rob_head && maybe_full
   empty      := (rob_head === rob_tail) && (rob_head_vals.asUInt === 0.U)
 
-  io.rob_head_idx := rob_head_idx
-  io.rob_tail_idx := rob_tail_idx
-  io.rob_pnr_idx  := rob_pnr_idx
+  io.rob_head_idx      := rob_head_idx
+  io.rob_tail_idx      := rob_tail_idx
+  io.rob_pnr_idx       := rob_pnr_idx
+  io.rob_head_op_count  := cf_rob_head_uop(0).cf_op_count_id
+  io.rob_head_domain    := cf_rob_head_uop(0).cf_domain_id
+  io.rob_head_is_secret := cf_rob_head_uop(0).cf_secret_access || cf_rob_head_uop(0).cf_secret_propagation
   io.empty        := empty
   io.ready        := (rob_state === s_normal) && !full && !r_xcpt_val
 
