@@ -136,9 +136,18 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
 
   val ldq_full    = Output(Vec(coreWidth, Bool()))
   val stq_full    = Output(Vec(coreWidth, Bool()))
-  // corefuzzing: op_count of head entry for stall attribution
-  val ldq_head_op_count = Output(UInt(uopIDCounterWidthCF.W))
-  val stq_head_op_count = Output(UInt(uopIDCounterWidthCF.W))
+  // corefuzzing: op_count, domain, and secret-status of head entry for stall attribution
+  val ldq_head_op_count  = Output(UInt(uopIDCounterWidthCF.W))
+  val stq_head_op_count  = Output(UInt(uopIDCounterWidthCF.W))
+  val ldq_head_domain    = Output(UInt(1.W))   // cf_domain_id of ldq_head entry
+  val stq_head_domain    = Output(UInt(1.W))   // cf_domain_id of stq_head entry
+  val ldq_head_is_secret = Output(Bool())      // ldq_head had s_acc=1 or s_prop=1
+  val stq_head_is_secret = Output(Bool())      // stq_head had s_acc=1 or s_prop=1
+  val ldq_head_valid     = Output(Bool())      // ldq_head entry is occupied
+  val stq_head_valid     = Output(Bool())      // stq_head entry is occupied
+  // corefuzzing: TLB-stage FTQ secret updates — fires when s_acc determined at address resolution
+  // One port per memWidth; fires even for speculatively-executed (later squashed) memory ops
+  val cf_secret_ftq_updates = Output(Vec(memWidth, Valid(UInt(log2Ceil(ftqSz).W))))
 
   val fp_stdata   = Flipped(Decoupled(new ExeUnitResp(fLen)))
 
@@ -148,6 +157,10 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   // Stores clear busy bit when stdata is received
   // memWidth for int, 1 for fp (to avoid back-pressure fpstdat)
   val clr_bsy         = Output(Vec(memWidth + 1, Valid(UInt(robAddrSz.W))))
+  // corefuzzing: accumulated cf_fu_bitmap for the store (dtlb+dcache+stq bits), sent with clr_bsy
+  val clr_bsy_cf_bitmap = Output(Vec(memWidth + 1, UInt(numModules.W)))
+  // corefuzzing: cf_secret_transmission for stores, sent with clr_bsy
+  val clr_bsy_cf_stx    = Output(Vec(memWidth + 1, Bool()))
 
   // Speculatively safe load (barring memory ordering failure)
   val clr_unsafe      = Output(Vec(memWidth, Valid(UInt(robAddrSz.W))))
@@ -371,8 +384,13 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     {
       stq(st_enq_idx).valid           := true.B
       stq(st_enq_idx).bits.uop        := io.core.dis_uops(w).bits
-      // corefuzzing: stamp stqTagCF into cf_fu_bitmap at STQ enqueue
-      stq(st_enq_idx).bits.uop.cf_fu_bitmap := io.core.dis_uops(w).bits.cf_fu_bitmap | (1.U << stqTagCF.U)
+      // corefuzzing: stamp STQ/DTLB/DCache bits at STQ enqueue for non-fence stores
+      // All committed non-fence stores in BOOM go through DTLB (STA) then DCache (store_commit).
+      // Pre-mark these bits here so the ROB sees them at commit time via clr_bsy_cf_bitmap.
+      val store_bitmap_extra = (1.U << stqTagCF.U) |
+        Mux(!io.core.dis_uops(w).bits.is_fence,
+            (1.U << dtlbTagCF.U) | (1.U << dcacheTagCF.U), 0.U)
+      stq(st_enq_idx).bits.uop.cf_fu_bitmap := io.core.dis_uops(w).bits.cf_fu_bitmap | store_bitmap_extra
       stq(st_enq_idx).bits.addr.valid := false.B
       stq(st_enq_idx).bits.data.valid := false.B
       stq(st_enq_idx).bits.committed  := false.B
@@ -396,9 +414,17 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   ldq_tail := ld_enq_idx
   stq_tail := st_enq_idx
 
-  // corefuzzing: expose head entry op_count for stall attribution
-  io.core.ldq_head_op_count := Mux(ldq(ldq_head).valid, ldq(ldq_head).bits.uop.cf_op_count_id, 0.U)
-  io.core.stq_head_op_count := Mux(stq(stq_head).valid, stq(stq_head).bits.uop.cf_op_count_id, 0.U)
+  // corefuzzing: expose head entry op_count, domain, and secret-status for stall attribution
+  io.core.ldq_head_op_count  := Mux(ldq(ldq_head).valid, ldq(ldq_head).bits.uop.cf_op_count_id, 0.U)
+  io.core.stq_head_op_count  := Mux(stq(stq_head).valid, stq(stq_head).bits.uop.cf_op_count_id, 0.U)
+  io.core.ldq_head_domain    := Mux(ldq(ldq_head).valid, ldq(ldq_head).bits.uop.cf_domain_id, 0.U)
+  io.core.stq_head_domain    := Mux(stq(stq_head).valid, stq(stq_head).bits.uop.cf_domain_id, 0.U)
+  io.core.ldq_head_is_secret := Mux(ldq(ldq_head).valid,
+    ldq(ldq_head).bits.uop.cf_secret_access || ldq(ldq_head).bits.uop.cf_secret_propagation, false.B)
+  io.core.stq_head_is_secret := Mux(stq(stq_head).valid,
+    stq(stq_head).bits.uop.cf_secret_access || stq(stq_head).bits.uop.cf_secret_propagation, false.B)
+  io.core.ldq_head_valid     := ldq(ldq_head).valid
+  io.core.stq_head_valid     := stq(stq_head).valid
 
   io.dmem.force_order   := io.core.fence_dmem
   io.core.fencei_rdy    := !stq_nonempty && io.dmem.ordered
@@ -795,10 +821,30 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                     (exe_tlb_paddr(w) >= io.core.cf_secret_start_addr) &&
                     (exe_tlb_paddr(w) <= io.core.cf_secret_end_addr)
     uop_tlb_base.cf_secret_access := exe_tlb_uop(w).cf_secret_access || in_secret
+    // corefuzzing: TLB-stage FTQ update — mark this fetch packet as secret as soon as s_acc is known.
+    // Fires speculatively (even for squashed memory ops) to capture transient secret access flows.
+    io.core.cf_secret_ftq_updates(w).valid := exe_tlb_valid(w) && in_secret
+    io.core.cf_secret_ftq_updates(w).bits  := exe_tlb_uop(w).ftq_idx
+    // s_tx Case A: store carrying secret-dependent data to a non-secret memory address.
+    //   The secret escapes to attacker-accessible memory (anything outside the secret range).
+    val is_secret_bearing_store = exe_tlb_uop(w).uses_stq && !in_secret &&
+                                   (exe_tlb_uop(w).cf_secret_access || exe_tlb_uop(w).cf_secret_propagation)
+    // s_tx Case B: load where the effective address is derived from secret-propagated data
+    //   AND the address is outside the secret range (attacker-accessible memory).
+    //   The secret controls which non-secret memory location is accessed, leaking it via address
+    //   pattern (e.g., cache timing: load from mem[secret_value + base]).
+    //   Exclude loads to secret-range addresses: if the pointer happens to land in secret memory,
+    //   the access stays within the secure domain and is not observable by the attacker.
+    val is_secret_addr_load = exe_tlb_uop(w).uses_ldq && exe_tlb_uop(w).cf_secret_propagation && !in_secret
+    uop_tlb_base.cf_secret_transmission := exe_tlb_uop(w).cf_secret_transmission ||
+                                           is_secret_bearing_store || is_secret_addr_load
     // Stage 2: DTLB domain mismatch → INFL_DTLB_STATE (reads uop_tlb_base, writes uop_tlb_final)
     val uop_tlb_final = WireInit(uop_tlb_base)
     when (dtlb.io.resp_domain_mismatch(w)) {
-      uop_tlb_final := addInfluencer(uop_tlb_base, 0.U, INFL_DTLB_STATE.U)
+      // DTLB mismatch: victim using a TLB entry cached by attacker (is_atk=true, is_secret=false)
+      uop_tlb_final := addInfluencer(uop_tlb_base, 0.U, INFL_DTLB_STATE.U,
+        is_atk = uop_tlb_base.cf_domain_id === 0.U,
+        is_secret = false.B)
     }
     exe_tlb_uop_cf(w) := uop_tlb_final
   }
@@ -960,6 +1006,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       stq(stq_idx).bits.addr.bits  := Mux(exe_tlb_miss(w), exe_tlb_vaddr(w), exe_tlb_paddr(w))
       stq(stq_idx).bits.uop.pdst   := exe_tlb_uop(w).pdst // Needed for AMOs
       stq(stq_idx).bits.addr_is_virtual := exe_tlb_miss(w)
+      // corefuzzing: write IFT flags computed in TLB stage into STQ so clr_bsy carries them to ROB
+      stq(stq_idx).bits.uop.cf_secret_transmission :=
+        stq(stq_idx).bits.uop.cf_secret_transmission || exe_tlb_uop_cf(w).cf_secret_transmission
+      stq(stq_idx).bits.uop.cf_secret_access :=
+        stq(stq_idx).bits.uop.cf_secret_access || exe_tlb_uop_cf(w).cf_secret_access
 
       assert(!(will_fire_sta_incoming(w) && stq_incoming_e(w).bits.addr.valid),
         "[lsu] Incoming store is overwriting a valid address")
@@ -1122,65 +1173,88 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val mem_paddr                = RegNext(widthMap(w => dmem_req(w).bits.addr))
 
   // Task 1: Clr ROB busy bit
-  val clr_bsy_valid   = RegInit(widthMap(w => false.B))
-  val clr_bsy_rob_idx = Reg(Vec(memWidth, UInt(robAddrSz.W)))
-  val clr_bsy_brmask  = Reg(Vec(memWidth, UInt(maxBrCount.W)))
+  val clr_bsy_valid    = RegInit(widthMap(w => false.B))
+  val clr_bsy_rob_idx  = Reg(Vec(memWidth, UInt(robAddrSz.W)))
+  val clr_bsy_brmask   = Reg(Vec(memWidth, UInt(maxBrCount.W)))
+  // corefuzzing: carry accumulated STQ uop cf_fu_bitmap to ROB so stores have dtlb+dcache bits
+  val clr_bsy_cf_bmap  = Reg(Vec(memWidth, UInt(numModules.W)))
+  // corefuzzing: carry cf_secret_transmission from STQ uop to ROB
+  val clr_bsy_cf_stx_r = RegInit(widthMap(w => false.B))
 
   for (w <- 0 until memWidth) {
-    clr_bsy_valid   (w) := false.B
-    clr_bsy_rob_idx (w) := 0.U
-    clr_bsy_brmask  (w) := 0.U
+    clr_bsy_valid      (w) := false.B
+    clr_bsy_rob_idx    (w) := 0.U
+    clr_bsy_brmask     (w) := 0.U
+    clr_bsy_cf_bmap    (w) := 0.U
+    clr_bsy_cf_stx_r   (w) := false.B
 
 
     when (fired_stad_incoming(w)) {
-      clr_bsy_valid   (w) := mem_stq_incoming_e(w).valid           &&
-                            !mem_tlb_miss(w)                       &&
-                            !mem_stq_incoming_e(w).bits.uop.is_amo &&
-                            !IsKilledByBranch(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
-      clr_bsy_rob_idx (w) := mem_stq_incoming_e(w).bits.uop.rob_idx
-      clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
+      clr_bsy_valid      (w) := mem_stq_incoming_e(w).valid           &&
+                               !mem_tlb_miss(w)                       &&
+                               !mem_stq_incoming_e(w).bits.uop.is_amo &&
+                               !IsKilledByBranch(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
+      clr_bsy_rob_idx    (w) := mem_stq_incoming_e(w).bits.uop.rob_idx
+      clr_bsy_brmask     (w) := GetNewBrMask(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
+      // corefuzzing: capture live stq cf_fu_bitmap (updated in EXE stage with dtlb/dcache bits)
+      clr_bsy_cf_bmap    (w) := stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.uop.cf_fu_bitmap
+      clr_bsy_cf_stx_r   (w) := stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.uop.cf_secret_transmission
     } .elsewhen (fired_sta_incoming(w)) {
-      clr_bsy_valid   (w) := mem_stq_incoming_e(w).valid            &&
-                             mem_stq_incoming_e(w).bits.data.valid  &&
-                            !mem_tlb_miss(w)                        &&
-                            !mem_stq_incoming_e(w).bits.uop.is_amo  &&
-                            !IsKilledByBranch(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
-      clr_bsy_rob_idx (w) := mem_stq_incoming_e(w).bits.uop.rob_idx
-      clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
+      clr_bsy_valid      (w) := mem_stq_incoming_e(w).valid            &&
+                                mem_stq_incoming_e(w).bits.data.valid  &&
+                               !mem_tlb_miss(w)                        &&
+                               !mem_stq_incoming_e(w).bits.uop.is_amo  &&
+                               !IsKilledByBranch(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
+      clr_bsy_rob_idx    (w) := mem_stq_incoming_e(w).bits.uop.rob_idx
+      clr_bsy_brmask     (w) := GetNewBrMask(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
+      clr_bsy_cf_bmap    (w) := stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.uop.cf_fu_bitmap
+      clr_bsy_cf_stx_r   (w) := stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.uop.cf_secret_transmission
     } .elsewhen (fired_std_incoming(w)) {
-      clr_bsy_valid   (w) := mem_stq_incoming_e(w).valid                 &&
-                             mem_stq_incoming_e(w).bits.addr.valid       &&
-                            !mem_stq_incoming_e(w).bits.addr_is_virtual  &&
-                            !mem_stq_incoming_e(w).bits.uop.is_amo       &&
-                            !IsKilledByBranch(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
-      clr_bsy_rob_idx (w) := mem_stq_incoming_e(w).bits.uop.rob_idx
-      clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
+      clr_bsy_valid      (w) := mem_stq_incoming_e(w).valid                 &&
+                                mem_stq_incoming_e(w).bits.addr.valid       &&
+                               !mem_stq_incoming_e(w).bits.addr_is_virtual  &&
+                               !mem_stq_incoming_e(w).bits.uop.is_amo       &&
+                               !IsKilledByBranch(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
+      clr_bsy_rob_idx    (w) := mem_stq_incoming_e(w).bits.uop.rob_idx
+      clr_bsy_brmask     (w) := GetNewBrMask(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
+      clr_bsy_cf_bmap    (w) := stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.uop.cf_fu_bitmap
+      clr_bsy_cf_stx_r   (w) := stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.uop.cf_secret_transmission
     } .elsewhen (fired_sfence(w)) {
-      clr_bsy_valid   (w) := (w == 0).B // SFence proceeds down all paths, only allow one to clr the rob
-      clr_bsy_rob_idx (w) := mem_incoming_uop(w).rob_idx
-      clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_incoming_uop(w))
+      clr_bsy_valid      (w) := (w == 0).B // SFence proceeds down all paths, only allow one to clr the rob
+      clr_bsy_rob_idx    (w) := mem_incoming_uop(w).rob_idx
+      clr_bsy_brmask     (w) := GetNewBrMask(io.core.brupdate, mem_incoming_uop(w))
+      clr_bsy_cf_bmap    (w) := mem_incoming_uop(w).cf_fu_bitmap
+      clr_bsy_cf_stx_r   (w) := false.B
     } .elsewhen (fired_sta_retry(w)) {
-      clr_bsy_valid   (w) := mem_stq_retry_e.valid            &&
-                             mem_stq_retry_e.bits.data.valid  &&
-                            !mem_tlb_miss(w)                  &&
-                            !mem_stq_retry_e.bits.uop.is_amo  &&
-                            !IsKilledByBranch(io.core.brupdate, mem_stq_retry_e.bits.uop)
-      clr_bsy_rob_idx (w) := mem_stq_retry_e.bits.uop.rob_idx
-      clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_stq_retry_e.bits.uop)
+      clr_bsy_valid      (w) := mem_stq_retry_e.valid            &&
+                                mem_stq_retry_e.bits.data.valid  &&
+                               !mem_tlb_miss(w)                  &&
+                               !mem_stq_retry_e.bits.uop.is_amo  &&
+                               !IsKilledByBranch(io.core.brupdate, mem_stq_retry_e.bits.uop)
+      clr_bsy_rob_idx    (w) := mem_stq_retry_e.bits.uop.rob_idx
+      clr_bsy_brmask     (w) := GetNewBrMask(io.core.brupdate, mem_stq_retry_e.bits.uop)
+      clr_bsy_cf_bmap    (w) := stq(mem_stq_retry_e.bits.uop.stq_idx).bits.uop.cf_fu_bitmap
+      clr_bsy_cf_stx_r   (w) := stq(mem_stq_retry_e.bits.uop.stq_idx).bits.uop.cf_secret_transmission
     }
 
-    io.core.clr_bsy(w).valid := clr_bsy_valid(w) &&
+    io.core.clr_bsy(w).valid          := clr_bsy_valid(w) &&
                                !IsKilledByBranch(io.core.brupdate, clr_bsy_brmask(w)) &&
                                !io.core.exception && !RegNext(io.core.exception) && !RegNext(RegNext(io.core.exception))
-    io.core.clr_bsy(w).bits  := clr_bsy_rob_idx(w)
+    io.core.clr_bsy(w).bits           := clr_bsy_rob_idx(w)
+    io.core.clr_bsy_cf_bitmap(w)      := clr_bsy_cf_bmap(w)
+    io.core.clr_bsy_cf_stx(w)        := clr_bsy_cf_stx_r(w)
   }
 
-  val stdf_clr_bsy_valid   = RegInit(false.B)
-  val stdf_clr_bsy_rob_idx = Reg(UInt(robAddrSz.W))
-  val stdf_clr_bsy_brmask  = Reg(UInt(maxBrCount.W))
-  stdf_clr_bsy_valid   := false.B
-  stdf_clr_bsy_rob_idx := 0.U
-  stdf_clr_bsy_brmask  := 0.U
+  val stdf_clr_bsy_valid    = RegInit(false.B)
+  val stdf_clr_bsy_rob_idx  = Reg(UInt(robAddrSz.W))
+  val stdf_clr_bsy_brmask   = Reg(UInt(maxBrCount.W))
+  val stdf_clr_bsy_cf_bmap  = Reg(UInt(numModules.W))
+  val stdf_clr_bsy_cf_stx   = RegInit(false.B)
+  stdf_clr_bsy_valid    := false.B
+  stdf_clr_bsy_rob_idx  := 0.U
+  stdf_clr_bsy_brmask   := 0.U
+  stdf_clr_bsy_cf_bmap  := 0.U
+  stdf_clr_bsy_cf_stx   := false.B
   when (fired_stdf_incoming) {
     val s_idx = mem_stdf_uop.stq_idx
     stdf_clr_bsy_valid   := stq(s_idx).valid                 &&
@@ -1190,14 +1264,18 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                             !IsKilledByBranch(io.core.brupdate, mem_stdf_uop)
     stdf_clr_bsy_rob_idx := mem_stdf_uop.rob_idx
     stdf_clr_bsy_brmask  := GetNewBrMask(io.core.brupdate, mem_stdf_uop)
+    stdf_clr_bsy_cf_bmap := stq(s_idx).bits.uop.cf_fu_bitmap
+    stdf_clr_bsy_cf_stx  := stq(s_idx).bits.uop.cf_secret_transmission
   }
 
 
 
-  io.core.clr_bsy(memWidth).valid := stdf_clr_bsy_valid &&
+  io.core.clr_bsy(memWidth).valid           := stdf_clr_bsy_valid &&
                                     !IsKilledByBranch(io.core.brupdate, stdf_clr_bsy_brmask) &&
                                     !io.core.exception && !RegNext(io.core.exception) && !RegNext(RegNext(io.core.exception))
-  io.core.clr_bsy(memWidth).bits  := stdf_clr_bsy_rob_idx
+  io.core.clr_bsy(memWidth).bits            := stdf_clr_bsy_rob_idx
+  io.core.clr_bsy_cf_bitmap(memWidth)       := stdf_clr_bsy_cf_bmap
+  io.core.clr_bsy_cf_stx(memWidth)         := stdf_clr_bsy_cf_stx
 
 
 
@@ -1304,7 +1382,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           failed_loads(i)        := true.B
           // corefuzzing: cross-domain memory ordering violation
           when (stq(lcam_stq_idx(w)).bits.uop.cf_domain_id =/= l_bits.uop.cf_domain_id) {
-            ldq(i).bits.uop := addInfluencer(l_bits.uop, stq(lcam_stq_idx(w)).bits.uop.cf_op_count_id, INFL_MEM_ORDER.U)
+            val stq_infl_uop = stq(lcam_stq_idx(w)).bits.uop
+            ldq(i).bits.uop := addInfluencer(l_bits.uop, stq_infl_uop.cf_op_count_id, INFL_MEM_ORDER.U,
+              is_atk = stq_infl_uop.cf_domain_id === 1.U,
+              is_secret = stq_infl_uop.cf_secret_access || stq_infl_uop.cf_secret_propagation)
           }
         }
       } .elsewhen (do_ld_search(w)            &&
@@ -1322,7 +1403,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
             failed_loads(i)        := true.B
             // corefuzzing: cross-domain LD-LD ordering violation (the searcher's store from other domain)
             when (lcam_uop(w).cf_domain_id =/= l_bits.uop.cf_domain_id) {
-              ldq(i).bits.uop := addInfluencer(l_bits.uop, lcam_uop(w).cf_op_count_id, INFL_MEM_ORDER.U)
+              ldq(i).bits.uop := addInfluencer(l_bits.uop, lcam_uop(w).cf_op_count_id, INFL_MEM_ORDER.U,
+                is_atk = lcam_uop(w).cf_domain_id === 1.U,
+                is_secret = lcam_uop(w).cf_secret_access || lcam_uop(w).cf_secret_propagation)
             }
           }
         } .elsewhen (lcam_ldq_idx(w) =/= i.U) {
@@ -1531,7 +1614,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           when (resp_cf.cf_influencer_list(i).valid) {
             cf_next := addInfluencer(cf_chain,
               resp_cf.cf_influencer_list(i).op_count,
-              resp_cf.cf_influencer_list(i).infl_type)
+              resp_cf.cf_influencer_list(i).infl_type,
+              is_atk = resp_cf.cf_influencer_list(i).is_atk,
+              is_secret = resp_cf.cf_influencer_list(i).is_secret)
           }
           cf_chain = cf_next
         }
@@ -1588,7 +1673,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       // corefuzzing: STL forwarding cross-domain influencer
       val fwd_uop_cf = WireInit(forward_uop)
       when (data_ready && live && (forward_uop.cf_domain_id =/= stq_e.bits.uop.cf_domain_id)) {
-        fwd_uop_cf := addInfluencer(forward_uop, stq_e.bits.uop.cf_op_count_id, INFL_STL_FORWARD.U)
+        val stl_infl_uop = stq_e.bits.uop
+        fwd_uop_cf := addInfluencer(forward_uop, stl_infl_uop.cf_op_count_id, INFL_STL_FORWARD.U,
+          is_atk = stl_infl_uop.cf_domain_id === 1.U,
+          is_secret = stl_infl_uop.cf_secret_access || stl_infl_uop.cf_secret_propagation)
       }
 
       io.core.exe(w).iresp.valid := (fwd_uop_cf.dst_rtype === RT_FIX) && data_ready && live
