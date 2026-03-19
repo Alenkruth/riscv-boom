@@ -1029,9 +1029,8 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     // Stage 1: start from s2_req uop, apply bitmap + secret_transmission
     val uop_resp_base = WireInit(s2_req(w).uop)
     uop_resp_base.cf_fu_bitmap := s2_req(w).uop.cf_fu_bitmap | (1.U << dcacheTagCF.U)
-    when (s2_req(w).uop.cf_secret_access && !s2_hit(w)) {
-      uop_resp_base.cf_secret_transmission := true.B
-    }
+    // s_tx is NOT set here: cache misses are not transmissions (data stays in the processor).
+    // Transmission detection happens in lsu.scala at TLB time for stores/loads with secret-derived addresses.
     // Stage 2: conditionally apply INFL_CACHE_EVICTION for cross-domain hit.
     // Only fires when a VICTIM (domain=0) hits a line last filled by ATTACKER (domain=1).
     val uop_resp_final = WireInit(uop_resp_base)
@@ -1042,28 +1041,28 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       val uop_dom    = s2_req(w).uop.cf_domain_id
       // Victim (domain=0) hitting a line last filled by attacker (domain=1)
       when (uop_dom === 0.U && line_dom === 1.U) {
-        uop_resp_final := addInfluencer(uop_resp_base, line_oc, INFL_CACHE_EVICTION.U)
+        uop_resp_final := addInfluencer(uop_resp_base, line_oc, INFL_CACHE_EVICTION.U,
+          is_atk = true.B, is_secret = false.B)
       }
     }
     cache_resp(w).bits.uop      := uop_resp_final
     cache_resp(w).bits.data     := loadgen(w).data | s2_sc_fail
     cache_resp(w).bits.is_hella := s2_req(w).is_hella
 
-    // At s2 LSU miss: record domain and op_count of the missing uop to the set it targets.
-    // This is used to identify the filling instruction when a victim later hits the line.
-    when (s2_valid(w) && !s2_hit(w) && s2_type === t_lsu && mshrs.io.req(w).fire) {
-      val miss_set = s2_req(w).addr(untagBits-1, blockOffBits)
-      dcache_set_domain(miss_set)   := s2_req(w).uop.cf_domain_id
-      dcache_set_op_count(miss_set) := s2_req(w).uop.cf_op_count_id
-    }
+  }
+
+  // corefuzzing: update per-set domain at MSHR fill completion (meta_write), not miss request time.
+  // This prevents a victim miss from overwriting the attacker's domain before the fill completes.
+  when (mshrs.io.cf_meta_write_fill.valid) {
+    dcache_set_domain(mshrs.io.cf_meta_write_fill.bits.idx)   := mshrs.io.cf_meta_write_fill.bits.domain
+    dcache_set_op_count(mshrs.io.cf_meta_write_fill.bits.idx) := mshrs.io.cf_meta_write_fill.bits.op_count
   }
 
   val uncache_resp = Wire(Valid(new BoomDCacheResp))
   // corefuzzing: stamp dcacheTagCF into MSHR (miss) responses and mark secret_transmission
   uncache_resp.bits                     := mshrs.io.resp.bits
   uncache_resp.bits.uop.cf_fu_bitmap    := mshrs.io.resp.bits.uop.cf_fu_bitmap | (1.U << dcacheTagCF.U)
-  // MSHR completion = cache miss filled from memory; any secret access here is a transmission
-  uncache_resp.bits.uop.cf_secret_transmission := mshrs.io.resp.bits.uop.cf_secret_access
+  // s_tx is NOT set at MSHR completion: cache miss fill is not a transmission event.
   uncache_resp.valid    := mshrs.io.resp.valid
   mshrs.io.resp.ready := !(cache_resp.map(_.valid).reduce(_&&_)) // We can backpressure the MSHRs, but not cache hits
 

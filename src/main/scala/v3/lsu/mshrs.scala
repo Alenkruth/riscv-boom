@@ -18,6 +18,7 @@ import freechips.rocketchip.rocket._
 
 import boom.v3.common._
 import boom.v3.exu.BrUpdateInfo
+import freechips.rocketchip.util.CoreFuzzingConstants
 import boom.v3.util.{IsKilledByBranch, GetNewBrMask, BranchKillableQueue, IsOlder, UpdateBrMask, AgePriorityEncoder, WrapInc}
 
 class BoomDCacheReqInternal(implicit p: Parameters) extends BoomDCacheReq()(p)
@@ -35,6 +36,7 @@ class BoomDCacheReqInternal(implicit p: Parameters) extends BoomDCacheReq()(p)
 
 class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   with HasL1HellaCacheParameters
+  with CoreFuzzingConstants
 {
   val io = IO(new Bundle {
     val id = Input(UInt())
@@ -91,6 +93,9 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     val wb_resp     = Input(Bool())
 
     val probe_rdy   = Output(Bool())
+    // corefuzzing: domain of the stored request — valid while MSHR is active, used at meta_write time
+    val cf_req_domain   = Output(UInt(1.W))
+    val cf_req_op_count = Output(UInt(uopIDCounterWidthCF.W))
   })
 
   // TODO: Optimize this. We don't want to mess with cache during speculation
@@ -146,6 +151,9 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   when (meta_hazard =/= 0.U) { meta_hazard := meta_hazard + 1.U }
   when (io.meta_write.fire) { meta_hazard := 1.U }
   io.probe_rdy   := (meta_hazard === 0.U && (state.isOneOf(s_invalid, s_refill_req, s_refill_resp, s_drain_rpq_loads) || (state === s_meta_read && grantack.valid)))
+  // corefuzzing: expose stored request domain for fill-completion tracking in dcache
+  io.cf_req_domain   := req.uop.cf_domain_id
+  io.cf_req_op_count := req.uop.cf_op_count_id
   io.idx.valid := state =/= s_invalid
   io.tag.valid := state =/= s_invalid
   io.way.valid := !state.isOneOf(s_invalid, s_prefetch)
@@ -512,6 +520,7 @@ class LineBufferMeta(implicit p: Parameters) extends BoomBundle()(p)
 
 class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   with HasL1HellaCacheParameters
+  with CoreFuzzingConstants
 {
   val io = IO(new Bundle {
     val req  = Flipped(Vec(memWidth, Decoupled(new BoomDCacheReqInternal))) // Req from s2 of DCache pipe
@@ -545,6 +554,12 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
 
     val fence_rdy = Output(Bool())
     val probe_rdy = Output(Bool())
+    // corefuzzing: fill-completion event — fires when an MSHR meta_write completes
+    val cf_meta_write_fill = Output(Valid(new Bundle {
+      val idx      = UInt(idxBits.W)
+      val domain   = UInt(1.W)
+      val op_count = UInt(uopIDCounterWidthCF.W)
+    }))
   })
 
   val req_idx = OHToUInt(io.req.map(_.valid))
@@ -711,6 +726,13 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
   io.meta_write <> meta_write_arb.io.out
   io.meta_read  <> meta_read_arb.io.out
   io.wb_req     <> wb_req_arb.io.out
+  // corefuzzing: fire fill-completion event when an MSHR's meta_write is accepted
+  io.cf_meta_write_fill.valid         := meta_write_arb.io.out.fire
+  io.cf_meta_write_fill.bits.idx      := meta_write_arb.io.out.bits.idx
+  io.cf_meta_write_fill.bits.domain   := Mux1H(UIntToOH(meta_write_arb.io.chosen),
+                                           VecInit(mshrs.map(_.io.cf_req_domain)))
+  io.cf_meta_write_fill.bits.op_count := Mux1H(UIntToOH(meta_write_arb.io.chosen),
+                                           VecInit(mshrs.map(_.io.cf_req_op_count)))
 
   val mmio_alloc_arb = Module(new Arbiter(Bool(), nIOMSHRs))
 
