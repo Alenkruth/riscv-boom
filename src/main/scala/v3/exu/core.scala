@@ -303,6 +303,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   io.lsu.cf_debug_dcache_enable := custom_csrs.cf_debug_dcache_enable
 
   rob.io.cf_debug_rob_enable := custom_csrs.cf_debug_rob_enable && custom_csrs.cf_debug_enable
+  // corefuzzing: drive cycle-N mispredict UOP so ROB flush log can annotate INFL_PIPELINE_FLUSH correctly
+  rob.io.cf_mispredict_uop.valid := b1.mispredict_mask =/= 0.U
+  rob.io.cf_mispredict_uop.bits  := oldest_mispredict.uop
   // io.ifu.cf_debug_log := custom_csrs.cf_debug_log
 
   // Assigning the CSR's output to the cf_tage_to_gshare signal in the frontend.
@@ -337,6 +340,13 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   rename_stage.io.cf_debug_rename_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable
   fp_rename_stage.io.cf_debug_rename_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable
   pred_rename_stage.io.cf_debug_rename_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable
+  // corefuzzing: drive cycle-N mispredict UOP to rename stages (same signal as ROB)
+  rename_stage.io.cf_mispredict_uop.valid      := b1.mispredict_mask =/= 0.U
+  rename_stage.io.cf_mispredict_uop.bits       := oldest_mispredict.uop
+  fp_rename_stage.io.cf_mispredict_uop.valid   := b1.mispredict_mask =/= 0.U
+  fp_rename_stage.io.cf_mispredict_uop.bits    := oldest_mispredict.uop
+  pred_rename_stage.io.cf_mispredict_uop.valid := b1.mispredict_mask =/= 0.U
+  pred_rename_stage.io.cf_mispredict_uop.bits  := oldest_mispredict.uop
 
   mem_iss_unit.io.cf_debug_issue_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable
   int_iss_unit.io.cf_debug_issue_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable
@@ -598,6 +608,24 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
                              rob.io.com_xcpt.bits.ftq_idx,
                              rob.io.commit.uops(youngest_com_idx).ftq_idx)
 
+  // corefuzzing: multi-port FTQ secret marking at dispatch time (s_prop) and TLB time (s_acc via LSU).
+  // Design principle: mark the FTQ entry as soon as the secret state is known, regardless of commit.
+  // This captures transient flows — speculative instructions that touch secret state even if squashed.
+  //
+  // Ports 0..coreWidth-1: dispatch stage — s_prop is determined here (taint table, C5 queue stall).
+  //   Fires for every dispatched instruction with cf_secret_propagation=true.
+  //   Multiple slots can fire simultaneously for different FTQ entries — no conflict (Reg(Vec)).
+  //
+  // Ports coreWidth..coreWidth+memWidth-1: wired from LSU TLB stage (lsu.cf_secret_ftq_updates).
+  //   Fires when in_secret is determined at address resolution — captures s_acc speculatively.
+  for (w <- 0 until coreWidth) {
+    io.ifu.cf_secret_ftq_updates(w).valid := dis_fire(w) && dis_uops(w).cf_secret_propagation
+    io.ifu.cf_secret_ftq_updates(w).bits  := dis_uops(w).ftq_idx
+  }
+  for (w <- 0 until memWidth) {
+    io.ifu.cf_secret_ftq_updates(coreWidth + w) := io.lsu.cf_secret_ftq_updates(w)
+  }
+
   assert(!(rob.io.commit.valids.reduce(_|_) && rob.io.com_xcpt.valid),
     "ROB can't commit and except in same cycle!")
 
@@ -659,34 +687,50 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
     dec_uops(w) := decode_units(w).io.deq.uop
   }
-  // corefuzzing: [FLUSH] logging for decode-stage uops killed by branch mispredict.
-  // Uses the same format as ROB's [FLUSH] log; gated by cf_debug_rob_enable.
-  for (w <- 0 until coreWidth) {
-    when (dec_valids(w) && IsKilledByBranch(brupdate, dec_uops(w)) &&
-          custom_csrs.cf_debug_rob_enable && custom_csrs.cf_debug_enable) {
-      val dec_fu_base = dec_uops(w)
-      val dec_fu = WireInit(dec_fu_base)
-      when (brupdate.b2.mispredict &&
-            brupdate.b2.uop.cf_domain_id =/= dec_fu_base.cf_domain_id) {
-        dec_fu := addInfluencer(dec_fu_base,
-          brupdate.b2.uop.cf_op_count_id, INFL_PIPELINE_FLUSH.U)
-      }
-      printf("[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d) FU=0x%x OVF=%d INFL=[",
-        Sext(dec_fu.debug_pc(vaddrBits-1,0), xLen), dec_fu.debug_inst,
-        dec_fu.cf_domain_id, dec_fu.cf_speculated, dec_fu.cf_attacker_influence,
-        dec_fu.cf_secret_access, dec_fu.cf_secret_propagation, dec_fu.cf_secret_transmission,
-        dec_fu.cf_op_count_id, dec_fu.cf_spec_branch_is_atk, dec_fu.cf_spec_branch_op_id,
-        dec_fu.cf_fu_bitmap, dec_fu.cf_infl_overflow)
-      for (k <- 0 until numInfluencerSlotsCF) {
-        when (dec_fu.cf_influencer_list(k).valid) {
-          printf("{oc=%d,ty=%d}", dec_fu.cf_influencer_list(k).op_count,
-            dec_fu.cf_influencer_list(k).infl_type)
+  // corefuzzing: [FLUSH] logging for decode-stage uops killed by branch mispredict or ROB flush.
+  // SRC=1 (decode). Gated by cf_debug_rob_enable + cf_debug_enable.
+  {
+    val decFlushInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d,dc=%d}"}.mkString(" ")
+    val decFlushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d $decFlushInflFmt\n"
+    def printDecFlush(uop: MicroOp): Unit = {
+      val inflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
+        uop.cf_influencer_list(k).valid,
+        uop.cf_influencer_list(k).op_count,
+        uop.cf_influencer_list(k).infl_type,
+        uop.cf_influencer_list(k).is_atk,
+        uop.cf_influencer_list(k).is_secret,
+        uop.cf_influencer_list(k).deny_count
+      ))
+      printf(decFlushFmt, (Seq[Bits](
+        Sext(uop.debug_pc(vaddrBits-1,0), xLen), uop.debug_inst,
+        uop.cf_domain_id, uop.cf_speculated, uop.cf_attacker_influence,
+        uop.cf_secret_access, uop.cf_secret_propagation, uop.cf_secret_transmission,
+        uop.cf_op_count_id, uop.cf_spec_branch_is_atk, uop.cf_spec_branch_op_id,
+        uop.cf_fu_bitmap, 1.U, inflBitmapFromList(uop.cf_influencer_list), uop.cf_infl_overflow
+      ) ++ inflArgs): _*)
+    }
+    for (w <- 0 until coreWidth) {
+      when (custom_csrs.cf_debug_rob_enable && custom_csrs.cf_debug_enable) {
+        // Path A: branch mispredict kills this instruction
+        when (dec_valids(w) && IsKilledByBranch(brupdate, dec_uops(w))) {
+          val dec_fu_base = dec_uops(w)
+          val dec_fu = WireInit(dec_fu_base)
+          when (brupdate.b2.mispredict &&
+                brupdate.b2.uop.cf_domain_id =/= dec_fu_base.cf_domain_id) {
+            val br_uop = brupdate.b2.uop
+            dec_fu := addInfluencer(dec_fu_base, br_uop.cf_op_count_id, INFL_PIPELINE_FLUSH.U,
+              is_atk = br_uop.cf_domain_id === 1.U,
+              is_secret = br_uop.cf_secret_access || br_uop.cf_secret_propagation)
+          }
+          printDecFlush(dec_fu)
+        }
+        // Path B: ROB flush (exception, FENCE.I, etc.) — kills all in-flight decode instructions
+        .elsewhen (dec_valids(w) && rob.io.flush.valid) {
+          printDecFlush(dec_uops(w))
         }
       }
-      printf("]\n")
     }
   }
-
   //-------------------------------------------------------------
   // FTQ GetPC Port Arbitration
 
@@ -937,7 +981,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   }
 
   // corefuzzing: Unified dispatch influencer computation.
-  // Chains INFL_REG_DATAFLOW (taint), INFL_ROB_FULL, INFL_LDQ_FULL, INFL_STQ_FULL.
+  // Chains INFL_REG_DATAFLOW (taint), INFL_REG_PRESSURE (freelist), INFL_ROB_FULL, INFL_LDQ_FULL, INFL_STQ_FULL.
   // All additions use rename_stage.io.ren2_uops(w) as the cycle-free base to avoid
   // combinational loops that would arise from reading dis_uops(w) after writing it.
   val dis_stall_was_rob = (0 until coreWidth).map(w =>
@@ -946,39 +990,121 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     RegNext(dis_valids(w) && !dis_fire(w) && io.lsu.ldq_full(w) && dis_uops(w).uses_ldq))
   val dis_stall_was_stq = (0 until coreWidth).map(w =>
     RegNext(dis_valids(w) && !dis_fire(w) && io.lsu.stq_full(w) && dis_uops(w).uses_stq))
+  // C5: capture whether the blocking queue head was secret-dependent at stall time.
+  // Used to propagate s_prop to the stalled instruction.
+  val dis_stall_was_rob_secret = (0 until coreWidth).map(w =>
+    RegNext(dis_valids(w) && !dis_fire(w) && !rob.io.ready && rob.io.rob_head_is_secret))
+  val dis_stall_was_ldq_secret = (0 until coreWidth).map(w =>
+    RegNext(dis_valids(w) && !dis_fire(w) && io.lsu.ldq_full(w) && dis_uops(w).uses_ldq && io.lsu.ldq_head_is_secret))
+  val dis_stall_was_stq_secret = (0 until coreWidth).map(w =>
+    RegNext(dis_valids(w) && !dis_fire(w) && io.lsu.stq_full(w) && dis_uops(w).uses_stq && io.lsu.stq_head_is_secret))
+  // Capture the BLOCKING head's attributes during the stall cycle.
+  // On the fire cycle, the queue head has already advanced; we need the stall-cycle head for correct influencer attribution.
+  val dis_stall_rob_head_op_count = (0 until coreWidth).map(w =>
+    RegEnable(rob.io.rob_head_op_count, dis_valids(w) && !dis_fire(w) && !rob.io.ready))
+  val dis_stall_rob_head_domain   = (0 until coreWidth).map(w =>
+    RegEnable(rob.io.rob_head_domain,   dis_valids(w) && !dis_fire(w) && !rob.io.ready))
+  val dis_stall_rob_head_is_secret= (0 until coreWidth).map(w =>
+    RegEnable(rob.io.rob_head_is_secret,dis_valids(w) && !dis_fire(w) && !rob.io.ready))
+  val dis_stall_ldq_head_op_count = (0 until coreWidth).map(w =>
+    RegEnable(io.lsu.ldq_head_op_count, dis_valids(w) && !dis_fire(w) && io.lsu.ldq_full(w) && dis_uops(w).uses_ldq))
+  val dis_stall_ldq_head_domain   = (0 until coreWidth).map(w =>
+    RegEnable(io.lsu.ldq_head_domain,   dis_valids(w) && !dis_fire(w) && io.lsu.ldq_full(w) && dis_uops(w).uses_ldq))
+  val dis_stall_ldq_head_is_secret= (0 until coreWidth).map(w =>
+    RegEnable(io.lsu.ldq_head_is_secret,dis_valids(w) && !dis_fire(w) && io.lsu.ldq_full(w) && dis_uops(w).uses_ldq))
+  val dis_stall_stq_head_op_count = (0 until coreWidth).map(w =>
+    RegEnable(io.lsu.stq_head_op_count, dis_valids(w) && !dis_fire(w) && io.lsu.stq_full(w) && dis_uops(w).uses_stq))
+  val dis_stall_stq_head_domain   = (0 until coreWidth).map(w =>
+    RegEnable(io.lsu.stq_head_domain,   dis_valids(w) && !dis_fire(w) && io.lsu.stq_full(w) && dis_uops(w).uses_stq))
+  val dis_stall_stq_head_is_secret= (0 until coreWidth).map(w =>
+    RegEnable(io.lsu.stq_head_is_secret,dis_valids(w) && !dis_fire(w) && io.lsu.stq_full(w) && dis_uops(w).uses_stq))
+  // REG_PRESSURE: stall due to physical register freelist exhausted (INT or FP rename)
+  val dis_stall_was_reg = (0 until coreWidth).map(w =>
+    RegNext(dis_valids(w) && !dis_fire(w) && ren_stalls(w)))
+  val dis_stall_reg_head_op_count = (0 until coreWidth).map(w =>
+    RegEnable(rob.io.rob_head_op_count, dis_valids(w) && !dis_fire(w) && ren_stalls(w)))
+  val dis_stall_reg_head_domain   = (0 until coreWidth).map(w =>
+    RegEnable(rob.io.rob_head_domain,   dis_valids(w) && !dis_fire(w) && ren_stalls(w)))
+  val dis_stall_reg_head_is_secret= (0 until coreWidth).map(w =>
+    RegEnable(rob.io.rob_head_is_secret,dis_valids(w) && !dis_fire(w) && ren_stalls(w)))
   for (w <- 0 until coreWidth) {
     val pre = rename_stage.io.ren2_uops(w)  // cycle-free base
     val is_tainted = dis_uops(w).cf_src_tainted && dis_uops(w).cf_domain_id === 0.U
 
     // Step 1: INFL_REG_DATAFLOW (register taint)
-    val post1 = addInfluencer(pre, pre.cf_taint_producer_op, INFL_REG_DATAFLOW.U)
+    // is_atk/is_secret come from the rename-stage producer tables
+    val post1 = addInfluencer(pre, pre.cf_taint_producer_op, INFL_REG_DATAFLOW.U,
+      is_atk = pre.cf_taint_producer_is_atk, is_secret = pre.cf_taint_producer_is_secret)
     val list1 = Mux(is_tainted, post1.cf_influencer_list, pre.cf_influencer_list)
     val ovf1  = Mux(is_tainted, post1.cf_infl_overflow,   pre.cf_infl_overflow)
     when (is_tainted) { dis_uops(w).cf_secret_propagation := true.B }
 
-    // Step 2: INFL_ROB_FULL
-    val mid2 = Wire(pre.cloneType); mid2 := pre
-    mid2.cf_influencer_list := list1; mid2.cf_infl_overflow := ovf1
-    val post2 = addInfluencer(mid2, 0.U, INFL_ROB_FULL.U)
-    val list2 = Mux(dis_fire(w) && dis_stall_was_rob(w), post2.cf_influencer_list, list1)
-    val ovf2  = Mux(dis_fire(w) && dis_stall_was_rob(w), post2.cf_infl_overflow,   ovf1)
+    // Step 1.5: INFL_REG_PRESSURE — physical register freelist exhausted; attributed to ROB head
+    // (the oldest committed instruction will free a register, so it is the structural bottleneck).
+    val mid15 = Wire(pre.cloneType); mid15 := pre
+    mid15.cf_influencer_list := list1; mid15.cf_infl_overflow := ovf1
+    val post15 = addInfluencer(mid15, dis_stall_reg_head_op_count(w), INFL_REG_PRESSURE.U,
+      is_atk = dis_stall_reg_head_domain(w) === 1.U, is_secret = dis_stall_reg_head_is_secret(w))
+    val list15 = Mux(dis_fire(w) && dis_stall_was_reg(w), post15.cf_influencer_list, list1)
+    val ovf15  = Mux(dis_fire(w) && dis_stall_was_reg(w), post15.cf_infl_overflow,   ovf1)
 
-    // Step 3: INFL_LDQ_FULL
+    // Step 2: INFL_ROB_FULL — ROB head is the influencer (blocked dispatch)
+    // Use stall-cycle captured head attributes: on the fire cycle the head has already advanced.
+    val mid2 = Wire(pre.cloneType); mid2 := pre
+    mid2.cf_influencer_list := list15; mid2.cf_infl_overflow := ovf15
+    val post2 = addInfluencer(mid2, dis_stall_rob_head_op_count(w), INFL_ROB_FULL.U,
+      is_atk = dis_stall_rob_head_domain(w) === 1.U, is_secret = dis_stall_rob_head_is_secret(w))
+    val list2 = Mux(dis_fire(w) && dis_stall_was_rob(w), post2.cf_influencer_list, list15)
+    val ovf2  = Mux(dis_fire(w) && dis_stall_was_rob(w), post2.cf_infl_overflow,   ovf15)
+
+    // Step 3: INFL_LDQ_FULL — LDQ head is the influencer
     val mid3 = Wire(pre.cloneType); mid3 := pre
     mid3.cf_influencer_list := list2; mid3.cf_infl_overflow := ovf2
-    val post3 = addInfluencer(mid3, io.lsu.ldq_head_op_count, INFL_LDQ_FULL.U)
+    val post3 = addInfluencer(mid3, dis_stall_ldq_head_op_count(w), INFL_LDQ_FULL.U,
+      is_atk = dis_stall_ldq_head_domain(w) === 1.U, is_secret = dis_stall_ldq_head_is_secret(w))
     val list3 = Mux(dis_fire(w) && dis_stall_was_ldq(w), post3.cf_influencer_list, list2)
     val ovf3  = Mux(dis_fire(w) && dis_stall_was_ldq(w), post3.cf_infl_overflow,   ovf2)
 
-    // Step 4: INFL_STQ_FULL
+    // Step 4: INFL_STQ_FULL — STQ head is the influencer
     val mid4 = Wire(pre.cloneType); mid4 := pre
     mid4.cf_influencer_list := list3; mid4.cf_infl_overflow := ovf3
-    val post4 = addInfluencer(mid4, io.lsu.stq_head_op_count, INFL_STQ_FULL.U)
+    val post4 = addInfluencer(mid4, dis_stall_stq_head_op_count(w), INFL_STQ_FULL.U,
+      is_atk = dis_stall_stq_head_domain(w) === 1.U, is_secret = dis_stall_stq_head_is_secret(w))
     val list4 = Mux(dis_fire(w) && dis_stall_was_stq(w), post4.cf_influencer_list, list3)
     val ovf4  = Mux(dis_fire(w) && dis_stall_was_stq(w), post4.cf_infl_overflow,   ovf3)
 
-    dis_uops(w).cf_influencer_list := list4
-    dis_uops(w).cf_infl_overflow   := ovf4
+    // Step 5: INFL_MEM_HOL — head entry from different domain present at dispatch
+    val dis_hol_ldq = dis_fire(w) && dis_uops(w).uses_ldq && io.lsu.ldq_head_valid &&
+                      (io.lsu.ldq_head_domain =/= dis_uops(w).cf_domain_id)
+    val dis_hol_stq = dis_fire(w) && dis_uops(w).uses_stq && io.lsu.stq_head_valid &&
+                      (io.lsu.stq_head_domain =/= dis_uops(w).cf_domain_id)
+    val dis_hol_any = dis_hol_ldq || dis_hol_stq
+    val hol_head_op    = Mux(dis_hol_ldq, io.lsu.ldq_head_op_count,   io.lsu.stq_head_op_count)
+    val hol_is_atk     = Mux(dis_hol_ldq, io.lsu.ldq_head_domain === 1.U, io.lsu.stq_head_domain === 1.U)
+    val hol_is_secret  = Mux(dis_hol_ldq, io.lsu.ldq_head_is_secret,  io.lsu.stq_head_is_secret)
+    val mid5 = Wire(pre.cloneType); mid5 := pre
+    mid5.cf_influencer_list := list4; mid5.cf_infl_overflow := ovf4
+    val post5 = addInfluencer(mid5, hol_head_op, INFL_MEM_HOL.U,
+      is_atk = hol_is_atk, is_secret = hol_is_secret)
+    val list5 = Mux(dis_hol_any, post5.cf_influencer_list, list4)
+    val ovf5  = Mux(dis_hol_any, post5.cf_infl_overflow,   ovf4)
+
+    // Step 6: INFL_ISSUE_CONTENTION — now injected at issue time via ROB update bus.
+    // Dispatch no longer injects this influencer; the ROB receives cf_issue_contention_upd
+    // from each issue unit and calls addInfluencer on the correct entry when the instruction issues.
+    dis_uops(w).cf_influencer_list := list5
+    dis_uops(w).cf_infl_overflow   := ovf5
+
+    // Derive cf_attacker_influence from final influencer list: any entry with is_atk=true means
+    // an attacker-domain instruction influenced this uop.  OR with pre.cf_attacker_influence to
+    // preserve any atk flag already set by upstream stages (fetch-buffer, etc.).
+    val final_atk_from_list = list5.map(e => e.valid && e.is_atk).reduce(_ || _)
+    dis_uops(w).cf_attacker_influence := pre.cf_attacker_influence || final_atk_from_list
+
+    // C5: if the blocking queue head was secret-dependent, propagate s_prop to this instruction.
+    when (dis_fire(w) && (dis_stall_was_rob_secret(w) || dis_stall_was_ldq_secret(w) || dis_stall_was_stq_secret(w))) {
+      dis_uops(w).cf_secret_propagation := true.B
+    }
   }
 
   //-------------------------------------------------------------
@@ -1555,9 +1681,14 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   }
 
   // LSU <> ROB
-  rob.io.lsu_clr_bsy    := io.lsu.clr_bsy
-  rob.io.lsu_clr_unsafe := io.lsu.clr_unsafe
+  rob.io.lsu_clr_bsy           := io.lsu.clr_bsy
+  rob.io.lsu_clr_bsy_cf_bitmap := io.lsu.clr_bsy_cf_bitmap
+  rob.io.lsu_clr_bsy_cf_stx   := io.lsu.clr_bsy_cf_stx
+  rob.io.lsu_clr_unsafe        := io.lsu.clr_unsafe
   rob.io.lxcpt          <> io.lsu.lxcpt
+
+  // corefuzzing: issue contention updates — flatten per-port outputs from all issue units
+  rob.io.cf_issue_contention_upd := VecInit(issue_units.flatMap(u => u.io.cf_contention_upd))
 
   assert (!(csr.io.singleStep), "[core] single-step is unsupported.")
 
@@ -1605,6 +1736,17 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   //-------------------------------------------------------------
 
 
+  // COMMIT_LOG_PRINTF is a compile-time flag (enabled for CoreFuzzingConfig via
+  // WithBoomCommitLogPrintf).  The commit log always fires — it is NOT gated by
+  // the runtime cf_debug_log CSR (0xbc1).  The CSR only controls the FLUSH-log
+  // (ROB and fetch-buffer squash prints [FLUSH:ROB] / [FLUSH:FB]) via
+  // cf_debug_rob_enable (bit 4).  Decode/rename no longer emit FLUSH lines.
+  //
+  // arch_valids(w) fires for architecturally committed instructions only.
+  // These are by definition non-speculative at commit time (all branches prior
+  // to the ROB head have resolved). The cf_speculated field records the
+  // dispatch-time speculation state (br_mask≠0 when dispatched) but does NOT
+  // mean the instruction is still speculative at commit.
   if (COMMIT_LOG_PRINTF) {
     var new_commit_cnt = 0.U
 
@@ -1623,6 +1765,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       when (rob.io.commit.arch_valids(w)) {
         // ---------------------------------------------------------------------
         // BEGIN MOD: Commit logging extended for core-fuzzing (cf_*) fields
+        // Non-IFT fields (priv, pc, inst, rd, wdata) are unchanged from the
+        // original BOOM commit log format used for spike diffs.
         // ---------------------------------------------------------------------
         // NOTE: The original printf lines are preserved below, but commented
         // out to keep a record of the previous behavior. We now print the
@@ -1670,18 +1814,22 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
           printf("[SSTEP] ")
         }
 
-        // Print module bitmap and influencer list (IFT Phase 2 format)
-        printf("FU=0x%x OVF=%d INFL=[",
+        // Print module bitmap, INFL_FU bitmap, and influencer slots (single atomic printf)
+        val comInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d,dc=%d}"}.mkString(" ")
+        val comFmt = s"FU=0x%x INFL_FU=0x%x OVF=%d $comInflFmt"
+        val comInflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
+          rob.io.commit.uops(w).cf_influencer_list(k).valid,
+          rob.io.commit.uops(w).cf_influencer_list(k).op_count,
+          rob.io.commit.uops(w).cf_influencer_list(k).infl_type,
+          rob.io.commit.uops(w).cf_influencer_list(k).is_atk,
+          rob.io.commit.uops(w).cf_influencer_list(k).is_secret,
+          rob.io.commit.uops(w).cf_influencer_list(k).deny_count
+        ))
+        printf(comFmt, (Seq[Bits](
           rob.io.commit.uops(w).cf_fu_bitmap,
-          rob.io.commit.uops(w).cf_infl_overflow)
-        for (i <- 0 until numInfluencerSlotsCF) {
-          when (rob.io.commit.uops(w).cf_influencer_list(i).valid) {
-            printf("{oc=%d,ty=%d}",
-              rob.io.commit.uops(w).cf_influencer_list(i).op_count,
-              rob.io.commit.uops(w).cf_influencer_list(i).infl_type)
-          }
-        }
-        printf("]")
+          inflBitmapFromList(rob.io.commit.uops(w).cf_influencer_list),
+          rob.io.commit.uops(w).cf_infl_overflow
+        ) ++ comInflArgs): _*)
         // END MOD: commit CF prints
         // ---------------------------------------------------------------------
         when (rob.io.commit.uops(w).dst_rtype === RT_FIX && rob.io.commit.uops(w).ldst =/= 0.U) {
