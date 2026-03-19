@@ -41,6 +41,8 @@ class FrontendResp(implicit p: Parameters) extends BoomBundle()(p) {
   val tsrc = UInt(BSRC_SZ.W)
   // corefuzzing: ICache line was last refilled by a different domain
   val icache_domain_mismatch = Bool()
+  // corefuzzing: ITLB entry was last filled by a different domain
+  val itlb_domain_mismatch = Bool()
 }
 
 class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
@@ -251,7 +253,14 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
 
   // corefuzzing: domain mismatch flags for IFT influencer injection
   val icache_domain_mismatch = Bool()  // ICache line last filled by different domain
+  val itlb_domain_mismatch   = Bool()  // ITLB entry last filled by different domain
   val ras_domain_mismatch    = Bool()  // RAS return addr pushed by different domain
+  val bpd_domain_mismatch    = Bool()  // TAGE entry last updated by different domain
+  val btb_domain_mismatch    = Bool()  // BTB entry last written by different domain
+  val cf_fetch_domain        = UInt(1.W) // domain of this fetch packet (for FTQ/bpdupdate)
+  // corefuzzing: secret shadow mismatch — predictor entry was trained by secret instruction
+  val bpd_secret_mismatch    = Bool()
+  val btb_secret_mismatch    = Bool()
 }
 
 
@@ -314,6 +323,10 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   // corefuzzing: attacker address range for fetch-domain computation in frontend
   val cf_attacker_start_addr = Output(UInt(vaddrBitsExtended.W))
   val cf_attacker_end_addr   = Output(UInt(vaddrBitsExtended.W))
+
+  // corefuzzing: multi-port dispatch/execute-time FTQ secret marking (replaces commit-time single port)
+  // Driven from core.scala dispatch and lsu.scala TLB stage; forwarded to FTQ.cf_secret_ftq_updates
+  val cf_secret_ftq_updates = Output(Vec(coreWidth + memWidth, Valid(UInt(log2Ceil(ftqSz).W))))
 }
 
 /**
@@ -402,6 +415,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   bpd.io.f0_req.valid      := s0_valid
   bpd.io.f0_req.bits.pc    := s0_vpc
   bpd.io.f0_req.bits.ghist := s0_ghist
+  // corefuzzing: compute s0 domain for BPD domain shadow tracking
+  bpd.io.f0_req_domain_id := Mux(
+    (io.cpu.cf_attacker_start_addr =/= 0.U) &&
+    (s0_vpc >= io.cpu.cf_attacker_start_addr) &&
+    (s0_vpc < io.cpu.cf_attacker_end_addr), 1.U, 0.U)
 
   // Value from reconfigure CSR - AK
   // for the fuzzycore. 
@@ -441,6 +459,33 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     (s0_vpc >= io.cpu.cf_attacker_start_addr) && (s0_vpc < io.cpu.cf_attacker_end_addr)
   val s1_fetch_domain = RegNext(s0_fetch_is_attacker)
   icache.io.s1_domain_id := s1_fetch_domain
+
+  // corefuzzing: ITLB domain shadow — parallel array indexed by VPN low bits.
+  // Updated when TLB fills (miss→hit transition); compared on every TLB hit.
+  val itlb_shadow_nEntries = nTLBSets * nTLBWays
+  val itlb_vpn_bits        = log2Ceil(itlb_shadow_nEntries)
+  val itlb_shadow_domain   = RegInit(VecInit(Seq.fill(itlb_shadow_nEntries)(false.B)))
+  val itlb_shadow_valid    = RegInit(VecInit(Seq.fill(itlb_shadow_nEntries)(false.B)))
+
+  // VPN index: strip page-offset bits, take low itlb_vpn_bits
+  val s1_vpn_idx       = s1_vpc(itlb_vpn_bits + pgIdxBits - 1, pgIdxBits)
+  val s1_tlb_miss_prev = RegNext(s1_tlb_miss, false.B)
+  // Fill detected: was a miss last cycle, now a hit
+  val s1_tlb_just_filled = s1_valid && !s1_tlb_miss && s1_tlb_miss_prev
+  when (s1_tlb_just_filled) {
+    // Use RegNext of vpn_idx/domain since the miss was serviced the previous cycle
+    itlb_shadow_domain(RegNext(s1_vpn_idx)) := RegNext(s1_fetch_domain).asBool
+    itlb_shadow_valid(RegNext(s1_vpn_idx))  := true.B
+  }
+  // Flush shadow on sfence
+  when (tlb.io.sfence.valid) {
+    itlb_shadow_valid := VecInit(Seq.fill(itlb_shadow_nEntries)(false.B))
+  }
+  // Mismatch: hit in ITLB but shadow was written by a different domain
+  val s1_itlb_mismatch = s1_valid && !s1_tlb_miss &&
+    itlb_shadow_valid(s1_vpn_idx) &&
+    (itlb_shadow_domain(s1_vpn_idx) =/= s1_fetch_domain)
+  val s2_itlb_mismatch = RegNext(s1_itlb_mismatch, false.B)
 
   val f1_mask = fetchMask(s1_vpc)
   val f1_redirects = (0 until fetchWidth) map { i =>
@@ -576,8 +621,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3.io.enq.bits.xcpt := s2_tlb_resp
   f3.io.enq.bits.fsrc := s2_fsrc
   f3.io.enq.bits.tsrc := s2_tsrc
-  // corefuzzing: carry icache domain mismatch through the f3 queue
-  f3.io.enq.bits.icache_domain_mismatch := icache.io.resp.bits.icache_domain_mismatch
+  // corefuzzing: carry icache domain mismatch through the f3 queue;
+  // gate on resp.valid to avoid propagating stale bits when we enqueue due to a TLB fault
+  f3.io.enq.bits.icache_domain_mismatch := icache.io.resp.bits.icache_domain_mismatch &&
+                                            icache.io.resp.valid
+  // corefuzzing: carry ITLB domain mismatch (computed at s1, registered to s2) into f3 queue
+  f3.io.enq.bits.itlb_domain_mismatch := s2_itlb_mismatch
 
   // RAS takes a cycle to read
   val ras_read_idx = RegInit(0.U(log2Ceil(nRasEntries).W))
@@ -827,11 +876,19 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     (f3_imemresp.pc >= io.cpu.cf_attacker_start_addr) &&
     (f3_imemresp.pc < io.cpu.cf_attacker_end_addr)
   f3_fetch_bundle.icache_domain_mismatch := f3_imemresp.icache_domain_mismatch
+  f3_fetch_bundle.itlb_domain_mismatch   := f3_imemresp.itlb_domain_mismatch
   // RAS domain mismatch: ret pops an addr pushed by a different domain
   f3_fetch_bundle.ras_domain_mismatch := (
     f3_fetch_bundle.cfi_is_ret && f3_fetch_bundle.cfi_idx.valid &&
     (ras.io.read_domain =/= f3_fetch_is_attacker)
   )
+  // corefuzzing: BPD/BTB domain and secret mismatches from the prediction response
+  f3_fetch_bundle.bpd_domain_mismatch := f3_bpd_resp.io.deq.bits.bpd_domain_mismatch
+  f3_fetch_bundle.btb_domain_mismatch := f3_bpd_resp.io.deq.bits.btb_domain_mismatch
+  f3_fetch_bundle.bpd_secret_mismatch := f3_bpd_resp.io.deq.bits.bpd_secret_mismatch
+  f3_fetch_bundle.btb_secret_mismatch := f3_bpd_resp.io.deq.bits.btb_secret_mismatch
+  // corefuzzing: record the fetch domain for the FTQ bpdupdate path
+  f3_fetch_bundle.cf_fetch_domain     := f3_fetch_is_attacker.asUInt
   // Redirect earlier stages only if the later stage
   // can consume this packet
 
@@ -905,6 +962,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f4_btb_corrections.io.enq.bits.ghist                := f3_fetch_bundle.ghist
   f4_btb_corrections.io.enq.bits.lhist                := f3_fetch_bundle.lhist
   f4_btb_corrections.io.enq.bits.meta                 := f3_fetch_bundle.bpd_meta
+  // corefuzzing: carry fetch domain into BTB correction update
+  f4_btb_corrections.io.enq.bits.cf_domain_id         := f3_fetch_bundle.cf_fetch_domain
 
 
   // -------------------------------------------------------
@@ -987,6 +1046,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   ftq.io.enq.valid          := f4.io.deq.valid && fb.io.enq.ready && !f4_delay
   ftq.io.enq.bits           := f4.io.deq.bits
+  // corefuzzing: wire commit-time secret feedback from core to FTQ
+  ftq.io.cf_secret_ftq_updates := io.cpu.cf_secret_ftq_updates
 
   val bpd_update_arbiter = Module(new Arbiter(new BranchPredictionUpdate, 2))
   bpd_update_arbiter.io.in(0).valid := ftq.io.bpdupdate.valid

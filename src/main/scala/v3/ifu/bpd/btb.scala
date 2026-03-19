@@ -65,15 +65,23 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   val meta     = Seq.fill(nWays) { SyncReadMem(nSets, Vec(bankWidth, UInt(btbMetaSz.W))) }
   val btb      = Seq.fill(nWays) { SyncReadMem(nSets, Vec(bankWidth, UInt(btbEntrySz.W))) }
   val ebtb     = SyncReadMem(extendedNSets, UInt(vaddrBitsExtended.W))
+  // corefuzzing: domain shadow — tracks domain of the fetch that last wrote each BTB entry
+  val btb_domain  = Seq.fill(nWays) { SyncReadMem(nSets, Vec(bankWidth, UInt(1.W))) }
+  // corefuzzing: secret shadow — 1 if entry was trained by a secret-dependent instruction
+  val btb_secret  = Seq.fill(nWays) { SyncReadMem(nSets, Vec(bankWidth, Bool())) }
 
   val mems = (((0 until nWays) map ({w:Int => Seq(
     (f"btb_meta_way$w", nSets, bankWidth * btbMetaSz),
     (f"btb_data_way$w", nSets, bankWidth * btbEntrySz))})).flatten ++ Seq(("ebtb", extendedNSets, vaddrBitsExtended)))
 
-  val s1_req_rbtb  = VecInit(btb.map { b => VecInit(b.read(s0_idx , s0_valid).map(_.asTypeOf(new BTBEntry))) })
-  val s1_req_rmeta = VecInit(meta.map { m => VecInit(m.read(s0_idx, s0_valid).map(_.asTypeOf(new BTBMeta))) })
-  val s1_req_rebtb = ebtb.read(s0_idx, s0_valid)
-  val s1_req_tag   = s1_idx >> log2Ceil(nSets)
+  val s1_req_rbtb    = VecInit(btb.map { b => VecInit(b.read(s0_idx , s0_valid).map(_.asTypeOf(new BTBEntry))) })
+  val s1_req_rmeta   = VecInit(meta.map { m => VecInit(m.read(s0_idx, s0_valid).map(_.asTypeOf(new BTBMeta))) })
+  val s1_req_rebtb   = ebtb.read(s0_idx, s0_valid)
+  val s1_req_tag     = s1_idx >> log2Ceil(nSets)
+  // corefuzzing: domain shadow read — same index/enable as btb/meta
+  val s1_req_rdomain = VecInit(btb_domain.map { d => d.read(s0_idx, s0_valid) })
+  // corefuzzing: secret shadow read
+  val s1_req_rsecret = VecInit(btb_secret.map { s => s.read(s0_idx, s0_valid) })
 
   val s1_resp   = Wire(Vec(bankWidth, Valid(UInt(vaddrBitsExtended.W))))
   val s1_is_br  = Wire(Vec(bankWidth, Bool()))
@@ -118,6 +126,18 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
       }
     }
   }
+
+  // corefuzzing: BTB domain mismatch — any hit entry was last updated by a different domain
+  val s1_btb_domain_mismatch = VecInit((0 until bankWidth).map { w =>
+    s1_hits(w) && (s1_req_rdomain(s1_hit_ways(w))(w) =/= s1_domain)
+  }).reduce(_||_)
+  // corefuzzing: BTB secret mismatch — any hit entry was trained by a secret instruction
+  val s1_btb_secret_mismatch = VecInit((0 until bankWidth).map { w =>
+    s1_hits(w) && s1_req_rsecret(s1_hit_ways(w))(w).asBool
+  }).reduce(_||_)
+  // pipeline 2 cycles to f3 (s1→f2→f3)
+  io.f3_btb_domain_mismatch  := RegNext(RegNext(s1_btb_domain_mismatch))
+  io.f3_btb_secret_mismatch  := RegNext(RegNext(s1_btb_secret_mismatch))
 
   val alloc_way = if (nWays > 1) {
     val r_metas = Cat(VecInit(s1_req_rmeta.map { w => VecInit(w.map(_.tag)) }).asUInt, s1_req_tag(tagSz-1,0))
@@ -187,8 +207,22 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
           (~(0.U(bankWidth.W))),
           s1_update_wmeta_mask).asBools
       )
-
-
+      // corefuzzing: write domain shadow alongside meta (same index/mask)
+      btb_domain(w).write(
+        Mux(doing_reset, reset_idx, s1_update_idx),
+        Mux(doing_reset,
+          VecInit(Seq.fill(bankWidth)(0.U(1.W))),
+          VecInit(Seq.fill(bankWidth)(s1_update.bits.cf_domain_id))),
+        Mux(doing_reset, (~(0.U(bankWidth.W))), s1_update_wmeta_mask).asBools
+      )
+      // corefuzzing: write secret shadow alongside domain (same index/mask)
+      btb_secret(w).write(
+        Mux(doing_reset, reset_idx, s1_update_idx),
+        Mux(doing_reset,
+          VecInit(Seq.fill(bankWidth)(false.B)),
+          VecInit(Seq.fill(bankWidth)(s1_update.bits.cf_is_secret))),
+        Mux(doing_reset, (~(0.U(bankWidth.W))), s1_update_wmeta_mask).asBools
+      )
     }
   }
   when (s1_update_wbtb_mask =/= 0.U && offset_is_extended) {

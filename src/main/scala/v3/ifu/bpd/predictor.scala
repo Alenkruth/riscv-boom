@@ -39,6 +39,12 @@ class BranchPredictionBundle(implicit p: Parameters) extends BoomBundle()(p)
   val preds = Vec(fetchWidth, new BranchPrediction)
   val meta = Output(Vec(nBanks, UInt(bpdMaxMetaLength.W)))
   val lhist = Output(Vec(nBanks, UInt(localHistoryLength.W)))
+  // corefuzzing: TAGE/BTB entry was last updated by a different domain
+  val bpd_domain_mismatch = Bool()
+  val btb_domain_mismatch = Bool()
+  // corefuzzing: TAGE/BTB entry was trained by a secret-dependent instruction
+  val bpd_secret_mismatch = Bool()
+  val btb_secret_mismatch = Bool()
 }
 
 
@@ -81,6 +87,11 @@ class BranchPredictionUpdate(implicit p: Parameters) extends BoomBundle()(p)
   val target        = UInt(vaddrBitsExtended.W)
 
   val meta          = Vec(nBanks, UInt(bpdMaxMetaLength.W))
+
+  // corefuzzing: domain of the fetch packet that generated this update
+  val cf_domain_id  = UInt(1.W)
+  // corefuzzing: fetch packet contained a secret-dependent instruction (s_acc or s_prop)
+  val cf_is_secret  = Bool()
 }
 
 // A branch update to a single bank
@@ -112,6 +123,11 @@ class BranchPredictionBankUpdate(implicit p: Parameters) extends BoomBundle()(p)
   val target           = UInt(vaddrBitsExtended.W)
 
   val meta             = UInt(bpdMaxMetaLength.W)
+
+  // corefuzzing: domain of the fetch packet that generated this update
+  val cf_domain_id     = UInt(1.W)
+  // corefuzzing: fetch packet contained a secret-dependent instruction
+  val cf_is_secret     = Bool()
 }
 
 class BranchPredictionRequest(implicit p: Parameters) extends BoomBundle()(p)
@@ -157,10 +173,23 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
 
     // added for the fuzzycore project - AK
     val cf_bpd_tage_to_gshare = Input(Bool()) // signal from the custom CSR to reconfigure to gshare.
+
+    // corefuzzing: fetch domain tracking for BPD/BTB domain mismatch detection
+    val f0_domain_id           = Input(UInt(1.W))   // domain of current fetch (f0 stage)
+    val f3_bpd_domain_mismatch = Output(Bool())     // TAGE entry last updated by different domain
+    val f3_btb_domain_mismatch = Output(Bool())     // BTB entry last updated by different domain
+    // corefuzzing: secret shadow mismatch — predictor entry was trained by secret instruction
+    val f3_bpd_secret_mismatch = Output(Bool())
+    val f3_btb_secret_mismatch = Output(Bool())
   })
   io.resp := io.resp_in(0)
 
   io.f3_meta := 0.U
+  // corefuzzing: default to no mismatch; overridden by concrete banks
+  io.f3_bpd_domain_mismatch := false.B
+  io.f3_btb_domain_mismatch := false.B
+  io.f3_bpd_secret_mismatch := false.B
+  io.f3_btb_secret_mismatch := false.B
 
   val s0_idx       = fetchIdx(io.f0_pc)
   val s1_idx       = RegNext(s0_idx)
@@ -188,7 +217,8 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
   val s1_update_idx = RegNext(s0_update_idx)
   val s1_update_valid = RegNext(s0_update_valid)
 
-
+  // corefuzzing: fetch domain piped one cycle (f0→s1) for use in domain shadow comparisons
+  val s1_domain = RegNext(io.f0_domain_id)
 
 }
 
@@ -215,6 +245,9 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
 
     // adding for core fuzzing - AK
     val cf_bpd_tage_to_gshare = Input(Bool())
+
+    // corefuzzing: domain of the fetch request for BPD/BTB domain shadow comparisons
+    val f0_req_domain_id = Input(UInt(1.W))
   })
 
   var total_memsize = 0
@@ -383,6 +416,11 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
   io.resp.f2.meta := DontCare
   io.resp.f1.lhist := DontCare
   io.resp.f2.lhist := DontCare
+  // corefuzzing: domain mismatch only meaningful at f3; f1/f2 set to false
+  io.resp.f1.bpd_domain_mismatch := false.B
+  io.resp.f2.bpd_domain_mismatch := false.B
+  io.resp.f1.btb_domain_mismatch := false.B
+  io.resp.f2.btb_domain_mismatch := false.B
 
 
   for (i <- 0 until nBanks) {
@@ -476,6 +514,21 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     }
 
   }
+
+  // corefuzzing: wire domain to all banked predictors and aggregate mismatch at f3
+  for (i <- 0 until nBanks) {
+    banked_predictors(i).io.f0_domain_id              := io.f0_req_domain_id
+    banked_predictors(i).io.update.bits.cf_domain_id  := io.update.bits.cf_domain_id
+    banked_predictors(i).io.update.bits.cf_is_secret  := io.update.bits.cf_is_secret
+  }
+  io.resp.f3.bpd_domain_mismatch := banked_predictors.map(_.io.f3_bpd_domain_mismatch).reduce(_||_)
+  io.resp.f3.btb_domain_mismatch := banked_predictors.map(_.io.f3_btb_domain_mismatch).reduce(_||_)
+  io.resp.f3.bpd_secret_mismatch := banked_predictors.map(_.io.f3_bpd_secret_mismatch).reduce(_||_)
+  io.resp.f3.btb_secret_mismatch := banked_predictors.map(_.io.f3_btb_secret_mismatch).reduce(_||_)
+  io.resp.f1.bpd_secret_mismatch := false.B
+  io.resp.f2.bpd_secret_mismatch := false.B
+  io.resp.f1.btb_secret_mismatch := false.B
+  io.resp.f2.btb_secret_mismatch := false.B
 
   when (io.update.valid) {
     when (io.update.bits.cfi_is_br && io.update.bits.cfi_idx.valid) {

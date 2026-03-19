@@ -45,6 +45,14 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
 
     val update_u_mask = Input(Vec(bankWidth, Bool()))
     val update_u = Input(Vec(bankWidth, UInt(2.W)))
+
+    // corefuzzing: domain tracking for TAGE shadow
+    val f1_req_domain_id    = Input(UInt(1.W))   // domain of the current fetch at f1
+    val update_cf_domain_id = Input(UInt(1.W))   // domain of the fetch being committed
+    val f3_domain_mismatch  = Output(Vec(bankWidth, Bool()))  // hit entry written by different domain
+    // corefuzzing: secret shadow — entry was trained by a secret-dependent instruction
+    val update_cf_is_secret = Input(Bool())
+    val f3_secret_mismatch  = Output(Vec(bankWidth, Bool()))  // hit entry trained by secret instr
   })
 
   def compute_folded_hist(hist: UInt, l: Int) = {
@@ -89,6 +97,10 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
   val hi_us  = SyncReadMem(nRows, Vec(bankWidth, Bool()))
   val lo_us  = SyncReadMem(nRows, Vec(bankWidth, Bool()))
   val table  = SyncReadMem(nRows, Vec(bankWidth, UInt(tageEntrySz.W)))
+  // corefuzzing: domain shadow — records the domain of the fetch that last wrote each row
+  val table_domain  = SyncReadMem(nRows, Vec(bankWidth, UInt(1.W)))
+  // corefuzzing: secret shadow — records whether the fetch that last wrote each row was secret
+  val table_secret  = SyncReadMem(nRows, Vec(bankWidth, Bool()))
 
   val mems = Seq((f"tage_l$histLength", nRows, bankWidth * tageEntrySz))
 
@@ -98,12 +110,21 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
   val s2_req_rhius = hi_us.read(s1_hashed_idx, io.f1_req_valid)
   val s2_req_rlous = lo_us.read(s1_hashed_idx, io.f1_req_valid)
   val s2_req_rhits = VecInit(s2_req_rtage.map(e => e.valid && e.tag === s2_tag && !doing_reset))
+  // corefuzzing: domain shadow read — same index/enable as main table
+  val s2_req_rdomain  = table_domain.read(s1_hashed_idx, io.f1_req_valid)
+  val s2_fetch_domain = RegNext(io.f1_req_domain_id)
+  // corefuzzing: secret shadow read — same index/enable
+  val s2_req_rsecret  = table_secret.read(s1_hashed_idx, io.f1_req_valid)
 
   for (w <- 0 until bankWidth) {
     // This bit indicates the TAGE table matched here
     io.f3_resp(w).valid    := RegNext(s2_req_rhits(w))
     io.f3_resp(w).bits.u   := RegNext(Cat(s2_req_rhius(w), s2_req_rlous(w)))
     io.f3_resp(w).bits.ctr := RegNext(s2_req_rtage(w).ctr)
+    // corefuzzing: domain mismatch if hit entry was written by a different domain
+    io.f3_domain_mismatch(w) := RegNext(s2_req_rhits(w) && (s2_req_rdomain(w) =/= s2_fetch_domain))
+    // corefuzzing: secret mismatch if hit entry was trained by a secret-dependent instruction
+    io.f3_secret_mismatch(w) := RegNext(s2_req_rhits(w) && s2_req_rsecret(w).asBool)
   }
 
   val clear_u_ctr = RegInit(0.U((log2Ceil(uBitPeriod) + log2Ceil(nRows) + 1).W))
@@ -122,6 +143,19 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
     Mux(doing_reset, reset_idx                                          , update_idx),
     Mux(doing_reset, VecInit(Seq.fill(bankWidth) { 0.U(tageEntrySz.W) }), VecInit(update_wdata.map(_.asUInt))),
     Mux(doing_reset, ~(0.U(bankWidth.W))                                , io.update_mask.asUInt).asBools
+  )
+
+  // corefuzzing: write domain shadow in parallel with main table
+  table_domain.write(
+    Mux(doing_reset, reset_idx, update_idx),
+    Mux(doing_reset, VecInit(Seq.fill(bankWidth)(0.U(1.W))), VecInit(Seq.fill(bankWidth)(io.update_cf_domain_id))),
+    Mux(doing_reset, ~(0.U(bankWidth.W)), io.update_mask.asUInt).asBools
+  )
+  // corefuzzing: write secret shadow in parallel — true if fetch packet had s_acc/s_prop
+  table_secret.write(
+    Mux(doing_reset, reset_idx, update_idx),
+    Mux(doing_reset, VecInit(Seq.fill(bankWidth)(false.B)), VecInit(Seq.fill(bankWidth)(io.update_cf_is_secret))),
+    Mux(doing_reset, ~(0.U(bankWidth.W)), io.update_mask.asUInt).asBools
   )
 
   val update_hi_wdata = Wire(Vec(bankWidth, Bool()))
@@ -223,9 +257,11 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
   val tt = params.tableInfo map {
     case (n, l, s) => {
       val t = Module(new TageTable(n, s, l, params.uBitPeriod))
-      t.io.f1_req_valid := RegNext(io.f0_valid)
-      t.io.f1_req_pc    := RegNext(io.f0_pc)
-      t.io.f1_req_ghist := io.f1_ghist
+      t.io.f1_req_valid       := RegNext(io.f0_valid)
+      t.io.f1_req_pc          := RegNext(io.f0_pc)
+      t.io.f1_req_ghist       := io.f1_ghist
+      // corefuzzing: wire domain to table for domain shadow tracking
+      t.io.f1_req_domain_id   := s1_domain
       (t, t.mems)
     }
   }
@@ -375,10 +411,17 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
       tables(i).io.update_u_mask(w) := RegNext(s1_update_u_mask(i)(w))
       tables(i).io.update_u(w)      := RegNext(s1_update_u(i)(w))
     }
-    tables(i).io.update_pc    := RegNext(s1_update.bits.pc)
-    tables(i).io.update_hist  := RegNext(s1_update.bits.ghist)
+    tables(i).io.update_pc             := RegNext(s1_update.bits.pc)
+    tables(i).io.update_hist           := RegNext(s1_update.bits.ghist)
+    // corefuzzing: wire update domain and secret to table for shadow writes
+    tables(i).io.update_cf_domain_id   := RegNext(s1_update.bits.cf_domain_id)
+    tables(i).io.update_cf_is_secret   := RegNext(s1_update.bits.cf_is_secret)
   }
 
+  // corefuzzing: TAGE domain mismatch — any table hit a row last updated by a different domain
+  io.f3_bpd_domain_mismatch := tables.map(t => t.io.f3_domain_mismatch.reduce(_||_)).reduce(_||_)
+  // corefuzzing: TAGE secret mismatch — any table hit a row trained by a secret instruction
+  io.f3_bpd_secret_mismatch := tables.map(t => t.io.f3_secret_mismatch.reduce(_||_)).reduce(_||_)
 
   //io.f3_meta := Cat(f3_meta.asUInt, micro.io.f3_meta(micro.metaSz-1,0), base.io.f3_meta(base.metaSz-1, 0))
   io.f3_meta := f3_meta.asUInt

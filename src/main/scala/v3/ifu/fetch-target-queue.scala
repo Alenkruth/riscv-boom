@@ -66,6 +66,11 @@ class FTQBundle(implicit p: Parameters) extends BoomBundle
   // Which bank did this start from?
   val start_bank = UInt(1.W)
 
+  // corefuzzing: domain of the fetch packet (0=victim, 1=attacker)
+  val cf_fetch_domain = UInt(1.W)
+  // corefuzzing: fetch packet contained a secret-dependent instruction (updated at commit)
+  val cf_fetch_secret = Bool()
+
   // // Metadata for the branch predictor
   // val bpd_meta = Vec(nBanks, UInt(bpdMaxMetaLength.W))
 }
@@ -126,6 +131,13 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   // corefuzzing: gate for speculative FTQ prints
   val cf_debug_ftq_enable = Input(Bool())
 
+  // corefuzzing: multi-port dispatch/execute-time feedback to mark FTQ entry as secret.
+  // Port 0..coreWidth-1: dispatch stage (cf_secret_propagation known at dispatch)
+  // Port coreWidth..coreWidth+memWidth-1: TLB stage (cf_secret_access determined at address resolution)
+  // Flag is sticky (write-only true.B). Multiple ports write different entries per cycle safely
+  // because ram is Reg(Vec(...)) — each element has an independent write enable.
+  val cf_secret_ftq_updates = Flipped(Vec(coreWidth + memWidth, Valid(UInt(idx_sz.W))))
+
     val bpdupdate = Output(Valid(new BranchPredictionUpdate))
 
     val ras_update = Output(Bool())
@@ -177,6 +189,9 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     new_entry.ras_idx       := io.enq.bits.ghist.ras_idx
     new_entry.br_mask       := io.enq.bits.br_mask & io.enq.bits.mask
     new_entry.start_bank    := bank(io.enq.bits.pc)
+    // corefuzzing: store fetch domain for bpdupdate path; secret flag updated lazily at commit
+    new_entry.cf_fetch_domain  := io.enq.bits.cf_fetch_domain
+    new_entry.cf_fetch_secret  := false.B
 
     val new_ghist = Mux(io.enq.bits.ghist.current_saw_branch_not_taken,
       io.enq.bits.ghist,
@@ -205,6 +220,14 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   }
 
   io.enq_idx := enq_ptr
+
+  // corefuzzing: multi-port secret feedback — mark FTQ entry as soon as secret state is known.
+  // All ports write true.B (monotone), so simultaneous writes to the same entry are harmless.
+  for (u <- io.cf_secret_ftq_updates) {
+    when (u.valid) {
+      ram(u.bits).cf_fetch_secret := true.B
+    }
+  }
 
   io.bpdupdate.valid := false.B
   io.bpdupdate.bits  := DontCare
@@ -312,6 +335,9 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     io.bpdupdate.bits.ghist      := bpd_ghist
     io.bpdupdate.bits.lhist      := bpd_lhist
     io.bpdupdate.bits.meta       := bpd_meta
+    // corefuzzing: carry fetch domain and secret flag to BPD shadow writes
+    io.bpdupdate.bits.cf_domain_id := bpd_entry.cf_fetch_domain
+    io.bpdupdate.bits.cf_is_secret := bpd_entry.cf_fetch_secret
 
     first_empty := false.B
   }

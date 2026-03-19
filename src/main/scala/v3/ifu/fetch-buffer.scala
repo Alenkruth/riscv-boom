@@ -24,7 +24,7 @@ import freechips.rocketchip.util._
 
 import boom.v3.common._
 import boom.v3.exu.{BrUpdateInfo}
-import boom.v3.util.{BoolToChar, MaskUpper, Sext, SpeculativePrintf, appendModuleTag, addInfluencer}
+import boom.v3.util.{BoolToChar, MaskUpper, Sext, SpeculativePrintf, appendModuleTag, addInfluencer, inflBitmapFromList}
 import freechips.rocketchip.util.CoreFuzzingConstants
 // imports for corefuzzing
 
@@ -78,6 +78,11 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   val ram = Reg(Vec(numEntries, new MicroOp))
   ram.suggestName("fb_uop_ram")
   val deq_vec = Wire(Vec(numRows, Vec(coreWidth, new MicroOp)))
+
+  // corefuzzing: track which RAM slots actually hold valid (enqueued, not yet dequeued/cleared)
+  // data. Used to suppress [FLUSH] printing for uninitialized or already-consumed slots.
+  val ram_valid = RegInit(VecInit(Seq.fill(numEntries)(false.B)))
+
 
   val head = RegInit(1.U(numRows.W))
   val tail = RegInit(1.U(numEntries.W))
@@ -209,7 +214,10 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     {case (e,i) => i % coreWidth == 0}.map {case (e,i) => e}).asUInt).map(tail => head & tail).reduce(_|_).orR
   val at_head = (VecInit(tail.asBools.zipWithIndex.filter {case (e,i) => i % coreWidth == 0}
     .map {case (e,i) => e}).asUInt & head).orR
-  val do_enq = !(at_head && maybe_full || might_hit_head)
+  // corefuzzing: block enqueue in the same cycle as io.clear to keep head/tail/ram_valid
+  // consistent (all reset to initial values at the clock edge; a concurrent enqueue would
+  // write ram/tail using the old pointers and then tail would snap back to 1.U, losing data).
+  val do_enq = !(at_head && maybe_full || might_hit_head) && !io.clear
 
   io.enq.ready := do_enq
 
@@ -279,15 +287,19 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     val priorValids = if (i == 0) 0.U else PopCount(in_mask.slice(0, i)).asUInt
     // Resize priorValids to the counter width before adding
     val id = (uopCount + priorValids)(uopIDCounterWidthCF - 1, 0)
-    in_uops(i).cf_op_count_id := id
+    // Only assign opcount to valid slots; invalid slots get 0 to avoid gaps
+    in_uops(i).cf_op_count_id := Mux(in_mask(i), id, 0.U)
   }
 
   // corefuzzing: Initialize all IFT cf_* fields for each newly created micro-op.
   // cf_fu_bitmap gets the fbTagCF bit set to mark this uop passed through the fetch buffer.
   // All other cf_* fields are zeroed here; they are set later in the pipeline
   // (domain_id and speculated at dispatch, secret flags in LSU/DCache).
+  // corefuzzing: FU bitmap base — all instructions pass through all IFU-stage modules.
+  // ras/bpd/btb bits are set unconditionally (path tracking). Domain mismatch events
+  // are tracked separately via the influencer list (INFL_RAS_STATE, INFL_BPD_STATE, etc.).
   for (i <- 0 until fetchWidth) {
-    in_uops(i).cf_fu_bitmap            := (1.U << fbTagCF.U)
+    in_uops(i).cf_fu_bitmap            := (1.U << fbTagCF.U) | (1.U << icacheTagCF.U) | (1.U << itlbTagCF.U) | (1.U << ftqTagCF.U) | (1.U << rasTagCF.U) | (1.U << bpdTagCF.U) | (1.U << btbTagCF.U)
     in_uops(i).cf_domain_id            := 0.U
     in_uops(i).cf_speculated           := false.B
     in_uops(i).cf_attacker_influence   := false.B
@@ -312,7 +324,11 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     base_uop.cf_infl_overflow   := false.B
 
     // Chain: add ICACHE first, then RAS on top
-    val post_icache = addInfluencer(base_uop, 0.U, INFL_ICACHE_STATE.U)
+    // For hardware state mismatches: if current uop is victim (domain=0), the HW state was
+    // populated by attacker → is_atk=true.  is_secret not tracked at fetch-buffer level.
+    val fb_is_victim = base_uop.cf_domain_id === 0.U
+    val post_icache = addInfluencer(base_uop, 0.U, INFL_ICACHE_STATE.U,
+      is_atk = fb_is_victim, is_secret = false.B)
 
     val mid = Wire(in_uops(i).cloneType)
     mid := base_uop
@@ -321,15 +337,70 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
       mid.cf_infl_overflow   := post_icache.cf_infl_overflow
     }
 
-    val post_ras = addInfluencer(mid, 0.U, INFL_RAS_STATE.U)
+    val post_ras = addInfluencer(mid, 0.U, INFL_RAS_STATE.U,
+      is_atk = fb_is_victim, is_secret = false.B)
+
+    val mid2 = Wire(in_uops(i).cloneType)
+    mid2 := mid
+    when (io.enq.bits.ras_domain_mismatch) {
+      mid2.cf_influencer_list := post_ras.cf_influencer_list
+      mid2.cf_infl_overflow   := post_ras.cf_infl_overflow
+    }
+
+    // corefuzzing: chain BPD (TAGE) and BTB domain mismatch influencers
+    val post_bpd = addInfluencer(mid2, 0.U, INFL_BPD_STATE.U,
+      is_atk = fb_is_victim, is_secret = false.B)
+
+    val mid3 = Wire(in_uops(i).cloneType)
+    mid3 := mid2
+    when (io.enq.bits.bpd_domain_mismatch) {
+      mid3.cf_influencer_list := post_bpd.cf_influencer_list
+      mid3.cf_infl_overflow   := post_bpd.cf_infl_overflow
+    }
+
+    val post_btb = addInfluencer(mid3, 0.U, INFL_BTB_STATE.U,
+      is_atk = fb_is_victim, is_secret = false.B)
+
+    val mid4 = Wire(in_uops(i).cloneType)
+    mid4 := mid3
+    when (io.enq.bits.btb_domain_mismatch) {
+      mid4.cf_influencer_list := post_btb.cf_influencer_list
+      mid4.cf_infl_overflow   := post_btb.cf_infl_overflow
+    }
+
+    // corefuzzing: BPD secret mismatch — entry was trained by a secret instruction → s_prop=1
+    val post_bpd_secret = addInfluencer(mid4, 0.U, INFL_BPD_STATE.U,
+      is_atk = false.B, is_secret = true.B)
+    val mid4b = Wire(in_uops(i).cloneType)
+    mid4b := mid4
+    when (io.enq.bits.bpd_secret_mismatch) {
+      mid4b.cf_influencer_list := post_bpd_secret.cf_influencer_list
+      mid4b.cf_infl_overflow   := post_bpd_secret.cf_infl_overflow
+      in_uops(i).cf_secret_propagation := true.B
+    }
+
+    // corefuzzing: BTB secret mismatch — entry was trained by a secret instruction → s_prop=1
+    val post_btb_secret = addInfluencer(mid4b, 0.U, INFL_BTB_STATE.U,
+      is_atk = false.B, is_secret = true.B)
+    val mid4c = Wire(in_uops(i).cloneType)
+    mid4c := mid4b
+    when (io.enq.bits.btb_secret_mismatch) {
+      mid4c.cf_influencer_list := post_btb_secret.cf_influencer_list
+      mid4c.cf_infl_overflow   := post_btb_secret.cf_infl_overflow
+      in_uops(i).cf_secret_propagation := true.B
+    }
+
+    // corefuzzing: ITLB domain mismatch influencer (ty=15)
+    val post_itlb = addInfluencer(mid4c, 0.U, INFL_ITLB_STATE.U,
+      is_atk = fb_is_victim, is_secret = false.B)
 
     val final_list = Wire(in_uops(i).cf_influencer_list.cloneType)
     val final_ovf  = Wire(Bool())
-    final_list := mid.cf_influencer_list
-    final_ovf  := mid.cf_infl_overflow
-    when (io.enq.bits.ras_domain_mismatch) {
-      final_list := post_ras.cf_influencer_list
-      final_ovf  := post_ras.cf_infl_overflow
+    final_list := mid4c.cf_influencer_list
+    final_ovf  := mid4c.cf_infl_overflow
+    when (io.enq.bits.itlb_domain_mismatch) {
+      final_list := post_itlb.cf_influencer_list
+      final_ovf  := post_itlb.cf_infl_overflow
     }
 
     in_uops(i).cf_influencer_list := final_list
@@ -381,6 +452,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     for (j <- 0 until numEntries) {
       when (do_enq && in_mask(i) && enq_idxs(i)(j)) {
         ram(j) := in_uops(i) // in_uops_tagged(i)
+        ram_valid(j) := true.B
         // for debugging: printing ram index for every enqueue - alex
         // printf(p"($rowsUsed, $coreWidth, enq, $j), ")
       }
@@ -433,42 +505,67 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   when (do_deq) {
     head := inc(head)
     maybe_full := false.B
+    // corefuzzing: invalidate the row being consumed so [FLUSH] won't print stale data
+    for (j <- 0 until numEntries) {
+      when (head(j / coreWidth)) { ram_valid(j) := false.B }
+    }
     // debugging: printing the row index for each dequeue - alex
     // printf(p"($rowsUsed, deq, $rowNum_head), ")
   }
 
   when (io.clear) {
-    // corefuzzing: [FLUSH] logging for fetch-buffer entries discarded on pipeline redirect.
-    // When io.clear fires due to branch mispredict (brupdate.b2.mispredict), add
-    // INFL_PIPELINE_FLUSH to any cross-domain entry.
-    for (i <- 0 until numEntries) {
-      when (io.cf_debug_rob_enable) {
-        val fb_fu_base = ram(i)
-        val fb_fu = WireInit(fb_fu_base)
+    // corefuzzing: [FLUSH] printing — one printf per valid entry, all in the io.clear cycle.
+    // A single printf call is atomic in Verilator's multi-threaded mode.
+    // Dump ALL valid entries (no filter): FB entries haven't yet accumulated influencers
+    // since influencer injection happens at dispatch, well after the fetch buffer stage.
+    when (io.cf_debug_rob_enable) {
+      // Expand influencer slots as fixed-format fields {v=,oc=,ty=} so the entire entry is
+      // one printf call — no per-slot conditional printf loop needed.
+      val flushInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d,dc=%d}"}.mkString(" ")
+      val flushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d $flushInflFmt\n"
+      for (i <- 0 until numEntries) {
+        val base_uop = ram(i)
+        val use_uop  = WireInit(base_uop)
         when (io.brupdate.b2.mispredict &&
-              io.brupdate.b2.uop.cf_domain_id =/= fb_fu_base.cf_domain_id) {
-          fb_fu := addInfluencer(fb_fu_base,
-            io.brupdate.b2.uop.cf_op_count_id, INFL_PIPELINE_FLUSH.U)
+              io.brupdate.b2.uop.cf_domain_id =/= base_uop.cf_domain_id) {
+          val fb_br_uop = io.brupdate.b2.uop
+          use_uop := addInfluencer(base_uop, fb_br_uop.cf_op_count_id, INFL_PIPELINE_FLUSH.U,
+            is_atk = fb_br_uop.cf_domain_id === 1.U,
+            is_secret = fb_br_uop.cf_secret_access || fb_br_uop.cf_secret_propagation)
         }
-        printf("[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d) FU=0x%x OVF=%d INFL=[",
-          Sext.apply(fb_fu.debug_pc(vaddrBits-1,0), xLen), fb_fu.debug_inst,
-          fb_fu.cf_domain_id, fb_fu.cf_speculated, fb_fu.cf_attacker_influence,
-          fb_fu.cf_secret_access, fb_fu.cf_secret_propagation, fb_fu.cf_secret_transmission,
-          fb_fu.cf_op_count_id, fb_fu.cf_spec_branch_is_atk, fb_fu.cf_spec_branch_op_id,
-          fb_fu.cf_fu_bitmap, fb_fu.cf_infl_overflow)
-        for (k <- 0 until numInfluencerSlotsCF) {
-          when (fb_fu.cf_influencer_list(k).valid) {
-            printf("{oc=%d,ty=%d}", fb_fu.cf_influencer_list(k).op_count,
-              fb_fu.cf_influencer_list(k).infl_type)
-          }
+        when (ram_valid(i)) {
+          val inflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
+            use_uop.cf_influencer_list(k).valid,
+            use_uop.cf_influencer_list(k).op_count,
+            use_uop.cf_influencer_list(k).infl_type,
+            use_uop.cf_influencer_list(k).is_atk,
+            use_uop.cf_influencer_list(k).is_secret,
+            use_uop.cf_influencer_list(k).deny_count
+          ))
+          printf(flushFmt, (Seq[Bits](
+            Sext.apply(use_uop.debug_pc(vaddrBits-1,0), xLen),
+            use_uop.debug_inst,
+            use_uop.cf_domain_id,
+            use_uop.cf_speculated,
+            use_uop.cf_attacker_influence,
+            use_uop.cf_secret_access,
+            use_uop.cf_secret_propagation,
+            use_uop.cf_secret_transmission,
+            use_uop.cf_op_count_id,
+            use_uop.cf_spec_branch_is_atk,
+            use_uop.cf_spec_branch_op_id,
+            use_uop.cf_fu_bitmap,
+            0.U, inflBitmapFromList(use_uop.cf_influencer_list),
+            use_uop.cf_infl_overflow
+          ) ++ inflArgs): _*)
         }
-        printf("]\n")
       }
     }
 
     head := 1.U
     tail := 1.U
     maybe_full := false.B
+    ram_valid := VecInit(Seq.fill(numEntries)(false.B))
   }
 
   // TODO Is this necessary?
