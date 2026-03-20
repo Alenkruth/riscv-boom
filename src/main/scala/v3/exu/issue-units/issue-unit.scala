@@ -51,6 +51,13 @@ class IssueContentionUpdate(implicit p: Parameters) extends BoomBundle with Core
   val deny_count      = UInt(4.W)
 }
 
+// corefuzzing: bundle driven into each issue slot to notify it of a cross-domain winner
+class IssueContendInput(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
+  val winner_op_count = UInt(uopIDCounterWidthCF.W)
+  val winner_is_atk   = Bool()
+  val winner_is_sec   = Bool()
+}
+
 /**
  * Constants for knowing about the status of a MicroOp
  */

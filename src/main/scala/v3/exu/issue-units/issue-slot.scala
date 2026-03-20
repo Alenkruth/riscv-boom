@@ -19,6 +19,7 @@ import chisel3._
 import chisel3.util._
 
 import org.chipsalliance.cde.config.Parameters
+import freechips.rocketchip.util.CoreFuzzingConstants
 
 import boom.v3.common._
 import boom.v3.util._
@@ -43,6 +44,9 @@ class IssueSlotIO(val numWakeupPorts: Int)(implicit p: Parameters) extends BoomB
   val ldspec_miss   = Input(Bool()) // Previous cycle's speculative load wakeup was mispredicted.
   // corefuzzing: gate for speculative issue-slot prints
   val cf_debug_issue_enable = Input(Bool())
+  // corefuzzing: per-slot issue contention — input from issue unit, output when granted
+  val cf_contend_in  = Flipped(Valid(new IssueContendInput))
+  val cf_contend_out = Output(Valid(new IssueContentionUpdate))
 
   val wakeup_ports  = Flipped(Vec(numWakeupPorts, Valid(new IqWakeup(maxPregSz))))
   val pred_wakeup_port = Flipped(Valid(UInt(log2Ceil(ftqSz).W)))
@@ -71,6 +75,7 @@ class IssueSlotIO(val numWakeupPorts: Int)(implicit p: Parameters) extends BoomB
 class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
   extends BoomModule
   with IssueUnitConstants
+  with CoreFuzzingConstants
 {
   val io = IO(new IssueSlotIO(numWakeupPorts))
 
@@ -303,6 +308,45 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
       io.uop.lrs1_rtype := RT_X
     }
   }
+
+  // corefuzzing: per-slot ISSUE_CONTENTION accumulation registers.
+  // Records the first cross-domain winner and total denial cycles while this slot waits.
+  // Registers are reset when the slot receives a new uop, is killed, or is cleared.
+  val cf_cntd_valid      = RegInit(false.B)
+  val cf_cntd_winner_op  = Reg(UInt(uopIDCounterWidthCF.W))
+  val cf_cntd_winner_atk = RegInit(false.B)
+  val cf_cntd_winner_sec = RegInit(false.B)
+  val cf_cntd_deny_count = RegInit(0.U(4.W))
+
+  // Accept cross-domain contention: record first winner, always increment deny_count (4-bit saturating).
+  when (io.cf_contend_in.valid) {
+    when (!cf_cntd_valid) {
+      cf_cntd_valid      := true.B
+      cf_cntd_winner_op  := io.cf_contend_in.bits.winner_op_count
+      cf_cntd_winner_atk := io.cf_contend_in.bits.winner_is_atk
+      cf_cntd_winner_sec := io.cf_contend_in.bits.winner_is_sec
+    }
+    cf_cntd_deny_count := Mux(cf_cntd_deny_count === 15.U, 15.U, cf_cntd_deny_count + 1.U)
+  }
+
+  // Reset accumulation when slot is overwritten, killed, or cleared.
+  when (io.in_uop.valid || io.kill || io.clear) {
+    cf_cntd_valid      := false.B
+    cf_cntd_deny_count := 0.U
+    cf_cntd_winner_atk := false.B
+    cf_cntd_winner_sec := false.B
+  }
+
+  // Output: fire when granted AND contention was recorded.
+  // The issue unit (age-ordered) reads this to forward to the ROB.
+  val is_granted = io.grant && ((state === s_valid_1) ||
+    ((state === s_valid_2) && p1 && p2 && ppred))
+  io.cf_contend_out.valid                  := is_granted && cf_cntd_valid
+  io.cf_contend_out.bits.rob_idx           := slot_uop.rob_idx
+  io.cf_contend_out.bits.winner_op_count   := cf_cntd_winner_op
+  io.cf_contend_out.bits.winner_is_atk     := cf_cntd_winner_atk
+  io.cf_contend_out.bits.winner_is_sec     := cf_cntd_winner_sec
+  io.cf_contend_out.bits.deny_count        := cf_cntd_deny_count
 
   // debug outputs
   io.debug.p1 := p1
