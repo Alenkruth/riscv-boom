@@ -20,7 +20,7 @@ import boom.v3.common._
 import boom.v3.exu.BrUpdateInfo
 import boom.v3.util.{IsKilledByBranch, GetNewBrMask, BranchKillableQueue, IsOlder, UpdateBrMask, AgePriorityEncoder, WrapInc, Transpose} 
 
-import boom.v3.util.{BoomCoreStringPrefix, appendModuleTag, addInfluencer}
+import boom.v3.util.{BoomCoreStringPrefix, appendModuleTag, addInfluencer, addInfluencerBatch, InfluencerCandidate}
 
 // import test
 // import freechips.rocketchip.rocket.constants.CoreFuzzingConstants
@@ -514,47 +514,24 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   }
   
   // === Dynamic DCache Reconfiguration Support ===
-  // val active_sets = io.lsu.cf_dcache_set_conf
-  // val active_ways = io.lsu.cf_dcache_way_conf
-  // val active_size = io.lsu.cf_dcache_size_conf
-  // val active_repl = io.lsu.cf_dcache_repl_conf
-  // val active_blocksize = io.lsu.cf_dcache_blocksize_conf // 16 or 8
+  // Block size (cacheBlockBytes) is NOT reconfigurable per user requirement.
+  val dcacheSetOptionsVec = VecInit(dcacheSetOptions.map(_.U))
+  val cacheWayOptionsVec  = VecInit(cacheWayOptions.map(_.U))
+  val cf_dcache_active_sets = dcacheSetOptionsVec(io.lsu.cf_dcache_set_conf)
+  val cf_dcache_active_ways = cacheWayOptionsVec(io.lsu.cf_dcache_way_conf)
+  val dcache_set_mask = cf_dcache_active_sets - 1.U
 
-  // val setBits = log2Ceil(active_sets)
-  // val wayBits = log2Ceil(active_ways)
-  // val offsetBits = log2Ceil(active_blocksize)
-  // val tagBits = paddrBits - setBits - offsetBits
-
-  // Helper functions for dynamic address partitioning
-  // Mask set index to active sets
-  // Mask tag to active tag bits
-  // These are used for meta/data array accesses
-
-  // def getSetIdx(addr: UInt): UInt = (addr >> offsetBits) & ((1.U << setBits) - 1.U)
-  // def getTag(addr: UInt): UInt = addr >> (setBits + offsetBits)
-
-  // def maskAddr(addr: UInt): UInt = {
-  //   val mask = ((1L << (setBits + wayBits + offsetBits)) - 1).U
-  //   addr & mask
-  // }
-
-  // Print when config changes
-  // val prev_sets = RegInit(active_sets)
-  // val prev_ways = RegInit(active_ways)
-  // val prev_size = RegInit(active_size)
-  // val prev_repl = RegInit(active_repl)
-  // val prev_blocksize = RegInit(active_blocksize)
-  // when (active_sets =/= prev_sets || active_ways =/= prev_ways || active_size =/= prev_size || active_repl =/= prev_repl) {
-  //   printf("[DCACHE] Reconfigured: sets=%d ways=%d size=%d repl=%d\n", active_sets, active_ways, active_size, active_repl)
-  //   prev_sets := active_sets
-  //   prev_ways := active_ways
-  //   prev_size := active_size
-  //   prev_repl := active_repl
-  // }
-  // when (active_blocksize =/= prev_blocksize) {
-  //   printf("[DCACHE] Block size changed: %d -> %d\n", prev_blocksize, active_blocksize)
-  //   prev_blocksize := active_blocksize
-  // }
+  // Mask just the set-index bits [untagBits-1 : blockOffBits] in a physical address.
+  def dcacheMaskIdx(addr: UInt): UInt =
+    (addr(untagBits-1, blockOffBits) & dcache_set_mask)(idxBits-1, 0)
+  def dcacheMaskAddr(addr: UInt): UInt = {
+    val idx_part = dcacheMaskIdx(addr)
+    val off_part = addr(blockOffBits-1, 0)
+    if (addr.getWidth > untagBits)
+      Cat(addr(addr.getWidth-1, untagBits), idx_part, off_part)
+    else
+      Cat(idx_part, off_part)
+  }
 
   val t_replay :: t_probe :: t_wb :: t_mshr_meta_read :: t_lsu :: t_prefetch :: Nil = Enum(6)
 
@@ -641,13 +618,13 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   // Writeback might be affected though. So, we might have to create and propagate a copy of the
   // original address to the writeback unit.
   for (w <- 0 until memWidth) {
-    // Tag read for new requests
-    metaReadArb.io.in(4).bits.req(w).idx    := io.lsu.req.bits(w).bits.addr >> blockOffBits //getSetIdx(io.lsu.req.bits(w).bits.addr)
+    // Tag read for new requests (masked set index for runtime size restriction)
+    metaReadArb.io.in(4).bits.req(w).idx    := dcacheMaskIdx(io.lsu.req.bits(w).bits.addr)
     metaReadArb.io.in(4).bits.req(w).way_en := DontCare
-    metaReadArb.io.in(4).bits.req(w).tag    := DontCare // getTag(io.lsu.req.bits(w).bits.addr)
-    // Data read for new requests
+    metaReadArb.io.in(4).bits.req(w).tag    := DontCare
+    // Data read for new requests (masked set index)
     dataReadArb.io.in(2).bits.valid(w)      := io.lsu.req.bits(w).valid
-    dataReadArb.io.in(2).bits.req(w).addr   := io.lsu.req.bits(w).bits.addr // maskAddr(io.lsu.req.bits(w).bits.addr)
+    dataReadArb.io.in(2).bits.req(w).addr   := dcacheMaskAddr(io.lsu.req.bits(w).bits.addr)
     dataReadArb.io.in(2).bits.req(w).way_en := ~0.U(nWays.W)
   }
 
@@ -662,12 +639,12 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   mshrs.io.replay.ready    := metaReadArb.io.in(0).ready && dataReadArb.io.in(0).ready
   // Tag read for MSHR replays
   metaReadArb.io.in(0).valid              := mshrs.io.replay.valid
-  metaReadArb.io.in(0).bits.req(0).idx    := mshrs.io.replay.bits.addr >> blockOffBits // getSetIdx(mshrs.io.replay.bits.addr)
+  metaReadArb.io.in(0).bits.req(0).idx    := dcacheMaskIdx(mshrs.io.replay.bits.addr)
   metaReadArb.io.in(0).bits.req(0).way_en := DontCare
-  metaReadArb.io.in(0).bits.req(0).tag    := DontCare // getTag(mshrs.io.replay.bits.addr)
+  metaReadArb.io.in(0).bits.req(0).tag    := DontCare
   // Data read for MSHR replays
   dataReadArb.io.in(0).valid              := mshrs.io.replay.valid
-  dataReadArb.io.in(0).bits.req(0).addr   := mshrs.io.replay.bits.addr // maskAddr(mshrs.io.replay.bits.addr)
+  dataReadArb.io.in(0).bits.req(0).addr   := dcacheMaskAddr(mshrs.io.replay.bits.addr)
   dataReadArb.io.in(0).bits.req(0).way_en := mshrs.io.replay.bits.way_en
   dataReadArb.io.in(0).bits.valid         := widthMap(w => (w == 0).B)
 
@@ -680,10 +657,8 @@ mshr_read_req(0).addr     := Cat(mshrs.io.meta_read.bits.tag, mshrs.io.meta_read
 mshr_read_req(0).data     := DontCare
 mshr_read_req(0).is_hella := false.B
 metaReadArb.io.in(3).valid       := mshrs.io.meta_read.valid
-metaReadArb.io.in(3).bits.req(0)        := mshrs.io.meta_read.bits
-// metaReadArb.io.in(3).bits.req(0).idx := getSetIdx(mshr_read_req(0).addr)
-// metaReadArb.io.in(3).bits.req(0).way_en := DontCare
-// metaReadArb.io.in(3).bits.req(0).tag := getTag(mshr_read_req(0).addr)
+metaReadArb.io.in(3).bits.req(0) := mshrs.io.meta_read.bits
+metaReadArb.io.in(3).bits.req(0).idx := mshrs.io.meta_read.bits.idx & dcache_set_mask(idxBits-1, 0)
 mshrs.io.meta_read.ready         := metaReadArb.io.in(3).ready
 
 // -----------
@@ -698,15 +673,12 @@ wb_req(0).is_hella := false.B
 // Tag read for write-back
 metaReadArb.io.in(2).valid        := wb.io.meta_read.valid
 metaReadArb.io.in(2).bits.req(0)  := wb.io.meta_read.bits
-// metaReadArb.io.in(2).bits.req(0).idx := getSetIdx(wb_req(0).addr)
-// metaReadArb.io.in(2).bits.req(0).way_en := DontCare
-// metaReadArb.io.in(2).bits.req(0).tag := getTag(wb_req(0).addr)
+metaReadArb.io.in(2).bits.req(0).idx := wb.io.meta_read.bits.idx & dcache_set_mask(idxBits-1, 0)
 wb.io.meta_read.ready := metaReadArb.io.in(2).ready && dataReadArb.io.in(1).ready
 // Data read for write-back
 dataReadArb.io.in(1).valid        := wb.io.data_req.valid
 dataReadArb.io.in(1).bits.req(0)  := wb.io.data_req.bits
-//dataReadArb.io.in(1).bits.req(0).addr := maskAddr(wb_req(0).addr)
-//dataReadArb.io.in(1).bits.req(0).way_en := wb.io.data_req.bits.way_en
+dataReadArb.io.in(1).bits.req(0).addr := dcacheMaskAddr(wb.io.data_req.bits.addr)
 dataReadArb.io.in(1).bits.valid   := widthMap(w => (w == 0).B)
 wb.io.data_req.ready  := metaReadArb.io.in(2).ready && dataReadArb.io.in(1).ready
 assert(!(wb.io.meta_read.fire ^ wb.io.data_req.fire))
@@ -723,7 +695,7 @@ prober_req(0).is_hella := false.B
 // Tag read for prober
 metaReadArb.io.in(1).valid       := prober.io.meta_read.valid
 metaReadArb.io.in(1).bits.req(0) := prober.io.meta_read.bits
-//metaReadArb.io.in(1).bits.req(0).idx := getSetIdx(prober_req(0).addr)
+metaReadArb.io.in(1).bits.req(0).idx := prober.io.meta_read.bits.idx & dcache_set_mask(idxBits-1, 0)
 //metaReadArb.io.in(1).bits.req(0).way_en := DontCare
 // metaReadArb.io.in(1).bits.req(0).tag := getTag(prober_req(0).addr)
 prober.io.meta_read.ready := metaReadArb.io.in(1).ready
@@ -737,7 +709,7 @@ prefetch_req    := DontCare
 prefetch_req(0) := mshrs.io.prefetch.bits
 // Tag read for prefetch
 metaReadArb.io.in(5).valid              := mshrs.io.prefetch.valid
-metaReadArb.io.in(5).bits.req(0).idx    := mshrs.io.prefetch.bits.addr >> blockOffBits // getSetIdx(mshrs.io.prefetch.bits.addr)
+metaReadArb.io.in(5).bits.req(0).idx    := dcacheMaskIdx(mshrs.io.prefetch.bits.addr)
 metaReadArb.io.in(5).bits.req(0).way_en := DontCare
 metaReadArb.io.in(5).bits.req(0).tag    := DontCare // getTag(mshrs.io.prefetch.bits.addr)
 mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
@@ -792,7 +764,8 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
                          Mux(s1_type === t_replay, s1_replay_way_en,
                          Mux(s1_type === t_wb,     s1_wb_way_en,
                          Mux(s1_type === t_mshr_meta_read, s1_mshr_meta_read_way_en,
-                           wayMap((w: Int) => s1_tag_eq_way(i)(w) && meta(i).io.resp(w).coh.isValid()).asUInt))))
+                           // Gate ways >= cf_dcache_active_ways to restrict effective cache size
+                           wayMap((w: Int) => s1_tag_eq_way(i)(w) && meta(i).io.resp(w).coh.isValid() && (w.U < cf_dcache_active_ways)).asUInt))))
 
   val s1_wb_idx_matches = widthMap(i => (s1_addr(i)(untagBits-1,blockOffBits) === wb.io.idx.bits) && wb.io.idx.valid)
 
@@ -881,8 +854,25 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
 
   // replacement policy
   val replacer = cacheParams.replacement
-  val s1_replaced_way_en = UIntToOH(replacer.way)
-  val s2_replaced_way_en = UIntToOH(RegNext(replacer.way))
+  // Clamp victim way to active ways to avoid replacing outside the active range
+  val cf_repl_way_clamped = replacer.way & (cf_dcache_active_ways - 1.U)
+  val s1_replaced_way_en = UIntToOH(cf_repl_way_clamped)
+  // MSHR way-collision fix: if the LRU-selected way is already claimed by a pending MSHR,
+  // pick an alternative way that is not currently occupied.  Without this, two concurrent
+  // misses to the same set can both be assigned the same physical way by PseudoLRU (which
+  // doesn't know about in-flight MSHR allocations), causing the second MSHR's refill to
+  // silently overwrite the first — the first MSHR's replay then misses and asserts.
+  val s2_repl_way_raw = UIntToOH(RegNext(cf_repl_way_clamped))
+  val s2_pending_mask  = mshrs.io.pending_way_mask
+  val s2_active_mask   = cf_dcache_active_ways - 1.U    // lower N bits: one per active way
+  val s2_avail_ways    = (~s2_pending_mask)(nWays-1,0) & s2_active_mask
+  // If the LRU choice is pending AND there are free alternatives, use the first free way.
+  // If all active ways are pending (all MSHRs busy), fall back to LRU — the miss will be
+  // nacked by the MSHR-full check above and retried next cycle.
+  val s2_replaced_way_en = Mux(
+    (s2_repl_way_raw & s2_pending_mask).orR && s2_avail_ways.orR,
+    PriorityEncoderOH(s2_avail_ways),
+    s2_repl_way_raw)
   val s2_repl_meta = widthMap(i => Mux1H(s2_replaced_way_en, wayMap((w: Int) => RegNext(meta(i).io.resp(w))).toSeq))
 
   // nack because of incoming probe
@@ -964,7 +954,11 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   }
 
   dataWriteArb.io.in(1) <> mshrs.io.refill
+  // Override refill write addr to use masked set (TileLink fetch uses full addr, SRAM write uses masked)
+  dataWriteArb.io.in(1).bits.addr := dcacheMaskAddr(mshrs.io.refill.bits.addr)
   metaWriteArb.io.in(0) <> mshrs.io.meta_write
+  // Override meta write idx to use masked set
+  metaWriteArb.io.in(0).bits.idx := mshrs.io.meta_write.bits.idx & dcache_set_mask(idxBits-1, 0)
 
   tl_out.e <> mshrs.io.mem_finish
 
@@ -998,64 +992,77 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   }
   // Mux between cache responses and uncache responses
   val cache_resp   = Wire(Vec(memWidth, Valid(new BoomDCacheResp)))
-  // corefuzzing: per-set domain table — tracks which domain last brought in a line per cache set
-  // Also tracks op_count of the filling instruction so it can be used as the influencer op_count.
-  val dcache_set_domain    = RegInit(VecInit(Seq.fill(nSets)(0.U(1.W))))
-  val dcache_set_op_count  = RegInit(VecInit(Seq.fill(nSets)(0.U(uopIDCounterWidthCF.W))))
+
+  // corefuzzing: per-way IFT metadata BRAMs (FPGA-friendly, single writer each).
+  //   ift_fill_meta  — written by MSHR fills only; tracks which domain last BROUGHT IN each line (timing channel → INFL_CACHE_EVICTION)
+  //   ift_store_meta — written by store hits only; tracks which domain last STORED to each line  (data channel   → INFL_MEM_DATAFLOW)
+  // Entry bit layout: [iftEntryBits-1]=secret  [iftEntryBits-2]=domain  [iftEntryBits-3:0]=op_count
+  val iftEntryBits = 1 + 1 + uopIDCounterWidthCF
+  def mkIftEntry(domain: UInt, op_count: UInt, secret: Bool): UInt = Cat(secret, domain, op_count)
+  def iftDomain(e: UInt)  : UInt = e(uopIDCounterWidthCF)
+  def iftOpCount(e: UInt) : UInt = e(uopIDCounterWidthCF - 1, 0)
+  def iftSecret(e: UInt)  : Bool = e(uopIDCounterWidthCF + 1)
+
+  val ift_fill_meta  = Seq.fill(nWays)(SyncReadMem(nSets, UInt(iftEntryBits.W)))
+  val ift_store_meta = Seq.fill(nWays)(SyncReadMem(nSets, UInt(iftEntryBits.W)))
+
   for (w <- 0 until memWidth) {
-    cache_resp(w).valid         := s2_valid(w) && s2_send_resp(w)
-    // corefuzzing
-    // Capture the uop into a registered value before tagging to avoid
-    // creating combinational cycles between the request path and the
-    // tag-update logic. We append the dcache tag on the registered copy
-    // when the response was valid in the previous cycle (RegNext on
-    // the valid/send conditions). This moves tagging to a stable, non-
-    // combinational value while still preserving an "on-entry" semantics
-    // (captured at response time).
-    // val cache_uop_reg = RegNext(s2_req(w).uop)
-    // val cache_uop_tagged = WireInit(s2_req(w).uop)
-    // val cache_uop_copy = Wire(new MicroOp)
-    // cache_uop_copy := s2_req(w).uop
-    // val cache_uop_tagged = Wire(new MicroOp)
-    // // when (RegNext(s2_valid(w) && s2_send_resp(w))) {
-    // when (s2_valid(w) && s2_send_resp(w) && s2_req(w).uop.cf_taint_module_id_1 =/= dcacheTagCF.U) {
-    //   // cache_resp(w).bits.uop := appendModuleTag(dcacheTagCF.U, cache_uop_reg) //s2_req(w).uop)
-    //   cache_uop_tagged := appendModuleTag(dcacheTagCF.U, s2_req(w).uop)
-    // }
-    // .otherwise {
-    //   cache_uop_tagged := s2_req(w).uop
-    // }
-    // corefuzzing: build the response uop in stages to avoid combinational cycles.
-    // Stage 1: start from s2_req uop, apply bitmap + secret_transmission
+    cache_resp(w).valid := s2_valid(w) && s2_send_resp(w)
+
+    // corefuzzing: build the response uop.
+    // Read ift_fill_meta and ift_store_meta in s1 (SyncReadMem: address presented in s1, result available in s2).
+    val s1_set        = dcacheMaskIdx(s1_req(w).addr)
+    val s2_fill_ways  = VecInit((0 until nWays).map(i => ift_fill_meta(i).read(s1_set,  s1_valid(w))))
+    val s2_store_ways = VecInit((0 until nWays).map(i => ift_store_meta(i).read(s1_set, s1_valid(w))))
+    // Mux by one-hot hit way (known in s2)
+    val s2_fill_entry  = Mux1H(s2_tag_match_way(w), s2_fill_ways)
+    val s2_store_entry = Mux1H(s2_tag_match_way(w), s2_store_ways)
+
     val uop_resp_base = WireInit(s2_req(w).uop)
     uop_resp_base.cf_fu_bitmap := s2_req(w).uop.cf_fu_bitmap | (1.U << dcacheTagCF.U)
-    // s_tx is NOT set here: cache misses are not transmissions (data stays in the processor).
-    // Transmission detection happens in lsu.scala at TLB time for stores/loads with secret-derived addresses.
-    // Stage 2: conditionally apply INFL_CACHE_EVICTION for cross-domain hit.
-    // Only fires when a VICTIM (domain=0) hits a line last filled by ATTACKER (domain=1).
+
     val uop_resp_final = WireInit(uop_resp_base)
     when (s2_valid(w) && s2_hit(w) && s2_type === t_lsu && !s2_nack(w)) {
-      val hit_set    = s2_req(w).addr(untagBits-1, blockOffBits)
-      val line_dom   = dcache_set_domain(hit_set)
-      val line_oc    = dcache_set_op_count(hit_set)
-      val uop_dom    = s2_req(w).uop.cf_domain_id
-      // Victim (domain=0) hitting a line last filled by attacker (domain=1)
-      when (uop_dom === 0.U && line_dom === 1.U) {
-        uop_resp_final := addInfluencer(uop_resp_base, line_oc, INFL_CACHE_EVICTION.U,
-          is_atk = true.B, is_secret = false.B)
+      val uop_dom   = s2_req(w).uop.cf_domain_id
+      val is_load   = !isWrite(s2_req(w).uop.mem_cmd)
+      // INFL_CACHE_EVICTION: victim hits a line last FILLED by attacker (timing channel, loads and stores)
+      val evict_fire  = uop_dom === 0.U && iftDomain(s2_fill_entry) === 1.U
+      // INFL_MEM_DATAFLOW: victim LOAD reads a line last STORED by attacker (data channel, loads only)
+      val memdf_fire  = uop_dom === 0.U && is_load && iftDomain(s2_store_entry) === 1.U
+
+      uop_resp_final := addInfluencerBatch(uop_resp_base, Seq(
+        InfluencerCandidate(evict_fire, iftOpCount(s2_fill_entry),  INFL_CACHE_EVICTION.U, true.B, iftSecret(s2_fill_entry)),
+        InfluencerCandidate(memdf_fire, iftOpCount(s2_store_entry), INFL_MEM_DATAFLOW.U,   true.B, iftSecret(s2_store_entry)),
+      ))
+
+      // corefuzzing: update ift_store_meta on store hits (per hit way)
+      when (!is_load) {
+        val s2_set   = dcacheMaskIdx(s2_req(w).addr)
+        val entry    = mkIftEntry(uop_dom, s2_req(w).uop.cf_op_count_id,
+                         s2_req(w).uop.cf_secret_propagation || s2_req(w).uop.cf_secret_access)
+        for (way <- 0 until nWays) {
+          when (s2_tag_match_way(w)(way)) {
+            ift_store_meta(way).write(s2_set, entry)
+          }
+        }
       }
     }
     cache_resp(w).bits.uop      := uop_resp_final
     cache_resp(w).bits.data     := loadgen(w).data | s2_sc_fail
     cache_resp(w).bits.is_hella := s2_req(w).is_hella
-
   }
 
-  // corefuzzing: update per-set domain at MSHR fill completion (meta_write), not miss request time.
-  // This prevents a victim miss from overwriting the attacker's domain before the fill completes.
+  // corefuzzing: update ift_fill_meta at MSHR fill completion (meta_write), one way at a time.
   when (mshrs.io.cf_meta_write_fill.valid) {
-    dcache_set_domain(mshrs.io.cf_meta_write_fill.bits.idx)   := mshrs.io.cf_meta_write_fill.bits.domain
-    dcache_set_op_count(mshrs.io.cf_meta_write_fill.bits.idx) := mshrs.io.cf_meta_write_fill.bits.op_count
+    val fill_idx = mshrs.io.cf_meta_write_fill.bits.idx & dcache_set_mask(idxBits-1, 0)
+    val entry    = mkIftEntry(mshrs.io.cf_meta_write_fill.bits.domain,
+                              mshrs.io.cf_meta_write_fill.bits.op_count,
+                              mshrs.io.cf_meta_write_fill.bits.secret)
+    for (way <- 0 until nWays) {
+      when (mshrs.io.cf_meta_write_fill.bits.way_en(way)) {
+        ift_fill_meta(way).write(fill_idx, entry)
+      }
+    }
   }
 
   val uncache_resp = Wire(Valid(new BoomDCacheResp))
@@ -1127,7 +1134,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   val s3_way   = RegNext(s2_tag_match_way(0))
 
   dataWriteArb.io.in(0).valid       := s3_valid
-  dataWriteArb.io.in(0).bits.addr   := s3_req.addr
+  dataWriteArb.io.in(0).bits.addr   := dcacheMaskAddr(s3_req.addr)
   dataWriteArb.io.in(0).bits.wmask  := UIntToOH(s3_req.addr.extract(rowOffBits-1,offsetlsb))
   dataWriteArb.io.in(0).bits.data   := Fill(rowWords, s3_req.data)
   dataWriteArb.io.in(0).bits.way_en := s3_way

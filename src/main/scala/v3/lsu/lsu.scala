@@ -54,7 +54,7 @@ import boom.v3.exu.{BrUpdateInfo, Exception, FuncUnitResp, CommitSignals, ExeUni
 
 // fore corefuzzing - SpeculativePRintf and Sext
 import boom.v3.util.{BoolToChar, AgePriorityEncoder, IsKilledByBranch, GetNewBrMask, WrapInc, IsOlder, UpdateBrMask, SpeculativePrintf}
-import boom.v3.util.{Sext, appendModuleTag, addInfluencer}
+import boom.v3.util.{Sext, appendModuleTag, addInfluencer, addInfluencerBatch, InfluencerCandidate}
 
 class LSUExeIO(implicit p: Parameters) extends BoomBundle()(p)
 {
@@ -133,6 +133,8 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   // Status signals for pipeline draining
   val queues_empty    = Output(Bool()) // Both LDQ and STQ empty
   val no_pending_mem  = Output(Bool()) // No outstanding memory requests
+  // Pulse to reset LSQ pointers to 0 on quiesce drain (queues are empty at this point)
+  val cf_lsq_quiesce_reset = Input(Bool())
 
   val ldq_full    = Output(Vec(coreWidth, Bool()))
   val stq_full    = Output(Vec(coreWidth, Bool()))
@@ -148,6 +150,14 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   // corefuzzing: TLB-stage FTQ secret updates — fires when s_acc determined at address resolution
   // One port per memWidth; fires even for speculatively-executed (later squashed) memory ops
   val cf_secret_ftq_updates = Output(Vec(memWidth, Valid(UInt(log2Ceil(ftqSz).W))))
+  // corefuzzing: direct ROB s_acc update at TLB stage — sets cf_secret_access in the ROB entry
+  // immediately when the effective address is found to be in the secret range, without waiting
+  // for the dcache response.  Enables correct s_acc in [FLUSH] for speculative secret loads.
+  val cf_s_acc_rob_upd = Output(Vec(memWidth, Valid(new CF_SAccUpdate)))
+  // corefuzzing: preg_secret early update — fires at TLB stage when load hits secret range.
+  // Enables in-flight consumers to receive s_prop before the producer commits (avoids needing
+  // a fence.i between the secret load and its consumers).  Bit index = pdst of the load.
+  val cf_preg_secret_upd = Output(Vec(memWidth, Valid(UInt(ipregSz.W))))
 
   val fp_stdata   = Flipped(Decoupled(new ExeUnitResp(fLen)))
 
@@ -206,11 +216,9 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
     val tlbMiss = Bool()
   })
 
-  // for corefuzzing - reconfigure is ouput bc bundle gets flipped
-  val reconfigure_stq_b1 = Input(Bool())
-  val reconfigure_stq_b0 = Input(Bool())
-  val reconfigure_ldq_b1 = Input(Bool())
-  val reconfigure_ldq_b0 = Input(Bool())
+  // 3-bit indices into ldQueueEntryOptions / stQueueEntryOptions for runtime reconfiguration
+  val cf_ldq_idx = Input(UInt(3.W))
+  val cf_stq_idx = Input(UInt(3.W))
 
   // corefuzzing: secret address range from CSRs for cf_secret_access detection
   val cf_secret_start_addr = Input(UInt(coreMaxAddrBits.W))
@@ -266,6 +274,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val io = IO(new LSUIO)
   io.hellacache := DontCare
 
+
+  // Runtime LDQ/STQ size selection via CSR index
+  val ldqOptionsVec = VecInit(ldQueueEntryOptions.map(_.U))
+  val stqOptionsVec = VecInit(stQueueEntryOptions.map(_.U))
+  val cf_ldq_active = ldqOptionsVec(io.core.cf_ldq_idx)
+  val cf_stq_active = stqOptionsVec(io.core.cf_stq_idx)
 
   val ldq = Reg(Vec(numLdqEntries, Valid(new LDQEntry)))
   val stq = Reg(Vec(numStqEntries, Valid(new STQEntry)))
@@ -351,11 +365,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   for (w <- 0 until coreWidth)
   {
-    ldq_full = WrapInc(ld_enq_idx, numLdqEntries) === ldq_head
+    ldq_full = WrapInc(ld_enq_idx, cf_ldq_active) === ldq_head
     io.core.ldq_full(w)    := ldq_full
     io.core.dis_ldq_idx(w) := ld_enq_idx
 
-    stq_full = WrapInc(st_enq_idx, numStqEntries) === stq_head
+    stq_full = WrapInc(st_enq_idx, cf_stq_active) === stq_head
     io.core.stq_full(w)    := stq_full
     io.core.dis_stq_idx(w) := st_enq_idx
 
@@ -400,12 +414,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       assert (!stq(st_enq_idx).valid, "[lsu] Enqueuing uop is overwriting stq entries")
     }
 
-    ld_enq_idx = Mux(dis_ld_val, WrapInc(ld_enq_idx, numLdqEntries),
+    ld_enq_idx = Mux(dis_ld_val, WrapInc(ld_enq_idx, cf_ldq_active),
                                  ld_enq_idx)
 
     next_live_store_mask = Mux(dis_st_val, next_live_store_mask | (1.U << st_enq_idx),
                                            next_live_store_mask)
-    st_enq_idx = Mux(dis_st_val, WrapInc(st_enq_idx, numStqEntries),
+    st_enq_idx = Mux(dis_st_val, WrapInc(st_enq_idx, cf_stq_active),
                                  st_enq_idx)
 
     assert(!(dis_ld_val && dis_st_val), "A UOP is trying to go into both the LDQ and the STQ")
@@ -481,8 +495,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val p2_block_load_mask = RegNext(p1_block_load_mask)
 
  // Prioritize emptying the store queue when it is almost full
-  val stq_almost_full = RegNext(WrapInc(WrapInc(st_enq_idx, numStqEntries), numStqEntries) === stq_head ||
-                                WrapInc(st_enq_idx, numStqEntries) === stq_head)
+  val stq_almost_full = RegNext(WrapInc(WrapInc(st_enq_idx, cf_stq_active), cf_stq_active) === stq_head ||
+                                WrapInc(st_enq_idx, cf_stq_active) === stq_head)
 
   // The store at the commit head needs the DCache to appear ordered
   // Delay firing load wakeups and retries now
@@ -750,6 +764,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     dtlb.io.req(w).bits.prv         := io.ptw.status.prv
     // corefuzzing: pass domain of requesting uop to DTLB
     dtlb.io.req_domain(w)           := exe_tlb_uop(w).cf_domain_id
+    dtlb.io.req_secret(w)           := exe_tlb_uop(w).cf_secret_propagation || exe_tlb_uop(w).cf_secret_access
   }
   dtlb.io.kill                      := exe_kill.reduce(_||_)
   dtlb.io.sfence                    := exe_sfence
@@ -817,14 +832,33 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     val uop_tlb_base = WireInit(exe_tlb_uop(w))
     uop_tlb_base.cf_fu_bitmap := exe_tlb_uop(w).cf_fu_bitmap | (1.U << dtlbTagCF.U)
     val secret_range_valid = io.core.cf_secret_end_addr =/= io.core.cf_secret_start_addr
+    // Use virtual address for secret-range check: CSRs hold virtual addresses, and on a TLB miss
+    // exe_tlb_paddr has invalid page-frame bits (0 from resp.paddr on miss), so physical comparison
+    // would always be false for speculative loads that never committed a TLB fill.
+    // In bare-metal simulation vaddr==paddr, so this is equivalent and correct in all cases.
     val in_secret = secret_range_valid &&
-                    (exe_tlb_paddr(w) >= io.core.cf_secret_start_addr) &&
-                    (exe_tlb_paddr(w) <= io.core.cf_secret_end_addr)
-    uop_tlb_base.cf_secret_access := exe_tlb_uop(w).cf_secret_access || in_secret
+                    (exe_tlb_vaddr(w) >= io.core.cf_secret_start_addr) &&
+                    (exe_tlb_vaddr(w) < io.core.cf_secret_end_addr)
+    // s_acc = reading secret data FROM memory into a register (loads only).
+    // Stores write TO the secret range but do not produce secret-tagged register values.
+    val is_secret_load = in_secret && exe_tlb_uop(w).uses_ldq
+    uop_tlb_base.cf_secret_access := exe_tlb_uop(w).cf_secret_access || is_secret_load
     // corefuzzing: TLB-stage FTQ update — mark this fetch packet as secret as soon as s_acc is known.
     // Fires speculatively (even for squashed memory ops) to capture transient secret access flows.
-    io.core.cf_secret_ftq_updates(w).valid := exe_tlb_valid(w) && in_secret
+    io.core.cf_secret_ftq_updates(w).valid := exe_tlb_valid(w) && is_secret_load
     io.core.cf_secret_ftq_updates(w).bits  := exe_tlb_uop(w).ftq_idx
+    // Direct ROB update: set s_acc immediately when address lands in secret range.
+    // op_count_id is included to guard against ROB slot reuse: if this TLB-stage
+    // update arrives after the original instruction was squashed and the slot reused,
+    // the ROB validates op_count_id before applying cf_secret_access.
+    io.core.cf_s_acc_rob_upd(w).valid               := exe_tlb_valid(w) && is_secret_load
+    io.core.cf_s_acc_rob_upd(w).bits.rob_idx        := exe_tlb_uop(w).rob_idx
+    io.core.cf_s_acc_rob_upd(w).bits.op_count_id    := exe_tlb_uop(w).cf_op_count_id
+    // preg_secret early update: mark the physical destination register as secret-tainted.
+    // This fires 1+ cycles before writeback, allowing consumers that are issued immediately
+    // after the load to see the taint at their issue-grant check cycle.
+    io.core.cf_preg_secret_upd(w).valid             := exe_tlb_valid(w) && is_secret_load
+    io.core.cf_preg_secret_upd(w).bits              := exe_tlb_uop(w).pdst
     // s_tx Case A: store carrying secret-dependent data to a non-secret memory address.
     //   The secret escapes to attacker-accessible memory (anything outside the secret range).
     val is_secret_bearing_store = exe_tlb_uop(w).uses_stq && !in_secret &&
@@ -840,11 +874,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                            is_secret_bearing_store || is_secret_addr_load
     // Stage 2: DTLB domain mismatch → INFL_DTLB_STATE (reads uop_tlb_base, writes uop_tlb_final)
     val uop_tlb_final = WireInit(uop_tlb_base)
-    when (dtlb.io.resp_domain_mismatch(w)) {
-      // DTLB mismatch: victim using a TLB entry cached by attacker (is_atk=true, is_secret=false)
+    when (dtlb.io.resp_domain_mismatch(w) || dtlb.io.resp_secret_mismatch(w)) {
+      // DTLB mismatch: victim using a TLB entry cached by attacker or secret instruction
       uop_tlb_final := addInfluencer(uop_tlb_base, 0.U, INFL_DTLB_STATE.U,
-        is_atk = uop_tlb_base.cf_domain_id === 0.U,
-        is_secret = false.B)
+        is_atk    = dtlb.io.resp_domain_mismatch(w) && uop_tlb_base.cf_domain_id === 0.U,
+        is_secret = dtlb.io.resp_secret_mismatch(w))
     }
     exe_tlb_uop_cf(w) := uop_tlb_final
   }
@@ -939,7 +973,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       dmem_req(w).bits.uop      := stq_commit_e.bits.uop
 
       stq_execute_head                     := Mux(dmem_req_fire(w),
-                                                WrapInc(stq_execute_head, numStqEntries),
+                                                WrapInc(stq_execute_head, cf_stq_active),
                                                 stq_execute_head)
 
       stq(stq_execute_head).bits.succeeded := false.B
@@ -992,6 +1026,17 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq(ldq_idx).bits.uop.pdst            := exe_tlb_uop(w).pdst
       ldq(ldq_idx).bits.addr_is_virtual     := exe_tlb_miss(w)
       ldq(ldq_idx).bits.addr_is_uncacheable := exe_tlb_uncacheable(w) && !exe_tlb_miss(w)
+      // corefuzzing: write IFT flags computed in TLB stage back to LDQ entry.
+      // Required because will_fire_load_wakeup bypasses TLB and uses the LDQ entry UOP
+      // directly as the dcache request UOP; without this write-back, IFT bits computed
+      // in the TLB stage (cf_secret_access, dtlb FU bit, cf_secret_transmission) are lost
+      // on dcache nack + wakeup replay paths.
+      ldq(ldq_idx).bits.uop.cf_secret_access       :=
+        ldq(ldq_idx).bits.uop.cf_secret_access || exe_tlb_uop_cf(w).cf_secret_access
+      ldq(ldq_idx).bits.uop.cf_secret_transmission :=
+        ldq(ldq_idx).bits.uop.cf_secret_transmission || exe_tlb_uop_cf(w).cf_secret_transmission
+      ldq(ldq_idx).bits.uop.cf_fu_bitmap           :=
+        ldq(ldq_idx).bits.uop.cf_fu_bitmap | exe_tlb_uop_cf(w).cf_fu_bitmap
 
       assert(!(will_fire_load_incoming(w) && ldq_incoming_e(w).bits.addr.valid),
         "[lsu] Incoming load is overwriting a valid address")
@@ -1608,19 +1653,42 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         merged_base_cf.cf_fu_bitmap          := ldq_base_cf.cf_fu_bitmap | resp_cf.cf_fu_bitmap
         merged_base_cf.cf_secret_access      := ldq_base_cf.cf_secret_access || resp_cf.cf_secret_access
         merged_base_cf.cf_secret_transmission := ldq_base_cf.cf_secret_transmission || resp_cf.cf_secret_transmission
-        var cf_chain: MicroOp = merged_base_cf
-        for (i <- 0 until numInfluencerSlotsCF) {
-          val cf_next = WireInit(cf_chain)
-          when (resp_cf.cf_influencer_list(i).valid) {
-            cf_next := addInfluencer(cf_chain,
-              resp_cf.cf_influencer_list(i).op_count,
-              resp_cf.cf_influencer_list(i).infl_type,
-              is_atk = resp_cf.cf_influencer_list(i).is_atk,
-              is_secret = resp_cf.cf_influencer_list(i).is_secret)
-          }
-          cf_chain = cf_next
+        // Merge resp_cf influencer list into merged_base_cf using parallel prefix.
+        val lsu_base_cnt = PopCount(VecInit(merged_base_cf.cf_influencer_list.map(_.valid)))
+        val resp_valid   = VecInit(resp_cf.cf_influencer_list.map(_.valid))
+        val resp_prefix  = (0 until numInfluencerSlotsCF).map { j =>
+          if (j == 0) 0.U(4.W) else PopCount(VecInit(resp_valid.take(j)))
         }
-        val dmem_resp_uop_cf = cf_chain
+        val resp_total = PopCount(resp_valid)
+        val dmem_resp_uop_cf = WireInit(merged_base_cf)
+        when (!merged_base_cf.cf_infl_overflow && lsu_base_cnt +& resp_total > numInfluencerSlotsCF.U) {
+          dmem_resp_uop_cf.cf_infl_overflow := true.B
+        }
+        // Precompute destination slot for each resp entry once; writers are one-hot per slot
+        // by prefix-sum construction → Mux1H is valid. Overflow check hoisted outside d-loop.
+        val resp_dst_slot = (0 until numInfluencerSlotsCF).map { j => lsu_base_cnt + resp_prefix(j) }
+        when (!merged_base_cf.cf_infl_overflow) {
+          for (d <- 0 until numInfluencerSlotsCF) {
+            val writers: Seq[Bool] = (0 until numInfluencerSlotsCF).map { j =>
+              resp_valid(j) && (resp_dst_slot(j) === d.U)
+            }
+            val any_write = writers.reduce(_ || _)
+            when (any_write) {
+              dmem_resp_uop_cf.cf_influencer_list(d).valid      := true.B
+              dmem_resp_uop_cf.cf_influencer_list(d).op_count   := Mux1H(writers, resp_cf.cf_influencer_list.map(_.op_count))
+              dmem_resp_uop_cf.cf_influencer_list(d).infl_type  := Mux1H(writers, resp_cf.cf_influencer_list.map(_.infl_type))
+              dmem_resp_uop_cf.cf_influencer_list(d).is_atk     := Mux1H(writers, resp_cf.cf_influencer_list.map(_.is_atk))
+              dmem_resp_uop_cf.cf_influencer_list(d).is_secret  := Mux1H(writers, resp_cf.cf_influencer_list.map(_.is_secret))
+              dmem_resp_uop_cf.cf_influencer_list(d).deny_count := Mux1H(writers, resp_cf.cf_influencer_list.map(_.deny_count))
+            }
+          }
+        }
+        for (j <- 0 until numInfluencerSlotsCF) {
+          when (resp_cf.cf_influencer_list(j).valid && resp_cf.cf_influencer_list(j).is_atk) {
+            dmem_resp_uop_cf.cf_attacker_influence := true.B
+          }
+        }
+        when (resp_cf.cf_infl_overflow) { dmem_resp_uop_cf.cf_infl_overflow := true.B }
 
         io.core.exe(w).iresp.bits.uop  := dmem_resp_uop_cf
         io.core.exe(w).fresp.bits.uop  := dmem_resp_uop_cf
@@ -1832,11 +1900,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     }
 
     temp_stq_commit_head = Mux(commit_store,
-                               WrapInc(temp_stq_commit_head, numStqEntries),
+                               WrapInc(temp_stq_commit_head, cf_stq_active),
                                temp_stq_commit_head)
 
     temp_ldq_head        = Mux(commit_load,
-                               WrapInc(temp_ldq_head, numLdqEntries),
+                               WrapInc(temp_ldq_head, cf_ldq_active),
                                temp_ldq_head)
   }
   stq_commit_head := temp_stq_commit_head
@@ -1861,10 +1929,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     stq(stq_head).bits.succeeded  := false.B
     stq(stq_head).bits.committed  := false.B
 
-    stq_head := WrapInc(stq_head, numStqEntries)
+    stq_head := WrapInc(stq_head, cf_stq_active)
     when (stq(stq_head).bits.uop.is_fence)
     {
-      stq_execute_head := WrapInc(stq_execute_head, numStqEntries)
+      stq_execute_head := WrapInc(stq_execute_head, cf_stq_active)
     }
   }
 
@@ -1988,6 +2056,19 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq(i).bits.addr.valid := false.B
       ldq(i).bits.executed   := false.B
     }
+  }
+
+  // corefuzzing: on quiesce drain, reset all LSQ pointers to 0.
+  // When this fires, queues_empty is true (ldq_head==ldq_tail, stq_commit_head==stq_tail),
+  // so all queue entries are already invalid.  Resetting to 0 ensures WrapInc(ptr, cf_*_active)
+  // wraps correctly within the new (possibly smaller) active range after a CSR reconfiguration.
+  when (io.core.cf_lsq_quiesce_reset) {
+    ldq_head         := 0.U
+    ldq_tail         := 0.U
+    stq_head         := 0.U
+    stq_tail         := 0.U
+    stq_commit_head  := 0.U
+    stq_execute_head := 0.U
   }
 
   //-------------------------------------------------------------

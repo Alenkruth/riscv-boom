@@ -96,6 +96,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     // corefuzzing: domain of the stored request — valid while MSHR is active, used at meta_write time
     val cf_req_domain   = Output(UInt(1.W))
     val cf_req_op_count = Output(UInt(uopIDCounterWidthCF.W))
+    val cf_req_secret   = Output(Bool())
   })
 
   // TODO: Optimize this. We don't want to mess with cache during speculation
@@ -154,6 +155,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   // corefuzzing: expose stored request domain for fill-completion tracking in dcache
   io.cf_req_domain   := req.uop.cf_domain_id
   io.cf_req_op_count := req.uop.cf_op_count_id
+  io.cf_req_secret   := req.uop.cf_secret_propagation || req.uop.cf_secret_access
   io.idx.valid := state =/= s_invalid
   io.tag.valid := state =/= s_invalid
   io.way.valid := !state.isOneOf(s_invalid, s_prefetch)
@@ -554,11 +556,18 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
 
     val fence_rdy = Output(Bool())
     val probe_rdy = Output(Bool())
+    // corefuzzing: union of way_en bits of all active MSHRs (one-hot per way).
+    // Used by the dcache to avoid assigning two concurrent misses to the same way,
+    // which would cause the second MSHR's refill to overwrite the first, making the
+    // first MSHR's subsequent replay miss and trigger assert(!(s2_type===t_replay && !s2_hit)).
+    val pending_way_mask = Output(UInt(nWays.W))
     // corefuzzing: fill-completion event — fires when an MSHR meta_write completes
     val cf_meta_write_fill = Output(Valid(new Bundle {
       val idx      = UInt(idxBits.W)
+      val way_en   = UInt(nWays.W)
       val domain   = UInt(1.W)
       val op_count = UInt(uopIDCounterWidthCF.W)
+      val secret   = Bool()
     }))
   })
 
@@ -716,6 +725,10 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     mshr
   }
 
+  // corefuzzing: OR together way_en of all active MSHRs so the dcache can avoid
+  // picking the same replacement way for two concurrent misses to the same set.
+  io.pending_way_mask := mshrs.map(m => Mux(m.io.way.valid, m.io.way.bits, 0.U)).reduce(_ | _)
+
   // Try to round-robin the MSHRs
   val mshr_head      = RegInit(0.U(log2Ceil(cfg.nMSHRs).W))
   mshr_alloc_idx    := RegNext(AgePriorityEncoder(mshrs.map(m=>m.io.req_pri_rdy), mshr_head))
@@ -729,10 +742,13 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
   // corefuzzing: fire fill-completion event when an MSHR's meta_write is accepted
   io.cf_meta_write_fill.valid         := meta_write_arb.io.out.fire
   io.cf_meta_write_fill.bits.idx      := meta_write_arb.io.out.bits.idx
+  io.cf_meta_write_fill.bits.way_en   := meta_write_arb.io.out.bits.way_en
   io.cf_meta_write_fill.bits.domain   := Mux1H(UIntToOH(meta_write_arb.io.chosen),
                                            VecInit(mshrs.map(_.io.cf_req_domain)))
   io.cf_meta_write_fill.bits.op_count := Mux1H(UIntToOH(meta_write_arb.io.chosen),
                                            VecInit(mshrs.map(_.io.cf_req_op_count)))
+  io.cf_meta_write_fill.bits.secret   := Mux1H(UIntToOH(meta_write_arb.io.chosen),
+                                           VecInit(mshrs.map(_.io.cf_req_secret)))
 
   val mmio_alloc_arb = Module(new Arbiter(Bool(), nIOMSHRs))
 
