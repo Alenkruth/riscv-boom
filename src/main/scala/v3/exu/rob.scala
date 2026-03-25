@@ -640,37 +640,39 @@ class Rob(
         when (wb_uop_i.cf_secret_transmission) { rob_uop(rob_row).cf_secret_transmission  := true.B }
         when (wb_uop_i.cf_secret_propagation)  { rob_uop(rob_row).cf_secret_propagation   := true.B }
 
-        // Merge influencer list: chain-of-wires fold so each wb entry finds the next free slot
-        var cur_list: Vec[InfluencerEntry] = rob_uop(rob_row).cf_influencer_list
-        var cur_ovf: Bool = Wire(Bool())
-        cur_ovf := rob_uop(rob_row).cf_infl_overflow
-        for (j <- 0 until numInfluencerSlotsCF) {
-          val step_list = WireInit(cur_list)
-          val step_ovf  = WireInit(cur_ovf)
-          when (wb_uop_i.cf_influencer_list(j).valid) {
-            val empties  = VecInit(cur_list.map(!_.valid))
-            val has_free = empties.reduce(_ || _)
-            val free_idx = PriorityEncoder(empties)
-            when (!cur_ovf && has_free) {
-              for (k <- 0 until numInfluencerSlotsCF) {
-                when (k.U === free_idx) {
-                  step_list(k).valid      := true.B
-                  step_list(k).op_count   := wb_uop_i.cf_influencer_list(j).op_count
-                  step_list(k).infl_type  := wb_uop_i.cf_influencer_list(j).infl_type
-                  step_list(k).is_atk     := wb_uop_i.cf_influencer_list(j).is_atk
-                  step_list(k).is_secret  := wb_uop_i.cf_influencer_list(j).is_secret
-                  step_list(k).deny_count := wb_uop_i.cf_influencer_list(j).deny_count
-                }
-              }
-            } .otherwise {
-              step_ovf := true.B
+        // Merge influencer list: parallel prefix compact-and-append.
+        // base_cnt = number of already-occupied slots in rob_uop.
+        // prefix(j) = number of valid wb slots before j → direct destination index.
+        val rob_base_cnt = PopCount(VecInit(rob_uop(rob_row).cf_influencer_list.map(_.valid)))
+        val wb_valid_vec = VecInit(wb_uop_i.cf_influencer_list.map(_.valid))
+        // Prefix sums: wb_prefix(j) = number of valid wb slots before j.
+        val wb_prefix    = (0 until numInfluencerSlotsCF).map { j =>
+          if (j == 0) 0.U(4.W) else PopCount(VecInit(wb_valid_vec.take(j)))
+        }
+        val wb_total = PopCount(wb_valid_vec)
+        when (!rob_uop(rob_row).cf_infl_overflow && rob_base_cnt +& wb_total > numInfluencerSlotsCF.U) {
+          rob_uop(rob_row).cf_infl_overflow := true.B
+        }
+        // Precompute destination slot for each wb entry once (avoids recomputing inside d-loop).
+        // writers are one-hot per slot by prefix-sum construction → Mux1H is valid.
+        val dst_slot = (0 until numInfluencerSlotsCF).map { j => rob_base_cnt + wb_prefix(j) }
+        when (!rob_uop(rob_row).cf_infl_overflow) {
+          for (d <- 0 until numInfluencerSlotsCF) {
+            val writers: Seq[Bool] = (0 until numInfluencerSlotsCF).map { j =>
+              wb_valid_vec(j) && (dst_slot(j) === d.U)
+            }
+            val any_write = writers.reduce(_ || _)
+            when (any_write) {
+              rob_uop(rob_row).cf_influencer_list(d).valid      := true.B
+              rob_uop(rob_row).cf_influencer_list(d).op_count   := Mux1H(writers, wb_uop_i.cf_influencer_list.map(_.op_count))
+              rob_uop(rob_row).cf_influencer_list(d).infl_type  := Mux1H(writers, wb_uop_i.cf_influencer_list.map(_.infl_type))
+              rob_uop(rob_row).cf_influencer_list(d).is_atk     := Mux1H(writers, wb_uop_i.cf_influencer_list.map(_.is_atk))
+              rob_uop(rob_row).cf_influencer_list(d).is_secret  := Mux1H(writers, wb_uop_i.cf_influencer_list.map(_.is_secret))
+              rob_uop(rob_row).cf_influencer_list(d).deny_count := Mux1H(writers, wb_uop_i.cf_influencer_list.map(_.deny_count))
             }
           }
-          cur_list = step_list
-          cur_ovf  = step_ovf
         }
-        rob_uop(rob_row).cf_influencer_list := cur_list
-        rob_uop(rob_row).cf_infl_overflow   := cur_ovf || wb_uop_i.cf_infl_overflow
+        when (wb_uop_i.cf_infl_overflow) { rob_uop(rob_row).cf_infl_overflow := true.B }
       }
       val temp_uop = rob_uop(GetRowIdx(rob_idx))
 

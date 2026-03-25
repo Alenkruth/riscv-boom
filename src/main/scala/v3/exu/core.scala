@@ -1043,77 +1043,58 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     RegEnable(rob.io.rob_head_is_secret,dis_valids(w) && !dis_fire(w) && ren_stalls(w)))
   for (w <- 0 until coreWidth) {
     val pre = rename_stage.io.ren2_uops(w)  // cycle-free base
-    val is_tainted = dis_uops(w).cf_src_tainted && dis_uops(w).cf_domain_id === 0.U
+    // Taint paths:
+    //   is_any_tainted  — tainted source from OTHER domain (domain=0 instr reading atk-written reg):
+    //                     fires INFL_REG_DATAFLOW with is_atk=true (cross-domain attack influence).
+    //   is_sec_tainted  — tainted source that had s_acc/s_prop: fires cf_secret_propagation.
+    //                     NO domain gate: attacker instructions propagating secret data also get s_prop.
+    //   reg_df_fire     — fires INFL_REG_DATAFLOW for BOTH cross-domain and same-domain-secret cases.
+    //   reg_df_is_atk   — true ONLY for cross-domain cases (is_any_tainted). Same-domain secret
+    //                     propagation uses is_atk=false, is_secret=true to distinguish it clearly.
+    //   preg_src_secret — source preg was secret-tainted in-flight (preg_secret set, taint_table not yet).
+    //                     Catches the case where producer's TLB fired AFTER consumer's dispatch but
+    //                     BEFORE consumer's dispatch checks. Fires separate candidate with op_count=0.
+    val is_any_tainted  = dis_uops(w).cf_src_tainted && dis_uops(w).cf_domain_id === 0.U
+    val is_sec_tainted  = dis_uops(w).cf_src_tainted && dis_uops(w).cf_taint_producer_is_secret
+    val reg_df_fire     = is_any_tainted || is_sec_tainted
+    val reg_df_is_atk   = is_any_tainted && pre.cf_taint_producer_is_atk
+    // In-flight preg_secret: check at dispatch whether source regs are already secret-tainted
+    // (set by TLB stage of an in-flight producer that hasn't committed yet).
+    // Only fire if not already covered by reg_df_fire (avoids duplicate INFL_REG_DATAFLOW entries).
+    val preg_src_secret = preg_secret(pre.prs1) || preg_secret(pre.prs2)
+    val preg_only_fire  = preg_src_secret && !reg_df_fire
 
-    // Step 1: INFL_REG_DATAFLOW (register taint)
-    // is_atk/is_secret come from the rename-stage producer tables
-    val post1 = addInfluencer(pre, pre.cf_taint_producer_op, INFL_REG_DATAFLOW.U,
-      is_atk = pre.cf_taint_producer_is_atk, is_secret = pre.cf_taint_producer_is_secret)
-    val list1 = Mux(is_tainted, post1.cf_influencer_list, pre.cf_influencer_list)
-    val ovf1  = Mux(is_tainted, post1.cf_infl_overflow,   pre.cf_infl_overflow)
-    when (is_tainted) { dis_uops(w).cf_secret_propagation := true.B }
+    when (is_sec_tainted || preg_src_secret) { dis_uops(w).cf_secret_propagation := true.B }
 
-    // Step 1.5: INFL_REG_PRESSURE — physical register freelist exhausted; attributed to ROB head
-    // (the oldest committed instruction will free a register, so it is the structural bottleneck).
-    val mid15 = Wire(pre.cloneType); mid15 := pre
-    mid15.cf_influencer_list := list1; mid15.cf_infl_overflow := ovf1
-    val post15 = addInfluencer(mid15, dis_stall_reg_head_op_count(w), INFL_REG_PRESSURE.U,
-      is_atk = dis_stall_reg_head_domain(w) === 1.U, is_secret = dis_stall_reg_head_is_secret(w))
-    val list15 = Mux(dis_fire(w) && dis_stall_was_reg(w), post15.cf_influencer_list, list1)
-    val ovf15  = Mux(dis_fire(w) && dis_stall_was_reg(w), post15.cf_infl_overflow,   ovf1)
-
-    // Step 2: INFL_ROB_FULL — ROB head is the influencer (blocked dispatch)
-    // Use stall-cycle captured head attributes: on the fire cycle the head has already advanced.
-    val mid2 = Wire(pre.cloneType); mid2 := pre
-    mid2.cf_influencer_list := list15; mid2.cf_infl_overflow := ovf15
-    val post2 = addInfluencer(mid2, dis_stall_rob_head_op_count(w), INFL_ROB_FULL.U,
-      is_atk = dis_stall_rob_head_domain(w) === 1.U, is_secret = dis_stall_rob_head_is_secret(w))
-    val list2 = Mux(dis_fire(w) && dis_stall_was_rob(w), post2.cf_influencer_list, list15)
-    val ovf2  = Mux(dis_fire(w) && dis_stall_was_rob(w), post2.cf_infl_overflow,   ovf15)
-
-    // Step 3: INFL_LDQ_FULL — LDQ head is the influencer
-    val mid3 = Wire(pre.cloneType); mid3 := pre
-    mid3.cf_influencer_list := list2; mid3.cf_infl_overflow := ovf2
-    val post3 = addInfluencer(mid3, dis_stall_ldq_head_op_count(w), INFL_LDQ_FULL.U,
-      is_atk = dis_stall_ldq_head_domain(w) === 1.U, is_secret = dis_stall_ldq_head_is_secret(w))
-    val list3 = Mux(dis_fire(w) && dis_stall_was_ldq(w), post3.cf_influencer_list, list2)
-    val ovf3  = Mux(dis_fire(w) && dis_stall_was_ldq(w), post3.cf_infl_overflow,   ovf2)
-
-    // Step 4: INFL_STQ_FULL — STQ head is the influencer
-    val mid4 = Wire(pre.cloneType); mid4 := pre
-    mid4.cf_influencer_list := list3; mid4.cf_infl_overflow := ovf3
-    val post4 = addInfluencer(mid4, dis_stall_stq_head_op_count(w), INFL_STQ_FULL.U,
-      is_atk = dis_stall_stq_head_domain(w) === 1.U, is_secret = dis_stall_stq_head_is_secret(w))
-    val list4 = Mux(dis_fire(w) && dis_stall_was_stq(w), post4.cf_influencer_list, list3)
-    val ovf4  = Mux(dis_fire(w) && dis_stall_was_stq(w), post4.cf_infl_overflow,   ovf3)
-
-    // Step 5: INFL_MEM_HOL — head entry from different domain present at dispatch
+    // Steps 1–5: inject dispatch-level influencers in parallel using addInfluencerBatch.
+    // All candidates are evaluated from the same base (pre) simultaneously.
+    // Step 6 (INFL_ISSUE_CONTENTION) is injected at issue time via ROB update bus.
     val dis_hol_ldq = dis_fire(w) && dis_uops(w).uses_ldq && io.lsu.ldq_head_valid &&
                       (io.lsu.ldq_head_domain =/= dis_uops(w).cf_domain_id)
     val dis_hol_stq = dis_fire(w) && dis_uops(w).uses_stq && io.lsu.stq_head_valid &&
                       (io.lsu.stq_head_domain =/= dis_uops(w).cf_domain_id)
-    val dis_hol_any = dis_hol_ldq || dis_hol_stq
-    val hol_head_op    = Mux(dis_hol_ldq, io.lsu.ldq_head_op_count,   io.lsu.stq_head_op_count)
-    val hol_is_atk     = Mux(dis_hol_ldq, io.lsu.ldq_head_domain === 1.U, io.lsu.stq_head_domain === 1.U)
-    val hol_is_secret  = Mux(dis_hol_ldq, io.lsu.ldq_head_is_secret,  io.lsu.stq_head_is_secret)
-    val mid5 = Wire(pre.cloneType); mid5 := pre
-    mid5.cf_influencer_list := list4; mid5.cf_infl_overflow := ovf4
-    val post5 = addInfluencer(mid5, hol_head_op, INFL_MEM_HOL.U,
-      is_atk = hol_is_atk, is_secret = hol_is_secret)
-    val list5 = Mux(dis_hol_any, post5.cf_influencer_list, list4)
-    val ovf5  = Mux(dis_hol_any, post5.cf_infl_overflow,   ovf4)
+    val dis_hol_any   = dis_hol_ldq || dis_hol_stq
+    val hol_head_op   = Mux(dis_hol_ldq, io.lsu.ldq_head_op_count,      io.lsu.stq_head_op_count)
+    val hol_is_atk    = Mux(dis_hol_ldq, io.lsu.ldq_head_domain === 1.U, io.lsu.stq_head_domain === 1.U)
+    val hol_is_secret = Mux(dis_hol_ldq, io.lsu.ldq_head_is_secret,      io.lsu.stq_head_is_secret)
 
-    // Step 6: INFL_ISSUE_CONTENTION — now injected at issue time via ROB update bus.
-    // Dispatch no longer injects this influencer; the ROB receives cf_issue_contention_upd
-    // from each issue unit and calls addInfluencer on the correct entry when the instruction issues.
-    dis_uops(w).cf_influencer_list := list5
-    dis_uops(w).cf_infl_overflow   := ovf5
+    val post_dis = addInfluencerBatch(pre, Seq(
+      // reg_df_fire: cross-domain taint (is_atk=reg_df_is_atk) OR same-domain secret (is_atk=false).
+      // reg_df_is_atk is true only for cross-domain cases; same-domain secret gets is_atk=false, is_secret=true.
+      InfluencerCandidate(reg_df_fire,                         pre.cf_taint_producer_op,        INFL_REG_DATAFLOW.U, reg_df_is_atk,                         pre.cf_taint_producer_is_secret),
+      // preg_only_fire: in-flight preg_secret at dispatch (producer not yet committed to taint_table).
+      // op_count=0 (unknown at dispatch time — producer hasn't committed); is_atk=false (same-domain secret).
+      InfluencerCandidate(preg_only_fire,                      0.U,                             INFL_REG_DATAFLOW.U, false.B,                               true.B),
+      InfluencerCandidate(dis_fire(w) && dis_stall_was_reg(w), dis_stall_reg_head_op_count(w),  INFL_REG_PRESSURE.U, dis_stall_reg_head_domain(w) === 1.U,  dis_stall_reg_head_is_secret(w)),
+      InfluencerCandidate(dis_fire(w) && dis_stall_was_rob(w), dis_stall_rob_head_op_count(w),  INFL_ROB_FULL.U,     dis_stall_rob_head_domain(w) === 1.U,  dis_stall_rob_head_is_secret(w)),
+      InfluencerCandidate(dis_fire(w) && dis_stall_was_ldq(w), dis_stall_ldq_head_op_count(w),  INFL_LDQ_FULL.U,     dis_stall_ldq_head_domain(w) === 1.U,  dis_stall_ldq_head_is_secret(w)),
+      InfluencerCandidate(dis_fire(w) && dis_stall_was_stq(w), dis_stall_stq_head_op_count(w),  INFL_STQ_FULL.U,     dis_stall_stq_head_domain(w) === 1.U,  dis_stall_stq_head_is_secret(w)),
+      InfluencerCandidate(dis_hol_any,                          hol_head_op,                     INFL_MEM_HOL.U,      hol_is_atk,                            hol_is_secret),
+    ))
 
-    // Derive cf_attacker_influence from final influencer list: any entry with is_atk=true means
-    // an attacker-domain instruction influenced this uop.  OR with pre.cf_attacker_influence to
-    // preserve any atk flag already set by upstream stages (fetch-buffer, etc.).
-    val final_atk_from_list = list5.map(e => e.valid && e.is_atk).reduce(_ || _)
-    dis_uops(w).cf_attacker_influence := pre.cf_attacker_influence || final_atk_from_list
+    dis_uops(w).cf_influencer_list    := post_dis.cf_influencer_list
+    dis_uops(w).cf_infl_overflow      := post_dis.cf_infl_overflow
+    dis_uops(w).cf_attacker_influence := post_dis.cf_attacker_influence
 
     // C5: if the blocking queue head was secret-dependent, propagate s_prop to this instruction.
     when (dis_fire(w) && (dis_stall_was_rob_secret(w) || dis_stall_was_ldq_secret(w) || dis_stall_was_stq_secret(w))) {
