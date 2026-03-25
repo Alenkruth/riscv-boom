@@ -803,29 +803,103 @@ object appendModuleTag {
  * Finds the first empty slot; if all full, sets cf_infl_overflow instead.
  * Returns a modified Wire copy of the uop; the original is unchanged.
  */
-object addInfluencer {
+object addInfluencer extends CoreFuzzingConstants {
   def apply(uop: boom.v3.common.MicroOp, op_count: UInt, infl_type: UInt,
             is_atk: Bool = false.B, is_secret: Bool = false.B,
             deny_count: UInt = 0.U)
            (implicit p: Parameters): boom.v3.common.MicroOp = {
     val out = WireInit(uop)
-    val slots = uop.cf_influencer_list
-    val empties = VecInit(slots.map(!_.valid))
-    val has_empty = empties.reduce(_ || _)
-    val first_empty = PriorityEncoder(empties)
+    // PopCount is equivalent to PriorityEncoder here because slots are always filled
+    // sequentially from 0 upward — no gaps are ever created.
+    val nDyn = numInfluencerSlotsCF
+    val base_idx = PopCount(VecInit(uop.cf_influencer_list.take(nDyn).map(_.valid)))
+    val has_empty = base_idx < nDyn.U
     when (!uop.cf_infl_overflow) {
       when (has_empty) {
-        out.cf_influencer_list(first_empty).valid      := true.B
-        out.cf_influencer_list(first_empty).op_count   := op_count
-        out.cf_influencer_list(first_empty).infl_type  := infl_type
-        out.cf_influencer_list(first_empty).is_atk     := is_atk
-        out.cf_influencer_list(first_empty).is_secret  := is_secret
-        out.cf_influencer_list(first_empty).deny_count := deny_count
-        // When adding an attacker-sourced influencer, set the atk flag on the influenced instruction
-        when (is_atk) { out.cf_attacker_influence := true.B }
+        // Static outer loop avoids a dynamic Vec write (PriorityEncoder + mux tree).
+        for (k <- 0 until nDyn) {
+          when (base_idx === k.U) {
+            out.cf_influencer_list(k).valid      := true.B
+            out.cf_influencer_list(k).op_count   := op_count
+            out.cf_influencer_list(k).infl_type  := infl_type
+            out.cf_influencer_list(k).is_atk     := is_atk
+            out.cf_influencer_list(k).is_secret  := is_secret
+            out.cf_influencer_list(k).deny_count := deny_count
+            when (is_atk) { out.cf_attacker_influence := true.B }
+          }
+        }
       } .otherwise {
         out.cf_infl_overflow := true.B
       }
+    }
+    out
+  }
+}
+
+// corefuzzing — IFT Phase 2: Parallel batch influencer injection
+/**
+ * Candidate for addInfluencerBatch: fires when cond=true, appending one influencer entry.
+ */
+case class InfluencerCandidate(
+  cond:      Bool,
+  op_count:  UInt,
+  infl_type: UInt,
+  is_atk:    Bool,
+  is_secret: Bool)
+
+/**
+ * Add multiple influencer entries to a uop in parallel (O(~10 gates) vs O(N*90) serial).
+ *
+ * Algorithm:
+ *   base_idx = PopCount(existing valid slots)           — 3-level adder tree
+ *   prefix(k) = PopCount(conds[0..k-1])                — independent per-k, log2(N) levels each
+ *   slot for candidate k = base_idx + prefix(k)        — 1 adder
+ *   assign slot if cond[k] && slot < n_slots            — parallel, no serial dependency
+ *
+ * All outputs write to REGISTERS, so this path is register-bounded regardless of depth.
+ */
+object addInfluencerBatch extends CoreFuzzingConstants {
+  def apply(uop: boom.v3.common.MicroOp, candidates: Seq[InfluencerCandidate])
+           (implicit p: Parameters): boom.v3.common.MicroOp = {
+    val out    = WireInit(uop)
+    val n_dyn  = numInfluencerSlotsCF
+    val base_idx = PopCount(VecInit(uop.cf_influencer_list.take(n_dyn).map(_.valid)))
+
+    val cond_bits = candidates.map(_.cond)
+
+    // prefix(k) = number of candidates before k that fired
+    val prefix: Seq[UInt] = candidates.indices.map { k =>
+      if (k == 0) 0.U(log2Ceil(n_dyn + 1).W)
+      else PopCount(VecInit(cond_bits.take(k)))
+    }
+
+    val total_new = PopCount(VecInit(cond_bits))
+
+    when (!uop.cf_infl_overflow && base_idx +& total_new > n_dyn.U) {
+      out.cf_infl_overflow := true.B
+    }
+
+    // Iterate over all slots (STATIC indices).
+    // For each literal slot s, determine which candidate (if any) targets it.
+    // Candidate k targets slot s iff: cond[k] && base_idx + prefix[k] == s
+    for (s <- 0 until n_dyn) {
+      val writers: Seq[Bool] = candidates.zipWithIndex.map { case (c, k) =>
+        c.cond && !uop.cf_infl_overflow && (base_idx + prefix(k) === s.U)
+      }
+      val any_write = writers.reduce(_ || _)
+      // writers is one-hot by construction (prefix sums ensure at most one candidate per slot),
+      // so Mux1H (OR-based) is equivalent to MuxCase (priority) but ~2 LUT levels shallower.
+      when (any_write) {
+        out.cf_influencer_list(s).valid     := true.B
+        out.cf_influencer_list(s).op_count  := Mux1H(writers, candidates.map(_.op_count))
+        out.cf_influencer_list(s).infl_type := Mux1H(writers, candidates.map(_.infl_type))
+        out.cf_influencer_list(s).is_atk    := Mux1H(writers, candidates.map(_.is_atk))
+        out.cf_influencer_list(s).is_secret := Mux1H(writers, candidates.map(_.is_secret))
+      }
+    }
+
+    candidates.zip(cond_bits).foreach { case (c, f) =>
+      when (f && c.is_atk) { out.cf_attacker_influence := true.B }
     }
     out
   }
