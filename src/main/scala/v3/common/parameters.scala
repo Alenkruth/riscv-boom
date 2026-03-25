@@ -168,26 +168,27 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   }
 
   // second CSR - fetch_bufferCSR
+  // 3-bit binary index into fetchBufferEntryOptions = Seq(128, 64, 32, 24, 16, 8)
+  // init = 0x0 → index 0 = 128 entries (max, hardware-built size)
   override def fetchBufferCSRCF = {
-    val mask = BigInt(1 << 1 | 1 << 0) // bits 1 and 0 for numRows reconfiguration
-    val init = BigInt(1 << 1 | 1 << 0) // at initialization
+    val mask = BigInt(0x7) // 3-bit index
+    val init = BigInt(0x0) // index 0 = max (128 entries)
     Some(CustomCSR(fetchBufferCSRIdCF, mask, Some(init)))
   }
+  def cf_fetch_buffer_idx = getOrElse(fetchBufferCSRCF, _.value(2,0), 0.U)
 
   // load/store queue CSR
+  // bits [2:0] = LDQ index into ldQueueEntryOptions = Seq(64, 32, 24, 16, 8)
+  // bits [5:3] = STQ index into stQueueEntryOptions = Seq(64, 32, 24, 16, 8)
+  // init = 0x0 → both queues at index 0 = max (64 entries each)
   override def ldqStqCSRCF = {
-    val mask = BigInt(1 << 3 | 1 << 2 | 1 << 1 | 1 << 0) // for right now, 2 bits (<<2) for stq length reconfig, 2 bits (<<0) for ldq len
-    val init = BigInt(1 << 3 | 1 << 2 | 1 << 1 | 1 << 0) // at initialization
+    val mask = BigInt(0x3F) // 6-bit: 3 bits for LDQ + 3 bits for STQ
+    val init = BigInt(0x0)  // index 0,0 = both at max (64 entries)
     Some(CustomCSR(ldqStqCSRIdCF, mask, Some(init)))
   }
-
-  def reconfig_stq_b1 = getOrElse(ldqStqCSRCF, _.value(3), true.B)
-  def reconfig_stq_b0 = getOrElse(ldqStqCSRCF, _.value(2), true.B)
-  def reconfig_ldq_b1 = getOrElse(ldqStqCSRCF, _.value(1), true.B)
-  def reconfig_ldq_b0 = getOrElse(ldqStqCSRCF, _.value(0), true.B)
-  def reconfigureFB_rows_b0 = true.B  // full FB mode until dynamic reconfiguration is implemented
-  def reconfigureFB_rows_b1 = true.B
-  // def reconfigureBPD = getOrElse(configureCSR, _.value(2), true.B)  
+  def cf_ldq_idx = getOrElse(ldqStqCSRCF, _.value(2,0), 0.U)
+  def cf_stq_idx = getOrElse(ldqStqCSRCF, _.value(5,3), 0.U)
+  // def reconfigureBPD = getOrElse(configureCSR, _.value(2), true.B)
   
   def cf_bpd_tage_to_gshare = getOrElse(bpdCSRCF, _.value(2), true.B)  
   def disableOOO = getOrElse(chickenCSR, _.value(3), true.B)
@@ -195,53 +196,32 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   // core fuzzing specific
   // def cf_debug_log = getOrElse(chickenCSR, _.value(4), true.B)
 
-  // defining masks for cf_dcache_csr
-  val cf_dcache_set_shift = 0
-  val cf_dcache_way_shift = 7
-  val cf_dcache_size_shift = 15
-  val cf_dcache_repl_shift = 23
-
-  val cf_dcache_mask = 0xff
-  val cf_dcache_init = 0x01
-  override def dcacheCSRCF = {     
-
-    // val mask = BigInt(
-    //   cf_dcache_mask << cf_dcache_set_shift  |
-    //   cf_dcache_mask << cf_dcache_way_shift  |
-    //   cf_dcache_mask << cf_dcache_size_shift |
-    //   cf_dcache_mask << cf_dcache_repl_shift
-    // )
-    val mask = BigInt(0x7fffffff)
-    // val init = BigInt(
-    //   cf_dcache_init << cf_dcache_set_shift  |
-    //   cf_dcache_init << cf_dcache_way_shift  |
-    //   cf_dcache_init << cf_dcache_size_shift |
-    //   cf_dcache_init << cf_dcache_repl_shift
-    // )
-    val init = BigInt(0x0)
-    
+  // DCache reconfiguration CSR (0xbc1)
+  // bits [1:0]: set index into dcacheSetOptions = Seq(128, 64, 32, 16)  — index 0 = max
+  // bits [3:2]: way index into cacheWayOptions  = Seq(8, 4, 2, 1)       — index 0 = max
+  // Block size is NOT reconfigurable (cacheBlockBytes fixed).
+  override def dcacheCSRCF = {
+    val mask = BigInt(0xF)  // 4 bits: 2 for sets, 2 for ways
+    val init = BigInt(0x0)  // index (0,0) = hardware-built max sizes
     Some(CustomCSR(dcacheCSRIdCF, mask, Some(init)))
-  }  
+  }
+  // 2-bit index accessors (used directly in dcache.scala)
+  def cf_dcache_set_conf = getOrElse(dcacheCSRCF, _.value(1,0), 0.U)
+  def cf_dcache_way_conf = getOrElse(dcacheCSRCF, _.value(3,2), 0.U)
+  // Legacy stubs (keep to avoid compile errors in dcache.scala / lsu.scala)
+  def cf_dcache_size_conf = 0.U
+  def cf_dcache_repl_conf = 0.U
 
-  def cf_dcache_csr_val = getOrElse(dcacheCSRCF, _.value, 0x0.U)
-  def cf_dcache_set_conf = cf_dcache_csr_val & cf_dcache_mask.U
-  def cf_dcache_way_conf = (cf_dcache_csr_val >>  8.U) & cf_dcache_mask.U
-  def cf_dcache_size_conf = (cf_dcache_csr_val >> 16.U) & cf_dcache_mask.U// def cf_dcache_way_conf = (cf_dcache_csr_val >> (cf_dcache_way_shift.U + 1.U)) & cf_dcache_mask.U
-  def cf_dcache_repl_conf = (cf_dcache_csr_val >> 24.U) & cf_dcache_mask.U// def cf_dcache_size_conf = (cf_dcache_csr_val >> (cf_dcache_size_shift.U + 1.U)) & cf_dcache_mask.U
-  // def cf_dcache_repl_conf = (cf_dcache_csr_val >> (cf_dcache_repl_shift.U + 1.U)) & cf_dcache_mask.U
-// def decodeOneHot[T](csr: UInt, options: Seq[T]): UInt = {
-//   val optVec = options.zipWithIndex.map { case (opt, i) => (csr(i), opt.U) }
-//   optVec.tail.foldLeft(optVec.head._2) { case (sel, (cond, opt)) => Mux(cond.asBool, opt, sel) }
-// }
-
-// def getDCacheReconfParams(csr: UInt, blocksize_csr: UInt = 1.U) = {
-//   val sets = decodeOneHot((csr >> 0) & 0xff.U, DCacheReconfOptions.setOptions)
-//   val ways = decodeOneHot((csr >> 8) & 0xff.U, DCacheReconfOptions.wayOptions)
-//   val size = decodeOneHot((csr >> 16) & 0xff.U, DCacheReconfOptions.sizeOptions)
-//   val repl = decodeOneHot((csr >> 24) & 0xff.U, DCacheReconfOptions.replOptions)
-//   val blocksize = decodeOneHot(blocksize_csr & 0x3.U, DCacheReconfOptions.blockSizeOptions)
-//   (sets, ways, size, repl, blocksize)
-// } 
+  // ICache reconfiguration CSR (0xbcb)
+  // bits [1:0]: set index into icacheSetOptions = Seq(64, 32, 16, 8)  — index 0 = max
+  // bits [3:2]: way index into cacheWayOptions  = Seq(8, 4, 2, 1)     — index 0 = max
+  override def icacheCSRCF = {
+    val mask = BigInt(0xF)
+    val init = BigInt(0x0)
+    Some(CustomCSR(icacheCSRIdCF, mask, Some(init)))
+  }
+  def cf_icache_set_conf = getOrElse(icacheCSRCF, _.value(1,0), 0.U)
+  def cf_icache_way_conf = getOrElse(icacheCSRCF, _.value(3,2), 0.U)
   
   // val cf_dcache_blocksize_shift = 31
   val cf_dcache_blocksize_mask = 0x1
@@ -266,25 +246,25 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   // The generateCustomCSR function in rocket/CSR.scala (line 750) requires the mask 
   // value of a CSR is >= 0. Having the mask to be 0xffffffff violates that requirement
   // hence we forgo the MSB and we do not use it.
+  // Moreover, we do not need 31 bits for the debug log enables. 
     val mask = BigInt(0x7FFFFFFF)
     val init = BigInt(
-      1 << 0 | // debug log is enabled at init
-      0 << 1 | // dcache log is disabled at init
-      0 << 2 | // lsu log is disabled at init
-      1 << 3 | // core log is enabled at init
-      1 << 4 | // rob log is enabled at init
-      0 << 5 | // bpd log is disabled at init
-      0 << 6   // frontend logs are disabled at init
+      1 << 0 | // global debug enable
+      1 << 1 | // dcache log enabled at init
+      1 << 2 | // lsu log enabled at init
+      1 << 3 | // core log enabled at init
+      1 << 4 | // rob log enabled at init
+      1 << 5 | // bpd log enabled at init
+      1 << 6   // frontend log enabled at init
     )
     Some(CustomCSR(debugCSRIdCF, mask, Some(init)))
   }
  
   override def robSizeCSRCF = {
-    // Mask from parameters.scala
-    // List of allowed ROB entry sizes
-    // default is 130 for giga boom
-    val mask = (BigInt(1) << robEntryOptions.length) - 1
-    val init = BigInt(0) // Default: first option (130 entries)
+    // 3-bit binary index into robEntryOptions = Seq(512, 256, 192, 128, 96, 64, 32)
+    // init = 0x0 → index 0 = 512 entries (max, hardware-built size)
+    val mask = BigInt(0x7)   // 3-bit index, 7 options (indices 0-6)
+    val init = BigInt(0x0)   // index 0 = max (512 entries)
     Some(CustomCSR(robSizeCSRIdCF, mask, Some(init)))
   }
 
@@ -352,6 +332,57 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
 
   def cf_start_attack = getOrElse(attackStageCSRCF, _.value(0), false.B)
   def cf_start_secret_tagging = getOrElse(attackStageCSRCF, _.value(1), false.B)
+
+  // FTQ size CSR — 2-bit index into ftQueueEntryOptions = Seq(32, 24, 16, 8)
+  override def ftqSizeCSRCF = {
+    val mask = BigInt(0x3)   // 2-bit index, 4 options
+    val init = BigInt(0x0)   // index 0 = 32 entries (max)
+    Some(CustomCSR(ftqSizeCSRIdCF, mask, Some(init)))
+  }
+  def cf_ftq_idx = getOrElse(ftqSizeCSRCF, _.value(1,0), 0.U)
+
+  // RAS entry count CSR — 2-bit index into rasEntryCountOptions = Seq(32, 16, 8, 4)
+  override def rasCountCSRCF = {
+    val mask = BigInt(0x3)   // 2-bit index, 4 options
+    val init = BigInt(0x0)   // index 0 = 32 entries (max)
+    Some(CustomCSR(rasCountCSRIdCF, mask, Some(init)))
+  }
+  def cf_ras_idx = getOrElse(rasCountCSRCF, _.value(1,0), 0.U)
+
+  // PRF size CSR — 3-bit index into pregFileSizeOptions = Seq(256, 128, 96, 64, 48)
+  override def pregSizeCSRCF = {
+    val mask = BigInt(0x7)   // 3-bit index, 5 options
+    val init = BigInt(0x0)   // index 0 = 256 registers (max)
+    Some(CustomCSR(pregSizeCSRIdCF, mask, Some(init)))
+  }
+  def cf_preg_idx = getOrElse(pregSizeCSRCF, _.value(2,0), 0.U)
+
+  // Issue queue size CSR — 2-bit index into issueQueueEntryOptions = Seq(64, 32, 16, 8)
+  override def issueQueueCSRCF = {
+    val mask = BigInt(0x3)   // 2-bit index, 4 options
+    val init = BigInt(0x0)   // index 0 = 64 entries (max)
+    Some(CustomCSR(issueQueueCSRIdCF, mask, Some(init)))
+  }
+  def cf_iq_idx = getOrElse(issueQueueCSRCF, _.value(1,0), 0.U)
+
+  // BTB config CSR — bits [1:0] = set index (btbSetOptions = Seq(128, 64, 32)),
+  //                  bit [2] = way index (btbWayOptions = Seq(2, 1))
+  override def btbConfigCSRCF = {
+    val mask = BigInt(0x7)   // 3-bit
+    val init = BigInt(0x0)   // index 0 = 128 sets, 2 ways (max)
+    Some(CustomCSR(btbConfigCSRIdCF, mask, Some(init)))
+  }
+  def cf_btb_set_idx = getOrElse(btbConfigCSRCF, _.value(1,0), 0.U)
+  def cf_btb_way_idx = getOrElse(btbConfigCSRCF, _.value(2),   0.U)
+
+  // TAGE table count CSR — 3-bit index into tagetableCountOptions = Seq(6, 5, 4, 3, 2, 1)
+  override def tageCountCSRCF = {
+    val mask = BigInt(0x7)   // 3-bit index, 6 options
+    val init = BigInt(0x0)   // index 0 = 6 active tables (max)
+    Some(CustomCSR(tageCountCSRIdCF, mask, Some(init)))
+  }
+  def cf_tage_count_idx = getOrElse(tageCountCSRCF, _.value(2,0), 0.U)
+
   override def decls: Seq[CustomCSR] = super.decls :+ marchid
 
   def cf_debug_enable = getOrElse(debugCSRCF, _.value(0), true.B)

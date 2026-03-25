@@ -435,20 +435,20 @@ class WithFuzzingBoom(n: Int = 1, overrideIdOffset: Option[Int] = None) extends 
             core = BoomCoreParams(
               fetchWidth = 8,
               decodeWidth = 4,
-              numRobEntries = 256,
+              numRobEntries = 512, // must equal robEntryOptions(0); hardware is built at this size
               issueParams = Seq(
-                IssueParams(issueWidth=2, numEntries=24, iqType=IQT_MEM.litValue, dispatchWidth=4),
-                IssueParams(issueWidth=4, numEntries=40, iqType=IQT_INT.litValue, dispatchWidth=4),
-                IssueParams(issueWidth=2, numEntries=32, iqType=IQT_FP.litValue , dispatchWidth=4)),
+                IssueParams(issueWidth=2, numEntries=64, iqType=IQT_MEM.litValue, dispatchWidth=4),
+                IssueParams(issueWidth=4, numEntries=64, iqType=IQT_INT.litValue, dispatchWidth=4),
+                IssueParams(issueWidth=2, numEntries=64, iqType=IQT_FP.litValue , dispatchWidth=4)),
               numIntPhysRegisters = 256,
               numFpPhysRegisters = 256,
               numLdqEntries = 64,
               numStqEntries = 64,
               maxBrCount = 20,
-              numFetchBufferEntries = 64, // must be a multiple of coreWidth (4)
+              numFetchBufferEntries = 128, // max(fetchBufferEntryOptions) = 128; must be multiple of fetchWidth (8)
               enablePrefetching = true,
               numDCacheBanks = 1,
-              ftq = FtqParameters(nEntries=40),
+              ftq = FtqParameters(nEntries=32), // max(ftQueueEntryOptions) = 32
               nPerfCounters = 29,
               fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true))
             ),
