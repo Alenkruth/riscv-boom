@@ -16,7 +16,7 @@ import chisel3.util._
 
 import freechips.rocketchip.rocket.Instructions._
 import freechips.rocketchip.rocket._
-import freechips.rocketchip.util.{Str}
+import freechips.rocketchip.util.{Str, CoreFuzzingConstants}
 import org.chipsalliance.cde.config.{Parameters}
 import freechips.rocketchip.tile.{TileKey}
 
@@ -214,25 +214,15 @@ object WrapInc
   // this is a dynamic version that would be synthesized to HW
   def apply(value: UInt, n: UInt): UInt = {
     assert(n =/= 0.U, "n in WrapInc/WrapDec cannot be zero")
-    // isPow2 is only defined for Int and bigInt. We will use bit manip to ID if n is a power of 2.
-    // when ((n & n-1.U) === 0.U) {
-    //   //(value + 1.U)(log2Ceil(n)-1,0)
-    //   // https://stackoverflow.com/questions/60394862/taking-log2ceil-of-uint
-    //   // log2ceil is not built for synthesis, I.e it is defined only for Int and BigInt.
-    //   // so we use a priority encoder to get the most significant "set" bit.
-    //   // priority encoder picks the smallest lsb set. so we reverse the bits.
-    //   // likewise, chisel does not support dynamic splicing of bits. So we use a mask
-    //   (value + 1.U) & ((1.U << PriorityEncoder(Reverse(n))) - 1.U) 
-    // } .otherwise {
-    //   def wrap = (value === (n-1.U))
-    //   Mux(wrap, 0.U, value + 1.U)
-    // }
-    val isPow2 = (n & n-1.U) === 0.U
-    val shouldWrap = (value === (n-1.U))
-    val notPow2Val =  Mux(shouldWrap, 0.U, value + 1.U)
-
-    Mux(isPow2, (value + 1.U) & ((1.U << PriorityEncoder(Reverse(n))) - 1.U), notPow2Val)  
-  } 
+    // For power-of-2 n, the correct mask is (n-1): e.g. n=64 → mask=63=0b111111.
+    // The previous PriorityEncoder(Reverse(n)) approach was wrong: when n is stored in a
+    // wide UInt (e.g. 10-bit from VecInit), Reverse places the MSB at position (width-1-log2(n))
+    // instead of log2(n), so PriorityEncoder returns (width-1-log2(n)) and the mask is far too small.
+    val isPow2 = (n & (n - 1.U)) === 0.U
+    val shouldWrap = (value === (n - 1.U))
+    val notPow2Val = Mux(shouldWrap, 0.U, value + 1.U)
+    Mux(isPow2, (value + 1.U) & (n - 1.U), notPow2Val)
+  }
 }
 
 /**
@@ -255,19 +245,14 @@ object WrapDec
   // dynamic version that would be synthesized to HW
   def apply(value: UInt, n: UInt): UInt = {
     assert(n =/= 0.U, "n in WrapInc/WrapDec cannot be zero")
-
-    val isPow2 = (n & n-1.U) === 0.U
+    // For power-of-2 n: (value-1) & (n-1) handles the 0→(n-1) wrap via UInt underflow
+    // (0.U - 1.U wraps to all-ones; ANDed with n-1 gives n-1 correctly).
+    // PriorityEncoder(Reverse(n)) was wrong for the same reason as WrapInc: leading zeros
+    // in a wide UInt place the MSB at the wrong reversed position.
+    val isPow2 = (n & (n - 1.U)) === 0.U
     val shouldWrap = (value === 0.U)
-    val notPow2Val = Mux(shouldWrap, (n-1.U), value - 1.U)
-
-    Mux(isPow2, (value - 1.U) & (1.U << (PriorityEncoder(Reverse(n))) - 1.U), notPow2Val)
-    
-    // if (isPow2(n)) {
-    //   (value - 1.U)(log2Ceil(n)-1,0)
-    // } else {
-    //   val wrap = (value === 0.U)
-    //   Mux(wrap, (n-1).U, value - 1.U)
-    // }
+    val notPow2Val = Mux(shouldWrap, n - 1.U, value - 1.U)
+    Mux(isPow2, (value - 1.U) & (n - 1.U), notPow2Val)
   }
 }
 
@@ -868,10 +853,11 @@ object inflBitmapFromList {
     10 -> (1 << 4),  // INFL_BTB_STATE       → btb
     11 -> (1 << 6),  // INFL_RAS_STATE       → ras
     12 -> (1 << 18), // INFL_CACHE_EVICTION  → dcache
-    13 -> (1 << 14), // INFL_PIPELINE_FLUSH  → rob
+    // 13 = INFL_PIPELINE_FLUSH: represented via fl/floc fields in [FLUSH] log, not an influencer slot
     14 -> (1 << 17), // INFL_DTLB_STATE      → dtlb
     15 -> (1 << 1),  // INFL_ITLB_STATE      → itlb
     16 -> (1 << 0),  // INFL_ICACHE_STATE    → icache
+    17 -> (1 << 18), // INFL_MEM_DATAFLOW    → dcache (attacker store data read by victim)
   )
   def apply(infl_list: Vec[boom.v3.common.InfluencerEntry]): UInt = {
     val per_slot = infl_list.map { slot =>
