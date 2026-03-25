@@ -304,6 +304,11 @@ trait ScalarOpConstants
     uop.cf_taint_producer_is_secret := false.B
     uop.cf_spec_branch_is_atk   := false.B
     uop.cf_spec_branch_op_id    := 0.U
+    uop.cf_cntd_valid      := false.B
+    uop.cf_cntd_winner_op  := 0.U
+    uop.cf_cntd_winner_atk := false.B
+    uop.cf_cntd_winner_sec := false.B
+    uop.cf_cntd_deny_count := 0.U
     uop
   }
 

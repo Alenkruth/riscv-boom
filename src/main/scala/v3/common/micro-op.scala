@@ -46,6 +46,17 @@ class InfluencerEntry(implicit p: Parameters) extends BoomBundle with CoreFuzzin
 }
 
 /**
+ * Payload of the LSU→ROB direct s_acc update bus.
+ * Includes op_count_id so the ROB can validate the slot has not been reused
+ * (ROB slot reuse hazard: a squashed instruction's late TLB-stage update must
+ *  not corrupt a new instruction that was allocated the same rob_idx).
+ */
+class CF_SAccUpdate(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
+  val rob_idx    = UInt(robAddrSz.W)
+  val op_count_id = UInt(uopIDCounterWidthCF.W)
+}
+
+/**
  * MicroOp passing through the pipeline
  */
 class MicroOp(implicit p: Parameters) extends BoomBundle
@@ -196,8 +207,18 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   //   Enables detecting victim ops fetched/executed under an attacker speculative branch.
   // cf_spec_branch_op_id: cf_op_count_id of the first (lowest br_tag index) attacker-domain
   //   branch under which this uop is speculated.  Zero when cf_spec_branch_is_atk=false.
-  val cf_spec_branch_is_atk   = Bool()
-  val cf_spec_branch_op_id    = UInt(uopIDCounterWidthCF.W)
+  val cf_spec_branch_is_atk    = Bool()
+  val cf_spec_branch_op_id     = UInt(uopIDCounterWidthCF.W)
+  val cf_spec_branch_is_secret = Bool()  // any outstanding branch in br_mask was from secret domain
+
+  // Issue-slot contention carry: accumulated INFL_ISSUE_CONTENTION state that survives
+  // collapsing-queue shifts.  Set in issue-slot, propagated via out_uop → in_uop.
+  // Consumed when the slot fires cf_contend_out on grant.
+  val cf_cntd_valid      = Bool()
+  val cf_cntd_winner_op  = UInt(uopIDCounterWidthCF.W)
+  val cf_cntd_winner_atk = Bool()
+  val cf_cntd_winner_sec = Bool()
+  val cf_cntd_deny_count = UInt(4.W)
 
   // Do we allocate a branch tag for this?
   // SFB branches don't get a mask, they get a predicate bit
