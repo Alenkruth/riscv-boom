@@ -142,18 +142,14 @@ abstract class AbstractRenameStage(
 
     // corefuzzing: [FLUSH] for ren2 uops killed by branch mispredict. SRC=2 (rename).
     when (r_valid && IsKilledByBranch(io.brupdate, r_uop.br_mask) && io.cf_debug_rename_enable) {
-      val ren_fu_base = r_uop
-      val ren_fu = WireInit(ren_fu_base)
-      // corefuzzing: use cycle-N mispredict UOP (b2.mispredict fires 1 cycle after b1/kill)
-      when (io.cf_mispredict_uop.valid &&
-            io.cf_mispredict_uop.bits.cf_domain_id =/= ren_fu_base.cf_domain_id) {
-        val br_uop = io.cf_mispredict_uop.bits
-        ren_fu := addInfluencer(ren_fu_base, br_uop.cf_op_count_id, INFL_PIPELINE_FLUSH.U,
-          is_atk = br_uop.cf_domain_id === 1.U,
-          is_secret = br_uop.cf_secret_access || br_uop.cf_secret_propagation)
-      }
+      // corefuzzing: read pipeline register directly — fl/floc are separate fields.
+      val ren_fu = r_uop
+      val fl_cross_domain = io.cf_mispredict_uop.valid &&
+        (io.cf_mispredict_uop.bits.cf_domain_id =/= ren_fu.cf_domain_id)
+      val fl_op_count = Mux(io.cf_mispredict_uop.valid,
+        io.cf_mispredict_uop.bits.cf_op_count_id, 0.U)
       val renBrInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d,dc=%d}"}.mkString(" ")
-      val renBrFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d $renBrInflFmt\n"
+      val renBrFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d floc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d $renBrInflFmt\n"
       val renBrArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
         ren_fu.cf_influencer_list(k).valid,
         ren_fu.cf_influencer_list(k).op_count,
@@ -167,6 +163,7 @@ abstract class AbstractRenameStage(
         ren_fu.cf_domain_id, ren_fu.cf_speculated, ren_fu.cf_attacker_influence,
         ren_fu.cf_secret_access, ren_fu.cf_secret_propagation, ren_fu.cf_secret_transmission,
         ren_fu.cf_op_count_id, ren_fu.cf_spec_branch_is_atk, ren_fu.cf_spec_branch_op_id,
+        fl_cross_domain, fl_op_count,
         ren_fu.cf_fu_bitmap, 2.U, inflBitmapFromList(ren_fu.cf_influencer_list), ren_fu.cf_infl_overflow
       ) ++ renBrArgs): _*)
     }
@@ -175,7 +172,7 @@ abstract class AbstractRenameStage(
       // corefuzzing: [FLUSH] for ren2 uops killed by pipeline flush (exception/ROB flush). SRC=2.
       when (r_valid && io.cf_debug_rename_enable) {
         val renKillInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d,dc=%d}"}.mkString(" ")
-        val renKillFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d $renKillInflFmt\n"
+        val renKillFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d floc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d $renKillInflFmt\n"
         val renKillArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
           r_uop.cf_influencer_list(k).valid,
           r_uop.cf_influencer_list(k).op_count,
@@ -189,6 +186,7 @@ abstract class AbstractRenameStage(
           r_uop.cf_domain_id, r_uop.cf_speculated, r_uop.cf_attacker_influence,
           r_uop.cf_secret_access, r_uop.cf_secret_propagation, r_uop.cf_secret_transmission,
           r_uop.cf_op_count_id, r_uop.cf_spec_branch_is_atk, r_uop.cf_spec_branch_op_id,
+          0.U, 0.U,  // fl=0 floc=0: ROB flush has no flushing branch
           r_uop.cf_fu_bitmap, 2.U, inflBitmapFromList(r_uop.cf_influencer_list), r_uop.cf_infl_overflow
         ) ++ renKillArgs): _*)
       }
@@ -464,6 +462,13 @@ class RenameStage(
     val any_tainted = (prs1_t && (ren2_uops(w).lrs1_rtype === rtype)) ||
                       (prs2_t && (ren2_uops(w).lrs2_rtype === rtype)) ||
                       (prs3_t.asBool && ren2_uops(w).frs3_en)
+    // any_secret_tainted: true if ANY tainted source register's last writer had s_acc or s_prop.
+    // Used to gate cf_secret_propagation — attacker-domain taints do NOT propagate s_prop.
+    val prs3_sec = if (float) fwd_prod_sec(prs3_eff) else false.B
+    val any_secret_tainted =
+      (prs1_t && (ren2_uops(w).lrs1_rtype === rtype) && fwd_prod_sec(prs1_eff)) ||
+      (prs2_t && (ren2_uops(w).lrs2_rtype === rtype) && fwd_prod_sec(prs2_eff)) ||
+      (prs3_t.asBool && ren2_uops(w).frs3_en && prs3_sec)
     ren2_uops(w).cf_src_tainted := any_tainted
     // Pick one tainted source's producer metadata (priority: prs1 > prs2 > prs3)
     ren2_uops(w).cf_taint_producer_op := MuxCase(0.U, Seq(
@@ -474,10 +479,8 @@ class RenameStage(
       (prs1_t && (ren2_uops(w).lrs1_rtype === rtype)) -> fwd_prod_atk(prs1_eff),
       (prs2_t && (ren2_uops(w).lrs2_rtype === rtype)) -> fwd_prod_atk(prs2_eff)
     ) ++ (if (float) Seq((prs3_t.asBool && ren2_uops(w).frs3_en) -> fwd_prod_atk(prs3_eff)) else Nil))
-    ren2_uops(w).cf_taint_producer_is_secret := MuxCase(false.B, Seq(
-      (prs1_t && (ren2_uops(w).lrs1_rtype === rtype)) -> fwd_prod_sec(prs1_eff),
-      (prs2_t && (ren2_uops(w).lrs2_rtype === rtype)) -> fwd_prod_sec(prs2_eff)
-    ) ++ (if (float) Seq((prs3_t.asBool && ren2_uops(w).frs3_en) -> fwd_prod_sec(prs3_eff)) else Nil))
+    // is_secret = OR across all tainted sources: true if any tainted source came from a secret write.
+    ren2_uops(w).cf_taint_producer_is_secret := any_secret_tainted
     // Advance forwarded state with this slot's write so next slots see it
     val step_taint    = WireInit(fwd_taint)
     val step_prod     = WireInit(fwd_producer)
@@ -486,9 +489,14 @@ class RenameStage(
     when (ren2_fire(w) && ren2_valids(w) && (ren2_uops(w).dst_rtype === rtype)) {
       step_taint(ren2_uops(w).pdst)    := ren2_uops(w).cf_domain_id === 1.U || any_tainted
       step_prod(ren2_uops(w).pdst)     := ren2_uops(w).cf_op_count_id
-      step_prod_atk(ren2_uops(w).pdst) := ren2_uops(w).cf_domain_id === 1.U
-      // cf_secret_propagation is set at dispatch (after ren2), so use any_tainted && victim as proxy
-      val will_be_s_prop = any_tainted && (ren2_uops(w).cf_domain_id === 0.U)
+      // Propagate atk attribution transitively: if this instruction is domain=1 OR its source
+      // register was written (directly or transitively) by an attacker instruction, mark the
+      // dest as attacker-originated so downstream consumers see is_atk=true.
+      step_prod_atk(ren2_uops(w).pdst) := ren2_uops(w).cf_domain_id === 1.U ||
+                                          (any_tainted && ren2_uops(w).cf_taint_producer_is_atk)
+      // cf_secret_propagation is set at dispatch (after ren2); use any_secret_tainted && victim as proxy
+      // so that same-cycle consumers see the correct producer_secret state via step_prod_sec forwarding.
+      val will_be_s_prop = any_secret_tainted && (ren2_uops(w).cf_domain_id === 0.U)
       step_prod_sec(ren2_uops(w).pdst) := ren2_uops(w).cf_secret_access || ren2_uops(w).cf_secret_propagation || will_be_s_prop
     }
     fwd_taint    = step_taint
@@ -503,7 +511,8 @@ class RenameStage(
       val should_taint = ren2_uops(w).cf_domain_id === 1.U || ren2_uops(w).cf_src_tainted
       taint_table(ren2_uops(w).pdst)           := should_taint
       producer_table(ren2_uops(w).pdst)        := ren2_uops(w).cf_op_count_id
-      producer_domain_table(ren2_uops(w).pdst) := ren2_uops(w).cf_domain_id === 1.U
+      producer_domain_table(ren2_uops(w).pdst) := ren2_uops(w).cf_domain_id === 1.U ||
+                                                   (ren2_uops(w).cf_src_tainted && ren2_uops(w).cf_taint_producer_is_atk)
       producer_secret_table(ren2_uops(w).pdst) := ren2_uops(w).cf_secret_access || ren2_uops(w).cf_secret_propagation
     }
   }
@@ -521,14 +530,38 @@ class RenameStage(
   // source registers were tainted (data-channel propagation).  We intentionally do NOT trigger
   // on cf_secret_propagation alone because that flag is also set for timing-channel events
   // (C5 queue-head stalls, BPD/fetch-path redirects) whose register results are not secret-derived.
-  // Using cf_src_tainted restricts taint to actual data-flow from secret registers.
+  // taint_table fires on cf_src_tainted (any taint — attacker or secret) to track all data-flow
+  // for REG_DATAFLOW attribution after fence.i refetch.
+  // producer_secret_table ONLY fires when the taint is secret-originated: the instruction itself
+  // accessed secret memory (cf_secret_access) or its source registers were themselves secret-tainted
+  // (cf_taint_producer_is_secret). Pure attacker-domain taints must NOT set producer_secret_table.
   for (w <- 0 until plWidth) {
     when (io.com_valids(w) && !io.rollback &&
           (io.com_uops(w).cf_secret_access || io.com_uops(w).cf_src_tainted) &&
           io.com_uops(w).dst_rtype === rtype) {
-      taint_table(io.com_uops(w).pdst)           := true.B
-      producer_table(io.com_uops(w).pdst)        := io.com_uops(w).cf_op_count_id
-      producer_secret_table(io.com_uops(w).pdst) := true.B
+      taint_table(io.com_uops(w).pdst)    := true.B
+      producer_table(io.com_uops(w).pdst) := io.com_uops(w).cf_op_count_id
+      producer_secret_table(io.com_uops(w).pdst) :=
+        io.com_uops(w).cf_secret_access || io.com_uops(w).cf_taint_producer_is_secret
+    }
+  }
+
+  // corefuzzing F1: memory data-flow taint — when a load writeback carries INFL_MEM_DATAFLOW,
+  // the destination preg received attacker-originated data.  Mark it as tainted so that
+  // instructions renamed AFTER this cycle see cf_src_tainted and get INFL_REG_DATAFLOW.
+  // Fires at writeback time (earlier than C7 commit-time path) to capture more consumers.
+  for (i <- 0 until numWbPorts) {
+    when (io.wakeups(i).valid && io.wakeups(i).bits.uop.rf_wen &&
+          io.wakeups(i).bits.uop.dst_rtype === rtype) {
+      val wb_uop = io.wakeups(i).bits.uop
+      val has_mem_df = wb_uop.cf_influencer_list.map(e =>
+        e.valid && e.infl_type === INFL_MEM_DATAFLOW.U).reduce(_ || _)
+      when (has_mem_df) {
+        taint_table(wb_uop.pdst)           := true.B
+        producer_domain_table(wb_uop.pdst) := true.B
+        producer_table(wb_uop.pdst)        := wb_uop.cf_op_count_id
+        // producer_secret_table not set: attacker-data taint, not secret-origin taint
+      }
     }
   }
 
@@ -546,6 +579,18 @@ class RenameStage(
     // producer_domain_table and producer_secret_table don't need rollback:
     // taint_table rollback makes squashed pregs appear untainted, so their producer_* values
     // won't be consumed. New writes after rollback correctly overwrite producer_* entries.
+  }
+
+  // -- IFT quiesce flush (highest priority: fires when pipeline fully drained on quiesce) --
+  // Clears taint state for clean campaign boundaries and correct PRF-resize semantics.
+  // taint_snaps do NOT need clearing: no branches are in-flight when drained.
+  when (io.quiesce_flush) {
+    for (i <- 0 until numPhysRegs) {
+      taint_table(i)           := false.B
+      producer_table(i)        := 0.U
+      producer_domain_table(i) := false.B
+      producer_secret_table(i) := false.B
+    }
   }
 
   //-------------------------------------------------------------
