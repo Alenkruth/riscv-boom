@@ -94,6 +94,13 @@ abstract class AbstractRenameStage(
 
     val debug_rob_empty = Input(Bool())
     val debug = Output(new DebugRenameStageIO(numPhysRegs))
+
+    // corefuzzing: pulse high for one cycle on QS_DRAINING→QS_FETCH transition to clear
+    // taint_table / producer_domain_table / producer_secret_table for clean campaign boundaries
+    val quiesce_flush = Input(Bool())
+
+    // 3-bit index into pregFileSizeOptions for physical register file size reconfiguration
+    val cf_preg_idx = Input(UInt(3.W))
   })
 
   io.ren_stalls.foreach(_ := false.B)
@@ -378,6 +385,7 @@ class RenameStage(
   freelist.io.ren_br_tags := ren2_br_tags
   freelist.io.brupdate := io.brupdate
   freelist.io.debug.pipeline_empty := io.debug_rob_empty
+  freelist.io.cf_preg_idx := io.cf_preg_idx
 
   assert (ren2_alloc_reqs zip freelist.io.alloc_pregs map {case (r,p) => !r || p.bits =/= 0.U} reduce (_&&_),
            "[rename-stage] A uop is trying to allocate the zero physical register.")

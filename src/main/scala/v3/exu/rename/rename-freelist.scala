@@ -16,12 +16,14 @@ import chisel3.util._
 import boom.v3.common._
 import boom.v3.util._
 import org.chipsalliance.cde.config.Parameters
+import freechips.rocketchip.util.CoreFuzzingConstants
 
 class RenameFreeList(
   val plWidth: Int,
   val numPregs: Int,
   val numLregs: Int)
   (implicit p: Parameters) extends BoomModule
+  with CoreFuzzingConstants
 {
   private val pregSz = log2Ceil(numPregs)
   private val n = numPregs
@@ -45,13 +47,24 @@ class RenameFreeList(
       val freelist = Output(Bits(numPregs.W))
       val isprlist = Output(Bits(numPregs.W))
     }
+
+    // 3-bit index into pregFileSizeOptions for runtime physical register file size selection
+    val cf_preg_idx = Input(UInt(3.W))
   })
   // The free list register array and its branch allocation lists.
   val free_list = RegInit(UInt(numPregs.W), ~(1.U(numPregs.W)))
   val br_alloc_lists = Reg(Vec(maxBrCount, UInt(numPregs.W)))
 
-  // Select pregs from the free list.
-  val sels = SelectFirstN(free_list, plWidth)
+  // Runtime PRF size selection: pregFileSizeOptions = Seq(256, 128, 96, 64, 48)
+  val pregOptionsVec = VecInit(pregFileSizeOptions.map(_.U))
+  val cf_preg_active = pregOptionsVec(io.cf_preg_idx)
+  // Mask bits >= cf_preg_active so those registers are never allocated.
+  // (1.U << cf_preg_active) - 1.U gives a bitmask of 1s in [active-1:0].
+  val preg_active_mask = ((1.U(numPregs.W) << cf_preg_active) - 1.U)(numPregs-1, 0)
+  val masked_free_list = free_list & preg_active_mask
+
+  // Select pregs from the masked free list.
+  val sels = SelectFirstN(masked_free_list, plWidth)
   val sel_fire  = Wire(Vec(plWidth, Bool()))
 
   // Allocations seen by branches in each pipeline slot.

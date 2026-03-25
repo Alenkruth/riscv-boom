@@ -351,20 +351,34 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   mem_iss_unit.io.cf_debug_issue_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable
   int_iss_unit.io.cf_debug_issue_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable
 
-  // for corefuzzing, CSR outputs for ldq and stq lengths
-  io.lsu.reconfigure_stq_b1 := custom_csrs.reconfig_stq_b1
-  io.lsu.reconfigure_stq_b0 := custom_csrs.reconfig_stq_b0
-  io.lsu.reconfigure_ldq_b1 := custom_csrs.reconfig_ldq_b1
-  io.lsu.reconfigure_ldq_b0 := custom_csrs.reconfig_ldq_b0
+  // LDQ/STQ reconfiguration: 3-bit indices into ldQueueEntryOptions / stQueueEntryOptions
+  io.lsu.cf_ldq_idx := custom_csrs.cf_ldq_idx
+  io.lsu.cf_stq_idx := custom_csrs.cf_stq_idx
+
+  // Issue queue size reconfiguration: 2-bit index into issueQueueEntryOptions
+  mem_iss_unit.io.cf_iq_idx := custom_csrs.cf_iq_idx
+  int_iss_unit.io.cf_iq_idx := custom_csrs.cf_iq_idx
+  if (usingFPU) {
+    fp_pipeline.io.cf_iq_idx := custom_csrs.cf_iq_idx
+  }
+
+  // Physical register file size reconfiguration: 3-bit index into pregFileSizeOptions
+  rename_stage.io.cf_preg_idx      := custom_csrs.cf_preg_idx
+  fp_rename_stage.io.cf_preg_idx   := custom_csrs.cf_preg_idx
+  pred_rename_stage.io.cf_preg_idx := custom_csrs.cf_preg_idx
 
   // corefuzzing
   // Quiescing control signals
   val cf_quiesce_core = Wire(Bool())
   val pipeline_drained = Wire(Bool())
-  // Stricter pipeline drain: check fetch buffer and decode stage
-  val fetch_buffer_empty = !io.ifu.fetchpacket.valid
-  val decode_stage_empty = !dec_valids.reduce(_||_)
-  val pipeline_drained_strict = rob.io.empty && io.lsu.queues_empty && io.lsu.no_pending_mem && fetch_buffer_empty && decode_stage_empty
+  // Stricter pipeline drain: check fetch buffer, decode stage, and rename2/dispatch stage.
+  // dispatch_stage_empty guards against is_unique CSR writes stuck at rename2 (waiting for
+  // fencei_rdy) causing pipeline_drained_strict to fire spuriously — which would trigger
+  // runaway QS_EXECUTING→QS_FETCH cycles and a "Pipeline has hung" assertion.
+  val fetch_buffer_empty   = !io.ifu.fetchpacket.valid
+  val decode_stage_empty   = !dec_valids.reduce(_||_)
+  val dispatch_stage_empty = !dis_valids.reduce(_||_)
+  val pipeline_drained_strict = rob.io.empty && io.lsu.queues_empty && io.lsu.no_pending_mem && io.lsu.fencei_rdy && fetch_buffer_empty && decode_stage_empty && dispatch_stage_empty
 
   // 4-state FSM for quiesce (cf_chill) control
   // QS_IDLE:      normal operation; fetch ungated
