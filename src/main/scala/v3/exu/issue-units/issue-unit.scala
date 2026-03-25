@@ -119,6 +119,9 @@ class IssueUnitIO(
 
   // corefuzzing: per-port contention updates — fires when a slot issues and had accumulated cross-domain denial cycles
   val cf_contention_upd = Output(Vec(issueWidth, Valid(new IssueContentionUpdate)))
+
+  // 2-bit index into issueQueueEntryOptions for runtime issue queue size selection
+  val cf_iq_idx = Input(UInt(2.W))
 }
 
 /**
@@ -138,8 +141,13 @@ abstract class IssueUnit(
   (implicit p: Parameters)
   extends BoomModule
   with IssueUnitConstants
+  with freechips.rocketchip.util.CoreFuzzingConstants
 {
   val io = IO(new IssueUnitIO(issueWidth, numWakeupPorts, dispatchWidth))
+
+  // Runtime issue queue size selection: issueQueueEntryOptions = Seq(64, 32, 16, 8)
+  val iqOptionsVec = VecInit(issueQueueEntryOptions.map(_.U))
+  val cf_iq_active = iqOptionsVec(io.cf_iq_idx)
 
   //-------------------------------------------------------------
   // Set up the dispatch uops

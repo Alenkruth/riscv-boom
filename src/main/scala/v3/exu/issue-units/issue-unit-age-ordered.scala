@@ -56,7 +56,17 @@ class IssueUnitCollapsing(
   //-------------------------------------------------------------
   // Figure out how much to shift entries by
   val maxShift = dispatchWidth
-  val vacants = issue_slots.map(s => !(s.valid)) ++ io.dis_uops.map(_.valid).map(!_.asBool)
+
+  // corefuzzing: active slots are at the TOP of the queue (high indices), so they are adjacent
+  // to the dispatch positions. Inactive slots at low indices are forced to appear non-vacant
+  // so that shamts_oh does not get inflated and cause active slots to shift into inactive territory.
+  // active_offset = first active slot index = numIssueSlots - cf_iq_active
+  val active_offset = numIssueSlots.U - cf_iq_active
+
+  // Inactive slots (i < active_offset) appear non-vacant to shamts_oh.
+  val vacants = issue_slots.zipWithIndex.map { case (s, i) =>
+    !(s.valid) && (i.U >= active_offset)
+  } ++ io.dis_uops.map(_.valid).map(!_.asBool)
   val shamts_oh = Array.fill(numIssueSlots+dispatchWidth) {Wire(UInt(width=maxShift.W))}
   // track how many to shift up this entry by by counting previous vacant spots
   def SaturatingCounterOH(count_oh:UInt, inc: Bool, max: Int): UInt = {
@@ -77,7 +87,9 @@ class IssueUnitCollapsing(
   //-------------------------------------------------------------
 
   // which entries' uops will still be next cycle? (not being issued and vacated)
-  val will_be_valid = (0 until numIssueSlots).map(i => issue_slots(i).will_be_valid) ++
+  // Gate inactive slots: their will_be_valid is always false (they never hold uops)
+  val will_be_valid = (0 until numIssueSlots).map(i =>
+                        issue_slots(i).will_be_valid && (i.U >= active_offset)) ++
                       (0 until dispatchWidth).map(i => io.dis_uops(i).valid &&
                                                         !dis_uops(i).exception &&
                                                         !dis_uops(i).is_fence &&
@@ -87,12 +99,16 @@ class IssueUnitCollapsing(
   for (i <- 0 until numIssueSlots) {
   issue_slots(i).in_uop.valid := false.B
   issue_slots(i).in_uop.bits  := uops(i+1)
-    for (j <- 1 to maxShift by 1) {
-      when (shamts_oh(i+j) === (1 << (j-1)).U) {
-        issue_slots(i).in_uop.valid := will_be_valid(i+j)
-        issue_slots(i).in_uop.bits  := uops(i+j)
-        // corefuzzing: stamp issue-queue bitmap bit when uop enters slot
-        issue_slots(i).in_uop.bits.cf_fu_bitmap := uops(i+j).cf_fu_bitmap | (1.U << moduleTagCF.U)
+    // Gate: only active slots (i >= active_offset) receive new uops.
+    // Active slots are at TOP indices so they are adjacent to dispatch positions.
+    when (i.U >= active_offset) {
+      for (j <- 1 to maxShift by 1) {
+        when (shamts_oh(i+j) === (1 << (j-1)).U) {
+          issue_slots(i).in_uop.valid := will_be_valid(i+j)
+          issue_slots(i).in_uop.bits  := uops(i+j)
+          // corefuzzing: stamp issue-queue bitmap bit when uop enters slot
+          issue_slots(i).in_uop.bits.cf_fu_bitmap := uops(i+j).cf_fu_bitmap | (1.U << moduleTagCF.U)
+        }
       }
     }
     issue_slots(i).clear        := shamts_oh(i) =/= 0.U
@@ -102,8 +118,11 @@ class IssueUnitCollapsing(
   // Dispatch/Entry Logic
   // did we find a spot to slide the new dispatched uops into?
 
+  // Gate slot availability to active range: only top slots (i >= active_offset) are available.
   val will_be_available = (0 until numIssueSlots).map(i =>
-                            (!issue_slots(i).will_be_valid || issue_slots(i).clear) && !(issue_slots(i).in_uop.valid))
+                            (!issue_slots(i).will_be_valid || issue_slots(i).clear) &&
+                            !(issue_slots(i).in_uop.valid) &&
+                            (i.U >= active_offset))
   val num_available = PopCount(will_be_available)
   for (w <- 0 until dispatchWidth) {
     io.dis_uops(w).ready := RegNext(num_available > w.U)
@@ -154,6 +173,11 @@ class IssueUnitCollapsing(
   }
 
   // corefuzzing: per-slot cross-domain issue contention detection
+  // Default: no contention this cycle. Overridden below for losing slots.
+  for (i <- 0 until numIssueSlots) {
+    issue_slots(i).cf_contend_in.valid := false.B
+    issue_slots(i).cf_contend_in.bits  := DontCare
+  }
   // Pass 1: for each port, identify losing slots from a different domain and fire cf_contend_in.
   // All Bool computations are in the outer scope (not inside a when-block) so no Chisel scope
   // escaping occurs when the Scala vars are updated.

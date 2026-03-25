@@ -109,6 +109,22 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
   val slot_uop = RegInit(NullMicroOp())
   val next_uop = Mux(io.in_uop.valid, io.in_uop.bits, slot_uop)
 
+  // corefuzzing: per-slot ISSUE_CONTENTION accumulation registers.
+  // Declared here (before out_uop assignments) so they can be referenced in out_uop.
+  val cf_cntd_valid      = RegInit(false.B)
+  val cf_cntd_winner_op  = Reg(UInt(uopIDCounterWidthCF.W))
+  val cf_cntd_winner_atk = RegInit(false.B)
+  val cf_cntd_winner_sec = RegInit(false.B)
+  val cf_cntd_deny_count = RegInit(0.U(4.W))
+  // Next-cycle combinational shadows — default to current register values.
+  // A when-block below adds the cf_contend_in override.
+  // out_uop uses nc_cntd_* so same-cycle denials are inherited across collapsing shifts.
+  val nc_cntd_valid      = WireInit(cf_cntd_valid)
+  val nc_cntd_winner_op  = WireInit(cf_cntd_winner_op)
+  val nc_cntd_winner_atk = WireInit(cf_cntd_winner_atk)
+  val nc_cntd_winner_sec = WireInit(cf_cntd_winner_sec)
+  val nc_cntd_deny_count = WireInit(cf_cntd_deny_count)
+
   //-----------------------------------------------------------------------------
   // next slot state computation
   // compute the next state for THIS entry slot (in a collasping queue, the
@@ -296,6 +312,13 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
   io.out_uop.ppred_busy := !ppred
   io.out_uop.iw_p1_poisoned := p1_poisoned
   io.out_uop.iw_p2_poisoned := p2_poisoned
+  // Carry contention state through collapsing-queue shifts.
+  // nc_cntd_* includes same-cycle denials so the destination slot inherits them on shift.
+  io.out_uop.cf_cntd_valid      := nc_cntd_valid
+  io.out_uop.cf_cntd_winner_op  := nc_cntd_winner_op
+  io.out_uop.cf_cntd_winner_atk := nc_cntd_winner_atk
+  io.out_uop.cf_cntd_winner_sec := nc_cntd_winner_sec
+  io.out_uop.cf_cntd_deny_count := nc_cntd_deny_count
 
   when (state === s_valid_2) {
     when (p1 && p2 && ppred) {
@@ -309,36 +332,45 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
     }
   }
 
-  // corefuzzing: per-slot ISSUE_CONTENTION accumulation registers.
-  // Records the first cross-domain winner and total denial cycles while this slot waits.
-  // Registers are reset when the slot receives a new uop, is killed, or is cleared.
-  val cf_cntd_valid      = RegInit(false.B)
-  val cf_cntd_winner_op  = Reg(UInt(uopIDCounterWidthCF.W))
-  val cf_cntd_winner_atk = RegInit(false.B)
-  val cf_cntd_winner_sec = RegInit(false.B)
-  val cf_cntd_deny_count = RegInit(0.U(4.W))
+  // corefuzzing: per-slot ISSUE_CONTENTION accumulation
+  // nc_cntd_* Wires declared above (near slot_uop) default to current register values.
+  // Drive them conditionally from cf_contend_in so same-cycle denials are captured.
 
-  // Accept cross-domain contention: record first winner, always increment deny_count (4-bit saturating).
   when (io.cf_contend_in.valid) {
     when (!cf_cntd_valid) {
-      cf_cntd_valid      := true.B
-      cf_cntd_winner_op  := io.cf_contend_in.bits.winner_op_count
-      cf_cntd_winner_atk := io.cf_contend_in.bits.winner_is_atk
-      cf_cntd_winner_sec := io.cf_contend_in.bits.winner_is_sec
+      nc_cntd_valid      := true.B
+      nc_cntd_winner_op  := io.cf_contend_in.bits.winner_op_count
+      nc_cntd_winner_atk := io.cf_contend_in.bits.winner_is_atk
+      nc_cntd_winner_sec := io.cf_contend_in.bits.winner_is_sec
     }
-    cf_cntd_deny_count := Mux(cf_cntd_deny_count === 15.U, 15.U, cf_cntd_deny_count + 1.U)
+    nc_cntd_deny_count := Mux(cf_cntd_deny_count === 15.U, 15.U, cf_cntd_deny_count + 1.U)
   }
 
-  // Reset accumulation when slot is overwritten, killed, or cleared.
-  when (io.in_uop.valid || io.kill || io.clear) {
+  // Register update priority (last-connect wins in Chisel):
+  //   1. io.in_uop.valid — load inherited state from the shifting/dispatching uop
+  //   2. io.kill         — reset (branch misprediction / pipeline flush)
+  //   3. otherwise       — advance to next-cycle values (accumulate denial)
+  when (io.in_uop.valid) {
+    cf_cntd_valid      := io.in_uop.bits.cf_cntd_valid
+    cf_cntd_winner_op  := io.in_uop.bits.cf_cntd_winner_op
+    cf_cntd_winner_atk := io.in_uop.bits.cf_cntd_winner_atk
+    cf_cntd_winner_sec := io.in_uop.bits.cf_cntd_winner_sec
+    cf_cntd_deny_count := io.in_uop.bits.cf_cntd_deny_count
+  } .elsewhen (io.kill) {
     cf_cntd_valid      := false.B
     cf_cntd_deny_count := 0.U
     cf_cntd_winner_atk := false.B
     cf_cntd_winner_sec := false.B
+  } .otherwise {
+    cf_cntd_valid      := nc_cntd_valid
+    cf_cntd_winner_op  := nc_cntd_winner_op
+    cf_cntd_winner_atk := nc_cntd_winner_atk
+    cf_cntd_winner_sec := nc_cntd_winner_sec
+    cf_cntd_deny_count := nc_cntd_deny_count
   }
 
   // Output: fire when granted AND contention was recorded.
-  // The issue unit (age-ordered) reads this to forward to the ROB.
+  // Uses registered values — grant and denial are mutually exclusive so registers are final.
   val is_granted = io.grant && ((state === s_valid_1) ||
     ((state === s_valid_2) && p1 && p2 && ppred))
   io.cf_contend_out.valid                  := is_granted && cf_cntd_valid
