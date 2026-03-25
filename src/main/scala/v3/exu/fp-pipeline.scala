@@ -58,6 +58,8 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
     // corefuzzing: runtime gates for speculative logging
     val cf_debug_exu_enable = Input(Bool())
     val cf_debug_issue_enable = Input(Bool())
+    // 2-bit index into issueQueueEntryOptions for FP issue queue size selection
+    val cf_iq_idx = Input(UInt(2.W))
   })
 
   //**********************************
@@ -98,6 +100,7 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
   issue_unit.io.flush_pipeline := io.flush_pipeline
   // propagate corefuzzing cf_debug gate into FP issue unit
   issue_unit.io.cf_debug_issue_enable := io.cf_debug_issue_enable
+  issue_unit.io.cf_iq_idx := io.cf_iq_idx
   // Don't support ld-hit speculation to FP window.
   for (w <- 0 until memWidth) {
     issue_unit.io.spec_ld_wakeup(w).valid := false.B
