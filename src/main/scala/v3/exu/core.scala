@@ -310,6 +310,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   // Assigning the CSR's output to the cf_tage_to_gshare signal in the frontend.
   io.ifu.cf_bpd_tage_to_gshare := custom_csrs.cf_bpd_tage_to_gshare
+  io.ifu.cf_icache_set_conf    := custom_csrs.cf_icache_set_conf
+  io.ifu.cf_icache_way_conf    := custom_csrs.cf_icache_way_conf
   // Assigning the dcache reconfiguration flags to the lsu
   io.lsu.cf_dcache_set_conf := custom_csrs.cf_dcache_set_conf
   io.lsu.cf_dcache_way_conf := custom_csrs.cf_dcache_way_conf
@@ -321,20 +323,28 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   io.lsu.cf_secret_end_addr   := custom_csrs.cf_secret_end_addr
 
   // getting the rob entries from the CSR
-  rob.io.cf_rob_entries := custom_csrs.cf_rob_entries 
+  rob.io.cf_rob_entries := custom_csrs.cf_rob_entries
+  // cf_rob_quiesce_reset is driven below, after quiesce_flush_pulse is defined
 
   // printf("[CORE] dcacheCSR - 0x%x 0x%x 0x%x 0x%x \n", custom_csrs.cf_dcache_set_conf, custom_csrs.cf_dcache_way_conf, custom_csrs.cf_dcache_size_conf, custom_csrs.cf_dcache_repl_conf)
 
-  // for corefuzzing, assigning CSR output to frontend for reconfigureFB
-  io.ifu.reconfigureFB_rows_b0 := custom_csrs.reconfigureFB_rows_b0
-  io.ifu.reconfigureFB_rows_b1 := custom_csrs.reconfigureFB_rows_b1
-  // corefuzizng// corefuzizng// corefuzizng// corefuzizng
+  // Microarchitecture reconfiguration indices routed to frontend
+  io.ifu.cf_fb_idx          := custom_csrs.cf_fetch_buffer_idx
+  io.ifu.cf_ftq_idx         := custom_csrs.cf_ftq_idx
+  io.ifu.cf_ras_idx         := custom_csrs.cf_ras_idx
+  io.ifu.cf_btb_set_idx     := custom_csrs.cf_btb_set_idx
+  io.ifu.cf_btb_way_idx     := custom_csrs.cf_btb_way_idx
+  io.ifu.cf_tage_count_idx  := custom_csrs.cf_tage_count_idx
+
   // Wire cf_debug enables into frontend and core modules
   io.ifu.cf_debug_frontend_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_frontend_enable
   io.ifu.cf_debug_rob_enable      := custom_csrs.cf_debug_rob_enable && custom_csrs.cf_debug_enable
   // corefuzzing: attacker range for ICache/RAS domain tracking in frontend
   io.ifu.cf_attacker_start_addr   := custom_csrs.cf_attacker_start_addr
   io.ifu.cf_attacker_end_addr     := custom_csrs.cf_attacker_end_addr
+  // corefuzzing: secret range for ITLB secret shadow tracking in frontend
+  io.ifu.cf_secret_start_addr     := custom_csrs.cf_secret_start_addr
+  io.ifu.cf_secret_end_addr       := custom_csrs.cf_secret_end_addr
 
   // Propagate core-level debug enables to rename and issue units
   rename_stage.io.cf_debug_rename_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable
@@ -391,6 +401,30 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val QS_EXECUTING = 3.U(2.W)
   val qs_state = RegInit(QS_IDLE)
 
+  // Guard against runaway QS_EXECUTING→QS_FETCH when pipeline empties immediately
+  // after a [SSTEP] flush (before the new fetch arrives). Require that at least one
+  // ROB flush has occurred (from the [SSTEP] commit) before allowing QS_EXECUTING
+  // to advance back to QS_FETCH.
+  val qs_saw_flush = RegInit(false.B)
+  when (rob.io.flush.valid && (qs_state === QS_EXECUTING)) {
+    qs_saw_flush := true.B
+  } .elsewhen (qs_state =/= QS_EXECUTING) {
+    qs_saw_flush := false.B
+  }
+
+  // Fetch window register for QS_EXECUTING: keep allow_fetch open from the first cycle
+  // of QS_EXECUTING (armed in QS_FETCH) until fence.i commits (rob.io.flush.valid).
+  // Without this, only instructions in the first partial ICache bank after the redirect
+  // PC get fetched; if fence.i is in a subsequent bank the pipeline hangs permanently.
+  val qs_exec_fetch_open = RegInit(false.B)
+  when (qs_state === QS_FETCH) {
+    qs_exec_fetch_open := true.B
+  } .elsewhen (qs_state === QS_EXECUTING && rob.io.flush.valid) {
+    qs_exec_fetch_open := false.B
+  } .elsewhen (qs_state =/= QS_EXECUTING) {
+    qs_exec_fetch_open := false.B
+  }
+
   switch (qs_state) {
     is (QS_IDLE) {
       when (cf_quiesce_core) { qs_state := QS_DRAINING }
@@ -404,8 +438,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       qs_state := QS_EXECUTING
     }
     is (QS_EXECUTING) {
-      when (!cf_quiesce_core)              { qs_state := QS_IDLE      }
-      .elsewhen (pipeline_drained_strict)  { qs_state := QS_FETCH     }
+      when (!cf_quiesce_core)                               { qs_state := QS_IDLE  }
+      .elsewhen (pipeline_drained_strict && qs_saw_flush)   { qs_state := QS_FETCH }
     }
   }
 
@@ -415,9 +449,66 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // Determine if pipeline is drained by checking ROB empty and LSU status
   pipeline_drained := pipeline_drained_strict
 
-  // Allow fetch only in IDLE (normal) or during the one-cycle FETCH pulse
-  val allow_fetch = !cf_quiesce_core || (qs_state === QS_FETCH)
+  // Allow fetch only in IDLE (normal) or during the one-cycle FETCH pulse.
+  // Also allow on the cycle the QS transition fires (quiesce_flush_pulse or per-SSTEP
+  // drain complete) so the ICache can process the redirect_pc emitted by redirect_flush
+  // on that exact cycle. Without this, ICache misses the redirect and replays forever in
+  // QS_EXECUTING because allow_fetch is still false when redirect_flush fires.
+  // Note: quiesce_flush_pulse and the per-SSTEP condition are inlined here because
+  // ftq_reset_pulse (which is identical) is defined below.
+  val qs_transition_pulse = ((qs_state === QS_DRAINING) && pipeline_drained_strict) ||
+    ((qs_state === QS_EXECUTING) && pipeline_drained_strict && qs_saw_flush)
+  // Keep fetch open throughout QS_EXECUTING (qs_exec_fetch_open) so that instructions
+  // spanning multiple ICache banks (e.g., NOPs + fence.i crossing a 16-byte boundary)
+  // are all fetched. Also keep one extra cycle after the fence.i flush (RegNext) so
+  // that s0_vpc = redirect_pc is latched before the IFU advances.
+  val allow_fetch = !cf_quiesce_core || (qs_state === QS_FETCH) || qs_transition_pulse ||
+    (qs_state === QS_EXECUTING && (qs_exec_fetch_open || RegNext(rob.io.flush.valid)))
   io.ifu.allow_fetch := allow_fetch
+
+  // Debug: trace quiesce FSM state every cycle when quiesce is active.
+  // Prints qs_state, allow_fetch, qs_exec_fetch_open, qs_saw_flush,
+  // pipeline_drained_strict and its components, and rob.io.flush.valid.
+  when (cf_quiesce_core || qs_state =/= QS_IDLE) {
+    printf("[QS] st=%d af=%d efo=%d sf=%d pds=%d (rob=%d lsq=%d nmem=%d fri=%d fb=%d dec=%d dis=%d) flush=%d fp=%d\n",
+      qs_state, allow_fetch, qs_exec_fetch_open, qs_saw_flush, pipeline_drained_strict,
+      rob.io.empty, io.lsu.queues_empty, io.lsu.no_pending_mem, io.lsu.fencei_rdy,
+      fetch_buffer_empty, decode_stage_empty, dispatch_stage_empty,
+      rob.io.flush.valid, io.ifu.fetchpacket.valid)
+  }
+
+  // IFT quiesce-flush: pulse for one cycle on QS_DRAINING → QS_FETCH transition
+  // (pipeline_drained_strict just became true while still in QS_DRAINING).
+  // Clears taint tables for clean campaign boundaries and PRF-resize semantics.
+  val quiesce_flush_pulse = (qs_state === QS_DRAINING) && pipeline_drained_strict
+  rename_stage.io.quiesce_flush    := quiesce_flush_pulse
+  fp_rename_stage.io.quiesce_flush := quiesce_flush_pulse
+  pred_rename_stage.io.quiesce_flush := quiesce_flush_pulse
+  // Reset FTQ pointers when a ROB flush fires during quiesce (T=0, effect at T+1).
+  // This ensures the FTQ enq_ptr=1 is visible BEFORE redirect_flush fires at T+1
+  // and the IFU allocates a new entry. The previous approach (keyed on
+  // pipeline_drained_strict) fired at T+1 — same cycle as redirect_flush — so the
+  // IFU allocated at the OLD enq_ptr while the reset set enq_ptr:=1 one cycle later
+  // (T+2), orphaning the in-flight fetch and causing a permanent hang.
+  val ftq_reset_pulse = rob.io.flush.valid && cf_quiesce_core
+  io.ifu.cf_ftq_quiesce_reset := ftq_reset_pulse
+  // LSQ pointer reset: reset head/tail to 0 so WrapInc wraps correctly after CSR reconfiguration.
+  // Fires on same pulse as quiesce_flush (QS_DRAINING→QS_FETCH, queues already empty).
+  io.lsu.cf_lsq_quiesce_reset := quiesce_flush_pulse
+  // ROB pointer reset: reset head/tail to 0 so WrapInc wraps correctly after cf_rob_entries CSR change.
+  rob.io.cf_rob_quiesce_reset := quiesce_flush_pulse
+
+  // corefuzzing: preg_secret — per-physical-register secret-taint bit array.
+  // Updated EARLIER than taint_table (which only updates at commit via C7):
+  //   - At TLB stage (for loads hitting the secret range): fired by cf_preg_secret_upd from LSU
+  //   - At writeback (transitive): if any source preg was secret, set pdst's preg_secret
+  // This allows in-flight consumers to receive cf_secret_propagation at writeback time,
+  // before the producer commits (without requiring a fence.i between producer and consumer).
+  // Cleared at quiesce_flush_pulse (same as taint_table) for clean campaign boundaries.
+  val preg_secret = RegInit(VecInit(Seq.fill(numIntPhysRegs)(false.B)))
+  when (quiesce_flush_pulse) {
+    for (i <- 0 until numIntPhysRegs) { preg_secret(i) := false.B }
+  }
 
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
   val icache_blocked = false.B 
@@ -538,8 +629,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   io.ifu.mcontext := csr.io.mcontext
   io.ifu.scontext := csr.io.scontext
 
+  // Suppress ICache flush during quiesce: SSTEP instructions are CSR writes that don't
+  // modify instruction memory. The ICache should only be flushed after the final fence.i
+  // that exits quiesce (cf_quiesce_core = 0 at that point, so the flush fires normally).
   io.ifu.flush_icache := (0 until coreWidth).map { i =>
-    (rob.io.commit.arch_valids(i) && rob.io.commit.uops(i).is_fencei) ||
+    (rob.io.commit.arch_valids(i) && rob.io.commit.uops(i).is_fencei && !cf_quiesce_core) ||
     (RegNext(dec_valids(i) && dec_uops(i).is_jalr && csr.io.status.debug))
   }.reduce(_||_)
 
@@ -705,8 +799,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // SRC=1 (decode). Gated by cf_debug_rob_enable + cf_debug_enable.
   {
     val decFlushInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d,dc=%d}"}.mkString(" ")
-    val decFlushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d $decFlushInflFmt\n"
-    def printDecFlush(uop: MicroOp): Unit = {
+    val decFlushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d floc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d $decFlushInflFmt\n"
+    def printDecFlush(uop: MicroOp, fl: UInt, floc: UInt): Unit = {
       val inflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
         uop.cf_influencer_list(k).valid,
         uop.cf_influencer_list(k).op_count,
@@ -720,6 +814,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
         uop.cf_domain_id, uop.cf_speculated, uop.cf_attacker_influence,
         uop.cf_secret_access, uop.cf_secret_propagation, uop.cf_secret_transmission,
         uop.cf_op_count_id, uop.cf_spec_branch_is_atk, uop.cf_spec_branch_op_id,
+        fl, floc,
         uop.cf_fu_bitmap, 1.U, inflBitmapFromList(uop.cf_influencer_list), uop.cf_infl_overflow
       ) ++ inflArgs): _*)
     }
@@ -727,20 +822,15 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       when (custom_csrs.cf_debug_rob_enable && custom_csrs.cf_debug_enable) {
         // Path A: branch mispredict kills this instruction
         when (dec_valids(w) && IsKilledByBranch(brupdate, dec_uops(w))) {
-          val dec_fu_base = dec_uops(w)
-          val dec_fu = WireInit(dec_fu_base)
-          when (brupdate.b2.mispredict &&
-                brupdate.b2.uop.cf_domain_id =/= dec_fu_base.cf_domain_id) {
-            val br_uop = brupdate.b2.uop
-            dec_fu := addInfluencer(dec_fu_base, br_uop.cf_op_count_id, INFL_PIPELINE_FLUSH.U,
-              is_atk = br_uop.cf_domain_id === 1.U,
-              is_secret = br_uop.cf_secret_access || br_uop.cf_secret_propagation)
-          }
-          printDecFlush(dec_fu)
+          val dec_uop = dec_uops(w)
+          val fl_cross_domain = brupdate.b2.mispredict &&
+            (brupdate.b2.uop.cf_domain_id =/= dec_uop.cf_domain_id)
+          val fl_op_count = Mux(brupdate.b2.mispredict, brupdate.b2.uop.cf_op_count_id, 0.U)
+          printDecFlush(dec_uop, fl_cross_domain, fl_op_count)
         }
         // Path B: ROB flush (exception, FENCE.I, etc.) — kills all in-flight decode instructions
         .elsewhen (dec_valids(w) && rob.io.flush.valid) {
-          printDecFlush(dec_uops(w))
+          printDecFlush(dec_uops(w), 0.U, 0.U)
         }
       }
     }
@@ -810,8 +900,16 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val dec_stalls = dec_hazards.scanLeft(false.B) ((s,h) => s || h).takeRight(coreWidth)
   dec_fire := (0 until coreWidth).map(w => dec_valids(w) && !dec_stalls(w))
 
-  // all decoders are empty and ready for new instructions
-  dec_ready := dec_fire.last
+  // all decoders are empty and ready for new instructions.
+  // With ram_valid gating in fetch-buffer.scala, padding slots in a partial fetch packet
+  // are invalid (dec_valids(w)=false for unwritten entries).  The original dec_fire.last
+  // check deadlocks whenever the last physical slot is a padding entry (dec_fire.last
+  // stays false forever).  Instead, fire dec_ready when every valid slot has either fired
+  // this cycle (dec_fire(w)) or was already dispatched in a prior cycle (dec_finished_mask(w)).
+  val all_valid_dispatched = (0 until coreWidth).map(w =>
+    !dec_valids(w) || dec_fire(w) || dec_finished_mask(w)
+  ).reduce(_ && _)
+  dec_ready := all_valid_dispatched && io.ifu.fetchpacket.valid
 
   when (dec_ready || io.ifu.redirect_flush) {
     dec_finished_mask := 0.U
@@ -843,14 +941,16 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // attacker-domain branch (cf_spec_branch_is_atk / cf_spec_branch_op_id).
   // No rollback needed: stale entries are harmless because freed tags will be
   // overwritten before they appear in any future uop's br_mask.
-  val spec_branch_atk_table = Reg(Vec(maxBrCount, Bool()))
-  val spec_branch_op_table  = Reg(Vec(maxBrCount, UInt(uopIDCounterWidthCF.W)))
+  val spec_branch_atk_table    = Reg(Vec(maxBrCount, Bool()))
+  val spec_branch_secret_table = Reg(Vec(maxBrCount, Bool()))
+  val spec_branch_op_table     = Reg(Vec(maxBrCount, UInt(uopIDCounterWidthCF.W)))
 
   for (w <- 0 until coreWidth) {
     when (dec_fire(w) && dec_uops(w).allocate_brtag) {
       val tag = dec_brmask_logic.io.br_tag(w)
-      spec_branch_atk_table(tag) := dec_uops(w).cf_domain_id =/= 0.U
-      spec_branch_op_table(tag)  := dec_uops(w).cf_op_count_id
+      spec_branch_atk_table(tag)    := dec_uops(w).cf_domain_id =/= 0.U
+      spec_branch_secret_table(tag) := dec_uops(w).cf_secret_propagation || dec_uops(w).cf_secret_access
+      spec_branch_op_table(tag)     := dec_uops(w).cf_op_count_id
     }
   }
 
@@ -931,7 +1031,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val dis_prior_slot_valid = dis_valids.scanLeft(false.B) ((s,v) => s || v)
   val dis_prior_slot_unique = (dis_uops zip dis_valids).scanLeft(false.B) {case (s,(u,v)) => s || v && u.is_unique}
   val wait_for_empty_pipeline = (0 until coreWidth).map(w => (dis_uops(w).is_unique || custom_csrs.disableOOO) &&
-                                  (!rob.io.empty || !io.lsu.fencei_rdy || dis_prior_slot_valid(w)))
+                                  (!rob.io.empty || !io.lsu.fencei_rdy || (dis_prior_slot_valid(w) && !cf_quiesce_core)))
   val rocc_shim_busy = if (usingRoCC) !exe_units.rocc_unit.io.rocc.rxq_empty else false.B
   val wait_for_rocc = (0 until coreWidth).map(w =>
                         (dis_uops(w).is_fence || dis_uops(w).is_fencei) && (io.rocc.busy || rocc_shim_busy))
@@ -956,7 +1056,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
                       || io.ifu.redirect_flush))
 
 
-  io.lsu.fence_dmem := (dis_valids zip wait_for_empty_pipeline).map {case (v,w) => v && w} .reduce(_||_)
+  // Also assert fence_dmem during QS_DRAINING so dcache MSHRs drain and
+  // io.dmem.ordered becomes true, allowing fencei_rdy (and thus
+  // pipeline_drained_strict) to fire.  Without this, nothing dispatches in
+  // QS_DRAINING → fence_dmem stays false → MSHRs never drain → deadlock.
+  io.lsu.fence_dmem := (dis_valids zip wait_for_empty_pipeline).map {case (v,w) => v && w} .reduce(_||_) ||
+                       (qs_state === QS_DRAINING)
 
   val dis_stalls = dis_hazards.scanLeft(false.B) ((s,h) => s || h).takeRight(coreWidth)
   dis_fire := dis_valids zip dis_stalls map {case (v,s) => v && !s}
@@ -987,8 +1092,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     // Looks up spec_branch_atk_table for each set bit; takes the first (lowest br_tag) hit.
     val br_atk_bits = VecInit((0 until maxBrCount).map(i =>
       dis_uops(w).br_mask(i) && spec_branch_atk_table(i)))
-    dis_uops(w).cf_spec_branch_is_atk := br_atk_bits.reduce(_ || _)
-    dis_uops(w).cf_spec_branch_op_id  := Mux(
+    val br_sec_bits = VecInit((0 until maxBrCount).map(i =>
+      dis_uops(w).br_mask(i) && spec_branch_secret_table(i)))
+    dis_uops(w).cf_spec_branch_is_atk    := br_atk_bits.reduce(_ || _)
+    dis_uops(w).cf_spec_branch_is_secret := br_sec_bits.reduce(_ || _)
+    dis_uops(w).cf_spec_branch_op_id     := Mux(
       br_atk_bits.reduce(_ || _),
       spec_branch_op_table(PriorityEncoder(br_atk_bits)),
       0.U)
@@ -1684,6 +1792,49 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   // corefuzzing: issue contention updates — flatten per-port outputs from all issue units
   rob.io.cf_issue_contention_upd := VecInit(issue_units.flatMap(u => u.io.cf_contention_upd))
+  rob.io.cf_lsu_s_acc_upd        := io.lsu.cf_s_acc_rob_upd
+
+  // corefuzzing: preg_secret TLB-stage update from LSU — mark pdst as secret-tainted
+  // as soon as the load's address resolves to the secret range (before writeback).
+  for (w <- 0 until memWidth) {
+    when (io.lsu.cf_preg_secret_upd(w).valid) {
+      preg_secret(io.lsu.cf_preg_secret_upd(w).bits) := true.B
+    }
+  }
+
+  // corefuzzing: preg_secret writeback-time transitive propagation.
+  // For each integer writeback, if any source physical register was secret-tainted,
+  // mark the destination register as secret-tainted too, and emit a cf_s_prop_rob_upd
+  // to set cf_secret_propagation on the in-flight ROB entry.
+  // Also clears preg_secret[pdst] when a non-secret instruction overwrites the register,
+  // preventing stale taint from previous occupants of the same physical register.
+  rob.io.cf_s_prop_rob_upd.foreach { u => u.valid := false.B; u.bits := DontCare }
+  for (i <- 0 until rob.numWakeupPorts) {
+    val wb     = rob.io.wb_resps(i)
+    val wb_uop = wb.bits.uop
+    val int_wb = wb.valid && wb_uop.rf_wen && wb_uop.dst_rtype === RT_FIX && wb_uop.ldst_val
+    when (int_wb) {
+      val sec1 = preg_secret(wb_uop.prs1)
+      val sec2 = preg_secret(wb_uop.prs2)
+      // Taint the destination if any source was secret or this load already has s_acc.
+      // (cf_secret_access is already set on the wb_uop for secret-range loads via the
+      // existing TLB-stage path; this handles the transitive ALU→ALU case.)
+      val is_secret_wb = wb_uop.cf_secret_access || sec1 || sec2
+      when (is_secret_wb) {
+        preg_secret(wb_uop.pdst) := true.B
+        // Emit s_prop ROB update only for transitive register taint (not the primary load —
+        // s_acc for the load itself is already set via cf_lsu_s_acc_upd).
+        when (sec1 || sec2) {
+          rob.io.cf_s_prop_rob_upd(i).valid            := true.B
+          rob.io.cf_s_prop_rob_upd(i).bits.rob_idx     := wb_uop.rob_idx
+          rob.io.cf_s_prop_rob_upd(i).bits.op_count_id := wb_uop.cf_op_count_id
+        }
+      } .otherwise {
+        // Non-secret instruction writing this pdst: clear any stale preg_secret bit.
+        preg_secret(wb_uop.pdst) := false.B
+      }
+    }
+  }
 
   assert (!(csr.io.singleStep), "[core] single-step is unsupported.")
 
@@ -1793,7 +1944,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
         // predispatch taint queue (up to 5). Each taint entry is shown as
         // module:type:opcount. If some fields are zero, they will print as
         // zeros.
-        printf(" CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d) ",
+        printf(" CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_sec=%d spec_oc=%d) ",
           rob.io.commit.uops(w).cf_domain_id,
           rob.io.commit.uops(w).cf_speculated,
           rob.io.commit.uops(w).cf_attacker_influence,
@@ -1802,6 +1953,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
           rob.io.commit.uops(w).cf_secret_transmission,
           rob.io.commit.uops(w).cf_op_count_id,
           rob.io.commit.uops(w).cf_spec_branch_is_atk,
+          rob.io.commit.uops(w).cf_spec_branch_is_secret,
           rob.io.commit.uops(w).cf_spec_branch_op_id)
 
         // Print the single-step marker separately (preserves prior visible tag)

@@ -127,9 +127,23 @@ class RobIo(
   // sum non-FP IQ widths. IQT_FP.litValue == BigInt(4).
   val cf_issue_contention_upd = Input(Vec(issueParams.filter(_.iqType != BigInt(4)).map(_.issueWidth).sum, Valid(new IssueContentionUpdate)))
 
+  // corefuzzing: direct ROB update to set cf_secret_access at address-compute (TLB) time.
+  // Fires when LSU TLB detects the effective address falls in the secret range, before
+  // the dcache response — ensures s_acc is visible in [FLUSH] logs for speculative loads
+  // killed before the dcache responds.
+  val cf_lsu_s_acc_upd = Input(Vec(memWidth, Valid(new CF_SAccUpdate)))
+
+  // corefuzzing: direct ROB update to set cf_secret_propagation for in-flight instructions
+  // whose physical source registers are secret-tainted, discovered at writeback time.
+  // One port per integer writeback port (numWakeupPorts); unused ports stay valid=false.
+  val cf_s_prop_rob_upd = Input(Vec(numWakeupPorts, Valid(new CF_SAccUpdate)))
+
   // corefuzzing changes
   val cf_debug_rob_enable = Input(Bool())
   val cf_rob_entries = Input(UInt(log2Ceil(robEntryOptions.length).W))
+  // Pulse to reset ROB head/tail to 0 on quiesce drain so WrapInc wraps correctly
+  // after a cf_rob_entries CSR change (ROB is empty when this fires)
+  val cf_rob_quiesce_reset = Input(Bool())
 }
 
 /**
@@ -350,6 +364,18 @@ class Rob(
 
     val rob_debug_wdata = Mem(numRobRows, UInt(xLen.W))
 
+    // corefuzzing: pending tables for serialized influencer list writes.
+    // Replaces direct N-port writes to rob_uop influencer lists with a
+    // 1-drain-per-cycle pattern, reducing ROB register file MUX tree complexity.
+    //   sprob: one pending bit per row (fixed content: INFL_REG_DATAFLOW, is_secret=true)
+    //   ic:    pending bit + variable winner data per row (INFL_ISSUE_CONTENTION)
+    val sprob_infl_pending    = RegInit(VecInit(Seq.fill(numRobRows)(false.B)))
+    val ic_pending_valid      = RegInit(VecInit(Seq.fill(numRobRows)(false.B)))
+    val ic_pending_winner_op  = Reg(Vec(numRobRows, UInt(uopIDCounterWidthCF.W)))
+    val ic_pending_winner_atk = Reg(Vec(numRobRows, Bool()))
+    val ic_pending_winner_sec = Reg(Vec(numRobRows, Bool()))
+    val ic_pending_deny_cnt   = Reg(Vec(numRobRows, UInt(4.W)))
+
     //-----------------------------------------------
     // Dispatch: Add Entry to ROB
 
@@ -424,21 +450,111 @@ class Rob(
       }
     }
 
-    // corefuzzing: issue contention update — add INFL_ISSUE_CONTENTION influencer to the ROB entry
+    // corefuzzing: issue contention update — instead of writing directly to the ROB
+    // influencer list (6 ports × numRobRows × 140 bits = large MUX tree), record in a
+    // compact per-row pending table and drain 1 entry per cycle in the background.
     for (upd <- io.cf_issue_contention_upd) {
       when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx))) {
         val cidx = GetRowIdx(upd.bits.rob_idx)
         when (rob_val(cidx)) {
-          val updated = addInfluencer(rob_uop(cidx), upd.bits.winner_op_count,
-            INFL_ISSUE_CONTENTION.U,
-            is_atk     = upd.bits.winner_is_atk,
-            is_secret  = upd.bits.winner_is_sec,
-            deny_count = upd.bits.deny_count)
-          rob_uop(cidx).cf_influencer_list := updated.cf_influencer_list
-          rob_uop(cidx).cf_infl_overflow   := updated.cf_infl_overflow
-          rob_uop(cidx).cf_attacker_influence := updated.cf_attacker_influence
+          ic_pending_valid(cidx)      := true.B
+          ic_pending_winner_op(cidx)  := upd.bits.winner_op_count
+          ic_pending_winner_atk(cidx) := upd.bits.winner_is_atk
+          ic_pending_winner_sec(cidx) := upd.bits.winner_is_sec
+          ic_pending_deny_cnt(cidx)   := upd.bits.deny_count
         }
       }
+    }
+
+    // corefuzzing: direct s_acc update from LSU TLB stage — fires at address-compute time,
+    // before dcache response, so speculative secret loads show s_acc=1 in [FLUSH] logs.
+    for (upd <- io.cf_lsu_s_acc_upd) {
+      when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx))) {
+        val cidx = GetRowIdx(upd.bits.rob_idx)
+        // Guard against ROB slot reuse: only apply if the slot still holds the
+        // same instruction (same op_count_id) that generated this TLB-stage update.
+        // A squashed instruction can have its slot reallocated before the update
+        // arrives; without this guard the new instruction inherits a stale s_acc=1.
+        when (rob_val(cidx) && rob_uop(cidx).cf_op_count_id === upd.bits.op_count_id) {
+          rob_uop(cidx).cf_secret_access := true.B
+        }
+      }
+    }
+
+    // corefuzzing: s_prop direct ROB update — set cf_secret_propagation on in-flight
+    // instructions whose physical sources were secret-tainted (discovered at writeback time).
+    // The 1-bit cf_secret_propagation write is kept as N-port (cheap); the influencer list
+    // write (was 8 ports × numRobRows × 140 bits) is replaced by a pending bit and drained
+    // 1 entry per cycle in the background.  op_count_id guard prevents stale updates.
+    for (upd <- io.cf_s_prop_rob_upd) {
+      when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx))) {
+        val cidx = GetRowIdx(upd.bits.rob_idx)
+        when (rob_val(cidx) && rob_uop(cidx).cf_op_count_id === upd.bits.op_count_id) {
+          rob_uop(cidx).cf_secret_propagation := true.B  // 1-bit: cheap N-port write
+          sprob_infl_pending(cidx) := true.B              // defer influencer write to drain
+        }
+      }
+    }
+
+    // -----------------------------------------------
+    // Background drain: one influencer list write per pending table per cycle.
+    // Uses PriorityEncoderOH to pick one entry; clears pending bit after write.
+    // Timing correctness: since collect writes set pending bits as registers, the
+    // drain reads old (pre-collect) values and cannot fire for an entry in the same
+    // cycle its pending bit is set — guaranteed 1-cycle gap before first drain.
+    val sprob_drain_oh  = PriorityEncoderOH(sprob_infl_pending.asUInt)
+    val sprob_drain_idx = OHToUInt(sprob_drain_oh)
+    val sprob_drain_any = sprob_infl_pending.asUInt.orR
+
+    val ic_drain_oh   = PriorityEncoderOH(ic_pending_valid.asUInt)
+    val ic_drain_idx  = OHToUInt(ic_drain_oh)
+    val ic_drain_any  = ic_pending_valid.asUInt.orR
+    // Suppress ic drain when it would target the same ROB row as the sprob drain.
+    // Both use PopCount(valid) as the base slot; same row → same base → same slot → conflict.
+    val ic_drain_fires = ic_drain_any && !(sprob_drain_any && ic_drain_idx === sprob_drain_idx)
+
+    when (sprob_drain_any) {
+      val cidx = sprob_drain_idx
+      when (rob_val(cidx)) {
+        val infl_base = PopCount(VecInit(rob_uop(cidx).cf_influencer_list.map(_.valid)))
+        when (infl_base < numInfluencerSlotsCF.U) {
+          for (k <- 0 until numInfluencerSlotsCF) {
+            when (infl_base === k.U) {
+              rob_uop(cidx).cf_influencer_list(k).valid     := true.B
+              rob_uop(cidx).cf_influencer_list(k).op_count  := 0.U
+              rob_uop(cidx).cf_influencer_list(k).infl_type := INFL_REG_DATAFLOW.U
+              rob_uop(cidx).cf_influencer_list(k).is_atk    := false.B
+              rob_uop(cidx).cf_influencer_list(k).is_secret := true.B
+            }
+          }
+        } .otherwise {
+          rob_uop(cidx).cf_infl_overflow := true.B
+        }
+      }
+      sprob_infl_pending(cidx) := false.B
+    }
+
+    when (ic_drain_fires) {
+      val cidx = ic_drain_idx
+      when (rob_val(cidx)) {
+        val infl_base = PopCount(VecInit(rob_uop(cidx).cf_influencer_list.map(_.valid)))
+        when (infl_base < numInfluencerSlotsCF.U) {
+          for (k <- 0 until numInfluencerSlotsCF) {
+            when (infl_base === k.U) {
+              rob_uop(cidx).cf_influencer_list(k).valid      := true.B
+              rob_uop(cidx).cf_influencer_list(k).op_count   := ic_pending_winner_op(cidx)
+              rob_uop(cidx).cf_influencer_list(k).infl_type  := INFL_ISSUE_CONTENTION.U
+              rob_uop(cidx).cf_influencer_list(k).is_atk     := ic_pending_winner_atk(cidx)
+              rob_uop(cidx).cf_influencer_list(k).is_secret  := ic_pending_winner_sec(cidx)
+              rob_uop(cidx).cf_influencer_list(k).deny_count := ic_pending_deny_cnt(cidx)
+            }
+          }
+        } .otherwise {
+          rob_uop(cidx).cf_infl_overflow := true.B
+        }
+        when (ic_pending_winner_atk(cidx)) { rob_uop(cidx).cf_attacker_influence := true.B }
+      }
+      ic_pending_valid(cidx) := false.B
     }
 
     //-----------------------------------------------
@@ -491,6 +607,55 @@ class Rob(
       io.commit.uops(w).taken      := io.brupdate.b2.taken
     }
 
+    // corefuzzing: commit-time combinational override for pending influencer entries.
+    // If the drain hasn't serviced com_idx yet by the time it commits, apply the
+    // influencer(s) directly to io.commit.uops(w) (a Wire) so the commit log is correct.
+    // Purely combinational: reads registers, writes only to the commit output Wire.
+    // Also clears the pending bits so the drain skips this row after commit.
+    when (will_commit(w)) {
+      val pend_base0 = PopCount(VecInit(rob_uop(com_idx).cf_influencer_list.map(_.valid)))
+      val has_sprob  = sprob_infl_pending(com_idx)
+      val has_ic     = ic_pending_valid(com_idx)
+      // sprob slot = pend_base0; ic slot = pend_base0 + (1 if sprob also pending)
+      val ic_slot    = pend_base0 + has_sprob.asUInt
+
+      when (has_sprob) {
+        when (pend_base0 < numInfluencerSlotsCF.U) {
+          for (k <- 0 until numInfluencerSlotsCF) {
+            when (pend_base0 === k.U) {
+              io.commit.uops(w).cf_influencer_list(k).valid     := true.B
+              io.commit.uops(w).cf_influencer_list(k).op_count  := 0.U
+              io.commit.uops(w).cf_influencer_list(k).infl_type := INFL_REG_DATAFLOW.U
+              io.commit.uops(w).cf_influencer_list(k).is_atk    := false.B
+              io.commit.uops(w).cf_influencer_list(k).is_secret := true.B
+            }
+          }
+        } .otherwise {
+          io.commit.uops(w).cf_infl_overflow := true.B
+        }
+        sprob_infl_pending(com_idx) := false.B
+      }
+
+      when (has_ic) {
+        when (ic_slot < numInfluencerSlotsCF.U) {
+          for (k <- 0 until numInfluencerSlotsCF) {
+            when (ic_slot === k.U) {
+              io.commit.uops(w).cf_influencer_list(k).valid      := true.B
+              io.commit.uops(w).cf_influencer_list(k).op_count   := ic_pending_winner_op(com_idx)
+              io.commit.uops(w).cf_influencer_list(k).infl_type  := INFL_ISSUE_CONTENTION.U
+              io.commit.uops(w).cf_influencer_list(k).is_atk     := ic_pending_winner_atk(com_idx)
+              io.commit.uops(w).cf_influencer_list(k).is_secret  := ic_pending_winner_sec(com_idx)
+              io.commit.uops(w).cf_influencer_list(k).deny_count := ic_pending_deny_cnt(com_idx)
+            }
+          }
+        } .otherwise {
+          io.commit.uops(w).cf_infl_overflow := true.B
+        }
+        when (ic_pending_winner_atk(com_idx)) { io.commit.uops(w).cf_attacker_influence := true.B }
+        ic_pending_valid(com_idx) := false.B
+      }
+    }
+
 
     // Don't attempt to rollback the tail's row when the rob is full.
     val rbk_row = rob_state === s_rollback && !full
@@ -531,19 +696,20 @@ class Rob(
           // corefuzzing: add INFL_PIPELINE_FLUSH when flushing branch is from different domain
           // corefuzzing: single printf per entry — atomic in Verilator multi-threaded mode,
           // preventing interleaving of header/influencer-loop/footer across threads.
-          val flush_uop_base = rob_uop(i)
-          val flush_uop = WireInit(flush_uop_base)
-          // corefuzzing: use cycle-N mispredict UOP (b2.mispredict fires 1 cycle after b1/kill)
-          when (io.cf_mispredict_uop.valid &&
-                (io.cf_mispredict_uop.bits.cf_domain_id =/= flush_uop_base.cf_domain_id)) {
-            val br_uop = io.cf_mispredict_uop.bits
-            flush_uop := addInfluencer(flush_uop_base, br_uop.cf_op_count_id, INFL_PIPELINE_FLUSH.U,
-              is_atk = br_uop.cf_domain_id === 1.U,
-              is_secret = br_uop.cf_secret_access || br_uop.cf_secret_propagation)
-          }
-          val fu = flush_uop
+          // corefuzzing: no WireInit copy needed — read ROB state directly.
+          // Pipeline-flush info is printed as separate fl/floc fields (like spec_atk/spec_oc),
+          // completely outside the influencer list.  This eliminates the addInfluencer call
+          // and WireInit(full MicroOp) that previously generated ~100 mux expressions per entry
+          // across 128 entries, causing Rob.sv to balloon to 168 MB.
+          val fu = rob_uop(i)
+          val fl_cross_domain = io.cf_mispredict_uop.valid &&
+            (io.cf_mispredict_uop.bits.cf_domain_id =/= fu.cf_domain_id)
+          val fl_is_secret = io.cf_mispredict_uop.valid &&
+            (io.cf_mispredict_uop.bits.cf_secret_propagation || io.cf_mispredict_uop.bits.cf_secret_access)
+          val fl_op_count = Mux(io.cf_mispredict_uop.valid,
+            io.cf_mispredict_uop.bits.cf_op_count_id, 0.U)
           val robFlushInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d,dc=%d}"}.mkString(" ")
-          val robFlushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d $robFlushInflFmt\n"
+          val robFlushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d fl_sec=%d floc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d $robFlushInflFmt\n"
           val robInflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
             fu.cf_influencer_list(k).valid,
             fu.cf_influencer_list(k).op_count,
@@ -557,6 +723,7 @@ class Rob(
             fu.cf_domain_id, fu.cf_speculated, fu.cf_attacker_influence,
             fu.cf_secret_access, fu.cf_secret_propagation, fu.cf_secret_transmission,
             fu.cf_op_count_id, fu.cf_spec_branch_is_atk, fu.cf_spec_branch_op_id,
+            fl_cross_domain, fl_is_secret, fl_op_count,
             fu.cf_fu_bitmap, 3.U, inflBitmapFromList(fu.cf_influencer_list), fu.cf_infl_overflow
           ) ++ robInflArgs): _*)
         }
@@ -566,6 +733,10 @@ class Rob(
         {
           rob_val(i) := false.B
           rob_uop(i.U).debug_inst := BUBBLE
+          // corefuzzing: clear pending influencer bits so the drain doesn't
+          // write to a slot that has been freed and potentially reallocated.
+          sprob_infl_pending(i) := false.B
+          ic_pending_valid(i)   := false.B
         } .elsewhen (rob_val(i)) {
           // clear speculation bit even on correct speculation
           rob_uop(i).br_mask := GetNewBrMask(io.brupdate, br_mask)
@@ -970,6 +1141,19 @@ class Rob(
   // TODO should we add an extra 'parity bit' onto the ROB pointers to simplify this logic?
 
   maybe_full := !rob_deq && (rob_enq || maybe_full) || io.brupdate.b1.mispredict_mask =/= 0.U
+
+  // corefuzzing: reset ROB head/tail to 0 on quiesce drain (last-write-wins over normal updates above).
+  // When this fires, the ROB is empty (rob.io.empty = true in pipeline_drained_strict).
+  // Resetting ensures WrapInc(ptr, cf_rob_rows) wraps correctly after a cf_rob_entries CSR change.
+  when (io.cf_rob_quiesce_reset) {
+    rob_head     := 0.U
+    rob_head_lsb := 0.U
+    rob_tail     := 0.U
+    rob_tail_lsb := 0.U
+    rob_pnr      := 0.U
+    rob_pnr_lsb  := 0.U
+    maybe_full   := false.B
+  }
   full       := rob_tail === rob_head && maybe_full
   empty      := (rob_head === rob_tail) && (rob_head_vals.asUInt === 0.U)
 
