@@ -174,6 +174,11 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
     // added for the fuzzycore project - AK
     val cf_bpd_tage_to_gshare = Input(Bool()) // signal from the custom CSR to reconfigure to gshare.
 
+    // corefuzzing: runtime BTB/TAGE reconfiguration indices
+    val cf_btb_set_idx    = Input(UInt(2.W))
+    val cf_btb_way_idx    = Input(UInt(1.W))
+    val cf_tage_count_idx = Input(UInt(3.W))
+
     // corefuzzing: fetch domain tracking for BPD/BTB domain mismatch detection
     val f0_domain_id           = Input(UInt(1.W))   // domain of current fetch (f0 stage)
     val f3_bpd_domain_mismatch = Output(Bool())     // TAGE entry last updated by different domain
@@ -246,6 +251,11 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     // adding for core fuzzing - AK
     val cf_bpd_tage_to_gshare = Input(Bool())
 
+    // corefuzzing: runtime BTB/TAGE reconfiguration indices
+    val cf_btb_set_idx    = Input(UInt(2.W))
+    val cf_btb_way_idx    = Input(UInt(1.W))
+    val cf_tage_count_idx = Input(UInt(3.W))
+
     // corefuzzing: domain of the fetch request for BPD/BTB domain shadow comparisons
     val f0_req_domain_id = Input(UInt(1.W))
   })
@@ -282,6 +292,10 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
 
     // adding for the fuzzycore project - AK
     banked_predictors(0).io.cf_bpd_tage_to_gshare := io.cf_bpd_tage_to_gshare
+    // corefuzzing: runtime BTB/TAGE reconfig
+    banked_predictors(0).io.cf_btb_set_idx    := io.cf_btb_set_idx
+    banked_predictors(0).io.cf_btb_way_idx    := io.cf_btb_way_idx
+    banked_predictors(0).io.cf_tage_count_idx := io.cf_tage_count_idx
 
   } else {
     require(nBanks == 2)
@@ -295,6 +309,13 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     // adding for fuzzycore - AK
     banked_predictors(0).io.cf_bpd_tage_to_gshare := io.cf_bpd_tage_to_gshare
     banked_predictors(1).io.cf_bpd_tage_to_gshare := io.cf_bpd_tage_to_gshare
+    // corefuzzing: runtime BTB/TAGE reconfig
+    banked_predictors(0).io.cf_btb_set_idx    := io.cf_btb_set_idx
+    banked_predictors(1).io.cf_btb_set_idx    := io.cf_btb_set_idx
+    banked_predictors(0).io.cf_btb_way_idx    := io.cf_btb_way_idx
+    banked_predictors(1).io.cf_btb_way_idx    := io.cf_btb_way_idx
+    banked_predictors(0).io.cf_tage_count_idx := io.cf_tage_count_idx
+    banked_predictors(1).io.cf_tage_count_idx := io.cf_tage_count_idx
 
     when (bank(io.f0_req.bits.pc) === 0.U) {
       banked_lhist_providers(0).io.f0_valid := io.f0_req.valid

@@ -35,6 +35,10 @@ class ComposedBranchPredictorBank(implicit p: Parameters) extends BranchPredicto
 
     // addition for the fuzzycore project - AK
     c.io.cf_bpd_tage_to_gshare := io.cf_bpd_tage_to_gshare
+    // corefuzzing: runtime BTB/TAGE reconfig
+    c.io.cf_btb_set_idx    := io.cf_btb_set_idx
+    c.io.cf_btb_way_idx    := io.cf_btb_way_idx
+    c.io.cf_tage_count_idx := io.cf_tage_count_idx
 
     // corefuzzing: wire domain to each component
     c.io.f0_domain_id := io.f0_domain_id

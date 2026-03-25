@@ -20,7 +20,9 @@ case class BoomBTBParams(
 )
 
 
-class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p: Parameters) extends BranchPredictorBank()(p)
+class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p: Parameters)
+  extends BranchPredictorBank()(p)
+  with freechips.rocketchip.util.CoreFuzzingConstants
 {
   override val nSets         = params.nSets
   override val nWays         = params.nWays
@@ -62,6 +64,18 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   reset_idx := reset_idx + doing_reset
   when (reset_idx === (nSets-1).U) { doing_reset := false.B }
 
+  // corefuzzing: runtime BTB set count selection
+  val btbSetOptionsVec    = VecInit(btbSetOptions.map(_.U))
+  val cf_btb_active_sets  = btbSetOptionsVec(io.cf_btb_set_idx)
+  // Mask s0/s1_update indices to keep accesses within the active set range
+  val s0_idx_masked        = s0_idx       & (cf_btb_active_sets - 1.U)
+  val s1_update_idx_masked = s1_update_idx & (cf_btb_active_sets - 1.U)
+
+  // corefuzzing: runtime BTB way count selection — gates READ hits to active ways only
+  // Without this, stale entries in deactivated ways cause false BTB hits and corrupt IFT records
+  val btbWayOptionsVec   = VecInit(btbWayOptions.map(_.U))
+  val cf_btb_active_ways = btbWayOptionsVec(io.cf_btb_way_idx)
+
   val meta     = Seq.fill(nWays) { SyncReadMem(nSets, Vec(bankWidth, UInt(btbMetaSz.W))) }
   val btb      = Seq.fill(nWays) { SyncReadMem(nSets, Vec(bankWidth, UInt(btbEntrySz.W))) }
   val ebtb     = SyncReadMem(extendedNSets, UInt(vaddrBitsExtended.W))
@@ -74,14 +88,14 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
     (f"btb_meta_way$w", nSets, bankWidth * btbMetaSz),
     (f"btb_data_way$w", nSets, bankWidth * btbEntrySz))})).flatten ++ Seq(("ebtb", extendedNSets, vaddrBitsExtended)))
 
-  val s1_req_rbtb    = VecInit(btb.map { b => VecInit(b.read(s0_idx , s0_valid).map(_.asTypeOf(new BTBEntry))) })
-  val s1_req_rmeta   = VecInit(meta.map { m => VecInit(m.read(s0_idx, s0_valid).map(_.asTypeOf(new BTBMeta))) })
-  val s1_req_rebtb   = ebtb.read(s0_idx, s0_valid)
+  val s1_req_rbtb    = VecInit(btb.map { b => VecInit(b.read(s0_idx_masked, s0_valid).map(_.asTypeOf(new BTBEntry))) })
+  val s1_req_rmeta   = VecInit(meta.map { m => VecInit(m.read(s0_idx_masked, s0_valid).map(_.asTypeOf(new BTBMeta))) })
+  val s1_req_rebtb   = ebtb.read(s0_idx_masked, s0_valid)
   val s1_req_tag     = s1_idx >> log2Ceil(nSets)
   // corefuzzing: domain shadow read — same index/enable as btb/meta
-  val s1_req_rdomain = VecInit(btb_domain.map { d => d.read(s0_idx, s0_valid) })
+  val s1_req_rdomain = VecInit(btb_domain.map { d => d.read(s0_idx_masked, s0_valid) })
   // corefuzzing: secret shadow read
-  val s1_req_rsecret = VecInit(btb_secret.map { s => s.read(s0_idx, s0_valid) })
+  val s1_req_rsecret = VecInit(btb_secret.map { s => s.read(s0_idx_masked, s0_valid) })
 
   val s1_resp   = Wire(Vec(bankWidth, Valid(UInt(vaddrBitsExtended.W))))
   val s1_is_br  = Wire(Vec(bankWidth, Bool()))
@@ -89,7 +103,9 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
 
   val s1_hit_ohs = VecInit((0 until bankWidth) map { i =>
     VecInit((0 until nWays) map { w =>
-      s1_req_rmeta(w)(i).tag === s1_req_tag(tagSz-1,0)
+      // corefuzzing: gate by active ways — prevents stale entries in deactivated ways
+      // from generating false hits when BTB is reconfigured to fewer ways
+      s1_req_rmeta(w)(i).tag === s1_req_tag(tagSz-1,0) && (w.U < cf_btb_active_ways)
     })
   })
   val s1_hits     = s1_hit_ohs.map { oh => oh.reduce(_||_) }
@@ -150,9 +166,11 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   } else {
     0.U
   }
+  // corefuzzing: clamp alloc_way to 0 when only 1 way is active (cf_btb_way_idx === 1)
+  val alloc_way_clamped = Mux(io.cf_btb_way_idx === 1.U, 0.U, alloc_way)
   s1_meta.write_way := Mux(s1_hits.reduce(_||_),
     PriorityEncoder(s1_hit_ohs.map(_.asUInt).reduce(_|_)),
-    alloc_way)
+    alloc_way_clamped)
 
   val s1_update_cfi_idx = s1_update.bits.cfi_idx.bits
   val s1_update_meta    = s1_update.bits.meta.asTypeOf(new BTBPredictMeta)
@@ -188,7 +206,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
       btb(w).write(
         Mux(doing_reset,
           reset_idx,
-          s1_update_idx),
+          s1_update_idx_masked),
         Mux(doing_reset,
           VecInit(Seq.fill(bankWidth) { 0.U(btbEntrySz.W) }),
           VecInit(Seq.fill(bankWidth) { s1_update_wbtb_data.asUInt })),
@@ -199,7 +217,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
       meta(w).write(
         Mux(doing_reset,
           reset_idx,
-          s1_update_idx),
+          s1_update_idx_masked),
         Mux(doing_reset,
           VecInit(Seq.fill(bankWidth) { 0.U(btbMetaSz.W) }),
           VecInit(s1_update_wmeta_data.map(_.asUInt))),
@@ -209,7 +227,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
       )
       // corefuzzing: write domain shadow alongside meta (same index/mask)
       btb_domain(w).write(
-        Mux(doing_reset, reset_idx, s1_update_idx),
+        Mux(doing_reset, reset_idx, s1_update_idx_masked),
         Mux(doing_reset,
           VecInit(Seq.fill(bankWidth)(0.U(1.W))),
           VecInit(Seq.fill(bankWidth)(s1_update.bits.cf_domain_id))),
@@ -217,7 +235,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
       )
       // corefuzzing: write secret shadow alongside domain (same index/mask)
       btb_secret(w).write(
-        Mux(doing_reset, reset_idx, s1_update_idx),
+        Mux(doing_reset, reset_idx, s1_update_idx_masked),
         Mux(doing_reset,
           VecInit(Seq.fill(bankWidth)(false.B)),
           VecInit(Seq.fill(bankWidth)(s1_update.bits.cf_is_secret))),
@@ -226,7 +244,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
     }
   }
   when (s1_update_wbtb_mask =/= 0.U && offset_is_extended) {
-    ebtb.write(s1_update_idx, s1_update.bits.target)
+    ebtb.write(s1_update_idx_masked, s1_update.bits.target)
   }
 
 }

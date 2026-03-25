@@ -20,7 +20,7 @@ import chisel3._
 import chisel3.util._
 
 import org.chipsalliance.cde.config.{Parameters}
-import freechips.rocketchip.util.{Str}
+import freechips.rocketchip.util.{Str, CoreFuzzingConstants}
 
 import boom.v3.common._
 import boom.v3.exu._
@@ -103,6 +103,7 @@ class GetPCFromFtqIO(implicit p: Parameters) extends BoomBundle
 class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   with HasBoomCoreParameters
   with HasBoomFrontendParameters
+  with CoreFuzzingConstants
 {
   val num_entries = ftqSz
   private val idx_sz = log2Ceil(num_entries)
@@ -131,12 +132,22 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   // corefuzzing: gate for speculative FTQ prints
   val cf_debug_ftq_enable = Input(Bool())
 
+  // 2-bit index into ftQueueEntryOptions = Seq(32, 24, 16, 8) for runtime FTQ size selection
+  val cf_ftq_idx = Input(UInt(2.W))
+  // Pulse from core on QS_DRAINING→QS_FETCH: reset pointers to canonical state
+  // so they are always within [0, cf_ftq_active-1] after a RECONFIG CSR write.
+  val cf_ftq_quiesce_reset = Input(Bool())
+
   // corefuzzing: multi-port dispatch/execute-time feedback to mark FTQ entry as secret.
   // Port 0..coreWidth-1: dispatch stage (cf_secret_propagation known at dispatch)
   // Port coreWidth..coreWidth+memWidth-1: TLB stage (cf_secret_access determined at address resolution)
   // Flag is sticky (write-only true.B). Multiple ports write different entries per cycle safely
   // because ram is Reg(Vec(...)) — each element has an independent write enable.
   val cf_secret_ftq_updates = Flipped(Vec(coreWidth + memWidth, Valid(UInt(idx_sz.W))))
+  // corefuzzing: for each cf_secret_ftq_updates port that fires on a call-type FTQ entry,
+  // export the RAS slot index so the frontend can mark ras_secret retroactively.
+  val cf_ras_secret_upd_valid = Output(Vec(coreWidth + memWidth, Bool()))
+  val cf_ras_secret_upd_idx   = Output(Vec(coreWidth + memWidth, UInt(log2Ceil(nRasEntries).W)))
 
     val bpdupdate = Output(Valid(new BranchPredictionUpdate))
 
@@ -149,8 +160,12 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val deq_ptr    = RegInit(0.U(idx_sz.W))
   val enq_ptr    = RegInit(1.U(idx_sz.W))
 
-  val full = ((WrapInc(WrapInc(enq_ptr, num_entries), num_entries) === bpd_ptr) ||
-              (WrapInc(enq_ptr, num_entries) === bpd_ptr))
+  // Runtime FTQ size selection: ftQueueEntryOptions = Seq(32, 24, 16, 8)
+  val ftqOptionsVec = VecInit(ftQueueEntryOptions.map(_.U))
+  val cf_ftq_active = ftqOptionsVec(io.cf_ftq_idx)
+
+  val full = ((WrapInc(WrapInc(enq_ptr, cf_ftq_active), cf_ftq_active) === bpd_ptr) ||
+              (WrapInc(enq_ptr, cf_ftq_active) === bpd_ptr))
 
 
   val pcs      = Reg(Vec(num_entries, UInt(vaddrBitsExtended.W)))
@@ -216,16 +231,25 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     prev_entry := new_entry
     prev_ghist := new_ghist
 
-    enq_ptr := WrapInc(enq_ptr, num_entries)
+    enq_ptr := WrapInc(enq_ptr, cf_ftq_active)
   }
 
   io.enq_idx := enq_ptr
 
   // corefuzzing: multi-port secret feedback — mark FTQ entry as soon as secret state is known.
   // All ports write true.B (monotone), so simultaneous writes to the same entry are harmless.
-  for (u <- io.cf_secret_ftq_updates) {
+  // Also export RAS secret update for call-type entries so frontend can retroactively tag
+  // the pushed RAS slot as secret.
+  io.cf_ras_secret_upd_valid := VecInit(Seq.fill(coreWidth + memWidth)(false.B))
+  io.cf_ras_secret_upd_idx   := VecInit(Seq.fill(coreWidth + memWidth)(0.U(log2Ceil(nRasEntries).W)))
+  for ((u, i) <- io.cf_secret_ftq_updates.zipWithIndex) {
     when (u.valid) {
       ram(u.bits).cf_fetch_secret := true.B
+      // If the FTQ entry had a call CFI, propagate its RAS write index for the secret shadow
+      when (ram(u.bits).cfi_is_call) {
+        io.cf_ras_secret_upd_valid(i) := true.B
+        io.cf_ras_secret_upd_idx(i)   := ram(u.bits).ras_idx
+      }
     }
   }
 
@@ -266,7 +290,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   }
   val bpd_meta  = meta.read(bpd_idx, true.B) // TODO fix these SRAMs
   val bpd_pc    = RegNext(pcs(bpd_idx))
-  val bpd_target = RegNext(pcs(WrapInc(bpd_idx, num_entries)))
+  val bpd_target = RegNext(pcs(WrapInc(bpd_idx, cf_ftq_active)))
 
   when (io.redirect.valid) {
     bpd_update_mispredict := false.B
@@ -290,13 +314,13 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   } .elsewhen (bpd_update_mispredict) {
     bpd_update_mispredict := false.B
     bpd_update_repair     := true.B
-    bpd_repair_idx        := WrapInc(bpd_repair_idx, num_entries)
+    bpd_repair_idx        := WrapInc(bpd_repair_idx, cf_ftq_active)
   } .elsewhen (bpd_update_repair && RegNext(bpd_update_mispredict)) {
     bpd_repair_pc         := bpd_pc
-    bpd_repair_idx        := WrapInc(bpd_repair_idx, num_entries)
+    bpd_repair_idx        := WrapInc(bpd_repair_idx, cf_ftq_active)
   } .elsewhen (bpd_update_repair) {
-    bpd_repair_idx        := WrapInc(bpd_repair_idx, num_entries)
-    when (WrapInc(bpd_repair_idx, num_entries) === bpd_end_idx ||
+    bpd_repair_idx        := WrapInc(bpd_repair_idx, cf_ftq_active)
+    when (WrapInc(bpd_repair_idx, cf_ftq_active) === bpd_end_idx ||
       bpd_pc === bpd_repair_pc)  {
       bpd_update_repair := false.B
     }
@@ -307,7 +331,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val do_commit_update     = (!bpd_update_mispredict &&
                               !bpd_update_repair &&
                                bpd_ptr =/= deq_ptr &&
-                               enq_ptr =/= WrapInc(bpd_ptr, num_entries) &&
+                               enq_ptr =/= WrapInc(bpd_ptr, cf_ftq_active) &&
                               !io.brupdate.b2.mispredict &&
                               !io.redirect.valid && !RegNext(io.redirect.valid))
   val do_mispredict_update = bpd_update_mispredict
@@ -343,7 +367,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   }
 
   when (do_commit_update) {
-    bpd_ptr := WrapInc(bpd_ptr, num_entries)
+    bpd_ptr := WrapInc(bpd_ptr, cf_ftq_active)
   }
 
   io.enq.ready := RegNext(!full || do_commit_update)
@@ -353,7 +377,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val redirect_new_entry = WireInit(redirect_entry)
 
   when (io.redirect.valid) {
-    enq_ptr    := WrapInc(io.redirect.bits, num_entries)
+    enq_ptr    := WrapInc(io.redirect.bits, cf_ftq_active)
 
     when (io.brupdate.b2.mispredict) {
     val new_cfi_idx = (io.brupdate.b2.uop.pc_lob ^
@@ -378,13 +402,32 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     ram(RegNext(io.redirect.bits)) := RegNext(redirect_new_entry)
   }
 
+  // On quiesce drain (QS_DRAINING→QS_FETCH), reset all FTQ pointers to their
+  // reset-init canonical values. This ensures pointers stay within
+  // [0, cf_ftq_active-1] after a RECONFIG CSR write changes cf_ftq_active.
+  //
+  // PRIORITY: this block must appear AFTER the redirect handling above so that
+  // Chisel's last-writer-wins semantics guarantee enq_ptr := 1.U overrides any
+  // concurrent redirect enq_ptr := WrapInc(bits, active) that fires on the same
+  // cycle (e.g. the ROB flush redirect from QUIESCE's flush_on_commit).
+  // Without this priority, enq_ptr could become 30 or 31, making the FTQ appear
+  // full and blocking the QS_FETCH packet from being stored → deadlock.
+  when (io.cf_ftq_quiesce_reset) {
+    enq_ptr               := 1.U
+    bpd_ptr               := 0.U
+    deq_ptr               := 0.U
+    first_empty           := true.B
+    bpd_update_mispredict := false.B
+    bpd_update_repair     := false.B
+  }
+
   //-------------------------------------------------------------
   // **** Core Read PCs ****
   //-------------------------------------------------------------
 
   for (i <- 0 until 2) {
     val idx = io.get_ftq_pc(i).ftq_idx
-    val next_idx = WrapInc(idx, num_entries)
+    val next_idx = WrapInc(idx, cf_ftq_active)
     val next_is_enq = (next_idx === enq_ptr) && io.enq.fire
     val next_pc = Mux(next_is_enq, io.enq.bits.pc, pcs(next_idx))
     val get_entry = ram(idx)

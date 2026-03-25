@@ -84,6 +84,10 @@ class ICacheBundle(val outer: ICache) extends BoomBundle()(outer.p)
   // corefuzzing: domain of s1 fetch PC (1=attacker, 0=victim), for domain mismatch detection
   val s1_domain_id = Input(Bool())
 
+  // corefuzzing: ICache set/way reconfiguration indices (from icacheCSRCF at 0xbcb)
+  val cf_icache_set_conf = Input(UInt(2.W))  // index into icacheSetOptions = Seq(64, 32, 16, 8)
+  val cf_icache_way_conf = Input(UInt(2.W))  // index into cacheWayOptions  = Seq(8, 4, 2, 1)
+
   val perf = Output(new Bundle {
     val acquire = Bool()
   })
@@ -106,6 +110,7 @@ object GetPropertyByHartId
  */
 class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   with HasBoomFrontendParameters
+  with freechips.rocketchip.util.CoreFuzzingConstants
 {
   val enableICacheDelay = tileParams.core.asInstanceOf[BoomCoreParams].enableICacheDelay
   val io = IO(new ICacheBundle(outer))
@@ -137,9 +142,20 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val refill_valid = RegInit(false.B)
   val refill_fire = tl_out.a.fire
   val s2_miss = s2_valid && !s2_hit && !RegNext(refill_valid)
+
+  // corefuzzing: runtime ICache set/way reconfiguration
+  // icacheSetOptions = Seq(64, 32, 16, 8); cacheWayOptions = Seq(8, 4, 2, 1)
+  // All options are powers of 2, so (active_sets - 1) is a valid AND-mask.
+  val icacheSetOptionsVec = VecInit(icacheSetOptions.map(_.U))
+  val cacheWayOptionsVec  = VecInit(cacheWayOptions.map(_.U))
+  val cf_icache_active_sets = icacheSetOptionsVec(io.cf_icache_set_conf)
+  val cf_icache_active_ways = cacheWayOptionsVec(io.cf_icache_way_conf)
+  val icache_set_mask = cf_icache_active_sets - 1.U
+
   val refill_paddr = RegEnable(io.s1_paddr, s1_valid && !(refill_valid || s2_miss))
   val refill_tag = refill_paddr(tagBits+untagBits-1,untagBits)
-  val refill_idx = refill_paddr(untagBits-1,blockOffBits)
+  // Mask refill set index to active sets so refills stay within active region
+  val refill_idx = refill_paddr(untagBits-1,blockOffBits) & icache_set_mask
   val refill_one_beat = tl_out.d.fire && edge_out.hasData(tl_out.d.bits)
 
   io.req.ready := !refill_one_beat
@@ -150,48 +166,62 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   require (edge_out.manager.minLatency > 0)
   val replacer_LRU = outer.icacheParams.replacement_LRU
   val replacer_RAND = outer.icacheParams.replacement_RAND
-  // replace truw with config CSR flag
-  val repl_way = if (isDM) 0.U else ( if (true) replacer_LRU.way else replacer_RAND.way) // if (isDM) 0.U else LFSR(16, refill_fire)(log2Ceil(nWays)-1,0)
+  val repl_way_raw = if (isDM) 0.U else ( if (true) replacer_LRU.way else replacer_RAND.way)
+  // Clamp replacement way to active ways (prevent evicting outside active region)
+  val repl_way = Mux(repl_way_raw < cf_icache_active_ways, repl_way_raw, 0.U)
+
+  // Masked set index for tag/data array reads (s0 stage uses virtual addr)
+  val s0_set_idx_masked = (s0_vaddr(untagBits-1, blockOffBits) & icache_set_mask)(idxBits-1, 0)
+  // Rebuild s0_vaddr with masked set index for use in data-array row functions (row/b0Row/b1Row)
+  val s0_vaddr_msked = Cat(s0_vaddr(s0_vaddr.getWidth-1, untagBits), s0_set_idx_masked,
+                           s0_vaddr(blockOffBits-1, 0))
 
   val tag_array = SyncReadMem(nSets, Vec(nWays, UInt(tagBits.W)))
-  val tag_rdata = tag_array.read(s0_vaddr(untagBits-1, blockOffBits), !refill_done && s0_valid)
+  val tag_rdata = tag_array.read(s0_set_idx_masked, !refill_done && s0_valid)
   when (refill_done) {
     tag_array.write(refill_idx, VecInit(Seq.fill(nWays)(refill_tag)), Seq.tabulate(nWays)(repl_way === _.U))
   }
+
+  // corefuzzing: per-way IFT domain BRAM — read in s0 alongside tag_array, result in s1.
+  // Tracks which domain last FILLED each (set, way). On FPGA, infers as BRAM (not FFs).
+  // vb_array invalidation makes all hits false → stale BRAM data is never consumed after flush.
+  val ift_tag_meta = SyncReadMem(nSets, Vec(nWays, Bool()))
+  val ift_rdata    = ift_tag_meta.read(s0_set_idx_masked, !refill_done && s0_valid)
 
   val vb_array = RegInit(0.U((nSets*nWays).W))
   when (refill_one_beat) {
     vb_array := vb_array.bitSet(Cat(repl_way, refill_idx), refill_done && !invalidated)
   }
 
-  // corefuzzing: per-set domain shadow — records whether the last refill into this set was
-  // triggered by an attacker-domain (1) or victim-domain (0) fetch.
-  val icache_set_domain = RegInit(VecInit(Seq.fill(nSets)(false.B)))
+  // corefuzzing: write ift_tag_meta on refill_done (same cycle as tag_array write, one way mask)
   val refill_domain_reg = RegEnable(io.s1_domain_id, s1_valid && !(refill_valid || s2_miss))
-  when (refill_done) { icache_set_domain(refill_idx) := refill_domain_reg }
+  when (refill_done) {
+    ift_tag_meta.write(refill_idx, VecInit(Seq.fill(nWays)(refill_domain_reg)),
+      Seq.tabulate(nWays)(repl_way === _.U))
+  }
 
   when (io.invalidate) {
     vb_array := 0.U
     invalidated := true.B
-    icache_set_domain := VecInit(Seq.fill(nSets)(false.B))
+    // ift_tag_meta not cleared: vb_array flush prevents any tag hits, so stale domain data is unreachable
   }
 
   val s2_dout   = Wire(Vec(nWays, UInt(wordBits.W)))
   val s1_bankid = Wire(Bool())
 
   for (i <- 0 until nWays) {
-    val s1_idx = io.s1_paddr(untagBits-1,blockOffBits)
+    val s1_idx = io.s1_paddr(untagBits-1,blockOffBits) & icache_set_mask
     val s1_tag = io.s1_paddr(tagBits+untagBits-1,untagBits)
     val s1_vb = vb_array(Cat(i.U, s1_idx))
     val tag = tag_rdata(i)
-    s1_tag_hit(i) := s1_vb && tag === s1_tag
+    // Gate hits for ways beyond the active way count
+    s1_tag_hit(i) := s1_vb && tag === s1_tag && (i.U < cf_icache_active_ways)
   }
   assert(PopCount(s1_tag_hit) <= 1.U || !s1_valid)
 
-  // corefuzzing: check if s1 hit set was last filled by a different domain
-  val s1_hit_idx     = io.s1_paddr(untagBits-1, blockOffBits)
-  val s1_set_domain  = icache_set_domain(s1_hit_idx)
-  val s1_domain_mismatch = s1_hit && (s1_set_domain =/= io.s1_domain_id)
+  // corefuzzing: mux per-way IFT domain by hit way in s1 (ift_rdata was read from s0 address)
+  val s1_way_domain      = Mux1H(s1_tag_hit, ift_rdata)
+  val s1_domain_mismatch = s1_hit && (s1_way_domain =/= io.s1_domain_id)
   val s2_domain_mismatch = RegNext(s1_domain_mismatch && !io.s1_kill)
 
   val ramDepth = if (refillsToOneBank && nBanks == 2) {
@@ -237,7 +267,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
       val wen = (refill_one_beat && !invalidated) && repl_way === i.U
 
       val mem_idx = Mux(refill_one_beat, (refill_idx << log2Ceil(refillCycles)) | refill_cnt,
-                    row(s0_vaddr))
+                    row(s0_vaddr_msked))
       when (wen) {
         dataArray.write(mem_idx, tl_out.d.bits.data)
       }
@@ -280,10 +310,10 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
         // write a refill beat across only one beat.
         mem_idx0 =
           Mux(refill_one_beat, (refill_idx << (log2Ceil(refillCycles)-1)) | (refill_cnt >> 1.U),
-          b0Row(s0_vaddr))
+          b0Row(s0_vaddr_msked))
         mem_idx1 =
           Mux(refill_one_beat, (refill_idx << (log2Ceil(refillCycles)-1)) | (refill_cnt >> 1.U),
-          b1Row(s0_vaddr))
+          b1Row(s0_vaddr_msked))
 
         when (wen && refill_cnt(0) === 0.U) {
           dataArraysB0(i).write(mem_idx0, tl_out.d.bits.data)
@@ -295,10 +325,10 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
         // write a refill beat across both banks.
         mem_idx0 =
           Mux(refill_one_beat, (refill_idx << log2Ceil(refillCycles)) | refill_cnt,
-          b0Row(s0_vaddr))
+          b0Row(s0_vaddr_msked))
         mem_idx1 =
           Mux(refill_one_beat, (refill_idx << log2Ceil(refillCycles)) | refill_cnt,
-          b1Row(s0_vaddr))
+          b1Row(s0_vaddr_msked))
 
         when (wen) {
           val data = tl_out.d.bits.data

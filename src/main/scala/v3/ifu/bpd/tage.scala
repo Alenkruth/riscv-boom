@@ -230,7 +230,9 @@ case class BoomTageParams(
 )
 
 
-class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implicit p: Parameters) extends BranchPredictorBank()(p)
+class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implicit p: Parameters)
+  extends BranchPredictorBank()(p)
+  with freechips.rocketchip.util.CoreFuzzingConstants
 {
   val tageUBitPeriod = params.uBitPeriod
   val tageNTables    = params.tableInfo.size
@@ -290,8 +292,13 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
   // added for the fuzzycore project - AK
   // Create a val that will be written with the reconfigure signal from io
   val cf_bpd_tage_to_gshare = Wire(Bool())
-
   cf_bpd_tage_to_gshare := io.cf_bpd_tage_to_gshare
+
+  // corefuzzing: runtime TAGE active table count selection
+  val tageOptionsVec = VecInit(tagetableCountOptions.map(_.U))
+  val cf_tage_active = tageOptionsVec(io.cf_tage_count_idx)
+  // Bitmask of active tables: bits [cf_tage_active-1:0] = 1
+  val tage_active_mask = ((1.U(tageNTables.W) << cf_tage_active) - 1.U)(tageNTables-1, 0)
 
   for (w <- 0 until bankWidth) {
     var altpred = io.resp_in(0).f3(w).taken
@@ -307,29 +314,20 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
       // We use bank three of the TAGE predictor to emulate the behavior of a GShare predictor.
       // Addition for the fuzzycore project - AK
       // use_bank will be false only when cf_bpd_tage_to_gshare is true and i !== 0.
+      // corefuzzing: also gate by active table count (i.U < cf_tage_active)
       val bank_id = Wire(UInt(3.W))
-      // val temp_bank0 = Wire(Bool())
       val use_bank3 = Wire(Bool())
       bank_id := i.asUInt
-      use_bank3 := !(cf_bpd_tage_to_gshare ^ bank_id === 3.U(3.W))
-      // temp_bank0 := bank_id ===  0.U(3.W)
-      // printf(s"\nuse_bank is $use_bank3 = %c\n", use_bank3)
-      // use_bank0 := !cf_bpd_tage_to_gshare || temp_bank0
-      // printf("\nbank_id = %x || use_bank0 = %b || cf_bpd_tage_to_gshare = %b || hit = %b || condition = %b \n", bank_id, use_bank3, cf_bpd_tage_to_gshare, hit && !(cf_bpd_tage_to_gshare ^ bank_id === 3.U), !(cf_bpd_tage_to_gshare ^ bank_id === 3.U))
-      //when (cf_bpd_tage_to_gshare) {
-      //  printf("Baby Yoda!!")
-      // }
-      // printf("\nBank_id = %d | cf_bpd_tage_to_gshare = %b | prediction from bank? = %b \n", bank_id, cf_bpd_tage_to_gshare, hit && use_bank3)
+      use_bank3 := !(cf_bpd_tage_to_gshare ^ bank_id === 3.U(3.W)) && (i.U < cf_tage_active)
       when (hit && use_bank3) {
-        // printf("\nHit in tage bank %d\n", bank_id)
-        // printf("\n cf_bpd_tage_to_gshare = %b\n", cf_bpd_tage_to_gshare)
         io.resp.f3(w).taken := Mux(ctr === 3.U || ctr === 4.U, altpred, ctr(2))
         final_altpred       := altpred
       }
 
-      provided = provided || hit
-      provider = Mux(hit, i.U, provider)
-      altpred  = Mux(hit, f3_resps(i)(w).bits.ctr(2), altpred)
+      // corefuzzing: only update provided/provider/altpred for active tables
+      provided = provided || (hit && (i.U < cf_tage_active))
+      provider = Mux(hit && (i.U < cf_tage_active), i.U, provider)
+      altpred  = Mux(hit && (i.U < cf_tage_active), f3_resps(i)(w).bits.ctr(2), altpred)
     }
     f3_meta.provider(w).valid := provided
     f3_meta.provider(w).bits  := provider
@@ -339,9 +337,11 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
 
     // Create a mask of tables which did not hit our query, and also contain useless entries
     // and also uses a longer history than the provider
+    // corefuzzing: restrict allocation to active tables only (tage_active_mask)
     val allocatable_slots = (
       VecInit(f3_resps.map(r => !r(w).valid && r(w).bits.u === 0.U)).asUInt &
-      ~(MaskLower(UIntToOH(provider)) & Fill(tageNTables, provided))
+      ~(MaskLower(UIntToOH(provider)) & Fill(tageNTables, provided)) &
+      tage_active_mask
     )
     val alloc_lfsr = random.LFSR(tageNTables max 2)
 
