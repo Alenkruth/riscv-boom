@@ -26,8 +26,11 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
     val ptw = new TLBPTWIO
     val kill = Input(Bool())
     // corefuzzing: domain tracking
-    val req_domain          = Input(Vec(memWidth, UInt(1.W)))
+    val req_domain           = Input(Vec(memWidth, UInt(1.W)))
     val resp_domain_mismatch = Output(Vec(memWidth, Bool()))
+    // corefuzzing: secret tracking — entry was loaded by a secret-labeled instruction
+    val req_secret           = Input(Vec(memWidth, Bool()))
+    val resp_secret_mismatch = Output(Vec(memWidth, Bool()))
   })
   io.ptw := DontCare
   io.resp := DontCare
@@ -145,6 +148,11 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   val sectored_domain        = RegInit(VecInit(Seq.fill(sectored_entries.size)(0.U(1.W))))
   val superpage_domain       = RegInit(VecInit(Seq.fill(superpage_entries.size)(0.U(1.W))))
   val special_domain         = special_entry.map(_ => RegInit(0.U(1.W)))
+  // corefuzzing: secret shadow arrays (parallel to domain arrays)
+  val r_refill_secret        = RegInit(false.B)
+  val sectored_secret        = RegInit(VecInit(Seq.fill(sectored_entries.size)(false.B)))
+  val superpage_secret       = RegInit(VecInit(Seq.fill(superpage_entries.size)(false.B)))
+  val special_secret         = special_entry.map(_ => RegInit(false.B))
 
   val priv = if (instruction) io.ptw.status.prv else io.ptw.status.dprv
   val priv_s = priv(0)
@@ -208,21 +216,24 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
 
     when (special_entry.nonEmpty.B && !io.ptw.resp.bits.homogeneous) {
       special_entry.foreach(_.insert(r_refill_tag, io.ptw.resp.bits.level, newEntry))
-      // corefuzzing: write domain to special_domain
+      // corefuzzing: write domain and secret to special shadow arrays
       special_domain.foreach(_ := r_refill_domain)
+      special_secret.foreach(_ := r_refill_secret)
     }.elsewhen (io.ptw.resp.bits.level < (pgLevels-1).U) {
       for ((e, i) <- superpage_entries.zipWithIndex) when (r_superpage_repl_addr === i.U) {
         e.insert(r_refill_tag, io.ptw.resp.bits.level, newEntry)
-        // corefuzzing: write domain to superpage_domain
+        // corefuzzing: write domain and secret to superpage shadow arrays
         superpage_domain(i) := r_refill_domain
+        superpage_secret(i) := r_refill_secret
       }
     }.otherwise {
       val waddr = Mux(r_sectored_hit, r_sectored_hit_addr, r_sectored_repl_addr)
       for ((e, i) <- sectored_entries.zipWithIndex) when (waddr === i.U) {
         when (!r_sectored_hit) { e.invalidate() }
         e.insert(r_refill_tag, 0.U, newEntry)
-        // corefuzzing: write domain to sectored_domain
+        // corefuzzing: write domain and secret to sectored shadow arrays
         sectored_domain(i) := r_refill_domain
+        sectored_secret(i) := r_refill_secret
       }
     }
   }
@@ -326,11 +337,14 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
     io.resp(w).size := io.req(w).bits.size
     io.resp(w).cmd := io.req(w).bits.cmd
 
-    // corefuzzing: domain mismatch output
-    // Build all_domain parallel to all_entries for hit lookup
-    val all_domain = VecInit(sectored_domain ++ superpage_domain ++ special_domain.toSeq)
-    val hit_domain = Mux1H(hitsVec(w), all_domain)
+    // corefuzzing: domain and secret mismatch outputs
+    val all_domain  = VecInit(sectored_domain ++ superpage_domain ++ special_domain.toSeq)
+    val all_secret  = VecInit(sectored_secret ++ superpage_secret ++ special_secret.toSeq)
+    val hit_domain  = Mux1H(hitsVec(w), all_domain)
+    val hit_secret  = Mux1H(hitsVec(w), all_secret)
     io.resp_domain_mismatch(w) := io.req(w).valid && tlb_hit(w) && (hit_domain =/= io.req_domain(w))
+    // Secret mismatch: entry was loaded by a secret instruction but current request is non-secret
+    io.resp_secret_mismatch(w) := io.req(w).valid && tlb_hit(w) && hit_secret && !io.req_secret(w)
   }
 
   io.ptw.req.valid := state === s_request
@@ -343,8 +357,9 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
       when (io.req(w).fire && tlb_miss(w) && state === s_ready) {
         state := s_request
         r_refill_tag := vpn(w)
-        // corefuzzing: capture domain of the miss-causing uop
-        r_refill_domain := io.req_domain(w)
+        // corefuzzing: capture domain and secret status of the miss-causing uop
+        r_refill_domain  := io.req_domain(w)
+        r_refill_secret  := io.req_secret(w)
 
         r_superpage_repl_addr := replacementEntry(superpage_entries, superpage_plru.way)
         r_sectored_repl_addr  := replacementEntry(sectored_entries, sectored_plru.way)
