@@ -152,8 +152,23 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val cf_icache_active_ways = cacheWayOptionsVec(io.cf_icache_way_conf)
   val icache_set_mask = cf_icache_active_sets - 1.U
 
+  // Extended tag: use bits down to the minimum active set boundary (icacheSetOptions.min = 8).
+  // With the standard tag = paddr[63:untagBits], two addresses that map to the SAME masked
+  // set index can share the same tag even if their full (unmasked) set indices differ.
+  // Example with 8 active sets (untagBits=12): paddr[63:12] is identical for 0x80001084 and
+  // 0x80001684 (both = 0x80001), but they map to different full sets (2 vs 26).  After masking,
+  // both land in physical row 2 and the narrow tag comparison produces a FALSE HIT.
+  //
+  // Fix: widen the stored tag to paddr[63:minUntagBits] where minUntagBits uses the MINIMUM
+  // active set count.  This includes the "inactive" set bits as extra tag bits, ensuring that
+  // addresses differing only in those bits always produce a tag mismatch.
+  // Cost: tag SRAM grows by (untagBits - minUntagBits) bits per entry (3 bits for 64→8 range).
+  val icacheMinActiveSets = icacheSetOptions.min                   // = 8
+  val minUntagBits = log2Ceil(icacheMinActiveSets) + blockOffBits  // = 3 + 6 = 9
+  val extTagBits   = tagBits + untagBits - minUntagBits            // pAddrBits - minUntagBits
+
   val refill_paddr = RegEnable(io.s1_paddr, s1_valid && !(refill_valid || s2_miss))
-  val refill_tag = refill_paddr(tagBits+untagBits-1,untagBits)
+  val refill_tag = refill_paddr(tagBits+untagBits-1, minUntagBits)
   // Mask refill set index to active sets so refills stay within active region
   val refill_idx = refill_paddr(untagBits-1,blockOffBits) & icache_set_mask
   val refill_one_beat = tl_out.d.fire && edge_out.hasData(tl_out.d.bits)
@@ -176,7 +191,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val s0_vaddr_msked = Cat(s0_vaddr(s0_vaddr.getWidth-1, untagBits), s0_set_idx_masked,
                            s0_vaddr(blockOffBits-1, 0))
 
-  val tag_array = SyncReadMem(nSets, Vec(nWays, UInt(tagBits.W)))
+  val tag_array = SyncReadMem(nSets, Vec(nWays, UInt(extTagBits.W)))
   val tag_rdata = tag_array.read(s0_set_idx_masked, !refill_done && s0_valid)
   when (refill_done) {
     tag_array.write(refill_idx, VecInit(Seq.fill(nWays)(refill_tag)), Seq.tabulate(nWays)(repl_way === _.U))
@@ -211,7 +226,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
 
   for (i <- 0 until nWays) {
     val s1_idx = io.s1_paddr(untagBits-1,blockOffBits) & icache_set_mask
-    val s1_tag = io.s1_paddr(tagBits+untagBits-1,untagBits)
+    val s1_tag = io.s1_paddr(tagBits+untagBits-1, minUntagBits)
     val s1_vb = vb_array(Cat(i.U, s1_idx))
     val tag = tag_rdata(i)
     // Gate hits for ways beyond the active way count

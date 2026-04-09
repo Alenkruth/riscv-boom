@@ -300,6 +300,10 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   val redirect_pc      = Output(UInt()) // Where do we redirect to?
   val redirect_ftq_idx = Output(UInt()) // Which ftq entry should we reset to?
   val redirect_ghist   = Output(new GlobalHistory) // What are we setting as the global history?
+  // corefuzzing: true when redirect_flush was caused by a branch misprediction (not flush_on_commit).
+  // Used to suppress s0_vpc update during quiesce (allow_fetch=false) so the Packet-B/C oscillation
+  // is preserved. ROB flush-on-commit redirects (e.g., Packet A → Packet B) always update s0_vpc.
+  val redirect_flush_is_mispredict = Output(Bool())
 
   val commit = Valid(UInt(ftqSz.W))
 
@@ -315,6 +319,8 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   val cf_bpd_tage_to_gshare = Output(Bool())
   // 3-bit index into fetchBufferEntryOptions for fetch-buffer reconfiguration
   val cf_fb_idx = Output(UInt(3.W))
+  // 3-bit effective decode width for core-width throttling (1, 2, or 4)
+  val cf_active_width = Output(UInt(3.W))
   // 2-bit index into ftQueueEntryOptions for FTQ reconfiguration
   val cf_ftq_idx = Output(UInt(2.W))
   // 2-bit index into rasEntryCountOptions for RAS reconfiguration
@@ -335,6 +341,11 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   val allow_fetch       = Output(Bool())
   // Pulse on QS_DRAINING→QS_FETCH transition: reset FTQ pointers to canonical state
   val cf_ftq_quiesce_reset = Output(Bool())
+  // Suppress BTB/BPD redirects during quiesce to prevent stale predictions from
+  // killing single-step fetch packets mid-bundle (driven = cf_quiesce_core)
+  val cf_btb_quiesce = Output(Bool())
+  // Pulse to clear all RAS domain/secret shadow bits on quiesce flush
+  val cf_ras_quiesce_flush = Output(Bool())
 
   // ICache set/way reconfiguration indices (from icacheCSRCF at 0xbcb)
   // bits[1:0]: set index into icacheSetOptions = Seq(64, 32, 16, 8)
@@ -437,15 +448,19 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_tsrc    := BSRC_C
   }
 
+  // corefuzzing: fetch-throttle gate — driven by FetchBuffer cooldown timer after fb is instantiated.
+  // Declared here (before fb) to allow use at the icache/bpd req sites; single driver assigned below.
+  val cf_fetch_throttle_gate = Wire(Bool())
+
   // for corefuzzing
   // icache.io.req.valid := s0_valid
-  icache.io.req.valid     := s0_valid && io.cpu.allow_fetch
+  icache.io.req.valid     := s0_valid && io.cpu.allow_fetch && cf_fetch_throttle_gate
   icache.io.req.bits.addr := s0_vpc
 
   // corefuzzing: gate BPD requests when fetch is blocked (quiesce/QS_DRAINING).
   // Previously un-gated, BPD continued predicting during QS_DRAINING, queuing FTQ entries
   // that the IFU processed immediately on allow_fetch re-enable, causing over-fetch.
-  bpd.io.f0_req.valid      := s0_valid && io.cpu.allow_fetch
+  bpd.io.f0_req.valid      := s0_valid && io.cpu.allow_fetch && cf_fetch_throttle_gate
   bpd.io.f0_req.bits.pc    := s0_vpc
   bpd.io.f0_req.bits.ghist := s0_ghist
   // corefuzzing: compute s0 domain for BPD domain shadow tracking
@@ -461,6 +476,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   bpd.io.cf_btb_set_idx    := io.cpu.cf_btb_set_idx
   bpd.io.cf_btb_way_idx    := io.cpu.cf_btb_way_idx
   bpd.io.cf_tage_count_idx := io.cpu.cf_tage_count_idx
+  bpd.io.cf_btb_quiesce    := io.cpu.cf_btb_quiesce
 
   // --------------------------------------------------------
   // **** ICache Access (F1) ****
@@ -543,7 +559,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       (s1_bpd_resp.preds(i).is_br && s1_bpd_resp.preds(i).taken))
   }
   val f1_redirect_idx = PriorityEncoder(f1_redirects)
-  val f1_do_redirect = f1_redirects.reduce(_||_) && useBPD.B
+  val f1_do_redirect = f1_redirects.reduce(_||_) && useBPD.B && !io.cpu.cf_btb_quiesce
   val f1_targs = s1_bpd_resp.preds.map(_.predicted_pc.bits)
   val f1_predicted_target = Mux(f1_do_redirect,
                                 f1_targs(f1_redirect_idx),
@@ -598,7 +614,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   }
   val f2_redirect_idx = PriorityEncoder(f2_redirects)
   val f2_targs = f2_bpd_resp.preds.map(_.predicted_pc.bits)
-  val f2_do_redirect = f2_redirects.reduce(_||_) && useBPD.B
+  val f2_do_redirect = f2_redirects.reduce(_||_) && useBPD.B && !io.cpu.cf_btb_quiesce
   val f2_predicted_target = Mux(f2_do_redirect,
                                 f2_targs(f2_redirect_idx),
                                 nextFetch(s2_vpc))
@@ -918,7 +934,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     f3_prev_is_half := false.B
   }
 
-  f3_fetch_bundle.cfi_idx.valid := f3_redirects.reduce(_||_)
+  // corefuzzing: suppress BTB/BPD redirects during quiesce to prevent stale predictions
+  // from cancelling single-step fetch packets (cf_btb_quiesce = cf_quiesce_core in core.scala)
+  f3_fetch_bundle.cfi_idx.valid := f3_redirects.reduce(_||_) && !io.cpu.cf_btb_quiesce
   f3_fetch_bundle.cfi_idx.bits  := PriorityEncoder(f3_redirects)
 
   f3_fetch_bundle.ras_top := ras.io.read_addr
@@ -1036,11 +1054,14 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     Module(new Queue(new FetchBundle, 1, pipe=true, flow=false))}
 
   val fb  = Module(new FetchBuffer)
+  // corefuzzing: drive the fetch-throttle gate Wire now that fb is instantiated
+  cf_fetch_throttle_gate := fb.io.fetch_throttle_gate
   val ftq = Module(new FetchTargetQueue)
   // corefuzzing: late secret update from FTQ — fires when a secret instruction commits from a
   // call-containing fetch packet, retroactively marking the pushed RAS slot as secret
   ras.io.late_write_secret_valid := ftq.io.cf_ras_secret_upd_valid
   ras.io.late_write_secret_idx   := ftq.io.cf_ras_secret_upd_idx
+  ras.io.quiesce_flush           := io.cpu.cf_ras_quiesce_flush
   // corefuzzing
   // Wire frontend cf_debug gate into fetch buffer and FTQ
   fb.io.cf_debug_fetchbuf_enable := io.cpu.cf_debug_frontend_enable
@@ -1112,7 +1133,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   ).asBools
 
   // value from associated CSR for corefuzzing - alex
-  fb.io.cf_fb_idx := io.cpu.cf_fb_idx
+  fb.io.cf_fb_idx          := io.cpu.cf_fb_idx
+  fb.io.cf_active_width    := io.cpu.cf_active_width
 
 
   ftq.io.enq.valid          := f4.io.deq.valid && fb.io.enq.ready && !f4_delay
@@ -1192,7 +1214,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     f3_prev_is_half := false.B
 
     s0_valid     := io.cpu.redirect_val
-    s0_vpc       := io.cpu.redirect_pc
+    // corefuzzing: suppress branch-mispredict PC update during quiesce (allow_fetch=false).
+    // The Packet-B/C oscillation (established by Packet A's flush_on_commit) must be
+    // preserved so QS_FETCH resumes from Packet B, not from the branch target.
+    // ROB flush-on-commit redirects (redirect_flush_is_mispredict=false) always update s0_vpc.
+    s0_vpc       := Mux(io.cpu.redirect_flush_is_mispredict && !io.cpu.allow_fetch,
+                        s1_vpc, io.cpu.redirect_pc)
     s0_ghist     := io.cpu.redirect_ghist
     s0_tsrc      := BSRC_C
     s0_is_replay := false.B

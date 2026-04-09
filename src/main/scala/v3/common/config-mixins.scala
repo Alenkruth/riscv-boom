@@ -32,6 +32,29 @@ class WithBoomCommitLogPrintf extends Config((site, here, up) => {
   }
 })
 
+// Disables commit-log printfs for FireSim FPGA builds where IFTBridge replaces them.
+// Overrides the enableCommitLogPrintf=true set by WithBoomCommitLogPrintf inside WithFuzzingBoom.
+class WithoutBoomCommitLogPrintf extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      enableCommitLogPrintf = false
+    )))
+    case other => other
+  }
+})
+
+
+// WithIFTBridge: export IFT commit/squash records as tile-level BundleBridge IO.
+// Add to a FireSim config on top of CoreFuzzingConfig to enable the IFTBridge path.
+// Has zero effect on Verilator simulation (CoreFuzzingConfig leaves enableIFTBridge=false).
+class WithIFTBridge extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      enableIFTBridge = true
+    )))
+    case other => other
+  }
+})
 
 class WithBoomBranchPrintf extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
@@ -435,25 +458,25 @@ class WithFuzzingBoom(n: Int = 1, overrideIdOffset: Option[Int] = None) extends 
             core = BoomCoreParams(
               fetchWidth = 8,
               decodeWidth = 4,
-              numRobEntries = 512, // must equal robEntryOptions(0); hardware is built at this size
+              numRobEntries = 256, // must equal robEntryOptions(0); hardware is built at this size
               issueParams = Seq(
-                IssueParams(issueWidth=2, numEntries=64, iqType=IQT_MEM.litValue, dispatchWidth=4),
-                IssueParams(issueWidth=4, numEntries=64, iqType=IQT_INT.litValue, dispatchWidth=4),
-                IssueParams(issueWidth=2, numEntries=64, iqType=IQT_FP.litValue , dispatchWidth=4)),
-              numIntPhysRegisters = 256,
-              numFpPhysRegisters = 256,
-              numLdqEntries = 64,
-              numStqEntries = 64,
+                IssueParams(issueWidth=2, numEntries=32, iqType=IQT_MEM.litValue, dispatchWidth=4),
+                IssueParams(issueWidth=4, numEntries=32, iqType=IQT_INT.litValue, dispatchWidth=4),
+                IssueParams(issueWidth=2, numEntries=32, iqType=IQT_FP.litValue , dispatchWidth=4)),
+              numIntPhysRegisters = 192,
+              numFpPhysRegisters = 192,
+              numLdqEntries = 48,
+              numStqEntries = 48,
               maxBrCount = 20,
-              numFetchBufferEntries = 128, // max(fetchBufferEntryOptions) = 128; must be multiple of fetchWidth (8)
+              numFetchBufferEntries = 64, // max(fetchBufferEntryOptions) = 64; must be multiple of fetchWidth (8)
               enablePrefetching = true,
               numDCacheBanks = 1,
               ftq = FtqParameters(nEntries=32), // max(ftQueueEntryOptions) = 32
-              nPerfCounters = 29,
+              nPerfCounters = 0,
               fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true))
             ),
             dcache = Some(
-              DCacheParams(rowBits = 128, nSets=128, nWays=8, nMSHRs=8, nTLBWays=32)
+              DCacheParams(rowBits = 128, nSets=128, nWays=8, nMSHRs=4, nTLBWays=32)
             ),
             icache = Some(
               ICacheParams(rowBits = 128, nSets=64, nWays=8, fetchBytes=4*4)

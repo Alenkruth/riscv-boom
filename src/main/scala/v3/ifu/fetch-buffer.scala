@@ -70,6 +70,10 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     // [FLUSH] SRC=0 entries carry the correct domain even before decode.
     val cf_attacker_start_addr = Input(UInt(vaddrBitsExtended.W))
     val cf_attacker_end_addr   = Input(UInt(vaddrBitsExtended.W))
+    // 3-bit active width {4, 2, 1}: controls sub-row slicing and fetch cooldown
+    val cf_active_width     = Input(UInt(3.W))
+    // High when fetch cooldown is zero (gates IFU allow_fetch in the frontend)
+    val fetch_throttle_gate = Output(Bool())
   })
 
   // original
@@ -92,9 +96,15 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   val tail = RegInit(1.U(numEntries.W))
 
   val maybe_full = RegInit(false.B)
+  // Sub-row slicing: which group of N slots is being served from the current head row.
+  // Resets on flush (io.clear) so the next fetch starts from slot 0 of a fresh row.
+  val sub_row_cnt = RegInit(0.U(log2Ceil(coreWidth).W))
+  // Fetch cooldown: cycles remaining before IFU may issue the next fetch bundle.
+  // Prevents IFU from over-filling the FetchBuffer relative to decode throughput.
+  val fetch_cooldown_cnt = RegInit(0.U(3.W))
 
   // fetch-buffer size: runtime-reconfigurable via cf_fb_idx CSR
-  // fetchBufferEntryOptions = Seq(128, 64, 32, 24, 16, 8), rows per option (÷ coreWidth=4): 32,16,8,6,4,2
+  // rows per option = fetchBufferEntryOptions.map(_ / coreWidth)
   val rowsOptionsVec = VecInit(fetchBufferEntryOptions.map(e => (e / coreWidth).U))
   val rowsUsed = WireInit(rowsOptionsVec(io.cf_fb_idx))
   dontTouch(rowsUsed)
@@ -103,6 +113,18 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   dontTouch(rowNum_tail)
   dontTouch(rowNum_head)
 
+  // groups_per_row: how many N-slot sub-groups fit in one coreWidth row.
+  // Derived from coreWidth and active width so values update if parameters change.
+  // N=coreWidth → 1 group (no slicing), N=coreWidth/2 → 2 groups, N=1 → coreWidth groups
+  val groups_per_row = MuxLookup(io.cf_active_width, 1.U(3.W))(
+    Seq(2.U -> (coreWidth/2).U, 1.U -> coreWidth.U))
+  // last_group: true when this is the final sub-group of the current row
+  // At N=coreWidth: groups_per_row=1, sub_row_cnt=0, 0===0 → always true (no change to head advance)
+  val last_group = (sub_row_cnt === groups_per_row - 1.U)
+  // fetch_cooldown_period: (fetchWidth/N) - 1; 0 at N=coreWidth so gate is always open.
+  // Derived from fetchWidth/coreWidth parameters so values update if parameters change.
+  val fetch_cooldown_period = MuxLookup(io.cf_active_width, 0.U(3.W))(
+    Seq(2.U -> (fetchWidth/2 - 1).U, 1.U -> (fetchWidth - 1).U))
 
   // used ChatGPT to write these switch statements (head and tail) for debugging - alex, corefuzzing
   // for numRows = 16
@@ -127,24 +149,17 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // Step 3: Write MicroOps into the RAM.
 
 
-  // Rotate `in` (numEntries=128 wide, tail pointer) left by k positions within the active segment.
-  // fetchBufferEntryOptions = Seq(128, 64, 32, 24, 16, 8) → segments selected by cf_fb_idx.
-  // All bit-slice bounds are compile-time constants (k is a Scala Int).
+  // Rotate `in` (numEntries-wide tail pointer, one-hot) left by k positions within the active segment.
+  // Parameterized from fetchBufferEntryOptions — no hardcoded sizes.
+  // k is a Scala Int (compile-time constant), so all bit-slice bounds are elaboration-time constants.
   def rotateLeft(in: UInt, k: Int) = {
-    val r = Wire(UInt(numEntries.W))
-    when (io.cf_fb_idx === 0.U) {          // 128 entries
-      r := Cat(in(127-k,0), in(127, 128-k))
-    } .elsewhen (io.cf_fb_idx === 1.U) {   // 64 entries
-      r := Cat(0.U(64.W), in(63-k,0), in(63, 64-k))
-    } .elsewhen (io.cf_fb_idx === 2.U) {   // 32 entries
-      r := Cat(0.U(96.W), in(31-k,0), in(31, 32-k))
-    } .elsewhen (io.cf_fb_idx === 3.U) {   // 24 entries
-      r := Cat(0.U(104.W), in(23-k,0), in(23, 24-k))
-    } .elsewhen (io.cf_fb_idx === 4.U) {   // 16 entries
-      r := Cat(0.U(112.W), in(15-k,0), in(15, 16-k))
-    } .otherwise {                         // 8 entries (idx 5)
-      r := Cat(0.U(120.W), in(7-k,0), in(7, 8-k))
+    val cases = fetchBufferEntryOptions.zipWithIndex.map { case (n, idx) =>
+      val pad = numEntries - n
+      val rotated = if (pad == 0) Cat(in(n-k-1, 0), in(n-1, n-k))
+                    else Cat(0.U(pad.W), in(n-k-1, 0), in(n-1, n-k))
+      (io.cf_fb_idx === idx.U) -> rotated
     }
+    val r = MuxCase(0.U(numEntries.W), cases)
     Mux(r.orR, r, 1.U(numEntries.W))
   }
 
@@ -308,30 +323,24 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // Step 2. Generate one-hot write indices.
   val enq_idxs = Wire(Vec(fetchWidth, UInt(numEntries.W)))
 
-  // Advance head pointer (numRows=32 wide one-hot) by one row within the active segment.
-  // fetchBufferEntryOptions = Seq(128,64,32,24,16,8) → rows = 32,16,8,6,4,2
+  // Advance head pointer (numRows-wide one-hot) by one row within the active segment.
+  // Parameterized from fetchBufferEntryOptions — no hardcoded sizes.
   def inc(ptr: UInt) = {
-    val r = Wire(UInt(numRows.W))
-    when (io.cf_fb_idx === 0.U) {          // 32 rows
-      r := Cat(ptr(30,0), ptr(31))
-    } .elsewhen (io.cf_fb_idx === 1.U) {   // 16 rows
-      r := Cat(0.U(16.W), ptr(14,0), ptr(15))
-    } .elsewhen (io.cf_fb_idx === 2.U) {   // 8 rows
-      r := Cat(0.U(24.W), ptr(6,0), ptr(7))
-    } .elsewhen (io.cf_fb_idx === 3.U) {   // 6 rows
-      r := Cat(0.U(26.W), ptr(4,0), ptr(5))
-    } .elsewhen (io.cf_fb_idx === 4.U) {   // 4 rows
-      r := Cat(0.U(28.W), ptr(2,0), ptr(3))
-    } .otherwise {                         // 2 rows (idx 5)
-      r := Cat(0.U(30.W), ptr(0), ptr(1))
+    val cases = fetchBufferEntryOptions.zipWithIndex.map { case (n, idx) =>
+      val rows = n / coreWidth
+      val pad  = numRows - rows
+      val rotated = if (rows == 1) Cat(0.U(pad.W), ptr(0))
+                    else if (pad == 0) Cat(ptr(rows-2, 0), ptr(rows-1))
+                    else Cat(0.U(pad.W), ptr(rows-2, 0), ptr(rows-1))
+      (io.cf_fb_idx === idx.U) -> rotated
     }
+    val r = MuxCase(0.U(numRows.W), cases)
     Mux(r.orR, r, 1.U(numRows.W))
   }
 
-  // Use rotateLeft(enq_idx, 1) to advance the 128-bit entry-level tail pointer by one entry
-  // within the active buffer segment.  inc() operates on the 32-bit row-level head pointer
-  // only; calling inc() on the 128-bit tail would zero-extend a 32-bit result and corrupt the
-  // tail once it moves past bit 31.
+  // Use rotateLeft(enq_idx, 1) to advance the numEntries-wide entry-level tail pointer by one entry
+  // within the active buffer segment.  inc() operates on the numRows-wide row-level head pointer
+  // only; calling inc() on a wide tail would zero-extend and corrupt it.
   var enq_idx = tail
   for (i <- 0 until fetchWidth) {
     enq_idxs(i) := enq_idx
@@ -389,9 +398,21 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     deq_vec(i/coreWidth)(i%coreWidth) := ram(i)
   }
 
-  io.deq.bits.uops zip deq_valids           map {case (d,v) => d.valid := v}
-  io.deq.bits.uops zip Mux1H(head, deq_vec) map {case (d,q) => d.bits  := q}
-  io.deq.valid := deq_valids.reduce(_||_)
+  // Sub-row mask: slot w is active when it belongs to the current sub-group.
+  // Uses compile-time Scala integer division (w/2) — hardware-friendly constant folding.
+  // N=4: MuxCase default=true → all 4 slots always active (no slicing at full width)
+  // N=2: sub_row_cnt=0 → slots 0,1 (w/2==0); sub_row_cnt=1 → slots 2,3 (w/2==1)
+  // N=1: sub_row_cnt==w → exactly one slot active per cycle
+  val sub_row_mask = VecInit((0 until coreWidth).map { w =>
+    MuxCase(true.B, Seq(
+      (io.cf_active_width === 2.U) -> (sub_row_cnt === (w/2).U),
+      (io.cf_active_width === 1.U) -> (sub_row_cnt === w.U)
+    ))
+  })
+  val deq_valids_sub = VecInit(deq_valids.zip(sub_row_mask).map { case (v, m) => v && m })
+  io.deq.bits.uops zip deq_valids_sub        map {case (d,v) => d.valid := v}
+  io.deq.bits.uops zip Mux1H(head, deq_vec)  map {case (d,q) => d.bits  := q}
+  io.deq.valid := deq_valids_sub.reduce(_||_)
 
   //-------------------------------------------------------------
   // **** Update State ****
@@ -414,15 +435,71 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
 
   // modifying inc() function to account for varying buffer dimensions resuls in properly rotated head - alex, corefuzzing
   when (do_deq) {
-    head := inc(head)
-    maybe_full := false.B
-    // corefuzzing: invalidate the row being consumed so [FLUSH] won't print stale data
-    for (j <- 0 until numEntries) {
-      when (head(j / coreWidth)) { ram_valid(j) := false.B }
+    when (last_group) {
+      // Final sub-group of this row: advance head to the next row
+      sub_row_cnt := 0.U
+      head := inc(head)
+      maybe_full := false.B
+      // corefuzzing: invalidate the row being consumed so [FLUSH] won't print stale data
+      for (j <- 0 until numEntries) {
+        when (head(j / coreWidth)) { ram_valid(j) := false.B }
+      }
+    } .otherwise {
+      // More sub-groups remain in this row: advance sub-row pointer and invalidate
+      // the just-consumed slots so they won't appear in [FLUSH] output.
+      sub_row_cnt := sub_row_cnt + 1.U
+      for (j <- 0 until numEntries) {
+        when (head(j / coreWidth) && sub_row_mask(j % coreWidth)) {
+          ram_valid(j) := false.B
+        }
+      }
     }
     // debugging: printing the row index for each dequeue - alex
     // printf(p"($rowsUsed, deq, $rowNum_head), ")
   }
+
+  // Sub-group empty skip: when N<coreWidth, a correctly-predicted taken CFI in sub-group 0
+  // (slot 0 or 1 of a row) produces a partial packet with valid data ONLY in sub-group 0.
+  // After do_deq fires once (sub_row_cnt 0→1), sub-group 1 (slots 2,3) has no valid data.
+  // Since do_deq requires io.deq.valid (= deq_valids_sub.reduce), it can never fire again
+  // → head never advances → pipeline deadlock.
+  // Fix: advance sub_row_cnt (and head on last_group) whenever the current sub-group is
+  // empty AND the buffer is not empty (will_hit_tail=false) AND not being cleared.
+  // This is mutually exclusive with do_deq (do_deq requires io.deq.valid = true;
+  // sub_group_empty requires it to be false). io.clear (below) still overrides both.
+  val sub_group_empty = !deq_valids_sub.reduce(_||_) && !will_hit_tail && !io.clear
+
+  when (sub_group_empty) {
+    when (last_group) {
+      sub_row_cnt := 0.U
+      head        := inc(head)
+      maybe_full  := false.B
+      for (j <- 0 until numEntries) {
+        when (head(j / coreWidth)) { ram_valid(j) := false.B }
+      }
+    } .otherwise {
+      sub_row_cnt := sub_row_cnt + 1.U
+      for (j <- 0 until numEntries) {
+        when (head(j / coreWidth) && sub_row_mask(j % coreWidth)) {
+          ram_valid(j) := false.B
+        }
+      }
+    }
+  }
+
+  // Undefined width index guard: indices 0→N=coreWidth, 1→N=2, 2→N=1; index 3 is reserved.
+  assert(io.cf_active_width === 1.U || io.cf_active_width === 2.U || io.cf_active_width === coreWidth.U,
+    "[fetch-buffer] cf_active_width must be 1, 2, or coreWidth; index 3 is reserved")
+
+  // Fetch cooldown: starts on each IFU enqueue; decays to 0 each cycle.
+  // At N=coreWidth: fetch_cooldown_period=0, so cnt stays 0 and gate is always 1 (baseline unchanged).
+  // On io.clear: reset below ensures IFU can fetch immediately after a redirect.
+  when (io.enq.fire) {
+    fetch_cooldown_cnt := fetch_cooldown_period
+  } .elsewhen (fetch_cooldown_cnt > 0.U) {
+    fetch_cooldown_cnt := fetch_cooldown_cnt - 1.U
+  }
+  io.fetch_throttle_gate := (fetch_cooldown_cnt === 0.U)
 
   when (io.clear) {
     // corefuzzing: [FLUSH] printing — one printf per valid entry, all in the io.clear cycle.
@@ -476,6 +553,8 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     tail := 1.U
     maybe_full := false.B
     ram_valid := VecInit(Seq.fill(numEntries)(false.B))
+    sub_row_cnt        := 0.U
+    fetch_cooldown_cnt := 0.U
   }
 
   // TODO Is this necessary?

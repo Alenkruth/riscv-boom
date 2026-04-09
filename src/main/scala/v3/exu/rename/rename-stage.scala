@@ -101,10 +101,23 @@ abstract class AbstractRenameStage(
 
     // 3-bit index into pregFileSizeOptions for physical register file size reconfiguration
     val cf_preg_idx = Input(UInt(3.W))
+
+    // Fix 5: retroactive commit-time taint. If a committing instruction's source pregs are
+    // now tainted (C7 fired for a producer in a prior cycle) but cf_src_tainted was false
+    // at rename time, expose this so core can OR it into the commit-log s_prop field.
+    val com_late_taint          = Output(Vec(plWidth, Bool()))
+    val com_late_taint_producer = Output(Vec(plWidth, UInt(uopIDCounterWidthCF.W)))
+    // Fix 5c: late taint for stores/loads (no dst_rtype guard) — fires for any instruction
+    // whose source pregs are now secret-tainted, regardless of whether it writes a register.
+    // Used by core.scala to detect commit-time s_tx on stores.
+    val com_late_taint_any      = Output(Vec(plWidth, Bool()))
   })
 
   io.ren_stalls.foreach(_ := false.B)
   io.debug := DontCare
+  io.com_late_taint.foreach(_ := false.B)
+  io.com_late_taint_producer.foreach(_ := 0.U)
+  io.com_late_taint_any.foreach(_ := false.B)
 
   def BypassAllocations(uop: MicroOp, older_uops: Seq[MicroOp], alloc_reqs: Seq[Bool]): MicroOp
 
@@ -513,7 +526,15 @@ class RenameStage(
       producer_table(ren2_uops(w).pdst)        := ren2_uops(w).cf_op_count_id
       producer_domain_table(ren2_uops(w).pdst) := ren2_uops(w).cf_domain_id === 1.U ||
                                                    (ren2_uops(w).cf_src_tainted && ren2_uops(w).cf_taint_producer_is_atk)
-      producer_secret_table(ren2_uops(w).pdst) := ren2_uops(w).cf_secret_access || ren2_uops(w).cf_secret_propagation
+      // cf_secret_propagation is set at dispatch (core.scala), AFTER ren2, so it is
+      // always false here.  Use cf_taint_producer_is_secret (= any_secret_tainted from
+      // line 491) as a proxy: if any tainted source was secret-derived AND this is a
+      // victim instruction, the dest will get s_prop at dispatch.  This mirrors the
+      // will_be_s_prop logic in step_prod_sec (line 508) so that the Reg write matches
+      // the same-cycle forwarding path.
+      val will_be_s_prop_reg = ren2_uops(w).cf_taint_producer_is_secret &&
+                               (ren2_uops(w).cf_domain_id === 0.U)
+      producer_secret_table(ren2_uops(w).pdst) := ren2_uops(w).cf_secret_access || will_be_s_prop_reg
     }
   }
 
@@ -524,6 +545,78 @@ class RenameStage(
       producer_domain_table(io.com_uops(w).stale_pdst) := false.B
       producer_secret_table(io.com_uops(w).stale_pdst) := false.B
     }
+  }
+
+  // Fix 5: retroactive commit-time taint check with same-cycle forwarding.
+  //
+  // Problem: taint_table writes (C7, Fix 5d) take effect NEXT cycle (register semantics).
+  // When multiple instructions commit in the same retire group (up to coreWidth), a
+  // later slot's com_late_taint check reads the OLD taint_table — missing writes from
+  // earlier slots in the same group.
+  //
+  // Solution: same-cycle forwarding within the commit group (same pattern as dispatch-time
+  // fwd_taint/fwd_prod_sec in the rename loop above).  Build forwarded taint/secret views
+  // that accumulate writes from C7 and Fix 5d for prior slots w'<w.
+  //
+  // Reconfiguration-safe: cf_active_width reduces the number of active commit slots, but
+  // the forwarding loop iterates over all plWidth slots at elaboration time.  Inactive
+  // slots have com_valid=false (will_commit gated by rob_val), so their C7/Fix5d writes
+  // never fire and the forwarding naturally skips them.  ROB reconfiguration (cf_rob_entries)
+  // only affects which rows are valid — not the per-bank commit width — so it has no
+  // impact on this forwarding logic.
+
+  // Seed forwarded views from the register values (previous cycle).
+  // Use `var` chains (same pattern as dispatch-time fwd_taint) to avoid
+  // combinational loops: each slot w reads from the state accumulated by
+  // slots 0..w-1, then produces a new state for slot w+1.
+  var com_fwd_taint:  Vec[Bool] = WireInit(taint_table)
+  var com_fwd_secret: Vec[Bool] = WireInit(producer_secret_table)
+
+  for (w <- 0 until plWidth) {
+    val com_uop   = io.com_uops(w)
+    val com_valid = io.com_valids(w) && !io.rollback
+
+    // Read FORWARDED taint (includes writes from prior slots 0..w-1 only).
+    val prs1_t    = com_fwd_taint(com_uop.prs1)
+    val prs2_t    = com_fwd_taint(com_uop.prs2)
+    val prs1_sec  = com_fwd_secret(com_uop.prs1)
+    val prs2_sec  = com_fwd_secret(com_uop.prs2)
+    val src_sec   = (prs1_t && prs1_sec) || (prs2_t && prs2_sec)
+
+    // com_late_taint: fires for instructions with a destination register (s_prop in printf).
+    val late = com_valid && !com_uop.cf_src_tainted &&
+               (com_uop.dst_rtype === rtype) && src_sec
+    io.com_late_taint(w) := late
+    io.com_late_taint_producer(w) := Mux(prs1_t && prs1_sec,
+                                         producer_table(com_uop.prs1),
+                                         producer_table(com_uop.prs2))
+
+    // com_late_taint_any: fires for ANY instruction including stores (no dst_rtype guard).
+    val late_any = com_valid && !com_uop.cf_src_tainted && src_sec
+    io.com_late_taint_any(w) := late_any
+
+    // Fix 5d: propagate to taint_table register (takes effect next cycle).
+    when (late) {
+      taint_table(com_uop.pdst)           := true.B
+      producer_table(com_uop.pdst)        := com_uop.cf_op_count_id
+      producer_secret_table(com_uop.pdst) := true.B
+    }
+
+    // Same-cycle forwarding: produce NEW forwarded views for slot w+1.
+    // C7 fires on (cf_secret_access || cf_src_tainted) — also forward that.
+    val c7_fires = com_valid &&
+                   (com_uop.cf_secret_access || com_uop.cf_src_tainted) &&
+                   com_uop.dst_rtype === rtype
+    val c7_secret = com_uop.cf_secret_access || com_uop.cf_taint_producer_is_secret
+
+    val next_fwd_taint  = WireInit(com_fwd_taint)
+    val next_fwd_secret = WireInit(com_fwd_secret)
+    when (late || c7_fires) {
+      next_fwd_taint(com_uop.pdst)  := true.B
+      next_fwd_secret(com_uop.pdst) := Mux(late, true.B, c7_secret)
+    }
+    com_fwd_taint  = next_fwd_taint
+    com_fwd_secret = next_fwd_secret
   }
 
   // -- C7: At commit, mark pdst as secret-tainted if instruction accessed secret memory or its

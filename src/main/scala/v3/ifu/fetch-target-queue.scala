@@ -295,7 +295,13 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   when (io.redirect.valid) {
     bpd_update_mispredict := false.B
     bpd_update_repair     := false.B
-  } .elsewhen (RegNext(io.brupdate.b2.mispredict)) {
+  } .elsewhen (RegNext(io.brupdate.b2.mispredict) && !RegNext(io.redirect.valid)) {
+    // Suppress repair walk when redirect fired at T: at T+1, RegNext(redirect.valid)=true,
+    // meaning enq_ptr already jumped backwards. The repair walk would process entries from
+    // the now-invalid speculative path (including uninitialized slots at PC=0 with garbage
+    // targets like 0xcf10000a), corrupting the BPD and causing thread_entry spin.
+    // Since mispredict and redirect always co-fire at T, this effectively suppresses the
+    // repair walk entirely. Cost: no repair BPD updates (acceptable for correctness).
     bpd_update_mispredict := true.B
     bpd_repair_idx        := RegNext(io.brupdate.b2.uop.ftq_idx)
     bpd_end_idx           := RegNext(enq_ptr)
@@ -378,6 +384,16 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
   when (io.redirect.valid) {
     enq_ptr    := WrapInc(io.redirect.bits, cf_ftq_active)
+    // Reset bpd_ptr to the redirect point on ANY redirect (not just quiesce).
+    // After a redirect, enq_ptr jumps backwards to WrapInc(redirect.bits). If
+    // bpd_ptr was ahead of that point (e.g. after a mispredict in a small FTQ),
+    // bpd_ptr > new_enq_ptr causes full=true AND stale BPD updates for invalidated
+    // entries. Both corrupt the predictor (leading to thread_entry spin with small
+    // FTQ configs). Setting bpd_ptr := redirect.bits here ensures bpd_ptr is always
+    // one slot behind new enq_ptr, so full=false and no stale updates are sent.
+    // Cost: valid BPD updates for entries [old_bpd_ptr, redirect.bits) are skipped,
+    // slightly degrading predictor quality but never causing correctness failures.
+    bpd_ptr    := io.redirect.bits
 
     when (io.brupdate.b2.mispredict) {
     val new_cfi_idx = (io.brupdate.b2.uop.pc_lob ^
@@ -402,16 +418,14 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     ram(RegNext(io.redirect.bits)) := RegNext(redirect_new_entry)
   }
 
-  // On quiesce drain (QS_DRAINING→QS_FETCH), reset all FTQ pointers to their
-  // reset-init canonical values. This ensures pointers stay within
-  // [0, cf_ftq_active-1] after a RECONFIG CSR write changes cf_ftq_active.
-  //
-  // PRIORITY: this block must appear AFTER the redirect handling above so that
-  // Chisel's last-writer-wins semantics guarantee enq_ptr := 1.U overrides any
-  // concurrent redirect enq_ptr := WrapInc(bits, active) that fires on the same
-  // cycle (e.g. the ROB flush redirect from QUIESCE's flush_on_commit).
-  // Without this priority, enq_ptr could become 30 or 31, making the FTQ appear
-  // full and blocking the QS_FETCH packet from being stored → deadlock.
+  // On quiesce drain (QS_DRAINING→QS_FETCH), reset FTQ state to clear any
+  // in-flight BPD tracking. enq_ptr := 1.U here is immediately overwritten at
+  // T+1 by the redirect (redirect_flush = RegNext(flush.valid) in frontend),
+  // which sets enq_ptr := WrapInc(redirect.bits, N). The critical fix is the
+  // quiesce_reset_d1 block below, which fires at T+1 alongside the redirect and
+  // sets bpd_ptr/deq_ptr to redirect.bits — making them one slot behind enq_ptr
+  // so full=false regardless of where in the ring the redirect lands.
+  val quiesce_reset_d1 = RegNext(io.cf_ftq_quiesce_reset, false.B)
   when (io.cf_ftq_quiesce_reset) {
     enq_ptr               := 1.U
     bpd_ptr               := 0.U
@@ -419,6 +433,14 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     first_empty           := true.B
     bpd_update_mispredict := false.B
     bpd_update_repair     := false.B
+  }
+  // T+1: the flush-triggered redirect fires (redirect_flush = RegNext(flush)).
+  // Align bpd_ptr/deq_ptr with the new enq_ptr so FTQ full=false.
+  // Without this, bpd_ptr=0 from the quiesce reset combined with
+  // enq_ptr=WrapInc(redirect.bits, N) causes full=true when redirect.bits>=29.
+  when (quiesce_reset_d1 && io.redirect.valid) {
+    bpd_ptr := io.redirect.bits
+    deq_ptr := io.redirect.bits
   }
 
   //-------------------------------------------------------------

@@ -103,7 +103,13 @@ case class BoomCoreParams(
   /* debug stuff */
   enableCommitLogPrintf: Boolean = true,
   enableBranchPrintf: Boolean = true,
-  enableMemtracePrintf: Boolean = true 
+  enableMemtracePrintf: Boolean = true,
+
+  /* IFT bridge: export IFT commit/squash records as tile IO for FireSim IFTBridge.
+   * When true, BoomCore exposes ift_bridge_out IO and BoomTile creates a
+   * BundleBridgeSource that CanHaveBoomIFTIO in chipyard sinks at the system level.
+   * Has no effect on Verilator simulation (CoreFuzzingConfig leaves this false). */
+  enableIFTBridge: Boolean = false
 
 // DOC include end: BOOM Parameters
 ) extends freechips.rocketchip.tile.CoreParams
@@ -168,8 +174,8 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   }
 
   // second CSR - fetch_bufferCSR
-  // 3-bit binary index into fetchBufferEntryOptions = Seq(128, 64, 32, 24, 16, 8)
-  // init = 0x0 → index 0 = 128 entries (max, hardware-built size)
+  // 3-bit binary index into fetchBufferEntryOptions = Seq(64, 48, 32, 24, 16, 8)
+  // init = 0x0 → index 0 = 64 entries (max, hardware-built size)
   override def fetchBufferCSRCF = {
     val mask = BigInt(0x7) // 3-bit index
     val init = BigInt(0x0) // index 0 = max (128 entries)
@@ -190,7 +196,7 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   def cf_stq_idx = getOrElse(ldqStqCSRCF, _.value(5,3), 0.U)
   // def reconfigureBPD = getOrElse(configureCSR, _.value(2), true.B)
   
-  def cf_bpd_tage_to_gshare = getOrElse(bpdCSRCF, _.value(2), true.B)  
+  def cf_bpd_tage_to_gshare = getOrElse(bpdCSRCF, _.value(2), false.B)
   def disableOOO = getOrElse(chickenCSR, _.value(3), true.B)
   def marchid = CustomCSR.constant(CSRs.marchid, BigInt(2))
   // core fuzzing specific
@@ -199,18 +205,17 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   // DCache reconfiguration CSR (0xbc1)
   // bits [1:0]: set index into dcacheSetOptions = Seq(128, 64, 32, 16)  — index 0 = max
   // bits [3:2]: way index into cacheWayOptions  = Seq(8, 4, 2, 1)       — index 0 = max
+  // bits [5:4]: replacement policy (0=random, 1=TrueLRU, 2=PseudoLRU)
   // Block size is NOT reconfigurable (cacheBlockBytes fixed).
   override def dcacheCSRCF = {
-    val mask = BigInt(0xF)  // 4 bits: 2 for sets, 2 for ways
-    val init = BigInt(0x0)  // index (0,0) = hardware-built max sizes
+    val mask = BigInt(0x3F)  // 6 bits: 2 for sets, 2 for ways, 2 for replacement policy
+    val init = BigInt(0x0)   // index (0,0,0) = max sizes, random replacement
     Some(CustomCSR(dcacheCSRIdCF, mask, Some(init)))
   }
   // 2-bit index accessors (used directly in dcache.scala)
-  def cf_dcache_set_conf = getOrElse(dcacheCSRCF, _.value(1,0), 0.U)
-  def cf_dcache_way_conf = getOrElse(dcacheCSRCF, _.value(3,2), 0.U)
-  // Legacy stubs (keep to avoid compile errors in dcache.scala / lsu.scala)
-  def cf_dcache_size_conf = 0.U
-  def cf_dcache_repl_conf = 0.U
+  def cf_dcache_set_conf  = getOrElse(dcacheCSRCF, _.value(1,0), 0.U)
+  def cf_dcache_way_conf  = getOrElse(dcacheCSRCF, _.value(3,2), 0.U)
+  def cf_dcache_repl_conf = getOrElse(dcacheCSRCF, _.value(5,4), 0.U)
 
   // ICache reconfiguration CSR (0xbcb)
   // bits [1:0]: set index into icacheSetOptions = Seq(64, 32, 16, 8)  — index 0 = max
@@ -223,16 +228,6 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   def cf_icache_set_conf = getOrElse(icacheCSRCF, _.value(1,0), 0.U)
   def cf_icache_way_conf = getOrElse(icacheCSRCF, _.value(3,2), 0.U)
   
-  // val cf_dcache_blocksize_shift = 31
-  val cf_dcache_blocksize_mask = 0x1
-  override def cacheBlockSizeCSRCF = {
-    val mask = BigInt(cf_dcache_blocksize_mask)
-    val init = BigInt(0) // default: 16B
-    Some(CustomCSR(cacheBlockSizeCSRIdCF, mask, Some(init)))
-  }
-  def cf_dcache_blocksize_conf = getOrElse(cacheBlockSizeCSRCF, _.value(0), false.B)
-  // def dcache_blocksize = boom.common.decodeOneHot(dcache_blocksize_csr_val & 0x3.U, boom.common.DCacheReconfOptions.blockSizeOptions)
-
   override def debugCSRCF = {
   // CSR cf_debug_log 
   // id : 0xbc1
@@ -375,10 +370,13 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   def cf_btb_set_idx = getOrElse(btbConfigCSRCF, _.value(1,0), 0.U)
   def cf_btb_way_idx = getOrElse(btbConfigCSRCF, _.value(2),   0.U)
 
-  // TAGE table count CSR — 3-bit index into tagetableCountOptions = Seq(6, 5, 4, 3, 2, 1)
+  // TAGE table count CSR — 3-bit index into tagetableCountOptions = Seq(7, 6, 5, 3, 2, 1)
+  // cf_tage_active values >3 include table 3's slot; table 3 is excluded in TAGE mode
+  // (it is the GShare bank, enabled only via bpdCSRCF bit[2]).
+  // GShare mode is controlled separately by bpdCSRCF (0x7c2) bit[2].
   override def tageCountCSRCF = {
-    val mask = BigInt(0x7)   // 3-bit index, 6 options
-    val init = BigInt(0x0)   // index 0 = 6 active tables (max)
+    val mask = BigInt(0x7)   // 3-bit index (max value = 7, fits in 3 bits)
+    val init = BigInt(0x0)   // index 0 = cf_tage_active=7 = 6 real TAGE tables (max)
     Some(CustomCSR(tageCountCSRIdCF, mask, Some(init)))
   }
   def cf_tage_count_idx = getOrElse(tageCountCSRCF, _.value(2,0), 0.U)
@@ -391,7 +389,20 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   def cf_debug_core_enable = getOrElse(debugCSRCF, _.value(3), true.B)
   def cf_debug_rob_enable = getOrElse(debugCSRCF, _.value(4), true.B)
   def cf_debug_bpd_enable = getOrElse(debugCSRCF, _.value(5), false.B)
-  def cf_debug_frontend_enable = getOrElse(debugCSRCF, _.value(6), false.B) 
+  def cf_debug_frontend_enable = getOrElse(debugCSRCF, _.value(6), false.B)
+
+  // Core-width reconfiguration CSR (0xbcc)
+  // 2-bit index selects effective decode width: 0→N=4, 1→N=2, 2→N=1; index 3 is reserved.
+  // Note: mask=0x3 is unavoidable (need bit[1] for index 2=N=1); hardware asserts idx<=2.
+  override def coreWidthCSRCF = {
+    val mask = BigInt(0x3)   // 2-bit; indices 0-2 valid, index 3 reserved
+    val init = BigInt(0x0)   // index 0 = N=4 (full width, default)
+    Some(CustomCSR(coreWidthCSRIdCF, mask, Some(init)))
+  }
+  def cf_core_width_idx = getOrElse(coreWidthCSRCF, _.value(1,0), 0.U)
+  // Derive active width as a hardware signal: 0→4, 1→2, 2→1
+  def cf_active_width: UInt = MuxLookup(cf_core_width_idx, coreWidth.U)(
+    Seq(1.U -> 2.U, 2.U -> 1.U))
 }
 
 /**
@@ -533,6 +544,7 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val COMMIT_LOG_PRINTF   = boomParams.enableCommitLogPrintf // dump commit state, for comparision against ISA sim
   val BRANCH_PRINTF       = boomParams.enableBranchPrintf // dump branch predictor results
   val MEMTRACE_PRINTF     = boomParams.enableMemtracePrintf // dump trace of memory accesses to L1D for debugging
+  val ENABLE_IFT_BRIDGE   = boomParams.enableIFTBridge // export IFT records as tile IO for FireSim IFTBridge
 
   //************************************
   // Other Non/Should-not-be sythesizable modules

@@ -27,6 +27,10 @@ class BoomDCacheReqInternal(implicit p: Parameters) extends BoomDCacheReq()(p)
   // miss info
   val tag_match = Bool()
   val old_meta  = new L1Metadata
+  // Full (unmasked) set index addr[12:6] of the evicted block, from full_idx_snap.
+  // Used as wb_req.bits.idx so the TL Release targets the evicted block's physical address
+  // rather than the miss request's (aliased) address.
+  val old_idx   = UInt(idxBits.W)
   val way_en    = UInt(nWays.W)
 
   // Used in the MSHRs
@@ -329,7 +333,10 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     io.wb_req.valid          := true.B
 
     io.wb_req.bits.tag       := req.old_meta.tag
-    io.wb_req.bits.idx       := req_idx
+    // Use the evicted block's full set index (stored at MSHR alloc time from full_idx_snap)
+    // so the TL Release address is reconstructed correctly when the evicted block's full_idx
+    // differs from the miss request's full_idx (set-masked aliasing).
+    io.wb_req.bits.idx       := req.old_idx
     io.wb_req.bits.param     := shrink_param
     io.wb_req.bits.way_en    := req.way_en
     io.wb_req.bits.source    := io.id

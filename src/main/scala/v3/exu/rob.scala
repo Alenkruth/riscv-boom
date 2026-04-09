@@ -144,6 +144,16 @@ class RobIo(
   // Pulse to reset ROB head/tail to 0 on quiesce drain so WrapInc wraps correctly
   // after a cf_rob_entries CSR change (ROB is empty when this fires)
   val cf_rob_quiesce_reset = Input(Bool())
+
+  // IFT bridge outputs: 256-bit records for committed and squashed IFT-active instructions.
+  // Driven unconditionally (zero when ENABLE_IFT_BRIDGE=false in BoomCoreParams).
+  // core.scala gates them behind ENABLE_IFT_BRIDGE before forwarding to tile IO.
+  val ift_priv            = Input(UInt(3.W))               // current privilege mode (from csr.io.status.prv)
+  val ift_commit_valids   = Output(Vec(retireWidth, Bool())) // arch_valids
+  val ift_commit_records  = Output(Vec(retireWidth, UInt(256.W)))
+  val ift_squash_valid    = Output(Bool())                  // one squash record drains per cycle
+  val ift_squash_record   = Output(UInt(256.W))
+  val ift_squash_ovf      = Output(Bool())                  // pending bitvector was clobbered before drain
 }
 
 /**
@@ -300,6 +310,16 @@ class Rob(
   // for core fuzzing
   val cf_rob_head_uop     = Wire(Vec(coreWidth, new MicroOp()))
 
+  // IFT bridge: per-bank drain wires; arbitrated outside the bank loop to one output.
+  val ift_sq_bank_valid   = Wire(Vec(coreWidth, Bool()))
+  val ift_sq_bank_record  = Wire(Vec(coreWidth, UInt(256.W)))
+  // Only the winning bank may clear its pending bit; others retry next cycle.
+  val ift_sq_bank_drain_ok = Wire(Vec(coreWidth, Bool()))
+  // Initialised to safe defaults; each bank drives its own slot inside the loop.
+  ift_sq_bank_valid    := VecInit(Seq.fill(coreWidth)(false.B))
+  ift_sq_bank_record   := VecInit(Seq.fill(coreWidth)(0.U(256.W)))
+  ift_sq_bank_drain_ok := VecInit(Seq.fill(coreWidth)(false.B))
+
   val exception_thrown = Wire(Bool())
 
   // exception info
@@ -369,12 +389,24 @@ class Rob(
     // 1-drain-per-cycle pattern, reducing ROB register file MUX tree complexity.
     //   sprob: one pending bit per row (fixed content: INFL_REG_DATAFLOW, is_secret=true)
     //   ic:    pending bit + variable winner data per row (INFL_ISSUE_CONTENTION)
+    //   wb:    pending bit + full influencer list per row (writeback merge — Fix opt#1)
     val sprob_infl_pending    = RegInit(VecInit(Seq.fill(numRobRows)(false.B)))
     val ic_pending_valid      = RegInit(VecInit(Seq.fill(numRobRows)(false.B)))
     val ic_pending_winner_op  = Reg(Vec(numRobRows, UInt(uopIDCounterWidthCF.W)))
     val ic_pending_winner_atk = Reg(Vec(numRobRows, Bool()))
     val ic_pending_winner_sec = Reg(Vec(numRobRows, Bool()))
     val ic_pending_deny_cnt   = Reg(Vec(numRobRows, UInt(4.W)))
+    // wb_infl pending: captures influencer list from writeback responses.
+    // Drains 1/cycle via PriorityEncoder (same pattern as sprob/ic).
+    // If a second wb_resp hits the same row while pending, overflow is set.
+    val wb_infl_pending       = RegInit(VecInit(Seq.fill(numRobRows)(false.B)))
+    val wb_infl_list          = Reg(Vec(numRobRows, Vec(numInfluencerSlotsCF, new InfluencerEntry)))
+    val wb_infl_overflow      = Reg(Vec(numRobRows, Bool()))
+
+    // IFT bridge: per-row pending bits for squashed IFT-active entries.
+    // Set in branch-kill loop when rob_val && IFT-active; cleared in per-bank drain.
+    // Also cleared on dispatch (new enqueue to same row) to prevent stale drain.
+    val ift_squash_pending = RegInit(VecInit(Seq.fill(numRobRows)(false.B)))
 
     //-----------------------------------------------
     // Dispatch: Add Entry to ROB
@@ -393,6 +425,11 @@ class Rob(
       rob_exception(rob_tail) := io.enq_uops(w).exception
       rob_predicated(rob_tail)   := false.B
       rob_fflags(w)(rob_tail)    := 0.U
+      // IFT bridge: clear stale squash-pending bit so an old killed entry doesn't
+      // pollute a freshly dispatched instruction at the same ROB row.
+      ift_squash_pending(rob_tail) := false.B
+      // Opt#1: clear stale wb influencer pending on dispatch.
+      wb_infl_pending(rob_tail) := false.B
 
       assert (rob_val(rob_tail) === false.B, "[rob] overwriting a valid entry.")
       assert ((io.enq_uops(w).rob_idx >> log2Ceil(coreWidth)) === rob_tail)
@@ -557,6 +594,68 @@ class Rob(
       ic_pending_valid(cidx) := false.B
     }
 
+    // -----------------------------------------------
+    // Opt#1: wb influencer drain — merge pending wb influencer list into rob_uop.
+    // One row per cycle per bank. The compact-and-append runs from REGISTERED
+    // pending data (not combinationally from wb_resp), breaking the critical path.
+    val wb_drain_oh  = PriorityEncoderOH(wb_infl_pending.asUInt)
+    val wb_drain_idx = OHToUInt(wb_drain_oh)
+    val wb_drain_any = wb_infl_pending.asUInt.orR
+    // Suppress wb drain when it targets the same row as sprob or ic drain.
+    val wb_drain_fires = wb_drain_any &&
+      !(sprob_drain_any && wb_drain_idx === sprob_drain_idx) &&
+      !(ic_drain_fires  && wb_drain_idx === ic_drain_idx)
+
+    when (wb_drain_fires) {
+      val cidx = wb_drain_idx
+      when (rob_val(cidx)) {
+        val rob_base = PopCount(VecInit(rob_uop(cidx).cf_influencer_list.map(_.valid)))
+        val wb_list  = wb_infl_list(cidx)
+        val wb_valid = VecInit(wb_list.map(_.valid))
+        val wb_total = PopCount(wb_valid)
+        val wb_pfx   = (0 until numInfluencerSlotsCF).map { j =>
+          if (j == 0) 0.U(4.W) else PopCount(VecInit(wb_valid.take(j)))
+        }
+        when (!rob_uop(cidx).cf_infl_overflow && rob_base +& wb_total > numInfluencerSlotsCF.U) {
+          rob_uop(cidx).cf_infl_overflow := true.B
+        }
+        when (!rob_uop(cidx).cf_infl_overflow) {
+          for (d <- 0 until numInfluencerSlotsCF) {
+            val writers = (0 until numInfluencerSlotsCF).map { j =>
+              wb_valid(j) && ((rob_base + wb_pfx(j)) === d.U)
+            }
+            when (writers.reduce(_ || _)) {
+              rob_uop(cidx).cf_influencer_list(d).valid      := true.B
+              rob_uop(cidx).cf_influencer_list(d).op_count   := Mux1H(writers, wb_list.map(_.op_count))
+              rob_uop(cidx).cf_influencer_list(d).infl_type  := Mux1H(writers, wb_list.map(_.infl_type))
+              rob_uop(cidx).cf_influencer_list(d).is_atk     := Mux1H(writers, wb_list.map(_.is_atk))
+              rob_uop(cidx).cf_influencer_list(d).is_secret  := Mux1H(writers, wb_list.map(_.is_secret))
+              rob_uop(cidx).cf_influencer_list(d).deny_count := Mux1H(writers, wb_list.map(_.deny_count))
+            }
+          }
+        }
+        when (wb_infl_overflow(cidx)) { rob_uop(cidx).cf_infl_overflow := true.B }
+      }
+      wb_infl_pending(cidx) := false.B
+    }
+
+    // -----------------------------------------------
+    // IFT bridge: drain one squash-pending entry per bank per cycle.
+    // Drives ift_sq_bank_valid(w) / ift_sq_bank_record(w); arbitrated outside the loop.
+    val ift_sq_oh  = PriorityEncoderOH(ift_squash_pending.asUInt)
+    val ift_sq_idx = OHToUInt(ift_sq_oh)
+    val ift_sq_any = ift_squash_pending.asUInt.orR
+
+    when (ift_sq_any) {
+      ift_sq_bank_valid(w)  := true.B
+      ift_sq_bank_record(w) := uopToIFTBits(rob_uop(ift_sq_idx), 2.U /*squash*/, io.ift_priv)
+    }
+    // Only clear pending if this bank wins cross-bank arbitration (driven after the loop).
+    // Non-winning banks retain their pending entry and retry next cycle.
+    when (ift_sq_any && ift_sq_bank_drain_ok(w)) {
+      ift_squash_pending(ift_sq_idx) := false.B
+    }
+
     //-----------------------------------------------
     // Accruing fflags
     for (i <- 0 until numFpuPorts) {
@@ -654,6 +753,36 @@ class Rob(
         when (ic_pending_winner_atk(com_idx)) { io.commit.uops(w).cf_attacker_influence := true.B }
         ic_pending_valid(com_idx) := false.B
       }
+
+      // Opt#1: commit-time override for pending wb influencer entries.
+      val has_wb = wb_infl_pending(com_idx)
+      when (has_wb) {
+        val wb_base = pend_base0 + has_sprob.asUInt + has_ic.asUInt
+        val wb_list = wb_infl_list(com_idx)
+        val wb_valid = VecInit(wb_list.map(_.valid))
+        val wb_total = PopCount(wb_valid)
+        val wb_pfx   = (0 until numInfluencerSlotsCF).map { j =>
+          if (j == 0) 0.U(4.W) else PopCount(VecInit(wb_valid.take(j)))
+        }
+        when (wb_base +& wb_total > numInfluencerSlotsCF.U) {
+          io.commit.uops(w).cf_infl_overflow := true.B
+        }
+        for (d <- 0 until numInfluencerSlotsCF) {
+          val writers = (0 until numInfluencerSlotsCF).map { j =>
+            wb_valid(j) && ((wb_base + wb_pfx(j)) === d.U)
+          }
+          when (writers.reduce(_ || _)) {
+            io.commit.uops(w).cf_influencer_list(d).valid      := true.B
+            io.commit.uops(w).cf_influencer_list(d).op_count   := Mux1H(writers, wb_list.map(_.op_count))
+            io.commit.uops(w).cf_influencer_list(d).infl_type  := Mux1H(writers, wb_list.map(_.infl_type))
+            io.commit.uops(w).cf_influencer_list(d).is_atk     := Mux1H(writers, wb_list.map(_.is_atk))
+            io.commit.uops(w).cf_influencer_list(d).is_secret  := Mux1H(writers, wb_list.map(_.is_secret))
+            io.commit.uops(w).cf_influencer_list(d).deny_count := Mux1H(writers, wb_list.map(_.deny_count))
+          }
+        }
+        when (wb_infl_overflow(com_idx)) { io.commit.uops(w).cf_infl_overflow := true.B }
+        wb_infl_pending(com_idx) := false.B
+      }
     }
 
 
@@ -737,6 +866,21 @@ class Rob(
           // write to a slot that has been freed and potentially reallocated.
           sprob_infl_pending(i) := false.B
           ic_pending_valid(i)   := false.B
+          wb_infl_pending(i)    := false.B
+          // IFT bridge: if this entry has IFT activity, record it for bridge output.
+          // Pending bit is set here; drain fires 1/cycle per bank (register semantics
+          // guarantee drain reads correct pre-kill uop data even if dispatch co-fires).
+          when (rob_val(i)) {
+            val cf_has_ift_activity =
+              rob_uop(i).cf_attacker_influence  ||
+              rob_uop(i).cf_secret_access       ||
+              rob_uop(i).cf_secret_propagation  ||
+              rob_uop(i).cf_secret_transmission ||
+              rob_uop(i).cf_src_tainted         ||
+              VecInit(rob_uop(i).cf_influencer_list.map(_.valid)).asUInt.orR ||
+              wb_infl_pending(i)  // pending wb influencer data not yet drained
+            ift_squash_pending(i) := cf_has_ift_activity
+          }
         } .elsewhen (rob_val(i)) {
           // clear speculation bit even on correct speculation
           rob_uop(i).br_mask := GetNewBrMask(io.brupdate, br_mask)
@@ -770,6 +914,11 @@ class Rob(
     // -------------------------------------------------
     // CoreFuzzing outputs
     cf_rob_head_uop(w)   := rob_uop(rob_head)
+
+    // IFT bridge commit records: one per retire slot, valid on arch_valids.
+    // Use io.commit.uops (Wire with pending overrides applied) not rob_uop (register).
+    io.ift_commit_valids(w)  := io.commit.arch_valids(w)
+    io.ift_commit_records(w) := uopToIFTBits(io.commit.uops(w), 1.U /*commit*/, io.ift_priv)
     
     //------------------------------------------------
     // Invalid entries are safe; thrown exceptions are unsafe.
@@ -810,40 +959,28 @@ class Rob(
         when (wb_uop_i.cf_secret_access)       { rob_uop(rob_row).cf_secret_access        := true.B }
         when (wb_uop_i.cf_secret_transmission) { rob_uop(rob_row).cf_secret_transmission  := true.B }
         when (wb_uop_i.cf_secret_propagation)  { rob_uop(rob_row).cf_secret_propagation   := true.B }
+        // Fix 3c: dcache memsec_fire injects INFL_MEM_DATAFLOW(is_atk=false, is_secret=true)
+        // into the wb uop's influencer list. The flag itself is not on cf_secret_propagation
+        // (dcache doesn't write that field), so detect it here and set s_prop on the ROB entry.
+        val has_mem_sec_infl_rob = wb_uop_i.cf_influencer_list.map(e =>
+          e.valid && e.infl_type === INFL_MEM_DATAFLOW.U && !e.is_atk && e.is_secret).reduce(_ || _)
+        when (has_mem_sec_infl_rob) { rob_uop(rob_row).cf_secret_propagation := true.B }
 
-        // Merge influencer list: parallel prefix compact-and-append.
-        // base_cnt = number of already-occupied slots in rob_uop.
-        // prefix(j) = number of valid wb slots before j → direct destination index.
-        val rob_base_cnt = PopCount(VecInit(rob_uop(rob_row).cf_influencer_list.map(_.valid)))
-        val wb_valid_vec = VecInit(wb_uop_i.cf_influencer_list.map(_.valid))
-        // Prefix sums: wb_prefix(j) = number of valid wb slots before j.
-        val wb_prefix    = (0 until numInfluencerSlotsCF).map { j =>
-          if (j == 0) 0.U(4.W) else PopCount(VecInit(wb_valid_vec.take(j)))
-        }
-        val wb_total = PopCount(wb_valid_vec)
-        when (!rob_uop(rob_row).cf_infl_overflow && rob_base_cnt +& wb_total > numInfluencerSlotsCF.U) {
-          rob_uop(rob_row).cf_infl_overflow := true.B
-        }
-        // Precompute destination slot for each wb entry once (avoids recomputing inside d-loop).
-        // writers are one-hot per slot by prefix-sum construction → Mux1H is valid.
-        val dst_slot = (0 until numInfluencerSlotsCF).map { j => rob_base_cnt + wb_prefix(j) }
-        when (!rob_uop(rob_row).cf_infl_overflow) {
-          for (d <- 0 until numInfluencerSlotsCF) {
-            val writers: Seq[Bool] = (0 until numInfluencerSlotsCF).map { j =>
-              wb_valid_vec(j) && (dst_slot(j) === d.U)
-            }
-            val any_write = writers.reduce(_ || _)
-            when (any_write) {
-              rob_uop(rob_row).cf_influencer_list(d).valid      := true.B
-              rob_uop(rob_row).cf_influencer_list(d).op_count   := Mux1H(writers, wb_uop_i.cf_influencer_list.map(_.op_count))
-              rob_uop(rob_row).cf_influencer_list(d).infl_type  := Mux1H(writers, wb_uop_i.cf_influencer_list.map(_.infl_type))
-              rob_uop(rob_row).cf_influencer_list(d).is_atk     := Mux1H(writers, wb_uop_i.cf_influencer_list.map(_.is_atk))
-              rob_uop(rob_row).cf_influencer_list(d).is_secret  := Mux1H(writers, wb_uop_i.cf_influencer_list.map(_.is_secret))
-              rob_uop(rob_row).cf_influencer_list(d).deny_count := Mux1H(writers, wb_uop_i.cf_influencer_list.map(_.deny_count))
-            }
+        // Opt#1: Defer influencer merge to pending table (breaks critical path).
+        // Capture wb influencer list; drain 1 row/cycle via PriorityEncoder.
+        val has_wb_infl = wb_uop_i.cf_influencer_list.map(_.valid).reduce(_ || _) ||
+                          wb_uop_i.cf_infl_overflow
+        when (has_wb_infl) {
+          when (!wb_infl_pending(rob_row)) {
+            wb_infl_pending(rob_row)  := true.B
+            wb_infl_list(rob_row)     := wb_uop_i.cf_influencer_list
+            wb_infl_overflow(rob_row) := wb_uop_i.cf_infl_overflow
+          } .otherwise {
+            // Second wb_resp hits same row while pending → merge into pending list
+            // or set overflow if no room. Simple: just set overflow.
+            wb_infl_overflow(rob_row) := true.B
           }
         }
-        when (wb_uop_i.cf_infl_overflow) { rob_uop(rob_row).cf_infl_overflow := true.B }
       }
       val temp_uop = rob_uop(GetRowIdx(rob_idx))
 
@@ -1165,6 +1302,17 @@ class Rob(
   io.rob_head_is_secret := cf_rob_head_uop(0).cf_secret_access || cf_rob_head_uop(0).cf_secret_propagation
   io.empty        := empty
   io.ready        := (rob_state === s_normal) && !full && !r_xcpt_val
+
+  // IFT bridge: cross-bank squash arbitration (bank 0 wins, then 1, ...).
+  // Only the winning bank clears its pending bit; others retain and retry next cycle.
+  val ift_sq_winner_oh  = PriorityEncoderOH(ift_sq_bank_valid.asUInt)
+  val ift_sq_any_bank   = ift_sq_bank_valid.asUInt.orR
+  for (w <- 0 until coreWidth) {
+    ift_sq_bank_drain_ok(w) := ift_sq_winner_oh(w)
+  }
+  io.ift_squash_valid   := ift_sq_any_bank
+  io.ift_squash_record  := Mux1H(ift_sq_winner_oh, ift_sq_bank_record)
+  io.ift_squash_ovf     := false.B  // no longer needed — records are retained, not dropped
 
   //-----------------------------------------------
   //-----------------------------------------------

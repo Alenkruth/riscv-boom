@@ -39,6 +39,7 @@ class ComposedBranchPredictorBank(implicit p: Parameters) extends BranchPredicto
     c.io.cf_btb_set_idx    := io.cf_btb_set_idx
     c.io.cf_btb_way_idx    := io.cf_btb_way_idx
     c.io.cf_tage_count_idx := io.cf_tage_count_idx
+    c.io.cf_btb_quiesce    := io.cf_btb_quiesce
 
     // corefuzzing: wire domain to each component
     c.io.f0_domain_id := io.f0_domain_id

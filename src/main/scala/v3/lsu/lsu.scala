@@ -107,11 +107,9 @@ with CoreFuzzingConstants
   val cf_debug_dcache_enable = Output(Bool())
 
   // for corefuzzing - dcache configuration flags
-  val cf_dcache_set_conf = Output(UInt(dcacheParamsWidthCF.W))
-  val cf_dcache_way_conf = Output(UInt(dcacheParamsWidthCF.W))
-  val cf_dcache_size_conf = Output(UInt(dcacheParamsWidthCF.W))
+  val cf_dcache_set_conf  = Output(UInt(dcacheParamsWidthCF.W))
+  val cf_dcache_way_conf  = Output(UInt(dcacheParamsWidthCF.W))
   val cf_dcache_repl_conf = Output(UInt(dcacheParamsWidthCF.W))
-  val cf_dcache_blocksize_conf = Output(Bool())
 
   val perf = Input(new Bundle {
     val acquire = Bool()
@@ -157,7 +155,7 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   // corefuzzing: preg_secret early update — fires at TLB stage when load hits secret range.
   // Enables in-flight consumers to receive s_prop before the producer commits (avoids needing
   // a fence.i between the secret load and its consumers).  Bit index = pdst of the load.
-  val cf_preg_secret_upd = Output(Vec(memWidth, Valid(UInt(ipregSz.W))))
+  val cf_preg_secret_upd = Output(Vec(memWidth, Valid(new CF_PregSecretUpd)))
 
   val fp_stdata   = Flipped(Decoupled(new ExeUnitResp(fLen)))
 
@@ -204,11 +202,9 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
 
   // for corefuzzing - dcache configuration flags
   val cf_debug_dcache_enable = Input(Bool())
-  val cf_dcache_set_conf = Input(UInt(dcacheParamsWidthCF.W))
-  val cf_dcache_way_conf = Input(UInt(dcacheParamsWidthCF.W))
-  val cf_dcache_size_conf = Input(UInt(dcacheParamsWidthCF.W))
+  val cf_dcache_set_conf  = Input(UInt(dcacheParamsWidthCF.W))
+  val cf_dcache_way_conf  = Input(UInt(dcacheParamsWidthCF.W))
   val cf_dcache_repl_conf = Input(UInt(dcacheParamsWidthCF.W))
-  val cf_dcache_blocksize_conf = Input(Bool())
 
   val perf        = Output(new Bundle {
     val acquire = Bool()
@@ -858,7 +854,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     // This fires 1+ cycles before writeback, allowing consumers that are issued immediately
     // after the load to see the taint at their issue-grant check cycle.
     io.core.cf_preg_secret_upd(w).valid             := exe_tlb_valid(w) && is_secret_load
-    io.core.cf_preg_secret_upd(w).bits              := exe_tlb_uop(w).pdst
+    io.core.cf_preg_secret_upd(w).bits.pdst         := exe_tlb_uop(w).pdst
+    io.core.cf_preg_secret_upd(w).bits.is_fp        := exe_tlb_uop(w).dst_rtype === RT_FLT
     // s_tx Case A: store carrying secret-dependent data to a non-secret memory address.
     //   The secret escapes to attacker-accessible memory (anything outside the secret range).
     val is_secret_bearing_store = exe_tlb_uop(w).uses_stq && !in_secret &&
@@ -913,12 +910,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // reading a physical address from the LDQ,STQ, or the HellaCache adapter
 
   // pass corefuzzing configure values to dmem
-  io.dmem.cf_dcache_set_conf := io.core.cf_dcache_set_conf
-  io.dmem.cf_dcache_way_conf := io.core.cf_dcache_way_conf
-  io.dmem.cf_dcache_size_conf := io.core.cf_dcache_size_conf
+  io.dmem.cf_dcache_set_conf  := io.core.cf_dcache_set_conf
+  io.dmem.cf_dcache_way_conf  := io.core.cf_dcache_way_conf
   io.dmem.cf_dcache_repl_conf := io.core.cf_dcache_repl_conf
   io.dmem.cf_debug_dcache_enable := io.core.cf_debug_dcache_enable && io.core.cf_debug_lsu_enable
-  io.dmem.cf_dcache_blocksize_conf := io.core.cf_dcache_blocksize_conf
 
   // defaults
   io.dmem.brupdate       := io.core.brupdate

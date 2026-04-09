@@ -337,15 +337,14 @@ class BoomDuplicatedDataArray(implicit p: Parameters) extends AbstractBoomDataAr
   val cf_waddr_tagbits = waddr >> idxBits
   val cf_waddr = (cf_waddr_tagbits << idxBits) | cf_idx 
 
-  for (w <- 0 until memWidth) {
-    when(io.read(w).valid && io.cf_debug_dcache_enable) {
-      printf("[DCACHE] ADDR(TAG+OFF) is 0x%x \n", io.read(w).bits.addr)
-    }
-  } 
-  
-  when (io.write.valid && io.cf_debug_dcache_enable) {
-    printf("[DCACHE] ADDR(TAG+OFF) is 0x%x \n", io.write.bits.addr)
-  }
+  // for (w <- 0 until memWidth) {
+  //   when(io.read(w).valid && io.cf_debug_dcache_enable) {
+  //     printf("[DCACHE] ADDR(TAG+OFF) is 0x%x \n", io.read(w).bits.addr)
+  //   }
+  // }
+  // when (io.write.valid && io.cf_debug_dcache_enable) {
+  //   printf("[DCACHE] ADDR(TAG+OFF) is 0x%x \n", io.write.bits.addr)
+  // }
 
   for (j <- 0 until memWidth) {
 
@@ -385,15 +384,14 @@ class BoomBankedDataArray(implicit p: Parameters) extends AbstractBoomDataArrayC
   val bidxBits    = log2Ceil(bankSize)
   val bidxOffBits = bankOffBits + bankBits
 
-  // print accessed addresses in a multibank dcache array
-  for (w <- 0 until memWidth) {
-    when(io.read(w).valid && io.cf_debug_dcache_enable) {
-      printf("[DCACHE] ADDR(TAG+OFF) is 0x%x \n", io.read(w).bits.addr)
-    }
-  }
-  when (io.write.valid && io.cf_debug_dcache_enable) {
-    printf("[DCACHE] ADDR(TAG+OFF) is 0x%x \n", io.write.bits.addr)
-  }
+  // for (w <- 0 until memWidth) {
+  //   when(io.read(w).valid && io.cf_debug_dcache_enable) {
+  //     printf("[DCACHE] ADDR(TAG+OFF) is 0x%x \n", io.read(w).bits.addr)
+  //   }
+  // }
+  // when (io.write.valid && io.cf_debug_dcache_enable) {
+  //   printf("[DCACHE] ADDR(TAG+OFF) is 0x%x \n", io.write.bits.addr)
+  // }
   //----------------------------------------------------------------------------------------------------
 
   val s0_rbanks = if (nBanks > 1) VecInit(io.read.map(r => (r.bits.addr >> bankOffBits)(bankBits-1,0))) else VecInit(0.U)
@@ -507,11 +505,11 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
 
   def widthMap[T <: Data](f: Int => T) = VecInit((0 until memWidth).map(f))
 
-  for (w <- 0 until memWidth){
-    when (io.lsu.req.valid && io.lsu.cf_debug_dcache_enable){
-      printf("[DCACHE] LSU request address - 0x%x + DCACHE configuration 0x%x 0x%x 0x%x 0x%x \n", io.lsu.req.bits(w).bits.addr, io.lsu.cf_dcache_repl_conf, io.lsu.cf_dcache_size_conf, io.lsu.cf_dcache_way_conf, io.lsu.cf_dcache_set_conf)
-    }
-  }
+  // for (w <- 0 until memWidth){
+  //   when (io.lsu.req.valid && io.lsu.cf_debug_dcache_enable){
+  //     printf("[DCACHE] LSU request address - 0x%x + DCACHE configuration set=0x%x way=0x%x repl=0x%x \n", io.lsu.req.bits(w).bits.addr, io.lsu.cf_dcache_set_conf, io.lsu.cf_dcache_way_conf, io.lsu.cf_dcache_repl_conf)
+  //   }
+  // }
   
   // === Dynamic DCache Reconfiguration Support ===
   // Block size (cacheBlockBytes) is NOT reconfigurable per user requirement.
@@ -520,6 +518,18 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   val cf_dcache_active_sets = dcacheSetOptionsVec(io.lsu.cf_dcache_set_conf)
   val cf_dcache_active_ways = cacheWayOptionsVec(io.lsu.cf_dcache_way_conf)
   val dcache_set_mask = cf_dcache_active_sets - 1.U
+
+  // full_idx_snap: per-way SyncReadMem storing the FULL (unmasked) set index addr[12:6] of the
+  // block last filled into each (masked-set, way) slot.  Used in two ways:
+  //   1. Tag check: s1_full_idx_match prevents false hits between two addresses that alias to
+  //      the same masked set but differ in bits [12:10] (they have the same tag since those bits
+  //      fall below untagBits=13, but the stored full_idx disambiguates them).
+  //   2. Writeback address: s2_repl_full_idx_snap is passed to the MSHR as old_idx so the
+  //      TL Release uses the evicted block's physical set index, not the miss request's index.
+  // ISA safety: at full config (active_sets=128), dcache_set_mask=0x7F and full_idx=masked_idx
+  // for all DRAM addresses (addr[12:6] < 128 always), so full_idx_match is always true —
+  // no behavior change at full config.
+  val full_idx_snap = Seq.fill(nWays)(SyncReadMem(nSets, UInt(idxBits.W)))
 
   // Mask just the set-index bits [untagBits-1 : blockOffBits] in a physical address.
   def dcacheMaskIdx(addr: UInt): UInt =
@@ -760,12 +770,34 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // tag check
   def wayMap[T <: Data](f: Int => T) = VecInit((0 until nWays).map(f))
   val s1_tag_eq_way = widthMap(i => wayMap((w: Int) => meta(i).io.resp(w).tag === (s1_addr(i) >> untagBits)).asUInt)
+
+  // Read full_idx_snap in s0 (triggered by metaReadArb fire); result is in s1.
+  // Index: same masked idx used for the meta read for each lane.
+  // Value: the full (unmasked) addr[12:6] of the block stored in that (way, masked-set) slot.
+  val s1_full_idx_snap = VecInit(Seq.tabulate(nWays)(way =>
+    VecInit(Seq.tabulate(memWidth)(lane =>
+      full_idx_snap(way).read(
+        metaReadArb.io.out.bits.req(lane).idx,
+        metaReadArb.io.out.fire
+      )
+    ))
+  ))
+  // s1_full_idx_match(lane)(way): the stored full set index matches the current request's full
+  // set index. Prevents false hits between addresses that alias to the same masked set but
+  // differ in the masked-out bits (addr[12:10] for 16-set config, etc.).
+  val s1_full_idx_match = widthMap(lane =>
+    VecInit((0 until nWays).map(way =>
+      s1_full_idx_snap(way)(lane) === s1_addr(lane)(untagBits-1, blockOffBits)
+    ))
+  )
+
   val s1_tag_match_way = widthMap(i =>
                          Mux(s1_type === t_replay, s1_replay_way_en,
                          Mux(s1_type === t_wb,     s1_wb_way_en,
                          Mux(s1_type === t_mshr_meta_read, s1_mshr_meta_read_way_en,
-                           // Gate ways >= cf_dcache_active_ways to restrict effective cache size
-                           wayMap((w: Int) => s1_tag_eq_way(i)(w) && meta(i).io.resp(w).coh.isValid() && (w.U < cf_dcache_active_ways)).asUInt))))
+                           // Gate ways >= cf_dcache_active_ways AND require full-idx match to
+                           // prevent false hits between aliased addresses in the same masked set.
+                           wayMap((w: Int) => s1_tag_eq_way(i)(w) && meta(i).io.resp(w).coh.isValid() && (w.U < cf_dcache_active_ways) && s1_full_idx_match(i)(w)).asUInt))))
 
   val s1_wb_idx_matches = widthMap(i => (s1_addr(i)(untagBits-1,blockOffBits) === wb.io.idx.bits) && wb.io.idx.valid)
 
@@ -852,28 +884,46 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   val s2_data_muxed = widthMap(w => Mux1H(s2_tag_match_way(w), s2_data(w)))
   val s2_word_idx   = widthMap(w => if (rowWords == 1) 0.U else s2_req(w).addr(log2Up(rowWords*wordBytes)-1, log2Up(wordBytes)))
 
-  // replacement policy
-  val replacer = cacheParams.replacement
-  // Clamp victim way to active ways to avoid replacing outside the active range
-  val cf_repl_way_clamped = replacer.way & (cf_dcache_active_ways - 1.U)
-  val s1_replaced_way_en = UIntToOH(cf_repl_way_clamped)
-  // MSHR way-collision fix: if the LRU-selected way is already claimed by a pending MSHR,
-  // pick an alternative way that is not currently occupied.  Without this, two concurrent
-  // misses to the same set can both be assigned the same physical way by PseudoLRU (which
-  // doesn't know about in-flight MSHR allocations), causing the second MSHR's refill to
-  // silently overwrite the first — the first MSHR's replay then misses and asserts.
-  val s2_repl_way_raw = UIntToOH(RegNext(cf_repl_way_clamped))
+  // replacement policy — runtime-selectable via io.lsu.cf_dcache_repl_conf:
+  //   0 = random (global LFSR, no per-set state)
+  //   1 = TrueLRU (per-set, (nWays*(nWays-1)/2) bits)
+  //   2 = PseudoLRU (per-set, (nWays-1) bits)
+  val replacer      = cacheParams.replacement          // RandomReplacement (global LFSR)
+  val lru_replacer  = new TrueLRU(nWays)               // helper: get_replace_way / get_next_state
+  val plru_replacer = new PseudoLRU(nWays)             // helper: get_replace_way / get_next_state
+  // Per-set state SyncReadMems — present address at s1 → result available at s2
+  val lru_state_mem  = SyncReadMem(nSets, UInt(lru_replacer.nBits.W))
+  val plru_state_mem = SyncReadMem(nSets, UInt(plru_replacer.nBits.W))
+
+  // Read LRU/PLRU state for the s1 set address; result arrives at s2
+  val s1_set_for_repl = dcacheMaskIdx(s1_req(0).addr)
+  val s2_lru_state    = lru_state_mem.read(s1_set_for_repl,  s1_valid(0))
+  val s2_plru_state   = plru_state_mem.read(s1_set_for_repl, s1_valid(0))
+
+  // Compute victim way (one-hot) at s2 for each policy, clamped to active ways
+  val s2_random_way_en = UIntToOH(replacer.way & (cf_dcache_active_ways - 1.U))
+  val s2_lru_way_en    = UIntToOH(lru_replacer.get_replace_way(s2_lru_state)   & (cf_dcache_active_ways - 1.U))
+  val s2_plru_way_en   = UIntToOH(plru_replacer.get_replace_way(s2_plru_state) & (cf_dcache_active_ways - 1.U))
+  val s2_repl_way_raw  = MuxLookup(io.lsu.cf_dcache_repl_conf, s2_random_way_en)(Seq(
+    1.U -> s2_lru_way_en,
+    2.U -> s2_plru_way_en
+  ))
+  // MSHR way-collision fix: if the chosen way is already claimed by a pending MSHR,
+  // pick an alternative way that is not currently occupied.
   val s2_pending_mask  = mshrs.io.pending_way_mask
   val s2_active_mask   = cf_dcache_active_ways - 1.U    // lower N bits: one per active way
   val s2_avail_ways    = (~s2_pending_mask)(nWays-1,0) & s2_active_mask
-  // If the LRU choice is pending AND there are free alternatives, use the first free way.
-  // If all active ways are pending (all MSHRs busy), fall back to LRU — the miss will be
-  // nacked by the MSHR-full check above and retried next cycle.
+  // If the chosen way is pending AND there are free alternatives, use the first free way.
+  // If all active ways are pending (all MSHRs busy), fall back — miss retried next cycle.
   val s2_replaced_way_en = Mux(
     (s2_repl_way_raw & s2_pending_mask).orR && s2_avail_ways.orR,
     PriorityEncoderOH(s2_avail_ways),
     s2_repl_way_raw)
   val s2_repl_meta = widthMap(i => Mux1H(s2_replaced_way_en, wayMap((w: Int) => RegNext(meta(i).io.resp(w))).toSeq))
+  // Full set index of the evicted block: needed so MSHR passes the correct physical idx to WB.
+  val s2_repl_full_idx_snap = widthMap(i =>
+    Mux1H(s2_replaced_way_en, (0 until nWays).map(way => RegNext(s1_full_idx_snap(way)(i))))
+  )
 
   // nack because of incoming probe
   val s2_nack_hit    = RegNext(VecInit(s1_nack))
@@ -919,6 +969,9 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     mshrs.io.req(w).bits.addr        := s2_req(w).addr
     mshrs.io.req(w).bits.tag_match   := s2_tag_match(w)
     mshrs.io.req(w).bits.old_meta    := Mux(s2_tag_match(w), L1Metadata(s2_repl_meta(w).tag, s2_hit_state(w)), s2_repl_meta(w))
+    // old_idx: full (unmasked) set index of the evicted block, used by MSHR for the correct
+    // TL Release address.  At full config full_idx == masked_idx so this is a no-op.
+    mshrs.io.req(w).bits.old_idx     := s2_repl_full_idx_snap(w)
     mshrs.io.req(w).bits.way_en      := Mux(s2_tag_match(w), s2_tag_match_way(w), s2_replaced_way_en)
 
     mshrs.io.req(w).bits.data        := s2_req(w).data
@@ -928,7 +981,28 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
 
   mshrs.io.meta_resp.valid      := !s2_nack_hit(0) || prober.io.mshr_wb_rdy
   mshrs.io.meta_resp.bits       := Mux1H(s2_tag_match_way(0), RegNext(meta(0).io.resp))
-  when (mshrs.io.req.map(_.fire).reduce(_||_)) { replacer.miss }
+  // Update replacement state on MSHR miss allocation
+  when (mshrs.io.req.map(_.fire).reduce(_||_)) {
+    replacer.miss  // advances global LFSR (no-op for LRU/PLRU internal state_reg)
+    val s2_set_miss  = dcacheMaskIdx(s2_req(0).addr)
+    val s2_alloc_way = OHToUInt(s2_replaced_way_en)
+    when (io.lsu.cf_dcache_repl_conf === 1.U) {
+      lru_state_mem.write(s2_set_miss, lru_replacer.get_next_state(s2_lru_state, s2_alloc_way))
+    } .elsewhen (io.lsu.cf_dcache_repl_conf === 2.U) {
+      plru_state_mem.write(s2_set_miss, plru_replacer.get_next_state(s2_plru_state, s2_alloc_way))
+    }
+  }
+  // Update LRU/PLRU state on cache hit (to track access recency for future evictions)
+  val s2_lsu_hit = s2_valid(0) && s2_hit(0) && s2_type === t_lsu && !s2_nack(0)
+  when (s2_lsu_hit && io.lsu.cf_dcache_repl_conf =/= 0.U) {
+    val s2_set_hit = dcacheMaskIdx(s2_req(0).addr)
+    val s2_hit_way = OHToUInt(s2_tag_match_way(0)(nWays-1, 0))
+    when (io.lsu.cf_dcache_repl_conf === 1.U) {
+      lru_state_mem.write(s2_set_hit, lru_replacer.get_next_state(s2_lru_state, s2_hit_way))
+    } .otherwise {
+      plru_state_mem.write(s2_set_hit, plru_replacer.get_next_state(s2_plru_state, s2_hit_way))
+    }
+  }
   tl_out.a <> mshrs.io.mem_acquire
 
   // probes and releases
@@ -1029,10 +1103,16 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       val evict_fire  = uop_dom === 0.U && iftDomain(s2_fill_entry) === 1.U
       // INFL_MEM_DATAFLOW: victim LOAD reads a line last STORED by attacker (data channel, loads only)
       val memdf_fire  = uop_dom === 0.U && is_load && iftDomain(s2_store_entry) === 1.U
+      // Fix 3a: memsec_fire — any LOAD reading a line whose last store had s_prop/s_acc set.
+      // Same-domain secret propagation via memory: is_atk=false, is_secret=true.
+      // Gated by !memdf_fire to avoid two INFL_MEM_DATAFLOW entries for the same store
+      // when the store is simultaneously attacker-domain AND secret-marked.
+      val memsec_fire = is_load && iftSecret(s2_store_entry) && !memdf_fire
 
       uop_resp_final := addInfluencerBatch(uop_resp_base, Seq(
-        InfluencerCandidate(evict_fire, iftOpCount(s2_fill_entry),  INFL_CACHE_EVICTION.U, true.B, iftSecret(s2_fill_entry)),
-        InfluencerCandidate(memdf_fire, iftOpCount(s2_store_entry), INFL_MEM_DATAFLOW.U,   true.B, iftSecret(s2_store_entry)),
+        InfluencerCandidate(evict_fire,  iftOpCount(s2_fill_entry),  INFL_CACHE_EVICTION.U, true.B,  iftSecret(s2_fill_entry)),
+        InfluencerCandidate(memdf_fire,  iftOpCount(s2_store_entry), INFL_MEM_DATAFLOW.U,   true.B,  iftSecret(s2_store_entry)),
+        InfluencerCandidate(memsec_fire, iftOpCount(s2_store_entry), INFL_MEM_DATAFLOW.U,   false.B, true.B),
       ))
 
       // corefuzzing: update ift_store_meta on store hits (per hit way)
@@ -1061,6 +1141,21 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     for (way <- 0 until nWays) {
       when (mshrs.io.cf_meta_write_fill.bits.way_en(way)) {
         ift_fill_meta(way).write(fill_idx, entry)
+      }
+    }
+  }
+
+  // Update full_idx_snap at MSHR fill time: store the FULL (unmasked) set index of the newly
+  // filled block.  Written at the MASKED idx slot so future reads with the same masked idx
+  // see the full idx and can reject aliases (full_idx_match check in tag compare).
+  // Only MSHR fills create new blocks; prober writes only change coherence state, so the
+  // existing full_idx entry remains valid (same physical block, just different coh state).
+  when (mshrs.io.cf_meta_write_fill.valid) {
+    val fill_idx_masked = mshrs.io.cf_meta_write_fill.bits.idx & dcache_set_mask(idxBits-1, 0)
+    val fill_idx_full   = mshrs.io.cf_meta_write_fill.bits.idx
+    for (way <- 0 until nWays) {
+      when (mshrs.io.cf_meta_write_fill.bits.way_en(way)) {
+        full_idx_snap(way).write(fill_idx_masked, fill_idx_full)
       }
     }
   }

@@ -64,6 +64,19 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   reset_idx := reset_idx + doing_reset
   when (reset_idx === (nSets-1).U) { doing_reset := false.B }
 
+  // corefuzzing: re-arm reset when BTB set/way config changes.
+  // SyncReadMem entries from the old config remain valid in SRAM.  With a smaller
+  // set-count mask, two PCs that differ only in masked-out bits alias to the same set
+  // with identical tags (tag = idx >> log2Ceil(nSets), fixed at max), producing false
+  // hits that redirect the IFU to wrong PCs.  Reset takes nSets(=128) cycles; fetch
+  // is blocked during QS_EXECUTING so the BTB is clean before execution resumes.
+  val prev_btb_set_idx = RegNext(io.cf_btb_set_idx, 0.U)
+  val prev_btb_way_idx = RegNext(io.cf_btb_way_idx, 0.U)
+  when ((io.cf_btb_set_idx =/= prev_btb_set_idx) || (io.cf_btb_way_idx =/= prev_btb_way_idx)) {
+    doing_reset := true.B
+    reset_idx   := 0.U
+  }
+
   // corefuzzing: runtime BTB set count selection
   val btbSetOptionsVec    = VecInit(btbSetOptions.map(_.U))
   val cf_btb_active_sets  = btbSetOptionsVec(io.cf_btb_set_idx)
@@ -114,7 +127,11 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   for (w <- 0 until bankWidth) {
     val entry_meta = s1_req_rmeta(s1_hit_ways(w))(w)
     val entry_btb  = s1_req_rbtb(s1_hit_ways(w))(w)
-    s1_resp(w).valid := !doing_reset && s1_valid && s1_hits(w)
+    // corefuzzing: suppress BTB hit during quiesce — RegNext because BTB SyncReadMem
+    // delivers results at s1 (one cycle after the s0 request from the QS_FETCH window).
+    // Without suppression, a stale entry trained by pre-quiesce workload execution can
+    // redirect the IFU mid-bundle, killing Packet B/C before they enter the ROB.
+    s1_resp(w).valid := !doing_reset && !RegNext(io.cf_btb_quiesce) && s1_valid && s1_hits(w)
     s1_resp(w).bits  := Mux(
       entry_btb.extended,
       s1_req_rebtb,

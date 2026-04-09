@@ -44,6 +44,10 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
     // a call-containing fetch packet, marking the pushed RAS slot as secret.
     val late_write_secret_valid = Input(Vec(coreWidth + memWidth, Bool()))
     val late_write_secret_idx   = Input(Vec(coreWidth + memWidth, UInt(log2Ceil(nRasEntries).W)))
+
+    // corefuzzing: quiesce flush — clear all domain/secret shadow bits on campaign boundary.
+    // Fired from core.scala on QS_DRAINING→QS_FETCH transition (quiesce_flush_pulse).
+    val quiesce_flush = Input(Bool())
   })
   val ras = Reg(Vec(nRasEntries, UInt(vaddrBitsExtended.W)))
   // corefuzzing: per-entry domain shadow (1=pushed by attacker, 0=pushed by victim)
@@ -73,6 +77,16 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
   for (i <- 0 until (coreWidth + memWidth)) {
     when (io.late_write_secret_valid(i)) {
       ras_secret(io.late_write_secret_idx(i)) := true.B
+    }
+  }
+
+  // corefuzzing: quiesce flush — clear all domain/secret shadow bits for clean IFT campaign boundaries.
+  // Prevents stale domain/secret bits in entries beyond the new active RAS size from corrupting IFT
+  // records after a cf_ras_idx CSR reconfiguration.
+  when (io.quiesce_flush) {
+    for (i <- 0 until nRasEntries) {
+      ras_domain(i) := false.B
+      ras_secret(i) := false.B
     }
   }
 }

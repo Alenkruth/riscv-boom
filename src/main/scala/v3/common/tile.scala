@@ -8,6 +8,8 @@ package boom.v3.common
 import chisel3._
 import chisel3.util.{RRArbiter, Queue}
 
+import freechips.rocketchip.diplomacy.BundleBridgeSource
+
 import scala.collection.mutable.{ListBuffer}
 
 import org.chipsalliance.cde.config._
@@ -145,6 +147,13 @@ class BoomTile private(
   val roccs = p(BuildRoCC).map(_(p))
   roccs.map(_.atlNode).foreach { atl => tlMasterXbar.node :=* atl }
   roccs.map(_.tlNode).foreach { tl => tlOtherMastersNode :=* tl }
+
+  // IFT bridge: optional BundleBridgeSource exposed when enableIFTBridge=true.
+  // CanHaveBoomIFTIO in chipyard creates a matching BundleBridgeSink for each such tile.
+  val iftSourceNode: Option[BundleBridgeSource[boom.v3.exu.IFTTileIO]] =
+    if (boomParams.core.enableIFTBridge)
+      Some(BundleBridgeSource(() => new boom.v3.exu.IFTTileIO(boomParams.core.retireWidth)))
+    else None
 }
 
 /**
@@ -169,6 +178,11 @@ class BoomTileModuleImp(outer: BoomTile) extends BaseTileModuleImp(outer){
   outer.traceSourceNode.bundle <> core.io.trace
   outer.bpwatchSourceNode.bundle <> DontCare // core.io.bpwatch
   core.io.hartid := outer.hartIdSinkNode.bundle
+
+  // IFT bridge: wire core IFT output to the BundleBridgeSource when enabled.
+  outer.iftSourceNode.foreach { node =>
+    node.bundle := core.ift_bridge_out.get
+  }
 
   // Connect the core pipeline to other intra-tile modules
   outer.frontend.module.io.cpu <> core.io.ifu

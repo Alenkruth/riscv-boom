@@ -178,6 +178,8 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
     val cf_btb_set_idx    = Input(UInt(2.W))
     val cf_btb_way_idx    = Input(UInt(1.W))
     val cf_tage_count_idx = Input(UInt(3.W))
+    // corefuzzing: suppress BTB predictions during quiesce fetch window
+    val cf_btb_quiesce    = Input(Bool())
 
     // corefuzzing: fetch domain tracking for BPD/BTB domain mismatch detection
     val f0_domain_id           = Input(UInt(1.W))   // domain of current fetch (f0 stage)
@@ -255,6 +257,8 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     val cf_btb_set_idx    = Input(UInt(2.W))
     val cf_btb_way_idx    = Input(UInt(1.W))
     val cf_tage_count_idx = Input(UInt(3.W))
+    // corefuzzing: suppress BTB predictions during quiesce fetch window
+    val cf_btb_quiesce    = Input(Bool())
 
     // corefuzzing: domain of the fetch request for BPD/BTB domain shadow comparisons
     val f0_req_domain_id = Input(UInt(1.W))
@@ -296,6 +300,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     banked_predictors(0).io.cf_btb_set_idx    := io.cf_btb_set_idx
     banked_predictors(0).io.cf_btb_way_idx    := io.cf_btb_way_idx
     banked_predictors(0).io.cf_tage_count_idx := io.cf_tage_count_idx
+    banked_predictors(0).io.cf_btb_quiesce    := io.cf_btb_quiesce
 
   } else {
     require(nBanks == 2)
@@ -316,6 +321,8 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     banked_predictors(1).io.cf_btb_way_idx    := io.cf_btb_way_idx
     banked_predictors(0).io.cf_tage_count_idx := io.cf_tage_count_idx
     banked_predictors(1).io.cf_tage_count_idx := io.cf_tage_count_idx
+    banked_predictors(0).io.cf_btb_quiesce    := io.cf_btb_quiesce
+    banked_predictors(1).io.cf_btb_quiesce    := io.cf_btb_quiesce
 
     when (bank(io.f0_req.bits.pc) === 0.U) {
       banked_lhist_providers(0).io.f0_valid := io.f0_req.valid
