@@ -55,12 +55,14 @@ class RenameFreeList(
   val free_list = RegInit(UInt(numPregs.W), ~(1.U(numPregs.W)))
   val br_alloc_lists = Reg(Vec(maxBrCount, UInt(numPregs.W)))
 
-  // Runtime PRF size selection: pregFileSizeOptions = Seq(256, 128, 96, 64, 48)
-  val pregOptionsVec = VecInit(pregFileSizeOptions.map(_.U))
-  val cf_preg_active = pregOptionsVec(io.cf_preg_idx)
-  // Mask bits >= cf_preg_active so those registers are never allocated.
-  // (1.U << cf_preg_active) - 1.U gives a bitmask of 1s in [active-1:0].
-  val preg_active_mask = ((1.U(numPregs.W) << cf_preg_active) - 1.U)(numPregs-1, 0)
+  // Runtime PRF size selection: pregFileSizeOptions = Seq(192, 128, 96, 64, 48)
+  // Precompute one mask per option as a constant; runtime selection is a small Mux
+  // instead of a barrel-shifter + numPregs-wide subtractor (LUT optimization).
+  val preg_active_masks = VecInit(pregFileSizeOptions.map { sz =>
+    val capped = sz min numPregs
+    (((BigInt(1) << capped) - 1) & ((BigInt(1) << numPregs) - 1)).U(numPregs.W)
+  })
+  val preg_active_mask = preg_active_masks(io.cf_preg_idx)
   val masked_free_list = free_list & preg_active_mask
 
   // Select pregs from the masked free list.

@@ -253,6 +253,30 @@ abstract class PipelinedFunctionalUnit(
     r_uops(0)   := io.req.bits.uop
     r_uops(0).br_mask := GetNewBrMask(io.brupdate, io.req.bits.uop)
 
+    // IFT LUT optimization: zero cf_* fields not read by the FU pipeline or by
+    // the ROB wb_resps merge handler. PRESERVED fields (used downstream):
+    //   cf_fu_bitmap (FU OR's its own bit; rob.scala wb_resps OR-merges)
+    //   cf_attacker_influence, cf_secret_access, cf_secret_transmission,
+    //     cf_secret_propagation (rob.scala wb_resps conditional set-true)
+    //   cf_influencer_list, cf_infl_overflow (rob.scala wb_infl_pending capture)
+    // Stage 0 zeros propagate to stages 1..numStages-1 via r_uops(i):=r_uops(i-1).
+    r_uops(0).cf_domain_id               := 0.U
+    r_uops(0).cf_speculated               := false.B
+    r_uops(0).cf_op_count_id              := 0.U
+    r_uops(0).cf_single_step              := false.B
+    r_uops(0).cf_src_tainted              := false.B
+    r_uops(0).cf_spec_branch_is_atk       := false.B
+    r_uops(0).cf_spec_branch_op_id        := 0.U
+    r_uops(0).cf_spec_branch_is_secret    := false.B
+    r_uops(0).cf_cntd_valid               := false.B
+    r_uops(0).cf_cntd_winner_op           := 0.U
+    r_uops(0).cf_cntd_winner_atk          := false.B
+    r_uops(0).cf_cntd_winner_sec          := false.B
+    r_uops(0).cf_cntd_deny_count          := 0.U
+    r_uops(0).cf_taint_producer_op        := 0.U
+    r_uops(0).cf_taint_producer_is_atk    := false.B
+    r_uops(0).cf_taint_producer_is_secret := false.B
+
     // corefuzzing: set the FU bitmap bit and detect attacker-secret coexistence at stage 0
     {
       val fu = io.req.bits.uop.fu_code
@@ -317,6 +341,27 @@ abstract class PipelinedFunctionalUnit(
     io.resp.bits.predicated := false.B
     io.resp.bits.uop := io.req.bits.uop
     io.resp.bits.uop.br_mask := GetNewBrMask(io.brupdate, io.req.bits.uop)
+
+    // IFT LUT optimization: zero cf_* fields not read by the ROB wb_resps merge.
+    // Same field set as the pipelined branch above. Has no register storage to
+    // save, but consistent with the pipelined branch and lets the synthesizer
+    // propagate constants out of the FU's resp.uop.
+    io.resp.bits.uop.cf_domain_id               := 0.U
+    io.resp.bits.uop.cf_speculated               := false.B
+    io.resp.bits.uop.cf_op_count_id              := 0.U
+    io.resp.bits.uop.cf_single_step              := false.B
+    io.resp.bits.uop.cf_src_tainted              := false.B
+    io.resp.bits.uop.cf_spec_branch_is_atk       := false.B
+    io.resp.bits.uop.cf_spec_branch_op_id        := 0.U
+    io.resp.bits.uop.cf_spec_branch_is_secret    := false.B
+    io.resp.bits.uop.cf_cntd_valid               := false.B
+    io.resp.bits.uop.cf_cntd_winner_op           := 0.U
+    io.resp.bits.uop.cf_cntd_winner_atk          := false.B
+    io.resp.bits.uop.cf_cntd_winner_sec          := false.B
+    io.resp.bits.uop.cf_cntd_deny_count          := 0.U
+    io.resp.bits.uop.cf_taint_producer_op        := 0.U
+    io.resp.bits.uop.cf_taint_producer_is_atk    := false.B
+    io.resp.bits.uop.cf_taint_producer_is_secret := false.B
 
     // corefuzzing
     // Non-destructive logging for non-pipelined functional unit kills

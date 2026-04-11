@@ -122,6 +122,24 @@ class FDivSqrtUnit(implicit p: Parameters)
     r_buffer_val := true.B
     r_buffer_req := io.req.bits
     r_buffer_req.uop.br_mask := GetNewBrMask(io.brupdate, io.req.bits.uop)
+    // IFT LUT optimization: zero cf_* fields not read by FDivSqrtUnit or by ROB
+    // wb_resps merge handler. Same field set as PipelinedFunctionalUnit (Change 2).
+    r_buffer_req.uop.cf_domain_id               := 0.U
+    r_buffer_req.uop.cf_speculated               := false.B
+    r_buffer_req.uop.cf_op_count_id              := 0.U
+    r_buffer_req.uop.cf_single_step              := false.B
+    r_buffer_req.uop.cf_src_tainted              := false.B
+    r_buffer_req.uop.cf_spec_branch_is_atk       := false.B
+    r_buffer_req.uop.cf_spec_branch_op_id        := 0.U
+    r_buffer_req.uop.cf_spec_branch_is_secret    := false.B
+    r_buffer_req.uop.cf_cntd_valid               := false.B
+    r_buffer_req.uop.cf_cntd_winner_op           := 0.U
+    r_buffer_req.uop.cf_cntd_winner_atk          := false.B
+    r_buffer_req.uop.cf_cntd_winner_sec          := false.B
+    r_buffer_req.uop.cf_cntd_deny_count          := 0.U
+    r_buffer_req.uop.cf_taint_producer_op        := 0.U
+    r_buffer_req.uop.cf_taint_producer_is_atk    := false.B
+    r_buffer_req.uop.cf_taint_producer_is_secret := false.B
     r_buffer_fin.viewAsSupertype(new tile.FPUCtrlSigs) := fdiv_decoder.io.sigs
 
     r_buffer_fin.rm := Mux(ImmGenRm(io.req.bits.uop.imm_packed) === 7.U, io.fcsr_rm, ImmGenRm(io.req.bits.uop.imm_packed))
@@ -176,6 +194,24 @@ class FDivSqrtUnit(implicit p: Parameters)
     r_divsqrt_uop := r_buffer_req.uop
     r_divsqrt_killed := IsKilledByBranch(io.brupdate, r_buffer_req.uop) || io.req.bits.kill
     r_divsqrt_uop.br_mask := GetNewBrMask(io.brupdate, r_buffer_req.uop)
+    // IFT LUT optimization: explicit zero (Vivado would also propagate from
+    // r_buffer_req.uop's already-zero cf_* fields, but be explicit).
+    r_divsqrt_uop.cf_domain_id               := 0.U
+    r_divsqrt_uop.cf_speculated               := false.B
+    r_divsqrt_uop.cf_op_count_id              := 0.U
+    r_divsqrt_uop.cf_single_step              := false.B
+    r_divsqrt_uop.cf_src_tainted              := false.B
+    r_divsqrt_uop.cf_spec_branch_is_atk       := false.B
+    r_divsqrt_uop.cf_spec_branch_op_id        := 0.U
+    r_divsqrt_uop.cf_spec_branch_is_secret    := false.B
+    r_divsqrt_uop.cf_cntd_valid               := false.B
+    r_divsqrt_uop.cf_cntd_winner_op           := 0.U
+    r_divsqrt_uop.cf_cntd_winner_atk          := false.B
+    r_divsqrt_uop.cf_cntd_winner_sec          := false.B
+    r_divsqrt_uop.cf_cntd_deny_count          := 0.U
+    r_divsqrt_uop.cf_taint_producer_op        := 0.U
+    r_divsqrt_uop.cf_taint_producer_is_atk    := false.B
+    r_divsqrt_uop.cf_taint_producer_is_secret := false.B
   }
 
   //-----------------------------------------
@@ -199,6 +235,23 @@ class FDivSqrtUnit(implicit p: Parameters)
     r_out_val := !r_divsqrt_killed && !IsKilledByBranch(io.brupdate, r_divsqrt_uop) && !io.req.bits.kill
     r_out_uop := r_divsqrt_uop
     r_out_uop.br_mask := GetNewBrMask(io.brupdate, r_divsqrt_uop)
+    // IFT LUT optimization: explicit zero (chained from r_divsqrt_uop above).
+    r_out_uop.cf_domain_id               := 0.U
+    r_out_uop.cf_speculated               := false.B
+    r_out_uop.cf_op_count_id              := 0.U
+    r_out_uop.cf_single_step              := false.B
+    r_out_uop.cf_src_tainted              := false.B
+    r_out_uop.cf_spec_branch_is_atk       := false.B
+    r_out_uop.cf_spec_branch_op_id        := 0.U
+    r_out_uop.cf_spec_branch_is_secret    := false.B
+    r_out_uop.cf_cntd_valid               := false.B
+    r_out_uop.cf_cntd_winner_op           := 0.U
+    r_out_uop.cf_cntd_winner_atk          := false.B
+    r_out_uop.cf_cntd_winner_sec          := false.B
+    r_out_uop.cf_cntd_deny_count          := 0.U
+    r_out_uop.cf_taint_producer_op        := 0.U
+    r_out_uop.cf_taint_producer_is_atk    := false.B
+    r_out_uop.cf_taint_producer_is_secret := false.B
     r_out_wdata_double := sanitizeNaN(divsqrt.io.out, tile.FType.D)
     r_out_flags_double := divsqrt.io.exceptionFlags
 

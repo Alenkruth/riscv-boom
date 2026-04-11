@@ -422,6 +422,22 @@ class Rob(
       // corefuzzing: stamp robTagCF bit into cf_fu_bitmap at enqueue
       rob_uop(rob_tail)       := io.enq_uops(w)
       rob_uop(rob_tail).cf_fu_bitmap := io.enq_uops(w).cf_fu_bitmap | (1.U << robTagCF.U)
+      // IFT LUT optimization (Change 3): zero dead fields at ROB enqueue.
+      //   cf_cntd_*: consumed at issue time via cf_contend_out → ic_pending_*
+      //              tables; never read from rob_uop after enqueue.
+      //   cf_taint_producer_op / cf_taint_producer_is_atk: consumed at dispatch
+      //              in core.scala (INFL_REG_DATAFLOW addInfluencer); not read
+      //              from rob_uop afterward (printf reads dispatch-time copy via
+      //              rob_uop, but these specific fields aren't printed).
+      // KEEP cf_taint_producer_is_secret — rename-stage.scala:577 reads it at
+      // C7 commit (`io.com_uops(w).cf_taint_producer_is_secret`).
+      rob_uop(rob_tail).cf_cntd_valid            := false.B
+      rob_uop(rob_tail).cf_cntd_winner_op        := 0.U
+      rob_uop(rob_tail).cf_cntd_winner_atk       := false.B
+      rob_uop(rob_tail).cf_cntd_winner_sec       := false.B
+      rob_uop(rob_tail).cf_cntd_deny_count       := 0.U
+      rob_uop(rob_tail).cf_taint_producer_op     := 0.U
+      rob_uop(rob_tail).cf_taint_producer_is_atk := false.B
       rob_exception(rob_tail) := io.enq_uops(w).exception
       rob_predicated(rob_tail)   := false.B
       rob_fflags(w)(rob_tail)    := 0.U

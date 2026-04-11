@@ -142,6 +142,25 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
 
   rpq.io.enq.valid := ((io.req_pri_val && io.req_pri_rdy) || (io.req_sec_val && io.req_sec_rdy)) && !isPrefetch(io.req.uop.mem_cmd)
   rpq.io.enq.bits  := io.req
+  // IFT LUT optimization (Change 4): zero cf_* fields not needed by MSHR/rpq logic.
+  // rpq reads mem_cmd, mem_size, mem_signed; passes uop through io.resp.bits.uop
+  // back to wb_resps (same preservation list as FU pipeline Change 2).
+  rpq.io.enq.bits.uop.cf_speculated               := false.B
+  rpq.io.enq.bits.uop.cf_op_count_id              := 0.U
+  rpq.io.enq.bits.uop.cf_single_step              := false.B
+  rpq.io.enq.bits.uop.cf_src_tainted              := false.B
+  rpq.io.enq.bits.uop.cf_spec_branch_is_atk       := false.B
+  rpq.io.enq.bits.uop.cf_spec_branch_op_id        := 0.U
+  rpq.io.enq.bits.uop.cf_spec_branch_is_secret    := false.B
+  rpq.io.enq.bits.uop.cf_cntd_valid               := false.B
+  rpq.io.enq.bits.uop.cf_cntd_winner_op           := 0.U
+  rpq.io.enq.bits.uop.cf_cntd_winner_atk          := false.B
+  rpq.io.enq.bits.uop.cf_cntd_winner_sec          := false.B
+  rpq.io.enq.bits.uop.cf_cntd_deny_count          := 0.U
+  rpq.io.enq.bits.uop.cf_taint_producer_op        := 0.U
+  rpq.io.enq.bits.uop.cf_taint_producer_is_atk    := false.B
+  rpq.io.enq.bits.uop.cf_taint_producer_is_secret := false.B
+  rpq.io.enq.bits.uop.cf_domain_id                := 0.U
   rpq.io.deq.ready := false.B
 
 

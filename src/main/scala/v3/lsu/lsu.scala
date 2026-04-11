@@ -377,6 +377,27 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq(ld_enq_idx).bits.uop             := io.core.dis_uops(w).bits
       // corefuzzing: stamp ldqTagCF into cf_fu_bitmap at LDQ enqueue
       ldq(ld_enq_idx).bits.uop.cf_fu_bitmap := io.core.dis_uops(w).bits.cf_fu_bitmap | (1.U << ldqTagCF.U)
+      // IFT LUT optimization (Change 8): zero cf_* fields not read by LSU logic.
+      // PRESERVED: cf_op_count_id, cf_domain_id (head reads), cf_secret_access,
+      //   cf_secret_propagation (head + TLB update), cf_secret_transmission (TLB update),
+      //   cf_fu_bitmap (set above, merged at TLB+commit), cf_influencer_list + cf_infl_overflow
+      //   (addInfluencer calls in DTLB/ordering-violation/STL-forward paths).
+      // rob_uop holds the dispatch-time IFT state independently.
+      ldq(ld_enq_idx).bits.uop.cf_speculated               := false.B
+      ldq(ld_enq_idx).bits.uop.cf_attacker_influence       := false.B
+      ldq(ld_enq_idx).bits.uop.cf_single_step              := false.B
+      ldq(ld_enq_idx).bits.uop.cf_src_tainted              := false.B
+      ldq(ld_enq_idx).bits.uop.cf_taint_producer_op        := 0.U
+      ldq(ld_enq_idx).bits.uop.cf_taint_producer_is_atk    := false.B
+      ldq(ld_enq_idx).bits.uop.cf_taint_producer_is_secret := false.B
+      ldq(ld_enq_idx).bits.uop.cf_spec_branch_is_atk       := false.B
+      ldq(ld_enq_idx).bits.uop.cf_spec_branch_op_id        := 0.U
+      ldq(ld_enq_idx).bits.uop.cf_spec_branch_is_secret    := false.B
+      ldq(ld_enq_idx).bits.uop.cf_cntd_valid               := false.B
+      ldq(ld_enq_idx).bits.uop.cf_cntd_winner_op           := 0.U
+      ldq(ld_enq_idx).bits.uop.cf_cntd_winner_atk          := false.B
+      ldq(ld_enq_idx).bits.uop.cf_cntd_winner_sec          := false.B
+      ldq(ld_enq_idx).bits.uop.cf_cntd_deny_count          := 0.U
       ldq(ld_enq_idx).bits.youngest_stq_idx  := st_enq_idx
       ldq(ld_enq_idx).bits.st_dep_mask     := next_live_store_mask
 
@@ -401,6 +422,22 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         Mux(!io.core.dis_uops(w).bits.is_fence,
             (1.U << dtlbTagCF.U) | (1.U << dcacheTagCF.U), 0.U)
       stq(st_enq_idx).bits.uop.cf_fu_bitmap := io.core.dis_uops(w).bits.cf_fu_bitmap | store_bitmap_extra
+      // IFT LUT optimization (Change 8): same zeroing as LDQ above.
+      stq(st_enq_idx).bits.uop.cf_speculated               := false.B
+      stq(st_enq_idx).bits.uop.cf_attacker_influence       := false.B
+      stq(st_enq_idx).bits.uop.cf_single_step              := false.B
+      stq(st_enq_idx).bits.uop.cf_src_tainted              := false.B
+      stq(st_enq_idx).bits.uop.cf_taint_producer_op        := 0.U
+      stq(st_enq_idx).bits.uop.cf_taint_producer_is_atk    := false.B
+      stq(st_enq_idx).bits.uop.cf_taint_producer_is_secret := false.B
+      stq(st_enq_idx).bits.uop.cf_spec_branch_is_atk       := false.B
+      stq(st_enq_idx).bits.uop.cf_spec_branch_op_id        := 0.U
+      stq(st_enq_idx).bits.uop.cf_spec_branch_is_secret    := false.B
+      stq(st_enq_idx).bits.uop.cf_cntd_valid               := false.B
+      stq(st_enq_idx).bits.uop.cf_cntd_winner_op           := 0.U
+      stq(st_enq_idx).bits.uop.cf_cntd_winner_atk          := false.B
+      stq(st_enq_idx).bits.uop.cf_cntd_winner_sec          := false.B
+      stq(st_enq_idx).bits.uop.cf_cntd_deny_count          := 0.U
       stq(st_enq_idx).bits.addr.valid := false.B
       stq(st_enq_idx).bits.data.valid := false.B
       stq(st_enq_idx).bits.committed  := false.B

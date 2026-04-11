@@ -1080,6 +1080,18 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   val ift_fill_meta  = Seq.fill(nWays)(SyncReadMem(nSets, UInt(iftEntryBits.W)))
   val ift_store_meta = Seq.fill(nWays)(SyncReadMem(nSets, UInt(iftEntryBits.W)))
 
+  // Per-way ift_store_meta write staging: collect from all memWidth ports, merge into
+  // a single write per way after the loop.  Prevents Vivado Synth 8-4767 "multiple
+  // writes via different ports" which dissolves SyncReadMem into FFs.
+  val ift_sm_wr_valid = Seq.fill(nWays)(Wire(Vec(memWidth, Bool())))
+  val ift_sm_wr_idx   = Seq.fill(nWays)(Wire(Vec(memWidth, UInt(idxBits.W))))
+  val ift_sm_wr_data  = Seq.fill(nWays)(Wire(Vec(memWidth, UInt(iftEntryBits.W))))
+  for (way <- 0 until nWays) {
+    ift_sm_wr_valid(way) := VecInit(Seq.fill(memWidth)(false.B))
+    ift_sm_wr_idx(way)   := DontCare
+    ift_sm_wr_data(way)  := DontCare
+  }
+
   for (w <- 0 until memWidth) {
     cache_resp(w).valid := s2_valid(w) && s2_send_resp(w)
 
@@ -1115,14 +1127,18 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
         InfluencerCandidate(memsec_fire, iftOpCount(s2_store_entry), INFL_MEM_DATAFLOW.U,   false.B, true.B),
       ))
 
-      // corefuzzing: update ift_store_meta on store hits (per hit way)
+      // corefuzzing: ift_store_meta writes are collected per-way and merged after the
+      // memWidth loop so each SyncReadMem sees exactly ONE write port (Vivado dissolves
+      // multi-writer SyncReadMem into FFs — Synth 8-4767).  See merged write below.
       when (!is_load) {
         val s2_set   = dcacheMaskIdx(s2_req(w).addr)
         val entry    = mkIftEntry(uop_dom, s2_req(w).uop.cf_op_count_id,
                          s2_req(w).uop.cf_secret_propagation || s2_req(w).uop.cf_secret_access)
         for (way <- 0 until nWays) {
           when (s2_tag_match_way(w)(way)) {
-            ift_store_meta(way).write(s2_set, entry)
+            ift_sm_wr_valid(way)(w) := true.B
+            ift_sm_wr_idx(way)(w)   := s2_set
+            ift_sm_wr_data(way)(w)  := entry
           }
         }
       }
@@ -1130,6 +1146,17 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     cache_resp(w).bits.uop      := uop_resp_final
     cache_resp(w).bits.data     := loadgen(w).data | s2_sc_fail
     cache_resp(w).bits.is_hella := s2_req(w).is_hella
+  }
+
+  // corefuzzing: merged single-writer for ift_store_meta (one write port per way).
+  // Two stores from different memWidth ports cannot hit the same set+way simultaneously,
+  // so we merge with priority encoding.  This enables Vivado LUTRAM inference.
+  for (way <- 0 until nWays) {
+    val any_wr = ift_sm_wr_valid(way).asUInt.orR
+    val sel    = PriorityEncoder(ift_sm_wr_valid(way).asUInt)
+    when (any_wr) {
+      ift_store_meta(way).write(ift_sm_wr_idx(way)(sel), ift_sm_wr_data(way)(sel))
+    }
   }
 
   // corefuzzing: update ift_fill_meta at MSHR fill completion (meta_write), one way at a time.

@@ -176,6 +176,35 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
 
   when (io.in_uop.valid) {
     slot_uop := io.in_uop.bits
+    // IFT LUT optimization: zero pass-through cf_* fields not used inside the
+    // issue slot or issue unit. The slot has standalone cf_cntd_* registers
+    // (lines 114-118) for contention accumulation. The issue UNIT (issue-unit-
+    // age-ordered.scala lines 188-201) reads cf_domain_id, cf_op_count_id,
+    // cf_secret_access, cf_secret_propagation from slot_uop for cross-domain
+    // contention attribution — these MUST be preserved. Everything else listed
+    // here is pure pass-through to wb_resps, where the merge is additive
+    // (zero wb_uop fields are no-ops; rob_uop holds dispatch-time IFT state).
+    slot_uop.cf_speculated               := false.B
+    slot_uop.cf_attacker_influence       := false.B
+    slot_uop.cf_secret_transmission      := false.B
+    slot_uop.cf_single_step              := false.B
+    slot_uop.cf_fu_bitmap                := 0.U
+    slot_uop.cf_src_tainted              := false.B
+    slot_uop.cf_taint_producer_op        := 0.U
+    slot_uop.cf_taint_producer_is_atk    := false.B
+    slot_uop.cf_taint_producer_is_secret := false.B
+    slot_uop.cf_spec_branch_is_atk       := false.B
+    slot_uop.cf_spec_branch_op_id        := 0.U
+    slot_uop.cf_spec_branch_is_secret    := false.B
+    slot_uop.cf_infl_overflow            := false.B
+    slot_uop.cf_influencer_list.foreach { e =>
+      e.valid      := false.B
+      e.op_count   := 0.U
+      e.infl_type  := 0.U
+      e.is_atk     := false.B
+      e.is_secret  := false.B
+      e.deny_count := 0.U
+    }
     assert (is_invalid || io.clear || io.kill, "trying to overwrite a valid issue slot.")
   }
 
