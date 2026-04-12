@@ -109,11 +109,27 @@ case class BoomCoreParams(
    * When true, BoomCore exposes ift_bridge_out IO and BoomTile creates a
    * BundleBridgeSource that CanHaveBoomIFTIO in chipyard sinks at the system level.
    * Has no effect on Verilator simulation (CoreFuzzingConfig leaves this false). */
-  enableIFTBridge: Boolean = false
+  enableIFTBridge: Boolean = false,
+
+  /* IFT: compile-time gate for DIFT tracking logic (domain tagging, taint
+   * propagation, influencer tracking, secret detection, IFT commit log).
+   * When false, all IFT state and logic is elided at FIRRTL emission time.
+   * Set via WithIFT config fragment. */
+  enableIFT: Boolean = false,
+
+  /* Reconf: compile-time gate for runtime reconfigurability (dynamic structure
+   * sizing CSRs, quiesce-for-resize FSM, index masking, pointer wrapping with
+   * dynamic limits). When false, all reconfiguration CSRs are absent and
+   * structures use their hardware-built maximum sizes.
+   * Set via WithReconf config fragment. */
+  enableReconf: Boolean = false
 
 // DOC include end: BOOM Parameters
 ) extends freechips.rocketchip.tile.CoreParams
 {
+  require(!enableIFTBridge || enableIFT,
+    "enableIFTBridge requires enableIFT (cannot export IFT records without IFT tracking)")
+
   override def traceCustom = Some(new BoomTraceBundle)
   val xLen = 64
   val haveFSDirty = true
@@ -545,6 +561,8 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val BRANCH_PRINTF       = boomParams.enableBranchPrintf // dump branch predictor results
   val MEMTRACE_PRINTF     = boomParams.enableMemtracePrintf // dump trace of memory accesses to L1D for debugging
   val ENABLE_IFT_BRIDGE   = boomParams.enableIFTBridge // export IFT records as tile IO for FireSim IFTBridge
+  val ENABLE_IFT          = boomParams.enableIFT       // compile-time gate for DIFT tracking logic
+  val ENABLE_RECONF       = boomParams.enableReconf    // compile-time gate for runtime reconfigurability
 
   //************************************
   // Other Non/Should-not-be sythesizable modules

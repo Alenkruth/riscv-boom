@@ -56,6 +56,31 @@ class WithIFTBridge extends Config((site, here, up) => {
   }
 })
 
+// WithIFT: compile-time gate enabling DIFT tracking logic (domain tagging, taint
+// propagation, influencer tracking, secret detection, IFT commit log).
+// Layer on top of WithFuzzingBoom to synthesize BOOM with IFT hardware.
+class WithIFT extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      enableIFT = true
+    )))
+    case other => other
+  }
+})
+
+// WithReconf: compile-time gate enabling runtime reconfigurability (dynamic
+// structure sizing CSRs, quiesce-for-resize FSM, index masking, dynamic pointer
+// wrapping). Layer on top of WithFuzzingBoom to synthesize BOOM with
+// reconfigurable structures.
+class WithReconf extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      enableReconf = true
+    )))
+    case other => other
+  }
+})
+
 class WithBoomBranchPrintf extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
     case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
@@ -462,9 +487,15 @@ class WithFuzzingBoom(n: Int = 1, overrideIdOffset: Option[Int] = None) extends 
               issueParams = Seq(
                 IssueParams(issueWidth=2, numEntries=32, iqType=IQT_MEM.litValue, dispatchWidth=4),
                 IssueParams(issueWidth=4, numEntries=32, iqType=IQT_INT.litValue, dispatchWidth=4),
-                IssueParams(issueWidth=2, numEntries=32, iqType=IQT_FP.litValue , dispatchWidth=4)),
+                // FP issueWidth 2→1: eliminates fpu_exe_unit_1 (cited by Vivado
+                // in FpPipeline Level-5/6 congestion windows).  Drops one FPU +
+                // one wakeup port; dual-issue FP is unused by the fuzzing workload.
+                IssueParams(issueWidth=1, numEntries=32, iqType=IQT_FP.litValue , dispatchWidth=4)),
               numIntPhysRegisters = 192,
-              numFpPhysRegisters = 192,
+              // FP reduced from 192 to 96 — FpPipeline/fregfile is the top Vivado
+              // congestion hotspot (Level 5/6).  Runtime reconfig preserved via
+              // fpPregFileSizeOptions = Seq(96,64,48,32,16) sharing cf_preg_idx CSR.
+              numFpPhysRegisters = 96,
               numLdqEntries = 48,
               numStqEntries = 48,
               maxBrCount = 20,

@@ -300,7 +300,8 @@ class RenameStage(
   val freelist = Module(new RenameFreeList(
     plWidth,
     numPhysRegs,
-    if (float) 32 else 31))
+    if (float) 32 else 31,
+    if (float) fpPregFileSizeOptions else pregFileSizeOptions))
   val busytable = Module(new RenameBusyTable(
     plWidth,
     numPhysRegs,

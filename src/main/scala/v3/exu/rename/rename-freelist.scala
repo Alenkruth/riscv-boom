@@ -21,7 +21,12 @@ import freechips.rocketchip.util.CoreFuzzingConstants
 class RenameFreeList(
   val plWidth: Int,
   val numPregs: Int,
-  val numLregs: Int)
+  val numLregs: Int,
+  // Runtime reconfiguration option list for this freelist.  INT rename passes
+  // pregFileSizeOptions; FP rename passes fpPregFileSizeOptions.  Each option
+  // gets capped by `numPregs` at elaboration time, so lists whose max exceeds
+  // the hardware size are safely clamped.
+  val pregSizeOptions: Seq[Int])
   (implicit p: Parameters) extends BoomModule
   with CoreFuzzingConstants
 {
@@ -55,10 +60,12 @@ class RenameFreeList(
   val free_list = RegInit(UInt(numPregs.W), ~(1.U(numPregs.W)))
   val br_alloc_lists = Reg(Vec(maxBrCount, UInt(numPregs.W)))
 
-  // Runtime PRF size selection: pregFileSizeOptions = Seq(192, 128, 96, 64, 48)
+  // Runtime PRF size selection via `pregSizeOptions` constructor param.
+  // INT rename passes pregFileSizeOptions = Seq(192, 128, 96, 64, 48).
+  // FP  rename passes fpPregFileSizeOptions = Seq(96, 64, 48, 32, 16).
   // Precompute one mask per option as a constant; runtime selection is a small Mux
   // instead of a barrel-shifter + numPregs-wide subtractor (LUT optimization).
-  val preg_active_masks = VecInit(pregFileSizeOptions.map { sz =>
+  val preg_active_masks = VecInit(pregSizeOptions.map { sz =>
     val capped = sz min numPregs
     (((BigInt(1) << capped) - 1) & ((BigInt(1) << numPregs) - 1)).U(numPregs.W)
   })
