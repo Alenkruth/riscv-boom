@@ -1151,23 +1151,30 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // corefuzzing: merged single-writer for ift_store_meta (one write port per way).
   // Two stores from different memWidth ports cannot hit the same set+way simultaneously,
   // so we merge with priority encoding.  This enables Vivado LUTRAM inference.
-  for (way <- 0 until nWays) {
-    val any_wr = ift_sm_wr_valid(way).asUInt.orR
-    val sel    = PriorityEncoder(ift_sm_wr_valid(way).asUInt)
-    when (any_wr) {
-      ift_store_meta(way).write(ift_sm_wr_idx(way)(sel), ift_sm_wr_data(way)(sel))
-    }
-  }
-
-  // corefuzzing: update ift_fill_meta at MSHR fill completion (meta_write), one way at a time.
-  when (mshrs.io.cf_meta_write_fill.valid) {
-    val fill_idx = mshrs.io.cf_meta_write_fill.bits.idx & dcache_set_mask(idxBits-1, 0)
-    val entry    = mkIftEntry(mshrs.io.cf_meta_write_fill.bits.domain,
-                              mshrs.io.cf_meta_write_fill.bits.op_count,
-                              mshrs.io.cf_meta_write_fill.bits.secret)
+  //
+  // IFT compile-time gate: when ENABLE_IFT=false, the write loop is elided and
+  // FIRRTL DCE removes the staging signals (ift_sm_wr_*) and the ift_store_meta
+  // SRAMs entirely — their reads in the memWidth loop above (via s2_store_ways)
+  // constant-propagate to 0 and the consuming addInfluencerBatch candidates die.
+  if (ENABLE_IFT) {
     for (way <- 0 until nWays) {
-      when (mshrs.io.cf_meta_write_fill.bits.way_en(way)) {
-        ift_fill_meta(way).write(fill_idx, entry)
+      val any_wr = ift_sm_wr_valid(way).asUInt.orR
+      val sel    = PriorityEncoder(ift_sm_wr_valid(way).asUInt)
+      when (any_wr) {
+        ift_store_meta(way).write(ift_sm_wr_idx(way)(sel), ift_sm_wr_data(way)(sel))
+      }
+    }
+
+    // corefuzzing: update ift_fill_meta at MSHR fill completion (meta_write), one way at a time.
+    when (mshrs.io.cf_meta_write_fill.valid) {
+      val fill_idx = mshrs.io.cf_meta_write_fill.bits.idx & dcache_set_mask(idxBits-1, 0)
+      val entry    = mkIftEntry(mshrs.io.cf_meta_write_fill.bits.domain,
+                                mshrs.io.cf_meta_write_fill.bits.op_count,
+                                mshrs.io.cf_meta_write_fill.bits.secret)
+      for (way <- 0 until nWays) {
+        when (mshrs.io.cf_meta_write_fill.bits.way_en(way)) {
+          ift_fill_meta(way).write(fill_idx, entry)
+        }
       }
     }
   }

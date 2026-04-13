@@ -113,6 +113,10 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   with freechips.rocketchip.util.CoreFuzzingConstants
 {
   val enableICacheDelay = tileParams.core.asInstanceOf[BoomCoreParams].enableICacheDelay
+  // IFT compile-time gate: when false, ift_tag_meta has no write driver and
+  // FIRRTL DCE elides the BRAM; downstream s1_domain_mismatch constant-props to
+  // false and the IFU's INFL_ICACHE_STATE injection path dies at the consumer.
+  val ENABLE_IFT = tileParams.core.asInstanceOf[BoomCoreParams].enableIFT
   val io = IO(new ICacheBundle(outer))
   val (tl_out, edge_out) = outer.masterNode.out(0)
 
@@ -210,9 +214,11 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
 
   // corefuzzing: write ift_tag_meta on refill_done (same cycle as tag_array write, one way mask)
   val refill_domain_reg = RegEnable(io.s1_domain_id, s1_valid && !(refill_valid || s2_miss))
-  when (refill_done) {
-    ift_tag_meta.write(refill_idx, VecInit(Seq.fill(nWays)(refill_domain_reg)),
-      Seq.tabulate(nWays)(repl_way === _.U))
+  if (ENABLE_IFT) {
+    when (refill_done) {
+      ift_tag_meta.write(refill_idx, VecInit(Seq.fill(nWays)(refill_domain_reg)),
+        Seq.tabulate(nWays)(repl_way === _.U))
+    }
   }
 
   when (io.invalidate) {

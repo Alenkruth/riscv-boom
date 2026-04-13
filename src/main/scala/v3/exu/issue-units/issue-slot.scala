@@ -364,15 +364,22 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
   // corefuzzing: per-slot ISSUE_CONTENTION accumulation
   // nc_cntd_* Wires declared above (near slot_uop) default to current register values.
   // Drive them conditionally from cf_contend_in so same-cycle denials are captured.
-
-  when (io.cf_contend_in.valid) {
-    when (!cf_cntd_valid) {
-      nc_cntd_valid      := true.B
-      nc_cntd_winner_op  := io.cf_contend_in.bits.winner_op_count
-      nc_cntd_winner_atk := io.cf_contend_in.bits.winner_is_atk
-      nc_cntd_winner_sec := io.cf_contend_in.bits.winner_is_sec
+  //
+  // IFT compile-time gate: when ENABLE_IFT=false the denial-accumulation path is
+  // elided.  cf_cntd_* registers have no write driver from cf_contend_in; their
+  // only remaining writes come from io.in_uop propagation (always-false inputs)
+  // and the kill/otherwise branches, so FIRRTL constant-propagates all cf_cntd_*
+  // values to false/0 and DCE removes the registers entirely.
+  if (ENABLE_IFT) {
+    when (io.cf_contend_in.valid) {
+      when (!cf_cntd_valid) {
+        nc_cntd_valid      := true.B
+        nc_cntd_winner_op  := io.cf_contend_in.bits.winner_op_count
+        nc_cntd_winner_atk := io.cf_contend_in.bits.winner_is_atk
+        nc_cntd_winner_sec := io.cf_contend_in.bits.winner_is_sec
+      }
+      nc_cntd_deny_count := Mux(cf_cntd_deny_count === 15.U, 15.U, cf_cntd_deny_count + 1.U)
     }
-    nc_cntd_deny_count := Mux(cf_cntd_deny_count === 15.U, 15.U, cf_cntd_deny_count + 1.U)
   }
 
   // Register update priority (last-connect wins in Chisel):

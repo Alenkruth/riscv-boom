@@ -251,13 +251,17 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
         Mux(doing_reset, (~(0.U(bankWidth.W))), s1_update_wmeta_mask).asBools
       )
       // corefuzzing: write secret shadow alongside domain (same index/mask)
-      btb_secret(w).write(
-        Mux(doing_reset, reset_idx, s1_update_idx_masked),
-        Mux(doing_reset,
-          VecInit(Seq.fill(bankWidth)(false.B)),
-          VecInit(Seq.fill(bankWidth)(s1_update.bits.cf_is_secret))),
-        Mux(doing_reset, (~(0.U(bankWidth.W))), s1_update_wmeta_mask).asBools
-      )
+      // IFT gate: elided when ENABLE_IFT=false; btb_secret SRAMs become dead
+      // state with no write driver → FIRRTL DCE removes them entirely.
+      if (ENABLE_IFT) {
+        btb_secret(w).write(
+          Mux(doing_reset, reset_idx, s1_update_idx_masked),
+          Mux(doing_reset,
+            VecInit(Seq.fill(bankWidth)(false.B)),
+            VecInit(Seq.fill(bankWidth)(s1_update.bits.cf_is_secret))),
+          Mux(doing_reset, (~(0.U(bankWidth.W))), s1_update_wmeta_mask).asBools
+        )
+      }
     }
   }
   when (s1_update_wbtb_mask =/= 0.U && offset_is_extended) {

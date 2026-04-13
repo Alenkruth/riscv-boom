@@ -520,31 +520,38 @@ class RenameStage(
   }
 
   // -- Write taint at dispatch (ren2_fire = io.dis_fire) --
-  for (w <- 0 until plWidth) {
-    when (ren2_fire(w) && ren2_valids(w) && (ren2_uops(w).dst_rtype === rtype)) {
-      val should_taint = ren2_uops(w).cf_domain_id === 1.U || ren2_uops(w).cf_src_tainted
-      taint_table(ren2_uops(w).pdst)           := should_taint
-      producer_table(ren2_uops(w).pdst)        := ren2_uops(w).cf_op_count_id
-      producer_domain_table(ren2_uops(w).pdst) := ren2_uops(w).cf_domain_id === 1.U ||
-                                                   (ren2_uops(w).cf_src_tainted && ren2_uops(w).cf_taint_producer_is_atk)
-      // cf_secret_propagation is set at dispatch (core.scala), AFTER ren2, so it is
-      // always false here.  Use cf_taint_producer_is_secret (= any_secret_tainted from
-      // line 491) as a proxy: if any tainted source was secret-derived AND this is a
-      // victim instruction, the dest will get s_prop at dispatch.  This mirrors the
-      // will_be_s_prop logic in step_prod_sec (line 508) so that the Reg write matches
-      // the same-cycle forwarding path.
-      val will_be_s_prop_reg = ren2_uops(w).cf_taint_producer_is_secret &&
-                               (ren2_uops(w).cf_domain_id === 0.U)
-      producer_secret_table(ren2_uops(w).pdst) := ren2_uops(w).cf_secret_access || will_be_s_prop_reg
+  // IFT compile-time gate: when ENABLE_IFT=false the taint-table writes are
+  // elided; the RegInit storage stays all-false, reads in the forwarding loop
+  // above return false, all downstream cf_src_tainted/cf_taint_producer_* uop
+  // fields collapse to false via constant propagation, and FIRRTL DCE removes
+  // the register storage entirely.
+  if (ENABLE_IFT) {
+    for (w <- 0 until plWidth) {
+      when (ren2_fire(w) && ren2_valids(w) && (ren2_uops(w).dst_rtype === rtype)) {
+        val should_taint = ren2_uops(w).cf_domain_id === 1.U || ren2_uops(w).cf_src_tainted
+        taint_table(ren2_uops(w).pdst)           := should_taint
+        producer_table(ren2_uops(w).pdst)        := ren2_uops(w).cf_op_count_id
+        producer_domain_table(ren2_uops(w).pdst) := ren2_uops(w).cf_domain_id === 1.U ||
+                                                     (ren2_uops(w).cf_src_tainted && ren2_uops(w).cf_taint_producer_is_atk)
+        // cf_secret_propagation is set at dispatch (core.scala), AFTER ren2, so it is
+        // always false here.  Use cf_taint_producer_is_secret (= any_secret_tainted from
+        // line 491) as a proxy: if any tainted source was secret-derived AND this is a
+        // victim instruction, the dest will get s_prop at dispatch.  This mirrors the
+        // will_be_s_prop logic in step_prod_sec (line 508) so that the Reg write matches
+        // the same-cycle forwarding path.
+        val will_be_s_prop_reg = ren2_uops(w).cf_taint_producer_is_secret &&
+                                 (ren2_uops(w).cf_domain_id === 0.U)
+        producer_secret_table(ren2_uops(w).pdst) := ren2_uops(w).cf_secret_access || will_be_s_prop_reg
+      }
     }
-  }
 
-  // -- Clear taint at commit (stale physical register freed) --
-  for (w <- 0 until plWidth) {
-    when (io.com_valids(w) && !io.rollback) {
-      taint_table(io.com_uops(w).stale_pdst)           := false.B
-      producer_domain_table(io.com_uops(w).stale_pdst) := false.B
-      producer_secret_table(io.com_uops(w).stale_pdst) := false.B
+    // -- Clear taint at commit (stale physical register freed) --
+    for (w <- 0 until plWidth) {
+      when (io.com_valids(w) && !io.rollback) {
+        taint_table(io.com_uops(w).stale_pdst)           := false.B
+        producer_domain_table(io.com_uops(w).stale_pdst) := false.B
+        producer_secret_table(io.com_uops(w).stale_pdst) := false.B
+      }
     }
   }
 
@@ -566,126 +573,139 @@ class RenameStage(
   // only affects which rows are valid — not the per-bank commit width — so it has no
   // impact on this forwarding logic.
 
-  // Seed forwarded views from the register values (previous cycle).
-  // Use `var` chains (same pattern as dispatch-time fwd_taint) to avoid
-  // combinational loops: each slot w reads from the state accumulated by
-  // slots 0..w-1, then produces a new state for slot w+1.
-  var com_fwd_taint:  Vec[Bool] = WireInit(taint_table)
-  var com_fwd_secret: Vec[Bool] = WireInit(producer_secret_table)
-
+  // Default IO drivers for com_late_taint* — always fire so the rename-stage
+  // output bundle has defined values even when ENABLE_IFT=false.  The IFT
+  // commit-forwarding loop below overrides these via last-connect when enabled.
   for (w <- 0 until plWidth) {
-    val com_uop   = io.com_uops(w)
-    val com_valid = io.com_valids(w) && !io.rollback
-
-    // Read FORWARDED taint (includes writes from prior slots 0..w-1 only).
-    val prs1_t    = com_fwd_taint(com_uop.prs1)
-    val prs2_t    = com_fwd_taint(com_uop.prs2)
-    val prs1_sec  = com_fwd_secret(com_uop.prs1)
-    val prs2_sec  = com_fwd_secret(com_uop.prs2)
-    val src_sec   = (prs1_t && prs1_sec) || (prs2_t && prs2_sec)
-
-    // com_late_taint: fires for instructions with a destination register (s_prop in printf).
-    val late = com_valid && !com_uop.cf_src_tainted &&
-               (com_uop.dst_rtype === rtype) && src_sec
-    io.com_late_taint(w) := late
-    io.com_late_taint_producer(w) := Mux(prs1_t && prs1_sec,
-                                         producer_table(com_uop.prs1),
-                                         producer_table(com_uop.prs2))
-
-    // com_late_taint_any: fires for ANY instruction including stores (no dst_rtype guard).
-    val late_any = com_valid && !com_uop.cf_src_tainted && src_sec
-    io.com_late_taint_any(w) := late_any
-
-    // Fix 5d: propagate to taint_table register (takes effect next cycle).
-    when (late) {
-      taint_table(com_uop.pdst)           := true.B
-      producer_table(com_uop.pdst)        := com_uop.cf_op_count_id
-      producer_secret_table(com_uop.pdst) := true.B
-    }
-
-    // Same-cycle forwarding: produce NEW forwarded views for slot w+1.
-    // C7 fires on (cf_secret_access || cf_src_tainted) — also forward that.
-    val c7_fires = com_valid &&
-                   (com_uop.cf_secret_access || com_uop.cf_src_tainted) &&
-                   com_uop.dst_rtype === rtype
-    val c7_secret = com_uop.cf_secret_access || com_uop.cf_taint_producer_is_secret
-
-    val next_fwd_taint  = WireInit(com_fwd_taint)
-    val next_fwd_secret = WireInit(com_fwd_secret)
-    when (late || c7_fires) {
-      next_fwd_taint(com_uop.pdst)  := true.B
-      next_fwd_secret(com_uop.pdst) := Mux(late, true.B, c7_secret)
-    }
-    com_fwd_taint  = next_fwd_taint
-    com_fwd_secret = next_fwd_secret
+    io.com_late_taint(w)          := false.B
+    io.com_late_taint_producer(w) := 0.U
+    io.com_late_taint_any(w)      := false.B
   }
 
-  // -- C7: At commit, mark pdst as secret-tainted if instruction accessed secret memory or its
-  // source registers were tainted (data-channel propagation).  We intentionally do NOT trigger
-  // on cf_secret_propagation alone because that flag is also set for timing-channel events
-  // (C5 queue-head stalls, BPD/fetch-path redirects) whose register results are not secret-derived.
-  // taint_table fires on cf_src_tainted (any taint — attacker or secret) to track all data-flow
-  // for REG_DATAFLOW attribution after fence.i refetch.
-  // producer_secret_table ONLY fires when the taint is secret-originated: the instruction itself
-  // accessed secret memory (cf_secret_access) or its source registers were themselves secret-tainted
-  // (cf_taint_producer_is_secret). Pure attacker-domain taints must NOT set producer_secret_table.
-  for (w <- 0 until plWidth) {
-    when (io.com_valids(w) && !io.rollback &&
-          (io.com_uops(w).cf_secret_access || io.com_uops(w).cf_src_tainted) &&
-          io.com_uops(w).dst_rtype === rtype) {
-      taint_table(io.com_uops(w).pdst)    := true.B
-      producer_table(io.com_uops(w).pdst) := io.com_uops(w).cf_op_count_id
-      producer_secret_table(io.com_uops(w).pdst) :=
-        io.com_uops(w).cf_secret_access || io.com_uops(w).cf_taint_producer_is_secret
+  if (ENABLE_IFT) {
+    // Seed forwarded views from the register values (previous cycle).
+    // Use `var` chains (same pattern as dispatch-time fwd_taint) to avoid
+    // combinational loops: each slot w reads from the state accumulated by
+    // slots 0..w-1, then produces a new state for slot w+1.
+    var com_fwd_taint:  Vec[Bool] = WireInit(taint_table)
+    var com_fwd_secret: Vec[Bool] = WireInit(producer_secret_table)
+
+    for (w <- 0 until plWidth) {
+      val com_uop   = io.com_uops(w)
+      val com_valid = io.com_valids(w) && !io.rollback
+
+      // Read FORWARDED taint (includes writes from prior slots 0..w-1 only).
+      val prs1_t    = com_fwd_taint(com_uop.prs1)
+      val prs2_t    = com_fwd_taint(com_uop.prs2)
+      val prs1_sec  = com_fwd_secret(com_uop.prs1)
+      val prs2_sec  = com_fwd_secret(com_uop.prs2)
+      val src_sec   = (prs1_t && prs1_sec) || (prs2_t && prs2_sec)
+
+      // com_late_taint: fires for instructions with a destination register (s_prop in printf).
+      val late = com_valid && !com_uop.cf_src_tainted &&
+                 (com_uop.dst_rtype === rtype) && src_sec
+      io.com_late_taint(w) := late
+      io.com_late_taint_producer(w) := Mux(prs1_t && prs1_sec,
+                                           producer_table(com_uop.prs1),
+                                           producer_table(com_uop.prs2))
+
+      // com_late_taint_any: fires for ANY instruction including stores (no dst_rtype guard).
+      val late_any = com_valid && !com_uop.cf_src_tainted && src_sec
+      io.com_late_taint_any(w) := late_any
+
+      // Fix 5d: propagate to taint_table register (takes effect next cycle).
+      when (late) {
+        taint_table(com_uop.pdst)           := true.B
+        producer_table(com_uop.pdst)        := com_uop.cf_op_count_id
+        producer_secret_table(com_uop.pdst) := true.B
+      }
+
+      // Same-cycle forwarding: produce NEW forwarded views for slot w+1.
+      // C7 fires on (cf_secret_access || cf_src_tainted) — also forward that.
+      val c7_fires = com_valid &&
+                     (com_uop.cf_secret_access || com_uop.cf_src_tainted) &&
+                     com_uop.dst_rtype === rtype
+      val c7_secret = com_uop.cf_secret_access || com_uop.cf_taint_producer_is_secret
+
+      val next_fwd_taint  = WireInit(com_fwd_taint)
+      val next_fwd_secret = WireInit(com_fwd_secret)
+      when (late || c7_fires) {
+        next_fwd_taint(com_uop.pdst)  := true.B
+        next_fwd_secret(com_uop.pdst) := Mux(late, true.B, c7_secret)
+      }
+      com_fwd_taint  = next_fwd_taint
+      com_fwd_secret = next_fwd_secret
     }
   }
 
-  // corefuzzing F1: memory data-flow taint — when a load writeback carries INFL_MEM_DATAFLOW,
-  // the destination preg received attacker-originated data.  Mark it as tainted so that
-  // instructions renamed AFTER this cycle see cf_src_tainted and get INFL_REG_DATAFLOW.
-  // Fires at writeback time (earlier than C7 commit-time path) to capture more consumers.
-  for (i <- 0 until numWbPorts) {
-    when (io.wakeups(i).valid && io.wakeups(i).bits.uop.rf_wen &&
-          io.wakeups(i).bits.uop.dst_rtype === rtype) {
-      val wb_uop = io.wakeups(i).bits.uop
-      val has_mem_df = wb_uop.cf_influencer_list.map(e =>
-        e.valid && e.infl_type === INFL_MEM_DATAFLOW.U).reduce(_ || _)
-      when (has_mem_df) {
-        taint_table(wb_uop.pdst)           := true.B
-        producer_domain_table(wb_uop.pdst) := true.B
-        producer_table(wb_uop.pdst)        := wb_uop.cf_op_count_id
-        // producer_secret_table not set: attacker-data taint, not secret-origin taint
+  if (ENABLE_IFT) {
+    // -- C7: At commit, mark pdst as secret-tainted if instruction accessed secret memory or its
+    // source registers were tainted (data-channel propagation).  We intentionally do NOT trigger
+    // on cf_secret_propagation alone because that flag is also set for timing-channel events
+    // (C5 queue-head stalls, BPD/fetch-path redirects) whose register results are not secret-derived.
+    // taint_table fires on cf_src_tainted (any taint — attacker or secret) to track all data-flow
+    // for REG_DATAFLOW attribution after fence.i refetch.
+    // producer_secret_table ONLY fires when the taint is secret-originated: the instruction itself
+    // accessed secret memory (cf_secret_access) or its source registers were themselves secret-tainted
+    // (cf_taint_producer_is_secret). Pure attacker-domain taints must NOT set producer_secret_table.
+    for (w <- 0 until plWidth) {
+      when (io.com_valids(w) && !io.rollback &&
+            (io.com_uops(w).cf_secret_access || io.com_uops(w).cf_src_tainted) &&
+            io.com_uops(w).dst_rtype === rtype) {
+        taint_table(io.com_uops(w).pdst)    := true.B
+        producer_table(io.com_uops(w).pdst) := io.com_uops(w).cf_op_count_id
+        producer_secret_table(io.com_uops(w).pdst) :=
+          io.com_uops(w).cf_secret_access || io.com_uops(w).cf_taint_producer_is_secret
       }
     }
-  }
 
-  // -- Branch snapshot: capture taint state after this dispatch group's allocations --
-  // fwd_taint (built above) holds the complete post-dispatch taint state
-  for (w <- 0 until plWidth) {
-    when (ren2_fire(w) && ren2_uops(w).allocate_brtag) {
-      taint_snaps(ren2_uops(w).br_tag) := fwd_taint
+    // corefuzzing F1: memory data-flow taint — when a load writeback carries INFL_MEM_DATAFLOW,
+    // the destination preg received attacker-originated data.  Mark it as tainted so that
+    // instructions renamed AFTER this cycle see cf_src_tainted and get INFL_REG_DATAFLOW.
+    // Fires at writeback time (earlier than C7 commit-time path) to capture more consumers.
+    for (i <- 0 until numWbPorts) {
+      when (io.wakeups(i).valid && io.wakeups(i).bits.uop.rf_wen &&
+            io.wakeups(i).bits.uop.dst_rtype === rtype) {
+        val wb_uop = io.wakeups(i).bits.uop
+        val has_mem_df = wb_uop.cf_influencer_list.map(e =>
+          e.valid && e.infl_type === INFL_MEM_DATAFLOW.U).reduce(_ || _)
+        when (has_mem_df) {
+          taint_table(wb_uop.pdst)           := true.B
+          producer_domain_table(wb_uop.pdst) := true.B
+          producer_table(wb_uop.pdst)        := wb_uop.cf_op_count_id
+          // producer_secret_table not set: attacker-data taint, not secret-origin taint
+        }
+      }
     }
-  }
 
-  // -- Restore on branch mispredict (highest priority: overrides element writes above) --
-  when (io.brupdate.b2.mispredict) {
-    taint_table := taint_snaps(io.brupdate.b2.uop.br_tag)
-    // producer_domain_table and producer_secret_table don't need rollback:
-    // taint_table rollback makes squashed pregs appear untainted, so their producer_* values
-    // won't be consumed. New writes after rollback correctly overwrite producer_* entries.
-  }
-
-  // -- IFT quiesce flush (highest priority: fires when pipeline fully drained on quiesce) --
-  // Clears taint state for clean campaign boundaries and correct PRF-resize semantics.
-  // taint_snaps do NOT need clearing: no branches are in-flight when drained.
-  when (io.quiesce_flush) {
-    for (i <- 0 until numPhysRegs) {
-      taint_table(i)           := false.B
-      producer_table(i)        := 0.U
-      producer_domain_table(i) := false.B
-      producer_secret_table(i) := false.B
+    // -- Branch snapshot: capture taint state after this dispatch group's allocations --
+    // fwd_taint (built above) holds the complete post-dispatch taint state
+    for (w <- 0 until plWidth) {
+      when (ren2_fire(w) && ren2_uops(w).allocate_brtag) {
+        taint_snaps(ren2_uops(w).br_tag) := fwd_taint
+      }
     }
-  }
+
+    // -- Restore on branch mispredict (highest priority: overrides element writes above) --
+    when (io.brupdate.b2.mispredict) {
+      taint_table := taint_snaps(io.brupdate.b2.uop.br_tag)
+      // producer_domain_table and producer_secret_table don't need rollback:
+      // taint_table rollback makes squashed pregs appear untainted, so their producer_* values
+      // won't be consumed. New writes after rollback correctly overwrite producer_* entries.
+    }
+
+    // -- IFT quiesce flush (highest priority: fires when pipeline fully drained on quiesce) --
+    // Clears taint state for clean campaign boundaries and correct PRF-resize semantics.
+    // taint_snaps do NOT need clearing: no branches are in-flight when drained.
+    when (io.quiesce_flush) {
+      for (i <- 0 until numPhysRegs) {
+        taint_table(i)           := false.B
+        producer_table(i)        := 0.U
+        producer_domain_table(i) := false.B
+        producer_secret_table(i) := false.B
+      }
+    }
+  }  // end if (ENABLE_IFT)
 
   //-------------------------------------------------------------
   // Outputs

@@ -531,15 +531,21 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s1_tlb_miss_prev = RegNext(s1_tlb_miss, false.B)
   // Fill detected: was a miss last cycle, now a hit
   val s1_tlb_just_filled = s1_valid && !s1_tlb_miss && s1_tlb_miss_prev
-  when (s1_tlb_just_filled) {
-    // Use RegNext of vpn_idx/domain since the miss was serviced the previous cycle
-    itlb_shadow_domain(RegNext(s1_vpn_idx)) := RegNext(s1_fetch_domain).asBool
-    itlb_shadow_valid(RegNext(s1_vpn_idx))  := true.B
-    itlb_shadow_secret(RegNext(s1_vpn_idx)) := RegNext(s1_fetch_is_secret)
-  }
-  // Flush shadow on sfence (shadow_valid gates secret reads so no separate secret flush needed)
-  when (tlb.io.sfence.valid) {
-    itlb_shadow_valid := VecInit(Seq.fill(itlb_shadow_nEntries)(false.B))
+  // IFT compile-time gate: ITLB shadow writes are elided when ENABLE_IFT=false;
+  // the shadow registers stay at init (all false), reads return false, and
+  // s1_itlb_mismatch / s1_itlb_secret_mismatch collapse to false via
+  // constant propagation — FIRRTL DCE removes the shadow arrays entirely.
+  if (ENABLE_IFT) {
+    when (s1_tlb_just_filled) {
+      // Use RegNext of vpn_idx/domain since the miss was serviced the previous cycle
+      itlb_shadow_domain(RegNext(s1_vpn_idx)) := RegNext(s1_fetch_domain).asBool
+      itlb_shadow_valid(RegNext(s1_vpn_idx))  := true.B
+      itlb_shadow_secret(RegNext(s1_vpn_idx)) := RegNext(s1_fetch_is_secret)
+    }
+    // Flush shadow on sfence (shadow_valid gates secret reads so no separate secret flush needed)
+    when (tlb.io.sfence.valid) {
+      itlb_shadow_valid := VecInit(Seq.fill(itlb_shadow_nEntries)(false.B))
+    }
   }
   // Domain mismatch: hit in ITLB but shadow was written by a different domain
   val s1_itlb_mismatch = s1_valid && !s1_tlb_miss &&

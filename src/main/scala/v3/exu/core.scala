@@ -381,9 +381,17 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   pred_rename_stage.io.cf_preg_idx := custom_csrs.cf_preg_idx
 
   // corefuzzing
-  // Quiescing control signals
-  val cf_quiesce_core = Wire(Bool())
-  val pipeline_drained = Wire(Bool())
+  // Quiescing control signals.  Declared as outer-scope Wires so that consumers
+  // elsewhere in core.scala (fencei gating, single_step_active, dispatch logic,
+  // and the preg_secret / fp_preg_secret IFT clears) can reference them
+  // unconditionally — the quiesce FSM body is wrapped in `if (ENABLE_RECONF)` and
+  // drives these wires when reconf is enabled, or ties them to defaults otherwise.
+  val cf_quiesce_core     = Wire(Bool())
+  val pipeline_drained    = Wire(Bool())
+  val quiesce_flush_pulse = Wire(Bool())
+  val qs_draining         = Wire(Bool())
+
+  if (ENABLE_RECONF) {
   // Stricter pipeline drain: check fetch buffer, decode stage, and rename2/dispatch stage.
   // dispatch_stage_empty guards against is_unique CSR writes stuck at rename2 (waiting for
   // fencei_rdy) causing pipeline_drained_strict to fire spuriously — which would trigger
@@ -505,7 +513,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // IFT quiesce-flush: pulse for one cycle on QS_DRAINING → QS_FETCH transition
   // (pipeline_drained_strict just became true while still in QS_DRAINING).
   // Clears taint tables for clean campaign boundaries and PRF-resize semantics.
-  val quiesce_flush_pulse = (qs_state === QS_DRAINING) && pipeline_drained_strict
+  quiesce_flush_pulse := (qs_state === QS_DRAINING) && pipeline_drained_strict
+  qs_draining := (qs_state === QS_DRAINING)
   rename_stage.io.quiesce_flush    := quiesce_flush_pulse
   fp_rename_stage.io.quiesce_flush := quiesce_flush_pulse
   pred_rename_stage.io.quiesce_flush := quiesce_flush_pulse
@@ -525,6 +534,25 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // RAS domain/secret shadow clear: prevents stale IFT bits from entries beyond the new active
   // RAS size from corrupting domain/secret attribution after a cf_ras_idx CSR reconfiguration.
   io.ifu.cf_ras_quiesce_flush := quiesce_flush_pulse
+  } else {
+    // Reconf disabled: no quiesce FSM, no pipeline drain, no pointer resets.
+    // Drive all quiesce-related wires and IOs to neutral defaults so that
+    // downstream consumers see "never in quiesce" state and produce identical
+    // behavior to a non-reconfigurable BOOM.
+    cf_quiesce_core     := false.B
+    pipeline_drained    := false.B
+    quiesce_flush_pulse := false.B
+    qs_draining         := false.B
+    io.ifu.allow_fetch          := true.B
+    io.ifu.cf_btb_quiesce       := false.B
+    io.ifu.cf_ftq_quiesce_reset := false.B
+    io.ifu.cf_ras_quiesce_flush := false.B
+    io.lsu.cf_lsq_quiesce_reset := false.B
+    rob.io.cf_rob_quiesce_reset := false.B
+    rename_stage.io.quiesce_flush      := false.B
+    fp_rename_stage.io.quiesce_flush   := false.B
+    pred_rename_stage.io.quiesce_flush := false.B
+  }
 
   // IFT bridge: pass privilege mode to ROB for 256-bit record assembly.
   // RegNext matches the delay used in the commit printf (priv is the OLD privilege before any eret).
@@ -537,17 +565,26 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // This allows in-flight consumers to receive cf_secret_propagation at writeback time,
   // before the producer commits (without requiring a fence.i between producer and consumer).
   // Cleared at quiesce_flush_pulse (same as taint_table) for clean campaign boundaries.
-  val preg_secret = RegInit(VecInit(Seq.fill(numIntPhysRegs)(false.B)))
-  when (quiesce_flush_pulse) {
-    for (i <- 0 until numIntPhysRegs) { preg_secret(i) := false.B }
-  }
-  // FP physical register secret-taint table: mirrors preg_secret for the FP register file.
-  // Updated at: TLB stage (FP loads to secret range, routed via CF_PregSecretUpd.is_fp),
-  //             writeback (transitive FP→FP taint and INT→FP conversions).
-  // Cleared at quiesce_flush_pulse for clean IFT campaign boundaries.
+  //
+  // IFT compile-time gating: the RegInit declarations are always present so that
+  // unconditional readers elsewhere in core.scala see a well-typed Vec.  All write
+  // sites (quiesce clear, TLB update, commit clear, writeback transitive) are
+  // wrapped in `if (ENABLE_IFT) { ... }`.  When ENABLE_IFT=false, the registers
+  // have no drivers — FIRRTL DCE elides them entirely and all readers collapse to
+  // constant `false` via constant propagation.
+  val preg_secret    = RegInit(VecInit(Seq.fill(numIntPhysRegs)(false.B)))
   val fp_preg_secret = RegInit(VecInit(Seq.fill(numFpPhysRegs)(false.B)))
-  when (quiesce_flush_pulse) {
-    for (i <- 0 until numFpPhysRegs) { fp_preg_secret(i) := false.B }
+  if (ENABLE_IFT) {
+    when (quiesce_flush_pulse) {
+      for (i <- 0 until numIntPhysRegs) { preg_secret(i) := false.B }
+    }
+    // FP physical register secret-taint table: mirrors preg_secret for the FP register file.
+    // Updated at: TLB stage (FP loads to secret range, routed via CF_PregSecretUpd.is_fp),
+    //             writeback (transitive FP→FP taint and INT→FP conversions).
+    // Cleared at quiesce_flush_pulse for clean IFT campaign boundaries.
+    when (quiesce_flush_pulse) {
+      for (i <- 0 until numFpPhysRegs) { fp_preg_secret(i) := false.B }
+    }
   }
 
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
@@ -1116,7 +1153,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // pipeline_drained_strict) to fire.  Without this, nothing dispatches in
   // QS_DRAINING → fence_dmem stays false → MSHRs never drain → deadlock.
   io.lsu.fence_dmem := (dis_valids zip wait_for_empty_pipeline).map {case (v,w) => v && w} .reduce(_||_) ||
-                       (qs_state === QS_DRAINING)
+                       qs_draining
 
   val dis_stalls = dis_hazards.scanLeft(false.B) ((s,h) => s || h).takeRight(coreWidth)
   dis_fire := dis_valids zip dis_stalls map {case (v,s) => v && !s}
@@ -1870,6 +1907,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   rob.io.cf_issue_contention_upd := VecInit(issue_units.flatMap(u => u.io.cf_contention_upd))
   rob.io.cf_lsu_s_acc_upd        := io.lsu.cf_s_acc_rob_upd
 
+  // Default driver for rob.io.cf_s_prop_rob_upd — always fires so the IO has a
+  // valid default even when IFT is disabled. The IFT writeback-transitive block
+  // below conditionally overrides via last-connect semantics when ENABLE_IFT=true.
+  rob.io.cf_s_prop_rob_upd.foreach { u => u.valid := false.B; u.bits := DontCare }
+
+  if (ENABLE_IFT) {
   // corefuzzing: preg_secret TLB-stage update from LSU — mark pdst as secret-tainted
   // as soon as the load's address resolves to the secret range (before writeback).
   for (w <- 0 until memWidth) {
@@ -1901,7 +1944,6 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // to set cf_secret_propagation on the in-flight ROB entry.
   // Also clears preg_secret[pdst] when a non-secret instruction overwrites the register,
   // preventing stale taint from previous occupants of the same physical register.
-  rob.io.cf_s_prop_rob_upd.foreach { u => u.valid := false.B; u.bits := DontCare }
   for (i <- 0 until rob.numWakeupPorts) {
     val wb     = rob.io.wb_resps(i)
     val wb_uop = wb.bits.uop
@@ -1956,6 +1998,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       }
     }
   }
+  }  // end if (ENABLE_IFT)
 
   assert (!(csr.io.singleStep), "[core] single-step is unsupported.")
 
@@ -2014,7 +2057,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // to the ROB head have resolved). The cf_speculated field records the
   // dispatch-time speculation state (br_mask≠0 when dispatched) but does NOT
   // mean the instruction is still speculative at commit.
-  if (COMMIT_LOG_PRINTF) {
+  // IFT compile-time gate: the commit-log printf embeds every cf_* field and is
+  // meaningful only when ENABLE_IFT=true.  When IFT is disabled we skip the
+  // entire block so FIRRTL/Verilator doesn't emit the printf logic and the
+  // associated SourceInfo / assertion overhead.
+  if (COMMIT_LOG_PRINTF && ENABLE_IFT) {
     var new_commit_cnt = 0.U
 
     for (w <- 0 until coreWidth) {

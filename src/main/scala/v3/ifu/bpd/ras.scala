@@ -69,24 +69,33 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
 
   when (io.write_valid) {
     ras(io.write_idx)        := io.write_addr
-    ras_domain(io.write_idx) := io.write_domain
-    ras_secret(io.write_idx) := io.write_secret  // reset to false; late_write_secret marks true later
   }
 
-  // corefuzzing: late update — mark a slot secret when the associated call instruction is confirmed secret
-  for (i <- 0 until (coreWidth + memWidth)) {
-    when (io.late_write_secret_valid(i)) {
-      ras_secret(io.late_write_secret_idx(i)) := true.B
+  // IFT compile-time gate: ras_domain / ras_secret writes are elided when
+  // ENABLE_IFT=false.  Reads stay unconditional so io.read_domain / io.read_secret
+  // produce constant false (RegInit value), and FIRRTL DCE removes both shadow
+  // register arrays along with their forwarding muxes.
+  if (ENABLE_IFT) {
+    when (io.write_valid) {
+      ras_domain(io.write_idx) := io.write_domain
+      ras_secret(io.write_idx) := io.write_secret  // reset to false; late_write_secret marks true later
     }
-  }
 
-  // corefuzzing: quiesce flush — clear all domain/secret shadow bits for clean IFT campaign boundaries.
-  // Prevents stale domain/secret bits in entries beyond the new active RAS size from corrupting IFT
-  // records after a cf_ras_idx CSR reconfiguration.
-  when (io.quiesce_flush) {
-    for (i <- 0 until nRasEntries) {
-      ras_domain(i) := false.B
-      ras_secret(i) := false.B
+    // corefuzzing: late update — mark a slot secret when the associated call instruction is confirmed secret
+    for (i <- 0 until (coreWidth + memWidth)) {
+      when (io.late_write_secret_valid(i)) {
+        ras_secret(io.late_write_secret_idx(i)) := true.B
+      }
+    }
+
+    // corefuzzing: quiesce flush — clear all domain/secret shadow bits for clean IFT campaign boundaries.
+    // Prevents stale domain/secret bits in entries beyond the new active RAS size from corrupting IFT
+    // records after a cf_ras_idx CSR reconfiguration.
+    when (io.quiesce_flush) {
+      for (i <- 0 until nRasEntries) {
+        ras_domain(i) := false.B
+        ras_secret(i) := false.B
+      }
     }
   }
 }

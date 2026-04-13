@@ -152,11 +152,15 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
     Mux(doing_reset, ~(0.U(bankWidth.W)), io.update_mask.asUInt).asBools
   )
   // corefuzzing: write secret shadow in parallel — true if fetch packet had s_acc/s_prop
-  table_secret.write(
-    Mux(doing_reset, reset_idx, update_idx),
-    Mux(doing_reset, VecInit(Seq.fill(bankWidth)(false.B)), VecInit(Seq.fill(bankWidth)(io.update_cf_is_secret))),
-    Mux(doing_reset, ~(0.U(bankWidth.W)), io.update_mask.asUInt).asBools
-  )
+  // IFT gate: elided when ENABLE_IFT=false; table_secret SRAM becomes dead state
+  // with no write driver → FIRRTL DCE removes it.
+  if (ENABLE_IFT) {
+    table_secret.write(
+      Mux(doing_reset, reset_idx, update_idx),
+      Mux(doing_reset, VecInit(Seq.fill(bankWidth)(false.B)), VecInit(Seq.fill(bankWidth)(io.update_cf_is_secret))),
+      Mux(doing_reset, ~(0.U(bankWidth.W)), io.update_mask.asUInt).asBools
+    )
+  }
 
   val update_hi_wdata = Wire(Vec(bankWidth, Bool()))
   hi_us.write(
