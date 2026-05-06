@@ -62,7 +62,10 @@ class RenameFreeList(
 
   // Runtime PRF size selection via `pregSizeOptions` constructor param.
   // INT rename passes pregFileSizeOptions = Seq(192, 128, 96, 64, 48).
-  // FP  rename passes fpPregFileSizeOptions = Seq(96, 64, 48, 32, 16).
+  // FP  rename passes fpPregFileSizeOptions = Seq(96, 64, 48, 32, 32).
+  // NOTE: index 3 and 4 both give 32 — minimum is capped at 32 (not 16) because
+  // 32 arch FP regs require at least 32 physical regs to avoid deadlock on the
+  // 32nd unique FP write (stale preg from first writes is p0, never freed).
   // Precompute one mask per option as a constant; runtime selection is a small Mux
   // instead of a barrel-shifter + numPregs-wide subtractor (LUT optimization).
   val preg_active_masks = VecInit(pregSizeOptions.map { sz =>

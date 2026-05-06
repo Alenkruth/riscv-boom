@@ -494,7 +494,7 @@ class WithFuzzingBoom(n: Int = 1, overrideIdOffset: Option[Int] = None) extends 
               numIntPhysRegisters = 192,
               // FP reduced from 192 to 96 — FpPipeline/fregfile is the top Vivado
               // congestion hotspot (Level 5/6).  Runtime reconfig preserved via
-              // fpPregFileSizeOptions = Seq(96,64,48,32,16) sharing cf_preg_idx CSR.
+              // fpPregFileSizeOptions = Seq(96,64,48,32,32) sharing cf_preg_idx CSR.
               numFpPhysRegisters = 96,
               numLdqEntries = 48,
               numStqEntries = 48,
@@ -507,7 +507,7 @@ class WithFuzzingBoom(n: Int = 1, overrideIdOffset: Option[Int] = None) extends 
               fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true))
             ),
             dcache = Some(
-              DCacheParams(rowBits = 128, nSets=128, nWays=8, nMSHRs=4, nTLBWays=32)
+              DCacheParams(rowBits = 128, nSets=128, nWays=8, nMSHRs=8, nTLBWays=32)
             ),
             icache = Some(
               ICacheParams(rowBits = 128, nSets=64, nWays=8, fetchBytes=4*4)

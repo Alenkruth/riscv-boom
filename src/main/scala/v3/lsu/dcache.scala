@@ -759,7 +759,11 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   for (w <- 0 until memWidth)
     assert(!(io.lsu.s1_kill(w) && !RegNext(io.lsu.req.fire) && !RegNext(io.lsu.req.bits(w).valid)))
   val s1_addr         = s1_req.map(_.addr)
-  val s1_nack         = s1_addr.map(a => a(idxMSB,idxLSB) === prober.io.meta_write.bits.idx && !prober.io.req.ready)
+  // Compare masked indices: prober.io.meta_write.bits.idx is the full unmasked probe idx;
+  // the meta_write is overridden to the masked idx at the metaWriteArb (below), so the
+  // nack must also compare against the masked version of each to avoid missed nacks when
+  // a prober at full_idx=26 and an LSU at full_idx=10 share the same masked set.
+  val s1_nack         = s1_addr.map(a => dcacheMaskIdx(a) === (prober.io.meta_write.bits.idx & dcache_set_mask(idxBits-1,0)) && !prober.io.req.ready)
   val s1_send_resp_or_nack = RegNext(s0_send_resp_or_nack)
   val s1_type         = RegNext(s0_type)
 
@@ -911,10 +915,16 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // MSHR way-collision fix: if the chosen way is already claimed by a pending MSHR,
   // pick an alternative way that is not currently occupied.
   val s2_pending_mask  = mshrs.io.pending_way_mask
-  val s2_active_mask   = cf_dcache_active_ways - 1.U    // lower N bits: one per active way
+  // One bit per active way: bit w set iff w < cf_dcache_active_ways.
+  // Must NOT use (cf_dcache_active_ways - 1) here — that is a numerical mask for an
+  // index, not a one-hot bitmask. e.g. for 2 active ways: need 0b11, not 0b01.
+  val s2_active_mask   = VecInit((0 until nWays).map(w => w.U < cf_dcache_active_ways)).asUInt
   val s2_avail_ways    = (~s2_pending_mask)(nWays-1,0) & s2_active_mask
   // If the chosen way is pending AND there are free alternatives, use the first free way.
-  // If all active ways are pending (all MSHRs busy), fall back — miss retried next cycle.
+  // If all active ways are pending, s2_way_avail goes false and the MSHR valid is gated
+  // below — the LSU nacks the miss and retries next cycle rather than allocating two
+  // MSHRs to the same way (which would corrupt each other's fill data).
+  val s2_way_avail = s2_avail_ways.orR || !(s2_repl_way_raw & s2_pending_mask).orR
   val s2_replaced_way_en = Mux(
     (s2_repl_way_raw & s2_pending_mask).orR && s2_avail_ways.orR,
     PriorityEncoderOH(s2_avail_ways),
@@ -930,7 +940,10 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // Nack when we hit something currently being evicted
   val s2_nack_victim = widthMap(w => s2_valid(w) &&  s2_hit(w) && mshrs.io.secondary_miss(w))
   // MSHRs not ready for request
-  val s2_nack_miss   = widthMap(w => s2_valid(w) && !s2_hit(w) && !mshrs.io.req(w).ready)
+  // Nack if no MSHR is ready OR if no active cache way is available (all active ways
+  // are pending in other MSHRs).  The second condition gates the MSHR valid below, so
+  // without also nacking here the LSU would wait for a response that was never issued.
+  val s2_nack_miss   = widthMap(w => s2_valid(w) && !s2_hit(w) && (!mshrs.io.req(w).ready || !s2_way_avail))
   // Bank conflict on data arrays
   val s2_nack_data   = widthMap(w => data.io.nacks(w))
   // Can't allocate MSHR for same set currently being written back
@@ -956,6 +969,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
                             !s2_nack_victim(w)    &&
                             !s2_nack_data(w)      &&
                             !s2_nack_wb(w)        &&
+                             s2_way_avail         &&
                              s2_type.isOneOf(t_lsu, t_prefetch)             &&
                             !IsKilledByBranch(io.lsu.brupdate, s2_req(w).uop) &&
                             !(io.lsu.exception && s2_req(w).uop.uses_ldq)   &&
@@ -1012,8 +1026,14 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   prober.io.way_en      := s2_tag_match_way(0)
   prober.io.block_state := s2_hit_state(0)
   metaWriteArb.io.in(1) <> prober.io.meta_write
+  // Mask the prober's meta write idx to the active set range, same as the MSHR meta write.
+  // Without this, a probe for full_idx=26 (masked_idx=10) would write coherence state to
+  // meta[26] rather than meta[10], leaving the L1 with stale (pre-probe) permissions.
+  metaWriteArb.io.in(1).bits.idx := prober.io.meta_write.bits.idx & dcache_set_mask(idxBits-1, 0)
   prober.io.mshr_rdy    := mshrs.io.probe_rdy
-  prober.io.wb_rdy      := (prober.io.meta_write.bits.idx =/= wb.io.idx.bits) || !wb.io.idx.valid
+  // wb_rdy: compare masked indices so a WB for full_idx=10 and prober at full_idx=26 are
+  // correctly seen as conflicting (same masked set slot).
+  prober.io.wb_rdy      := ((prober.io.meta_write.bits.idx & dcache_set_mask(idxBits-1,0)) =/= (wb.io.idx.bits & dcache_set_mask(idxBits-1,0))) || !wb.io.idx.valid
   mshrs.io.prober_state := prober.io.state
 
   // refills
@@ -1122,10 +1142,13 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       val memsec_fire = is_load && iftSecret(s2_store_entry) && !memdf_fire
 
       uop_resp_final := addInfluencerBatch(uop_resp_base, Seq(
-        InfluencerCandidate(evict_fire,  iftOpCount(s2_fill_entry),  INFL_CACHE_EVICTION.U, true.B,  iftSecret(s2_fill_entry)),
-        InfluencerCandidate(memdf_fire,  iftOpCount(s2_store_entry), INFL_MEM_DATAFLOW.U,   true.B,  iftSecret(s2_store_entry)),
-        InfluencerCandidate(memsec_fire, iftOpCount(s2_store_entry), INFL_MEM_DATAFLOW.U,   false.B, true.B),
+        InfluencerCandidate(evict_fire,  iftOpCount(s2_fill_entry),  INFL_CACHE_EVICTION, true.B,  iftSecret(s2_fill_entry)),
+        InfluencerCandidate(memdf_fire,  iftOpCount(s2_store_entry), INFL_MEM_DATAFLOW,   true.B,  iftSecret(s2_store_entry)),
+        InfluencerCandidate(memsec_fire, iftOpCount(s2_store_entry), INFL_MEM_DATAFLOW,   false.B, true.B),
       ))
+      // Set summary flags so writeback paths can skip scanning cf_influencer_list.
+      when (memdf_fire)  { uop_resp_final.cf_mem_dataflow_atk := true.B }
+      when (memsec_fire) { uop_resp_final.cf_mem_sec_dataflow  := true.B }
 
       // corefuzzing: ift_store_meta writes are collected per-way and merged after the
       // memWidth loop so each SyncReadMem sees exactly ONE write port (Vivado dissolves

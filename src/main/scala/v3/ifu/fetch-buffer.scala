@@ -296,15 +296,16 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   fb_base_tmpl.cf_attacker_influence := false.B
 
   val fb_post = addInfluencerBatch(fb_base_tmpl, Seq(
-    InfluencerCandidate(io.enq.bits.icache_domain_mismatch, 0.U, INFL_ICACHE_STATE.U, any_is_victim, false.B),
-    InfluencerCandidate(io.enq.bits.ras_domain_mismatch,    0.U, INFL_RAS_STATE.U,    any_is_victim, false.B),
-    InfluencerCandidate(ras_pop_secret,                      0.U, INFL_RAS_STATE.U,    false.B,       true.B),
-    InfluencerCandidate(io.enq.bits.bpd_domain_mismatch,    0.U, INFL_BPD_STATE.U,    any_is_victim, false.B),
-    InfluencerCandidate(io.enq.bits.bpd_secret_mismatch,    0.U, INFL_BPD_STATE.U,    false.B,       true.B),
-    InfluencerCandidate(io.enq.bits.btb_domain_mismatch,    0.U, INFL_BTB_STATE.U,    any_is_victim, false.B),
-    InfluencerCandidate(io.enq.bits.btb_secret_mismatch,    0.U, INFL_BTB_STATE.U,    false.B,       true.B),
-    InfluencerCandidate(io.enq.bits.itlb_domain_mismatch,   0.U, INFL_ITLB_STATE.U,   any_is_victim, false.B),
-    InfluencerCandidate(io.enq.bits.itlb_secret_mismatch,   0.U, INFL_ITLB_STATE.U,   false.B,       true.B),
+    InfluencerCandidate(io.enq.bits.icache_domain_mismatch, 0.U, INFL_ICACHE_STATE, any_is_victim, false.B),
+    InfluencerCandidate(io.enq.bits.icache_secret_mismatch, 0.U, INFL_ICACHE_STATE, false.B,       true.B),
+    InfluencerCandidate(io.enq.bits.ras_domain_mismatch,    0.U, INFL_RAS_STATE,    any_is_victim, false.B),
+    InfluencerCandidate(ras_pop_secret,                      0.U, INFL_RAS_STATE,    false.B,       true.B),
+    InfluencerCandidate(io.enq.bits.bpd_domain_mismatch,    0.U, INFL_BPD_STATE,    any_is_victim, false.B),
+    InfluencerCandidate(io.enq.bits.bpd_secret_mismatch,    0.U, INFL_BPD_STATE,    false.B,       true.B),
+    InfluencerCandidate(io.enq.bits.btb_domain_mismatch,    0.U, INFL_BTB_STATE,    any_is_victim, false.B),
+    InfluencerCandidate(io.enq.bits.btb_secret_mismatch,    0.U, INFL_BTB_STATE,    false.B,       true.B),
+    InfluencerCandidate(io.enq.bits.itlb_domain_mismatch,   0.U, INFL_ITLB_STATE,   any_is_victim, false.B),
+    InfluencerCandidate(io.enq.bits.itlb_secret_mismatch,   0.U, INFL_ITLB_STATE,   false.B,       true.B),
   ))
 
   // Broadcast shared influencer list to all uops in the packet.
@@ -314,8 +315,8 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     when (fb_post.cf_attacker_influence) {
       in_uops(i).cf_attacker_influence := true.B
     }
-    // Secret propagation: set when BPD or BTB was trained by a secret instruction
-    when (io.enq.bits.bpd_secret_mismatch || io.enq.bits.btb_secret_mismatch) {
+    // Secret propagation: set when BPD, BTB, or RAS was trained/pushed by a secret instruction
+    when (io.enq.bits.bpd_secret_mismatch || io.enq.bits.btb_secret_mismatch || ras_pop_secret) {
       in_uops(i).cf_secret_propagation := true.B
     }
   }
@@ -385,12 +386,15 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
 
   val do_deq = io.deq.ready && !will_hit_tail
 
+  // head is always one-hot (initialized to 1.U, only updated via rotateLeft or reset to 1.U).
+  val head_row = OHToUInt(head)
+
   val deq_valids_mask = (~MaskUpper(slot_will_hit_tail)).asBools
   // Gate each deq slot by ram_valid for the current head row.
   // This prevents stale/uninitialized padding entries (left by row-boundary
   // padding of the tail pointer after a partial enqueue) from appearing valid.
   val head_ram_valid = VecInit((0 until coreWidth).map(j =>
-    Mux1H(head, VecInit((0 until numRows).map(i => ram_valid(i * coreWidth + j))))))
+    ram_valid(head_row * coreWidth.U + j.U)))
   val deq_valids = VecInit(deq_valids_mask.zip(head_ram_valid).map { case (m, rv) => m && rv })
 
   // Generate vec for dequeue read port.
@@ -411,7 +415,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   })
   val deq_valids_sub = VecInit(deq_valids.zip(sub_row_mask).map { case (v, m) => v && m })
   io.deq.bits.uops zip deq_valids_sub        map {case (d,v) => d.valid := v}
-  io.deq.bits.uops zip Mux1H(head, deq_vec)  map {case (d,q) => d.bits  := q}
+  io.deq.bits.uops zip deq_vec(head_row)      map {case (d,q) => d.bits  := q}
   io.deq.valid := deq_valids_sub.reduce(_||_)
 
   //-------------------------------------------------------------

@@ -12,7 +12,7 @@
 package boom.v3.exu
 
 import chisel3._
-import chisel3.util.{log2Ceil, PopCount}
+import chisel3.util.{log2Ceil, PopCount, UIntToOH, Mux1H}
 
 import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.util.Str
@@ -149,17 +149,26 @@ class IssueUnitCollapsing(
     port_issued(w) = false.B
   }
 
+  // Track which slot index won each port; used below to route cf_contend_out without a re-scan.
+  val port_winner_idx = Array.fill(issueWidth)(WireInit(numIssueSlots.U(log2Ceil(numIssueSlots + 1).W)))
+
+  // Pre-compute fu_code compatibility once; reused in grant pass and contention pass.
+  val slot_can_use_port = Array.tabulate(numIssueSlots, issueWidth) { (i, w) =>
+    (issue_slots(i).uop.fu_code & io.fu_types(w)) =/= 0.U
+  }
+
   for (i <- 0 until numIssueSlots) {
     issue_slots(i).grant := false.B
     var uop_issued = false.B
 
     for (w <- 0 until issueWidth) {
-      val can_allocate = (issue_slots(i).uop.fu_code & io.fu_types(w)) =/= 0.U
+      val can_allocate = slot_can_use_port(i)(w)
 
       when (requests(i) && !uop_issued && can_allocate && !port_issued(w)) {
         issue_slots(i).grant := true.B
         io.iss_valids(w) := true.B
         io.iss_uops(w) := issue_slots(i).uop
+        port_winner_idx(w) := i.U
         // probably not necessary. Hence commented.
         // Tag the micro-op as it leaves the issue queue and is issued to an
         // execution unit. Keeping the append combinational avoids extra
@@ -190,10 +199,11 @@ class IssueUnitCollapsing(
     val winner_is_atk = io.iss_uops(w).cf_domain_id === 1.U
     val winner_is_sec = io.iss_uops(w).cf_secret_access || io.iss_uops(w).cf_secret_propagation
     for (i <- 0 until numIssueSlots) {
-      val can_use_port   = (issue_slots(i).uop.fu_code & io.fu_types(w)) =/= 0.U
-      // Gate with io.iss_valids(w) here — all signals are in the outer scope
+      val can_use_port   = slot_can_use_port(i)(w)
+      // Gate with io.iss_valids(w) here — all signals are in the outer scope.
+      // Also fires when winner is same-domain but secret (same-domain secret contention).
       val is_cross_loser = io.iss_valids(w) && requests(i) && !issue_slots(i).grant &&
-                           can_use_port && (issue_slots(i).uop.cf_domain_id =/= winner_domain)
+                           can_use_port && (issue_slots(i).uop.cf_domain_id =/= winner_domain || winner_is_sec)
       when (is_cross_loser && !already_denied(i)) {
         issue_slots(i).cf_contend_in.valid                    := true.B
         issue_slots(i).cf_contend_in.bits.winner_op_count     := winner_op
@@ -204,30 +214,15 @@ class IssueUnitCollapsing(
     }
   }
 
-  // Pass 2: collect cf_contend_out from granted slots → output as per-port contention updates.
-  // Re-scan to find which slot was granted on which port (mirrors the grant loop above).
-  // Scala vars ensure priority (first matching slot per port wins).
-  val port_winner_idx = Array.fill(issueWidth)(WireInit(numIssueSlots.U(log2Ceil(numIssueSlots + 1).W)))
-  val port_assigned2  = Array.fill(issueWidth)(WireInit(false.B))
-  for (i <- 0 until numIssueSlots) {
-    var uop_seen2 = false.B
-    for (w <- 0 until issueWidth) {
-      val can_allocate2 = (issue_slots(i).uop.fu_code & io.fu_types(w)) =/= 0.U
-      when (requests(i) && !uop_seen2 && can_allocate2 && !port_assigned2(w)) {
-        port_winner_idx(w) := i.U
-      }
-      val was_port_assigned2 = port_assigned2(w)
-      port_assigned2(w) = port_assigned2(w) | (requests(i) && !uop_seen2 && can_allocate2)
-      uop_seen2 = uop_seen2 | (requests(i) && can_allocate2 && !was_port_assigned2)
-    }
-  }
+  // Route cf_contend_out from each port's winning slot.
+  // UIntToOH safe: iss_valids(w)=true implies port_winner_idx(w) is a valid slot index.
   for (w <- 0 until issueWidth) {
     when (io.iss_valids(w)) {
-      for (i <- 0 until numIssueSlots) {
-        when (port_winner_idx(w) === i.U && issue_slots(i).cf_contend_out.valid) {
-          io.cf_contention_upd(w).valid := true.B
-          io.cf_contention_upd(w).bits  := issue_slots(i).cf_contend_out.bits
-        }
+      val sel = UIntToOH(port_winner_idx(w), numIssueSlots)
+      val winner_out = Mux1H(sel, issue_slots.map(_.cf_contend_out))
+      when (winner_out.valid) {
+        io.cf_contention_upd(w).valid := true.B
+        io.cf_contention_upd(w).bits  := winner_out.bits
       }
     }
   }

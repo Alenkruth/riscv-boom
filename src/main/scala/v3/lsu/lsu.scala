@@ -48,6 +48,9 @@ import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.rocket
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util.{Str, CoreFuzzingConstants}
+import freechips.rocketchip.util.property.{cover => RCcover}
+import midas.targetutils.AutoCounterCoverModuleAnnotation
+import chisel3.experimental.annotate
 
 import boom.v3.common._
 import boom.v3.exu.{BrUpdateInfo, Exception, FuncUnitResp, CommitSignals, ExeUnitResp}
@@ -156,6 +159,16 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   // Enables in-flight consumers to receive s_prop before the producer commits (avoids needing
   // a fence.i between the secret load and its consumers).  Bit index = pdst of the load.
   val cf_preg_secret_upd = Output(Vec(memWidth, Valid(new CF_PregSecretUpd)))
+
+  // Gap 1 fix (DOC:23): live preg_secret read port — core exposes integer preg_secret so the
+  // TLB stage can check whether the load's source address register is already secret-tainted
+  // at issue time.  By the time a load reaches AGU, its source has written back (wakeup),
+  // so preg_secret[prs1] reflects the full writeback-transitive taint chain P1→Pn.
+  val cf_preg_secret  = Input(Vec(numIntPhysRegs, Bool()))
+  // Gap 1 fix (DOC:23): direct ROB s_tx update at TLB stage (mirrors cf_s_acc_rob_upd).
+  // Without this, squashed probe loads never show s_tx=1 in bridge records because the
+  // pipeline uop's cf_secret_transmission wire is discarded when the instruction is killed.
+  val cf_s_tx_rob_upd = Output(Vec(memWidth, Valid(new CF_SAccUpdate)))
 
   val fp_stdata   = Flipped(Decoupled(new ExeUnitResp(fLen)))
 
@@ -269,6 +282,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 {
   val io = IO(new LSUIO)
   io.hellacache := DontCare
+  // Gap 1 fix: default drivers for new IOs — overridden inside the TLB for-loop below.
+  io.core.cf_s_tx_rob_upd.foreach { u => u.valid := false.B; u.bits := DontCare }
 
 
   // Runtime LDQ/STQ size selection via CSR index
@@ -893,19 +908,35 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     io.core.cf_preg_secret_upd(w).valid             := exe_tlb_valid(w) && is_secret_load
     io.core.cf_preg_secret_upd(w).bits.pdst         := exe_tlb_uop(w).pdst
     io.core.cf_preg_secret_upd(w).bits.is_fp        := exe_tlb_uop(w).dst_rtype === RT_FLT
+    // Live preg_secret check for both store data registers and load address registers.
+    // The dispatch-time cf_secret_propagation snapshot misses tight-wave cases where the
+    // source register's secret load dispatched just before this instruction (its TLB hadn't
+    // fired at dispatch, so preg_secret wasn't set yet). By TLB time the load has written
+    // back and preg_secret[prs1/prs2] is up to date.
+    val prs1_live_secret = io.core.cf_preg_secret(exe_tlb_uop(w).prs1)
+    val prs2_live_secret = io.core.cf_preg_secret(exe_tlb_uop(w).prs2)
+    val data_reg_secret  = exe_tlb_uop(w).cf_secret_propagation || prs1_live_secret || prs2_live_secret
     // s_tx Case A: store carrying secret-dependent data to a non-secret memory address.
     //   The secret escapes to attacker-accessible memory (anything outside the secret range).
     val is_secret_bearing_store = exe_tlb_uop(w).uses_stq && !in_secret &&
-                                   (exe_tlb_uop(w).cf_secret_access || exe_tlb_uop(w).cf_secret_propagation)
+                                   (exe_tlb_uop(w).cf_secret_access || data_reg_secret)
     // s_tx Case B: load where the effective address is derived from secret-propagated data
     //   AND the address is outside the secret range (attacker-accessible memory).
     //   The secret controls which non-secret memory location is accessed, leaking it via address
     //   pattern (e.g., cache timing: load from mem[secret_value + base]).
     //   Exclude loads to secret-range addresses: if the pointer happens to land in secret memory,
     //   the access stays within the secure domain and is not observable by the attacker.
-    val is_secret_addr_load = exe_tlb_uop(w).uses_ldq && exe_tlb_uop(w).cf_secret_propagation && !in_secret
+    val addr_reg_secret  = data_reg_secret
+    val is_secret_addr_load = exe_tlb_uop(w).uses_ldq && addr_reg_secret && !in_secret
     uop_tlb_base.cf_secret_transmission := exe_tlb_uop(w).cf_secret_transmission ||
                                            is_secret_bearing_store || is_secret_addr_load
+    // Gap 1 fix: emit direct ROB write-back for s_tx at TLB time.
+    // Without this, a squashed probe load's ROB entry never shows s_tx=1 because the
+    // pipeline uop wire is discarded when the instruction is killed before commit.
+    // op_count_id guard (enforced in rob.scala handler) prevents stale-slot updates.
+    io.core.cf_s_tx_rob_upd(w).valid            := exe_tlb_valid(w) && is_secret_addr_load
+    io.core.cf_s_tx_rob_upd(w).bits.rob_idx     := exe_tlb_uop(w).rob_idx
+    io.core.cf_s_tx_rob_upd(w).bits.op_count_id := exe_tlb_uop(w).cf_op_count_id
     // Stage 2: DTLB domain mismatch → INFL_DTLB_STATE (reads uop_tlb_base, writes uop_tlb_final)
     val uop_tlb_final = WireInit(uop_tlb_base)
     when (dtlb.io.resp_domain_mismatch(w) || dtlb.io.resp_secret_mismatch(w)) {
@@ -1457,8 +1488,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           ((l_forward_stq_idx =/= lcam_stq_idx(w)) && forwarded_is_older)) { // If the load forwarded from us, we might be ok
           ldq(i).bits.order_fail := true.B
           failed_loads(i)        := true.B
-          // corefuzzing: cross-domain memory ordering violation
-          when (stq(lcam_stq_idx(w)).bits.uop.cf_domain_id =/= l_bits.uop.cf_domain_id) {
+          // corefuzzing: memory ordering violation (cross-domain OR secret-tainted store)
+          when (stq(lcam_stq_idx(w)).bits.uop.cf_domain_id =/= l_bits.uop.cf_domain_id ||
+                stq(lcam_stq_idx(w)).bits.uop.cf_secret_propagation ||
+                stq(lcam_stq_idx(w)).bits.uop.cf_secret_access) {
             val stq_infl_uop = stq(lcam_stq_idx(w)).bits.uop
             ldq(i).bits.uop := addInfluencer(l_bits.uop, stq_infl_uop.cf_op_count_id, INFL_MEM_ORDER.U,
               is_atk = stq_infl_uop.cf_domain_id === 1.U,
@@ -1478,8 +1511,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                 l_bits.observed) {        // Its only a ordering failure if the cache line was observed between the younger load and us
             ldq(i).bits.order_fail := true.B
             failed_loads(i)        := true.B
-            // corefuzzing: cross-domain LD-LD ordering violation (the searcher's store from other domain)
-            when (lcam_uop(w).cf_domain_id =/= l_bits.uop.cf_domain_id) {
+            // corefuzzing: LD-LD ordering violation (cross-domain OR secret-tainted searcher)
+            when (lcam_uop(w).cf_domain_id =/= l_bits.uop.cf_domain_id ||
+                  lcam_uop(w).cf_secret_propagation ||
+                  lcam_uop(w).cf_secret_access) {
               ldq(i).bits.uop := addInfluencer(l_bits.uop, lcam_uop(w).cf_op_count_id, INFL_MEM_ORDER.U,
                 is_atk = lcam_uop(w).cf_domain_id === 1.U,
                 is_secret = lcam_uop(w).cf_secret_access || lcam_uop(w).cf_secret_propagation)
@@ -1599,7 +1634,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val r_xcpt_valid = RegInit(false.B)
   val r_xcpt       = Reg(new Exception)
 
+  annotate(new AutoCounterCoverModuleAnnotation(chisel3.Module.currentModule.get.toTarget))
   val ld_xcpt_valid = failed_loads.reduce(_|_)
+  RCcover(ld_xcpt_valid, "BOOM_v3_MemOrderViolation",
+    "Memory ordering violation: a load observed a stale value and must be replayed")
   val ld_xcpt_uop   = ldq(Mux(l_idx >= numLdqEntries.U, l_idx - numLdqEntries.U, l_idx)).bits.uop
 
   val use_mem_xcpt = (mem_xcpt_valid && IsOlder(mem_xcpt_uop.rob_idx, ld_xcpt_uop.rob_idx, io.core.rob_head_idx)) || !ld_xcpt_valid
@@ -1770,13 +1808,30 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                 wb_forward_ld_addr(w),
                                 storegen.data, false.B, coreDataBytes)
 
-      // corefuzzing: STL forwarding cross-domain influencer
-      val fwd_uop_cf = WireInit(forward_uop)
-      when (data_ready && live && (forward_uop.cf_domain_id =/= stq_e.bits.uop.cf_domain_id)) {
-        val stl_infl_uop = stq_e.bits.uop
-        fwd_uop_cf := addInfluencer(forward_uop, stl_infl_uop.cf_op_count_id, INFL_STL_FORWARD.U,
+      // corefuzzing: STL forwarding — two explicit stages to avoid combinational feedback.
+      // Stage 1: cross-domain influencer injection (input: forward_uop only — no cycle).
+      val stl_infl_uop = stq_e.bits.uop
+      val stl_store_is_secret = stl_infl_uop.cf_secret_access || stl_infl_uop.cf_secret_propagation
+      val fwd_s1 = WireInit(forward_uop)
+      when (data_ready && live && (forward_uop.cf_domain_id =/= stl_infl_uop.cf_domain_id)) {
+        fwd_s1 := addInfluencer(forward_uop, stl_infl_uop.cf_op_count_id, INFL_STL_FORWARD.U,
           is_atk = stl_infl_uop.cf_domain_id === 1.U,
-          is_secret = stl_infl_uop.cf_secret_access || stl_infl_uop.cf_secret_propagation)
+          is_secret = stl_store_is_secret)
+      }
+      // Stage 2: secret propagation + same-domain attribution (input: fwd_s1 — no cycle).
+      // Cross-domain case: s_prop only (influencer already in fwd_s1).
+      // Same-domain secret case: build with_sprop from fwd_s1, then add attribution.
+      val fwd_uop_cf = WireInit(fwd_s1)
+      when (data_ready && live && stl_store_is_secret) {
+        when (forward_uop.cf_domain_id === stl_infl_uop.cf_domain_id) {
+          val with_sprop = WireInit(fwd_s1)
+          with_sprop.cf_secret_propagation := true.B
+          fwd_uop_cf := addInfluencer(with_sprop, stl_infl_uop.cf_op_count_id, INFL_STL_FORWARD.U,
+            is_atk = false.B,
+            is_secret = true.B)
+        } .otherwise {
+          fwd_uop_cf.cf_secret_propagation := true.B
+        }
       }
 
       io.core.exe(w).iresp.valid := (fwd_uop_cf.dst_rtype === RT_FIX) && data_ready && live

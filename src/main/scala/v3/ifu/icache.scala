@@ -62,6 +62,8 @@ class ICacheResp(val outer: ICache) extends Bundle
   val ae = Bool()
   // corefuzzing: set when the cache line was last filled by a different domain fetch
   val icache_domain_mismatch = Bool()
+  // corefuzzing: set when the cache line was last filled during a secret-range fetch (same-domain)
+  val icache_secret_mismatch = Bool()
 }
 
 /**
@@ -83,6 +85,8 @@ class ICacheBundle(val outer: ICache) extends BoomBundle()(outer.p)
 
   // corefuzzing: domain of s1 fetch PC (1=attacker, 0=victim), for domain mismatch detection
   val s1_domain_id = Input(Bool())
+  // corefuzzing: whether s1 fetch PC is in the secret range (for secret mismatch detection)
+  val s1_is_secret  = Input(Bool())
 
   // corefuzzing: ICache set/way reconfiguration indices (from icacheCSRCF at 0xbcb)
   val cf_icache_set_conf = Input(UInt(2.W))  // index into icacheSetOptions = Seq(64, 32, 16, 8)
@@ -204,8 +208,10 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   // corefuzzing: per-way IFT domain BRAM — read in s0 alongside tag_array, result in s1.
   // Tracks which domain last FILLED each (set, way). On FPGA, infers as BRAM (not FFs).
   // vb_array invalidation makes all hits false → stale BRAM data is never consumed after flush.
-  val ift_tag_meta = SyncReadMem(nSets, Vec(nWays, Bool()))
-  val ift_rdata    = ift_tag_meta.read(s0_set_idx_masked, !refill_done && s0_valid)
+  val ift_tag_meta        = SyncReadMem(nSets, Vec(nWays, Bool()))
+  val ift_tag_meta_secret = SyncReadMem(nSets, Vec(nWays, Bool()))
+  val ift_rdata        = ift_tag_meta.read(s0_set_idx_masked, !refill_done && s0_valid)
+  val ift_rdata_secret = ift_tag_meta_secret.read(s0_set_idx_masked, !refill_done && s0_valid)
 
   val vb_array = RegInit(0.U((nSets*nWays).W))
   when (refill_one_beat) {
@@ -214,9 +220,12 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
 
   // corefuzzing: write ift_tag_meta on refill_done (same cycle as tag_array write, one way mask)
   val refill_domain_reg = RegEnable(io.s1_domain_id, s1_valid && !(refill_valid || s2_miss))
+  val refill_secret_reg = RegEnable(io.s1_is_secret,  s1_valid && !(refill_valid || s2_miss))
   if (ENABLE_IFT) {
     when (refill_done) {
       ift_tag_meta.write(refill_idx, VecInit(Seq.fill(nWays)(refill_domain_reg)),
+        Seq.tabulate(nWays)(repl_way === _.U))
+      ift_tag_meta_secret.write(refill_idx, VecInit(Seq.fill(nWays)(refill_secret_reg)),
         Seq.tabulate(nWays)(repl_way === _.U))
     }
   }
@@ -242,8 +251,13 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
 
   // corefuzzing: mux per-way IFT domain by hit way in s1 (ift_rdata was read from s0 address)
   val s1_way_domain      = Mux1H(s1_tag_hit, ift_rdata)
+  val s1_way_secret      = Mux1H(s1_tag_hit, ift_rdata_secret)
   val s1_domain_mismatch = s1_hit && (s1_way_domain =/= io.s1_domain_id)
+  // Secret mismatch: hit way was filled during a secret-range fetch, but current fetch is not secret.
+  // Covers the same-domain channel where secret instruction's cache fill affects a non-secret fetch.
+  val s1_secret_mismatch = s1_hit && s1_way_secret && !io.s1_is_secret
   val s2_domain_mismatch = RegNext(s1_domain_mismatch && !io.s1_kill)
+  val s2_secret_mismatch = RegNext(s1_secret_mismatch && !io.s1_kill)
 
   val ramDepth = if (refillsToOneBank && nBanks == 2) {
     nSets * refillCycles / 2
@@ -389,6 +403,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   io.resp.bits.replay := DontCare
   io.resp.bits.data := s2_data
   io.resp.bits.icache_domain_mismatch := s2_domain_mismatch
+  io.resp.bits.icache_secret_mismatch := s2_secret_mismatch
   io.resp.valid := s2_valid && s2_hit
 
   tl_out.a.valid := s2_miss && !refill_valid && !io.s2_kill

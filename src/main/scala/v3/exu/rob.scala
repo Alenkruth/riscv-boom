@@ -123,15 +123,19 @@ class RobIo(
 
   // corefuzzing: issue contention update — fires from issue units when an instruction issues
   // with accumulated cross-domain denial cycles; ROB applies addInfluencer to the entry.
-  // FP issue unit lives inside fp_pipeline (not in issue_units in core.scala), so only
-  // sum non-FP IQ widths. IQT_FP.litValue == BigInt(4).
-  val cf_issue_contention_upd = Input(Vec(issueParams.filter(_.iqType != BigInt(4)).map(_.issueWidth).sum, Valid(new IssueContentionUpdate)))
+  // Includes all IQs: mem, int, and FP (fp_pipeline exposes cf_contention_upd as module IO).
+  val cf_issue_contention_upd = Input(Vec(issueParams.map(_.issueWidth).sum, Valid(new IssueContentionUpdate)))
 
   // corefuzzing: direct ROB update to set cf_secret_access at address-compute (TLB) time.
   // Fires when LSU TLB detects the effective address falls in the secret range, before
   // the dcache response — ensures s_acc is visible in [FLUSH] logs for speculative loads
   // killed before the dcache responds.
   val cf_lsu_s_acc_upd = Input(Vec(memWidth, Valid(new CF_SAccUpdate)))
+
+  // corefuzzing: direct ROB s_tx update at TLB stage — fires when live preg_secret check
+  // detects a secret-tainted source address register at issue time (Gap 1 fix, DOC:23).
+  // Mirrors cf_lsu_s_acc_upd; op_count_id guard prevents stale ROB slot updates.
+  val cf_lsu_s_tx_upd  = Input(Vec(memWidth, Valid(new CF_SAccUpdate)))
 
   // corefuzzing: direct ROB update to set cf_secret_propagation for in-flight instructions
   // whose physical source registers are secret-tainted, discovered at writeback time.
@@ -141,6 +145,9 @@ class RobIo(
   // corefuzzing changes
   val cf_debug_rob_enable = Input(Bool())
   val cf_rob_entries = Input(UInt(log2Ceil(robEntryOptions.length).W))
+  // Fires in the cycle the CSRRW to robSizeCSRCF commits (flush_on_commit=Y, is_unique=Y).
+  // Used to reset head/tail/pnr to 0 so WrapInc wraps correctly under the new cf_rob_rows.
+  val cf_rob_entries_wen = Input(Bool())
   // Pulse to reset ROB head/tail to 0 on quiesce drain so WrapInc wraps correctly
   // after a cf_rob_entries CSR change (ROB is empty when this fires)
   val cf_rob_quiesce_reset = Input(Bool())
@@ -534,6 +541,18 @@ class Rob(
       }
     }
 
+    // Gap 1 fix (DOC:23): direct s_tx update from LSU TLB stage.
+    // Fires when live preg_secret[prs1/prs2] check detects a secret-tainted source address.
+    // op_count_id guard prevents stale updates to reused ROB slots (same as cf_lsu_s_acc_upd).
+    for (upd <- io.cf_lsu_s_tx_upd) {
+      when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx))) {
+        val cidx = GetRowIdx(upd.bits.rob_idx)
+        when (rob_val(cidx) && rob_uop(cidx).cf_op_count_id === upd.bits.op_count_id) {
+          rob_uop(cidx).cf_secret_transmission := true.B
+        }
+      }
+    }
+
     // corefuzzing: s_prop direct ROB update — set cf_secret_propagation on in-flight
     // instructions whose physical sources were secret-tainted (discovered at writeback time).
     // The 1-bit cf_secret_propagation write is kept as N-port (cheap); the influencer list
@@ -545,6 +564,13 @@ class Rob(
         when (rob_val(cidx) && rob_uop(cidx).cf_op_count_id === upd.bits.op_count_id) {
           rob_uop(cidx).cf_secret_propagation := true.B  // 1-bit: cheap N-port write
           sprob_infl_pending(cidx) := true.B              // defer influencer write to drain
+          // Gap 2 fix (DOC:23): retroactively set s_tx for loads with late-arriving address taint.
+          // Covers the edge case where the probe load wrote back within the speculation window
+          // after the taint chain propagated, and the Gap 1 TLB-stage ROB update was sufficient.
+          // Belt-and-suspenders alongside Gap 1; runs whenever cf_s_prop_rob_upd fires.
+          when (rob_uop(cidx).uses_ldq && !rob_uop(cidx).cf_secret_access) {
+            rob_uop(cidx).cf_secret_transmission := true.B
+          }
         }
       }
     }
@@ -606,6 +632,9 @@ class Rob(
           rob_uop(cidx).cf_infl_overflow := true.B
         }
         when (ic_pending_winner_atk(cidx)) { rob_uop(cidx).cf_attacker_influence := true.B }
+        // D-CI fix: propagate shortcut atk/sec bits so software doesn't have to re-scan the log
+        rob_uop(cidx).cf_cntd_winner_atk := ic_pending_winner_atk(cidx)
+        rob_uop(cidx).cf_cntd_winner_sec := ic_pending_winner_sec(cidx)
       }
       ic_pending_valid(cidx) := false.B
     }
@@ -767,6 +796,9 @@ class Rob(
           io.commit.uops(w).cf_infl_overflow := true.B
         }
         when (ic_pending_winner_atk(com_idx)) { io.commit.uops(w).cf_attacker_influence := true.B }
+        // D-CI fix: propagate shortcut atk/sec bits to commit uop
+        io.commit.uops(w).cf_cntd_winner_atk := ic_pending_winner_atk(com_idx)
+        io.commit.uops(w).cf_cntd_winner_sec := ic_pending_winner_sec(com_idx)
         ic_pending_valid(com_idx) := false.B
       }
 
@@ -978,8 +1010,7 @@ class Rob(
         // Fix 3c: dcache memsec_fire injects INFL_MEM_DATAFLOW(is_atk=false, is_secret=true)
         // into the wb uop's influencer list. The flag itself is not on cf_secret_propagation
         // (dcache doesn't write that field), so detect it here and set s_prop on the ROB entry.
-        val has_mem_sec_infl_rob = wb_uop_i.cf_influencer_list.map(e =>
-          e.valid && e.infl_type === INFL_MEM_DATAFLOW.U && !e.is_atk && e.is_secret).reduce(_ || _)
+        val has_mem_sec_infl_rob = wb_uop_i.cf_mem_sec_dataflow
         when (has_mem_sec_infl_rob) { rob_uop(rob_row).cf_secret_propagation := true.B }
 
         // Opt#1: Defer influencer merge to pending table (breaks critical path).
@@ -1295,10 +1326,17 @@ class Rob(
 
   maybe_full := !rob_deq && (rob_enq || maybe_full) || io.brupdate.b1.mispredict_mask =/= 0.U
 
-  // corefuzzing: reset ROB head/tail to 0 on quiesce drain (last-write-wins over normal updates above).
-  // When this fires, the ROB is empty (rob.io.empty = true in pipeline_drained_strict).
-  // Resetting ensures WrapInc(ptr, cf_rob_rows) wraps correctly after a cf_rob_entries CSR change.
-  when (io.cf_rob_quiesce_reset) {
+  // corefuzzing: reset ROB head/tail to 0 when cf_rob_rows changes (last-write-wins over WrapInc above).
+  // Two triggers:
+  //   cf_rob_quiesce_reset — quiesce drain path (software-initiated, ROB already empty)
+  //   cf_rob_entries_wen_pending && flush_commit — DMI CSRRW to robSizeCSRCF
+  //     wen fires at CSR writeback time (1-2 cycles before ROB commit); the sticky flag
+  //     arms on wen and the reset fires on the subsequent flush_commit from that same CSRRW.
+  //     CSRRW is is_unique so no other flush_on_commit can intervene between wen and commit.
+  val cf_rob_entries_wen_pending = RegInit(false.B)
+  when (io.cf_rob_entries_wen)                              { cf_rob_entries_wen_pending := true.B  }
+  .elsewhen (flush_commit && !exception_thrown)             { cf_rob_entries_wen_pending := false.B }
+  when (io.cf_rob_quiesce_reset || (cf_rob_entries_wen_pending && flush_commit && !exception_thrown)) {
     rob_head     := 0.U
     rob_head_lsb := 0.U
     rob_tail     := 0.U

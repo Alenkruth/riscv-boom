@@ -841,11 +841,11 @@ object addInfluencer extends CoreFuzzingConstants {
  * Candidate for addInfluencerBatch: fires when cond=true, appending one influencer entry.
  */
 case class InfluencerCandidate(
-  cond:      Bool,
-  op_count:  UInt,
-  infl_type: UInt,
-  is_atk:    Bool,
-  is_secret: Bool)
+  cond:          Bool,
+  op_count:      UInt,
+  infl_type_int: Int,   // Scala compile-time constant — enables constant-folding in addInfluencerBatch
+  is_atk:        Bool,
+  is_secret:     Bool)
 
 /**
  * Add multiple influencer entries to a uop in parallel (O(~10 gates) vs O(N*90) serial).
@@ -892,7 +892,7 @@ object addInfluencerBatch extends CoreFuzzingConstants {
       when (any_write) {
         out.cf_influencer_list(s).valid     := true.B
         out.cf_influencer_list(s).op_count  := Mux1H(writers, candidates.map(_.op_count))
-        out.cf_influencer_list(s).infl_type := Mux1H(writers, candidates.map(_.infl_type))
+        out.cf_influencer_list(s).infl_type := Mux1H(writers, candidates.map(_.infl_type_int.U))
         out.cf_influencer_list(s).is_atk    := Mux1H(writers, candidates.map(_.is_atk))
         out.cf_influencer_list(s).is_secret := Mux1H(writers, candidates.map(_.is_secret))
       }

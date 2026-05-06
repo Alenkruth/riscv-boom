@@ -197,6 +197,8 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
     slot_uop.cf_spec_branch_op_id        := 0.U
     slot_uop.cf_spec_branch_is_secret    := false.B
     slot_uop.cf_infl_overflow            := false.B
+    slot_uop.cf_mem_dataflow_atk         := false.B
+    slot_uop.cf_mem_sec_dataflow         := false.B
     slot_uop.cf_influencer_list.foreach { e =>
       e.valid      := false.B
       e.op_count   := 0.U

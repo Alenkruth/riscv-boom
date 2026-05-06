@@ -205,6 +205,10 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   val cf_influencer_list      = Vec(numInfluencerSlotsCF, new InfluencerEntry)
   val cf_infl_overflow        = Bool()   // set when >numInfluencerSlotsCF influencers occurred
 
+  // Summary flags set by dcache to avoid scanning cf_influencer_list on writeback paths.
+  val cf_mem_dataflow_atk  = Bool()  // INFL_MEM_DATAFLOW(is_atk=true)  injected at dcache
+  val cf_mem_sec_dataflow  = Bool()  // INFL_MEM_DATAFLOW(is_atk=false, is_secret=true) injected
+
   // IFT Phase 2: register taint (set in rename; used at dispatch in core.scala)
   val cf_src_tainted              = Bool()                       // any source preg tainted by attacker
   val cf_taint_producer_op        = UInt(uopIDCounterWidthCF.W)  // op_count_id of the taint producer

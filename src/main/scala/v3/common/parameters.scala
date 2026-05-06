@@ -295,7 +295,9 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     Some(CustomCSR(robSizeCSRIdCF, mask, Some(init)))
   } else None
 
-  def cf_rob_entries = getOrElse(robSizeCSRCF, _.value, 0.U)
+  def cf_rob_entries     = getOrElse(robSizeCSRCF, _.value, 0.U)
+  // Fires in the cycle the CSRRW to robSizeCSRCF commits; used by ROB to reset pointers.
+  def cf_rob_entries_wen = getOrElse(robSizeCSRCF, _.wen, false.B)
   // move this to ROB
   // Helper to decode one-hot CSR value to actual entry count
   // val options = robEntryOptions.map(_.U)

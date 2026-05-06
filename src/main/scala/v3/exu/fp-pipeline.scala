@@ -60,6 +60,8 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
     val cf_debug_issue_enable = Input(Bool())
     // 2-bit index into issueQueueEntryOptions for FP issue queue size selection
     val cf_iq_idx = Input(UInt(2.W))
+    // corefuzzing: FP issue contention updates (one per FP issue port)
+    val cf_contention_upd = Output(Vec(fpIssueParams.issueWidth, Valid(new IssueContentionUpdate)))
   })
 
   //**********************************
@@ -160,6 +162,9 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
 
     require (exe_units(i).readsFrf)
   }
+
+  // corefuzzing: expose FP issue contention updates as module IO
+  io.cf_contention_upd := issue_unit.io.cf_contention_upd
 
   // Wakeup
   for ((writeback, issue_wakeup) <- io.wakeups zip issue_unit.io.wakeup_ports) {

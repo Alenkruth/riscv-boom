@@ -38,7 +38,10 @@ import freechips.rocketchip.rocket.Instructions._
 import freechips.rocketchip.tile.{TraceBundle}
 import freechips.rocketchip.rocket.{Causes, PRV, TracedInstruction}
 import freechips.rocketchip.util.{Str, UIntIsOneOf, CoreMonitorBundle, CoreFuzzingConstants}
+import freechips.rocketchip.util.property.{cover => RCcover}
 import freechips.rocketchip.devices.tilelink.{PLICConsts, CLINTConsts}
+import midas.targetutils.AutoCounterCoverModuleAnnotation
+import chisel3.experimental.annotate
 
 import boom.v3.common._
 import boom.v3.ifu.{GlobalHistory, HasBoomFrontendParameters}
@@ -531,6 +534,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   io.lsu.cf_lsq_quiesce_reset := quiesce_flush_pulse
   // ROB pointer reset: reset head/tail to 0 so WrapInc wraps correctly after cf_rob_entries CSR change.
   rob.io.cf_rob_quiesce_reset := quiesce_flush_pulse
+  rob.io.cf_rob_entries_wen   := custom_csrs.cf_rob_entries_wen
   // RAS domain/secret shadow clear: prevents stale IFT bits from entries beyond the new active
   // RAS size from corrupting domain/secret attribution after a cf_ras_idx CSR reconfiguration.
   io.ifu.cf_ras_quiesce_flush := quiesce_flush_pulse
@@ -549,6 +553,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     io.ifu.cf_ras_quiesce_flush := false.B
     io.lsu.cf_lsq_quiesce_reset := false.B
     rob.io.cf_rob_quiesce_reset := false.B
+    rob.io.cf_rob_entries_wen   := false.B
     rename_stage.io.quiesce_flush      := false.B
     fp_rename_stage.io.quiesce_flush   := false.B
     pred_rename_stage.io.quiesce_flush := false.B
@@ -1032,6 +1037,14 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       spec_branch_op_table(tag)     := dec_uops(w).cf_op_count_id
     }
   }
+  // D-BP fix: cf_secret_propagation is false at decode; re-write spec_branch_secret_table at
+  // dispatch when cf_secret_propagation is correctly computed (after rename/taint lookup).
+  for (w <- 0 until coreWidth) {
+    when (dis_fire(w) && dis_uops(w).allocate_brtag) {
+      spec_branch_secret_table(dis_uops(w).br_tag) :=
+        dis_uops(w).cf_secret_propagation || dis_uops(w).cf_secret_access
+    }
+  }
 
   //-------------------------------------------------------------
   //-------------------------------------------------------------
@@ -1182,11 +1195,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // cf_domain_id: 1 if PC is in attacker address range (from CSR), 0 otherwise
   // cf_speculated: true if any branch is unresolved in the branch mask
   for (w <- 0 until coreWidth) {
-    val pc = dis_uops(w).debug_pc
-    val in_attacker_range = (pc >= custom_csrs.cf_attacker_start_addr) &&
-                            (pc <= custom_csrs.cf_attacker_end_addr) &&
-                            (custom_csrs.cf_attacker_end_addr =/= custom_csrs.cf_attacker_start_addr)
-    dis_uops(w).cf_domain_id  := in_attacker_range.asUInt
+    // cf_domain_id set at decode from debug_pc vs CSR range; propagates intact through rename regs.
     dis_uops(w).cf_speculated := dis_uops(w).br_mask =/= 0.U
 
     // corefuzzing: determine whether any outstanding branch in br_mask is attacker-domain.
@@ -1195,10 +1204,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       dis_uops(w).br_mask(i) && spec_branch_atk_table(i)))
     val br_sec_bits = VecInit((0 until maxBrCount).map(i =>
       dis_uops(w).br_mask(i) && spec_branch_secret_table(i)))
-    dis_uops(w).cf_spec_branch_is_atk    := br_atk_bits.reduce(_ || _)
+    val any_br_atk = br_atk_bits.reduce(_ || _)
+    dis_uops(w).cf_spec_branch_is_atk    := any_br_atk
     dis_uops(w).cf_spec_branch_is_secret := br_sec_bits.reduce(_ || _)
     dis_uops(w).cf_spec_branch_op_id     := Mux(
-      br_atk_bits.reduce(_ || _),
+      any_br_atk,
       spec_branch_op_table(PriorityEncoder(br_atk_bits)),
       0.U)
   }
@@ -1290,10 +1300,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     // Steps 1–5: inject dispatch-level influencers in parallel using addInfluencerBatch.
     // All candidates are evaluated from the same base (pre) simultaneously.
     // Step 6 (INFL_ISSUE_CONTENTION) is injected at issue time via ROB update bus.
+    // G-HOL fix: also fire when the queue head carries secret taint (same-domain case)
     val dis_hol_ldq = dis_fire(w) && dis_uops(w).uses_ldq && io.lsu.ldq_head_valid &&
-                      (io.lsu.ldq_head_domain =/= dis_uops(w).cf_domain_id)
+                      (io.lsu.ldq_head_domain =/= dis_uops(w).cf_domain_id || io.lsu.ldq_head_is_secret)
     val dis_hol_stq = dis_fire(w) && dis_uops(w).uses_stq && io.lsu.stq_head_valid &&
-                      (io.lsu.stq_head_domain =/= dis_uops(w).cf_domain_id)
+                      (io.lsu.stq_head_domain =/= dis_uops(w).cf_domain_id || io.lsu.stq_head_is_secret)
     val dis_hol_any   = dis_hol_ldq || dis_hol_stq
     val hol_head_op   = Mux(dis_hol_ldq, io.lsu.ldq_head_op_count,      io.lsu.stq_head_op_count)
     val hol_is_atk    = Mux(dis_hol_ldq, io.lsu.ldq_head_domain === 1.U, io.lsu.stq_head_domain === 1.U)
@@ -1302,15 +1313,15 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     val post_dis = addInfluencerBatch(pre, Seq(
       // reg_df_fire: cross-domain taint (is_atk=reg_df_is_atk) OR same-domain secret (is_atk=false).
       // reg_df_is_atk is true only for cross-domain cases; same-domain secret gets is_atk=false, is_secret=true.
-      InfluencerCandidate(reg_df_fire,                         dis_uops(w).cf_taint_producer_op, INFL_REG_DATAFLOW.U, reg_df_is_atk,                         dis_uops(w).cf_taint_producer_is_secret),
+      InfluencerCandidate(reg_df_fire,                         dis_uops(w).cf_taint_producer_op, INFL_REG_DATAFLOW, reg_df_is_atk,                         dis_uops(w).cf_taint_producer_is_secret),
       // preg_only_fire: in-flight preg_secret at dispatch (producer not yet committed to taint_table).
       // op_count=0 (unknown at dispatch time — producer hasn't committed); is_atk=false (same-domain secret).
-      InfluencerCandidate(preg_only_fire,                      0.U,                             INFL_REG_DATAFLOW.U, false.B,                               true.B),
-      InfluencerCandidate(dis_fire(w) && dis_stall_was_reg(w), dis_stall_reg_head_op_count(w),  INFL_REG_PRESSURE.U, dis_stall_reg_head_domain(w) === 1.U,  dis_stall_reg_head_is_secret(w)),
-      InfluencerCandidate(dis_fire(w) && dis_stall_was_rob(w), dis_stall_rob_head_op_count(w),  INFL_ROB_FULL.U,     dis_stall_rob_head_domain(w) === 1.U,  dis_stall_rob_head_is_secret(w)),
-      InfluencerCandidate(dis_fire(w) && dis_stall_was_ldq(w), dis_stall_ldq_head_op_count(w),  INFL_LDQ_FULL.U,     dis_stall_ldq_head_domain(w) === 1.U,  dis_stall_ldq_head_is_secret(w)),
-      InfluencerCandidate(dis_fire(w) && dis_stall_was_stq(w), dis_stall_stq_head_op_count(w),  INFL_STQ_FULL.U,     dis_stall_stq_head_domain(w) === 1.U,  dis_stall_stq_head_is_secret(w)),
-      InfluencerCandidate(dis_hol_any,                          hol_head_op,                     INFL_MEM_HOL.U,      hol_is_atk,                            hol_is_secret),
+      InfluencerCandidate(preg_only_fire,                      0.U,                             INFL_REG_DATAFLOW, false.B,                               true.B),
+      InfluencerCandidate(dis_fire(w) && dis_stall_was_reg(w), dis_stall_reg_head_op_count(w),  INFL_REG_PRESSURE, dis_stall_reg_head_domain(w) === 1.U,  dis_stall_reg_head_is_secret(w)),
+      InfluencerCandidate(dis_fire(w) && dis_stall_was_rob(w), dis_stall_rob_head_op_count(w),  INFL_ROB_FULL,     dis_stall_rob_head_domain(w) === 1.U,  dis_stall_rob_head_is_secret(w)),
+      InfluencerCandidate(dis_fire(w) && dis_stall_was_ldq(w), dis_stall_ldq_head_op_count(w),  INFL_LDQ_FULL,     dis_stall_ldq_head_domain(w) === 1.U,  dis_stall_ldq_head_is_secret(w)),
+      InfluencerCandidate(dis_fire(w) && dis_stall_was_stq(w), dis_stall_stq_head_op_count(w),  INFL_STQ_FULL,     dis_stall_stq_head_domain(w) === 1.U,  dis_stall_stq_head_is_secret(w)),
+      InfluencerCandidate(dis_hol_any,                          hol_head_op,                     INFL_MEM_HOL,      hol_is_atk,                            hol_is_secret),
     ))
 
     dis_uops(w).cf_influencer_list    := post_dis.cf_influencer_list
@@ -1903,14 +1914,20 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   rob.io.lsu_clr_unsafe        := io.lsu.clr_unsafe
   rob.io.lxcpt          <> io.lsu.lxcpt
 
-  // corefuzzing: issue contention updates — flatten per-port outputs from all issue units
-  rob.io.cf_issue_contention_upd := VecInit(issue_units.flatMap(u => u.io.cf_contention_upd))
+  // corefuzzing: issue contention updates — flatten per-port outputs from all issue units (mem, int, fp)
+  rob.io.cf_issue_contention_upd := VecInit(
+    issue_units.flatMap(u => u.io.cf_contention_upd) ++
+    (if (usingFPU) fp_pipeline.io.cf_contention_upd else Nil)
+  )
   rob.io.cf_lsu_s_acc_upd        := io.lsu.cf_s_acc_rob_upd
 
   // Default driver for rob.io.cf_s_prop_rob_upd — always fires so the IO has a
   // valid default even when IFT is disabled. The IFT writeback-transitive block
   // below conditionally overrides via last-connect semantics when ENABLE_IFT=true.
   rob.io.cf_s_prop_rob_upd.foreach { u => u.valid := false.B; u.bits := DontCare }
+  // Gap 1 fix (DOC:23): defaults for new IOs — overridden inside if (ENABLE_IFT) below.
+  io.lsu.cf_preg_secret.foreach(_ := false.B)
+  rob.io.cf_lsu_s_tx_upd.foreach { u => u.valid := false.B; u.bits := DontCare }
 
   if (ENABLE_IFT) {
   // corefuzzing: preg_secret TLB-stage update from LSU — mark pdst as secret-tainted
@@ -1924,6 +1941,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       }
     }
   }
+
+  // Gap 1 fix (DOC:23): expose preg_secret to LSU so TLB stage can check live taint.
+  // preg_secret is a Reg here; this is a register-read fan-out (192 wires), no logic depth.
+  io.lsu.cf_preg_secret  := preg_secret
+  // Gap 1 fix: route LSU's cf_s_tx_rob_upd to ROB (mirrors cf_lsu_s_acc_upd at line 1913).
+  rob.io.cf_lsu_s_tx_upd := io.lsu.cf_s_tx_rob_upd
 
   // Fix 1: clear preg_secret for the stale physical register freed at commit.
   // taint_table[stale_pdst] is already cleared in rename-stage's stale-pdst loop;
@@ -1956,8 +1979,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       // existing TLB-stage path; this handles the transitive ALU→ALU case.)
       // Fix 3b: detect secret-store→load data flow injected by dcache memsec_fire.
       // An INFL_MEM_DATAFLOW entry with is_atk=false, is_secret=true marks this case.
-      val has_mem_sec_infl = wb_uop.cf_influencer_list.map(e =>
-        e.valid && e.infl_type === INFL_MEM_DATAFLOW.U && !e.is_atk && e.is_secret).reduce(_ || _)
+      val has_mem_sec_infl = wb_uop.cf_mem_sec_dataflow
       val is_secret_wb = wb_uop.cf_secret_access || sec1 || sec2 || has_mem_sec_infl
       when (is_secret_wb) {
         preg_secret(wb_uop.pdst) := true.B
@@ -1968,6 +1990,13 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
           rob.io.cf_s_prop_rob_upd(i).valid            := true.B
           rob.io.cf_s_prop_rob_upd(i).bits.rob_idx     := wb_uop.rob_idx
           rob.io.cf_s_prop_rob_upd(i).bits.op_count_id := wb_uop.cf_op_count_id
+          // Residual D-BP fix: if this is a branch, retroactively mark it secret in
+          // spec_branch_secret_table so speculative consumers dispatched after TLB fires
+          // see the correct secret state.  Writing a freed/reallocated br_tag slot is
+          // harmless — resolved branches have no remaining speculative consumers.
+          when (wb_uop.allocate_brtag) {
+            spec_branch_secret_table(wb_uop.br_tag) := true.B
+          }
         }
       } .otherwise {
         // Non-secret instruction writing this pdst: clear any stale preg_secret bit.
@@ -2314,4 +2343,56 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   } else {
     io.ifu.debug_ftq_idx := DontCare
   }
+
+  // ---------------------------------------------------------------------------
+  // AutoCounter performance instrumentation (FireSim GoldenGate)
+  //
+  // AutoCounterCoverModuleAnnotation tells GoldenGate to instrument this module's
+  // cover() calls. Without it the AutoCounterTransform silently discards all signals.
+  //
+  // Each cover() becomes one column in AUTOCOUNTERFILE*.csv, sampled every
+  // read_rate target cycles (default 1M set in config_runtime*.yaml).
+  //
+  // IPC per CSV row  = (CommitSlot0 + CommitSlot1 + CommitSlot2 + CommitSlot3)
+  //                    / read_rate
+  // Average IPC over N rows = sum(CommitSlot*) / (N * read_rate)
+  //
+  // See claude-artifacts/21-autocounter-metrics.md for full signal reference.
+  // ---------------------------------------------------------------------------
+  annotate(new AutoCounterCoverModuleAnnotation(chisel3.Module.currentModule.get.toTarget))
+
+  // --- Throughput ---
+  // WireDefault pulls rob.io into BoomCore scope so target module matches clock for GoldenGate.
+  for (w <- 0 until coreWidth) {
+    val ac_commit_valid = WireDefault(rob.io.commit.arch_valids(w))
+    RCcover(ac_commit_valid, s"BOOM_v3_CommitSlot$w",
+      s"Instructions architecturally committed in ROB slot $w")
+  }
+
+  // --- Branch prediction ---
+  RCcover(brupdate.b2.mispredict, "BOOM_v3_BrMispredict",
+    "Branch resolved as mispredicted (pipeline flush imminent)")
+
+  // --- Frontend stall ---
+  RCcover(!io.ifu.fetchpacket.valid && !io.ifu.redirect_flush, "BOOM_v3_FetchStall",
+    "Fetch buffer empty and no redirect in flight; decode starved")
+
+  // --- Dispatch / structural stalls ---
+  val dis_any_valid = dis_valids.reduce(_||_)
+  RCcover(!rob.io.ready && dis_any_valid, "BOOM_v3_ROBFullStall",
+    "ROB full; dispatch stalled with valid instructions waiting")
+  RCcover(io.lsu.ldq_full.reduce(_||_) && dis_any_valid, "BOOM_v3_LDQFullStall",
+    "Load queue full; dispatch stalled for a load instruction")
+  RCcover(io.lsu.stq_full.reduce(_||_) && dis_any_valid, "BOOM_v3_STQFullStall",
+    "Store queue full; dispatch stalled for a store instruction")
+
+  // --- Memory subsystem ---
+  RCcover(io.lsu.perf.acquire, "BOOM_v3_DCacheMiss",
+    "L1 data-cache miss; TileLink acquire issued to L2")
+  RCcover(io.lsu.perf.tlbMiss, "BOOM_v3_DTLBMiss",
+    "Data TLB miss; page-table walk initiated")
+  RCcover(io.ifu.perf.acquire, "BOOM_v3_ICacheMiss",
+    "L1 instruction-cache miss; TileLink acquire issued to L2")
+  RCcover(io.ifu.perf.tlbMiss, "BOOM_v3_ITLBMiss",
+    "Instruction TLB miss; page-table walk initiated")
 }

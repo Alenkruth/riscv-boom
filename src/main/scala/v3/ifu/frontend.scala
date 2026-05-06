@@ -41,6 +41,8 @@ class FrontendResp(implicit p: Parameters) extends BoomBundle()(p) {
   val tsrc = UInt(BSRC_SZ.W)
   // corefuzzing: ICache line was last refilled by a different domain
   val icache_domain_mismatch = Bool()
+  // corefuzzing: ICache line was last refilled during a secret-range fetch (same-domain case)
+  val icache_secret_mismatch = Bool()
   // corefuzzing: ITLB entry was last filled by a different domain
   val itlb_domain_mismatch = Bool()
   // corefuzzing: ITLB entry was last filled during a secret instruction fetch
@@ -256,6 +258,7 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
 
   // corefuzzing: domain mismatch flags for IFT influencer injection
   val icache_domain_mismatch = Bool()  // ICache line last filled by different domain
+  val icache_secret_mismatch = Bool()  // ICache line last filled during secret-range fetch
   val itlb_domain_mismatch   = Bool()  // ITLB entry last filled by different domain
   val itlb_secret_mismatch   = Bool()  // ITLB entry last filled during secret instruction fetch
   val ras_domain_mismatch    = Bool()  // RAS return addr pushed by different domain
@@ -516,6 +519,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     (s0_vpc >= io.cpu.cf_secret_start_addr) && (s0_vpc < io.cpu.cf_secret_end_addr)
   val s1_fetch_is_secret = RegNext(s0_fetch_is_secret)
   icache.io.s1_domain_id := s1_fetch_domain
+  icache.io.s1_is_secret := s1_fetch_is_secret
 
   // corefuzzing: ITLB domain shadow — parallel array indexed by VPN low bits.
   // Updated when TLB fills (miss→hit transition); compared on every TLB hit.
@@ -697,6 +701,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // corefuzzing: carry icache domain mismatch through the f3 queue;
   // gate on resp.valid to avoid propagating stale bits when we enqueue due to a TLB fault
   f3.io.enq.bits.icache_domain_mismatch := icache.io.resp.bits.icache_domain_mismatch &&
+                                            icache.io.resp.valid
+  f3.io.enq.bits.icache_secret_mismatch := icache.io.resp.bits.icache_secret_mismatch &&
                                             icache.io.resp.valid
   // corefuzzing: carry ITLB domain/secret mismatch (computed at s1, registered to s2) into f3 queue
   f3.io.enq.bits.itlb_domain_mismatch  := s2_itlb_mismatch
@@ -952,6 +958,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     (f3_imemresp.pc >= io.cpu.cf_attacker_start_addr) &&
     (f3_imemresp.pc < io.cpu.cf_attacker_end_addr)
   f3_fetch_bundle.icache_domain_mismatch := f3_imemresp.icache_domain_mismatch
+  f3_fetch_bundle.icache_secret_mismatch := f3_imemresp.icache_secret_mismatch
   f3_fetch_bundle.itlb_domain_mismatch   := f3_imemresp.itlb_domain_mismatch
   f3_fetch_bundle.itlb_secret_mismatch   := f3_imemresp.itlb_secret_mismatch
   // RAS domain mismatch: ret pops an addr pushed by a different domain
