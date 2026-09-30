@@ -203,6 +203,14 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     Some(CustomCSR(bpdCSRIdCF, mask, Some(init)))
   } else None
 
+  // :622/reconfig hardening helper: a size-select CSR's mask can admit indices beyond its
+  // option-list length (e.g. robSizeCSRCF mask 0x7 = 0..7 but robEntryOptions has 6 entries). An
+  // out-of-range dynamic Vec subaccess at the lookup site is impl-defined (firtool returns an
+  // indeterminate element; on FPGA asserts are compiled out -> silent wrong size). Saturate to the
+  // last valid index (= smallest listed size, always a safe forward-progress config). No-op for
+  // in-range indices, so valid fuzzer/software writes are unaffected.
+  private def cfClampIdx(raw: UInt, n: Int): UInt = if (n <= 1) raw else Mux(raw >= n.U, (n - 1).U, raw)
+
   // second CSR - fetch_bufferCSR
   // 3-bit binary index into fetchBufferEntryOptions = Seq(64, 48, 32, 24, 16, 8)
   // init = 0x0 → index 0 = 64 entries (max, hardware-built size)
@@ -247,6 +255,7 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   def cf_dcache_way_conf  = getOrElse(dcacheCSRCF, _.value(3,2), 0.U)
   def cf_dcache_repl_conf = getOrElse(dcacheCSRCF, _.value(5,4), 0.U)
 
+
   // ICache reconfiguration CSR (0xbcb)
   // bits [1:0]: set index into icacheSetOptions = Seq(64, 32, 16, 8)  — index 0 = max
   // bits [3:2]: way index into cacheWayOptions  = Seq(8, 4, 2, 1)     — index 0 = max
@@ -257,6 +266,34 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   } else None
   def cf_icache_set_conf = getOrElse(icacheCSRCF, _.value(1,0), 0.U)
   def cf_icache_way_conf = getOrElse(icacheCSRCF, _.value(3,2), 0.U)
+
+  // [reconf-fix Phase C] D$ cache-control CSR (0xbc4) — RESTORE-ONLY.
+  // bit1 write-1 starts the L1 invalidate-all walk (discards dirty data, no
+  // writeback).  Contract: `csrw 0xbc4, 0x2; fence` — the walker holds
+  // io.lsu.ordered low, so the FENCE blocks until the walk completes.
+  override def cachectlCSRCF = if (cfReconfEnabled) {
+    val mask = BigInt(0x2)
+    Some(CustomCSR(cachectlCSRIdCF, mask, Some(BigInt(0))))
+  } else None
+  // Write pulse + wdata, consumed by the dcache walker (plumbed core→lsu→dcache).
+  def cf_cachectl_wen   = getOrElse(cachectlCSRCF, _.wen, false.B)
+  def cf_cachectl_wdata = getOrElse(cachectlCSRCF, _.wdata(1,0), 0.U)
+
+  // [reconf-fix Phase C] D$ status CSR (0xbcd), hardware-published every cycle
+  // via set/sdata (see cf_dcache_status_set below); software writes have no
+  // effect (the continuous hardware set wins).  Layout (stable ABI, doc 30 T4):
+  // [10:0] dirty_count, [11] reconf_blocked, [15:12] applied set/way,
+  // [16] cfg_pending — all tied 0 until their producers land — [17] l1 wipe busy.
+  override def dcacheStatusCSRCF = if (cfReconfEnabled) {
+    val mask = BigInt("3ffff", 16)
+    Some(CustomCSR(dcacheStatusCSRIdCF, mask, Some(BigInt(0))))
+  } else None
+  // Hardware publication hook: core.scala calls this every cycle with the live
+  // status vector.  No-op when the CSR is not built (baseline flavor).
+  def cf_dcache_status_set(v: UInt): Unit = dcacheStatusCSRCF.foreach { c =>
+    val idx = decls.indexWhere(_.id == c.id)
+    if (idx >= 0) { csrs(idx).set := true.B; csrs(idx).sdata := v }
+  }
   
   // Debug-log enable CSR: controls IFT-specific debug printfs throughout the core.
   // Gated on ENABLE_IFT because all consumers are inside IFT logic blocks.
@@ -404,7 +441,7 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     val init = BigInt(0x0)   // index 0 = 128 sets, 2 ways (max)
     Some(CustomCSR(btbConfigCSRIdCF, mask, Some(init)))
   } else None
-  def cf_btb_set_idx = getOrElse(btbConfigCSRCF, _.value(1,0), 0.U)
+  def cf_btb_set_idx = cfClampIdx(getOrElse(btbConfigCSRCF, _.value(1,0), 0.U), btbSetOptions.length)
   def cf_btb_way_idx = getOrElse(btbConfigCSRCF, _.value(2),   0.U)
 
   // TAGE table count CSR — 3-bit index into tagetableCountOptions = Seq(7, 6, 5, 3, 2, 1)
@@ -416,7 +453,7 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     val init = BigInt(0x0)   // index 0 = cf_tage_active=7 = 6 real TAGE tables (max)
     Some(CustomCSR(tageCountCSRIdCF, mask, Some(init)))
   } else None
-  def cf_tage_count_idx = getOrElse(tageCountCSRCF, _.value(2,0), 0.U)
+  def cf_tage_count_idx = cfClampIdx(getOrElse(tageCountCSRCF, _.value(2,0), 0.U), tagetableCountOptions.length)
 
   override def decls: Seq[CustomCSR] = super.decls :+ marchid
 
@@ -569,8 +606,13 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val lsuAddrSz       = ldqAddrSz max stqAddrSz
   val brTagSz         = log2Ceil(maxBrCount)
 
-  require (numIntPhysRegs >= (32 + coreWidth))
-  require (numFpPhysRegs >= (32 + coreWidth))
+  // 32 architectural registers plus coreWidth pregs held permanently in the rename
+  // freelist's pre-selection registers -> the real floor is 32 + 2*coreWidth.
+  // The old 32 + coreWidth bound was satisfied by fp=36 at coreWidth 4, which
+  // deadlocks (36 - 32 - 4 = 0 allocatable). See rename-freelist.scala, which
+  // enforces the same bound per runtime option.
+  require (numIntPhysRegs >= (32 + 2 * coreWidth))
+  require (numFpPhysRegs >= (32 + 2 * coreWidth))
   require (maxBrCount >=2)
   require (numRobEntries % coreWidth == 0)
   require ((numLdqEntries-1) > coreWidth)

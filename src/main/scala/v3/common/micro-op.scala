@@ -35,14 +35,19 @@ abstract trait HasBoomUOP extends BoomBundle
  */
 class InfluencerEntry(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
   val valid     = Bool()
-  val op_count  = UInt(uopIDCounterWidthCF.W)  // 16 bits: op_count_id of the influencing uop
+  // LOW inflOpCountWidthCF bits of the influencing uop's op_count_id; software
+  // reconstructs the full value against the consuming record's own op_count.
+  // See inflOpCountWidthCF in CoreFuzzing.scala for the range argument.
+  val op_count  = UInt(inflOpCountWidthCF.W)
   val infl_type = UInt(inflTypeWidthCF.W)       // 5 bits: influence type (INFL_*)
   val is_atk    = Bool()   // influencer instruction was from attacker domain (domain=1)
   val is_secret = Bool()   // influencer instruction had s_acc=1 or s_prop=1
-  // deny_count: for INFL_ISSUE_CONTENTION only — number of cycles this instruction was denied
-  // an issue port by a cross-domain instruction. 0 for all other influence types.
-  // Saturates at 15 (4-bit field). Tracked in issue slot, injected into ROB at issue time.
-  val deny_count = UInt(4.W)
+  // NOTE: deny_count used to live here, replicated into every slot.  It is now the
+  // per-uop cf_cntd_deny_count: a uop can hold at most one INFL_ISSUE_CONTENTION
+  // entry (the issue slot latches the FIRST denier and aggregates the count over all
+  // of them), so the per-slot association was already fictional past the first
+  // denial.  Measured: deny_count != 0 on exactly 95,815 entries, identical to the
+  // INFL_ISSUE_CONTENTION count.
 }
 
 /**
@@ -203,7 +208,18 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   // IFT Phase 2: multi-slot influencer list (replaces cf_influencer_uop_count)
   // Records up to numInfluencerSlotsCF cross-domain influence events
   val cf_influencer_list      = Vec(numInfluencerSlotsCF, new InfluencerEntry)
-  val cf_infl_overflow        = Bool()   // set when >numInfluencerSlotsCF influencers occurred
+  // How many influencers were DISCARDED because the slots were full, saturating at 3.
+  // Was a sticky Bool that said only "some were lost".  See SatDropped in util.scala.
+  val cf_infl_dropped         = UInt(2.W)
+  // Set when an influencer's op_count was truncated BEYOND the reconstructable range,
+  // i.e. the true distance exceeded 2^inflOpCountWidthCF and the stored low bits will
+  // reconstruct to the WRONG producer.  Without this the failure is silent, and for a
+  // flow-discovery tool a fabricated edge is worse than a missing one: it becomes a
+  // false novel flow someone has to chase.  Costs one bit and a 6-bit compare -- no
+  // subtract, because delta < 2^W iff the producer and consumer agree on the high bits
+  // or differ by exactly one.  The parser refuses to build flows through a record that
+  // has this set.
+  val cf_infl_oc_aliased      = Bool()
 
   // Summary flags set by dcache to avoid scanning cf_influencer_list on writeback paths.
   val cf_mem_dataflow_atk  = Bool()  // INFL_MEM_DATAFLOW(is_atk=true)  injected at dcache
@@ -211,9 +227,6 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
 
   // IFT Phase 2: register taint (set in rename; used at dispatch in core.scala)
   val cf_src_tainted              = Bool()                       // any source preg tainted by attacker
-  val cf_taint_producer_op        = UInt(uopIDCounterWidthCF.W)  // op_count_id of the taint producer
-  val cf_taint_producer_is_atk    = Bool()   // taint producer was from attacker domain (domain=1)
-  val cf_taint_producer_is_secret = Bool()   // taint producer had s_acc=1 or s_prop=1
 
   // IFT Phase 2: speculative-branch domain tracking (set at dispatch in core.scala)
   // cf_spec_branch_is_atk: true if any outstanding branch in br_mask was from attacker domain.
