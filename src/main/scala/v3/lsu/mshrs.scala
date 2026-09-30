@@ -249,6 +249,38 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     when (is_hit_again) {
       new_coh := dirtier_coh
     }
+    // [SECDOM 2026-09-09] Accumulate the REQUESTER taint across the primary and
+    // every accepted secondary.
+    //
+    // WHY: sec_rdy (above) accepts a request as a secondary whenever it needs no
+    // additional permission -- which is exactly the case for a LOAD hitting an
+    // outstanding miss.  Only the primary's uop is latched into `req`, so only the
+    // primary's domain/secret ever reached io.cf_req_* and therefore the fill's IFT
+    // entry.  A STORE to a shared line sets cmd_requires_second_acquire and is forced
+    // to allocate a fresh primary, so stores tagged the line and loads silently did
+    // not.  MEASURED (t37_atk_load_fill, TrueLRU): the attacker's load produced the
+    // 17th fill at its set, yet 0 of 60 MSHR allocations carried domain=1.
+    //
+    // This mirrors the OR-accumulation the store path already does in ift_store_meta.
+    // Cost is zero new state: `req` is an existing register and mem_cmd above is
+    // already written from this same block -- only a mux on 18 bits that exist.
+    //
+    // op_count must NAME the op that set the bit, or the parser traces the wrong uop:
+    // if the primary was clean and a tainted secondary is what raised domain/secret,
+    // adopt that secondary's op_count.  First tainted contributor wins; an already
+    // tainted primary keeps its own id.
+    // [G2 2026-09-09] compile-time gated: a non-IFT build must not elaborate these muxes.
+    // Convention follows dcache.scala:1511, whose comment notes the gate is what lets
+    // FIRRTL DCE remove the machinery rather than relying on it to prove them dead.
+    if (ENABLE_IFT) {
+      val cf_sec_req_tainted = io.req.uop.cf_domain_id.orR || io.req.uop.cf_secret_access
+      val cf_pri_untainted   = !req.uop.cf_domain_id.orR && !req.uop.cf_secret_access
+      req.uop.cf_domain_id     := req.uop.cf_domain_id | io.req.uop.cf_domain_id
+      req.uop.cf_secret_access := req.uop.cf_secret_access || io.req.uop.cf_secret_access
+      when (cf_sec_req_tainted && cf_pri_untainted) {
+        req.uop.cf_op_count_id := io.req.uop.cf_op_count_id
+      }
+    }
   }
 
   def handle_pri_req(old_state: UInt): UInt = {
