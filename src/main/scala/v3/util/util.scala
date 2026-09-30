@@ -212,16 +212,19 @@ object WrapInc
 
   // "n" is the number of increments, so we wrap at n-1.
   // this is a dynamic version that would be synthesized to HW
+  // [reconf-fix 2026-08-13] Uniform wrap for ALL n, power-of-2 or not.
+  // The previous version branched: pow2 n masked with (n-1), non-pow2 n wrapped only on the
+  // exact equality (value === n-1). That asymmetry is a bug when n SHRINKS at runtime (CSR
+  // 0x7c4): a pointer already >= the new n never equals n-1, so it never wraps and the queue
+  // deadlocks -- observed on FPGA with LDQ/STQ 48->24. The mask path hid this because it
+  // re-ranges a stray pointer by accident, which is luck, not correctness.
+  // "next >= n -> 0" is correct for every n AND self-heals an out-of-range pointer. It is also
+  // strictly LESS logic than before: no isPow2 computation ((n & (n-1)) === 0), no mask AND,
+  // one comparator + one mux instead of two paths + select.
   def apply(value: UInt, n: UInt): UInt = {
     assert(n =/= 0.U, "n in WrapInc/WrapDec cannot be zero")
-    // For power-of-2 n, the correct mask is (n-1): e.g. n=64 → mask=63=0b111111.
-    // The previous PriorityEncoder(Reverse(n)) approach was wrong: when n is stored in a
-    // wide UInt (e.g. 10-bit from VecInit), Reverse places the MSB at position (width-1-log2(n))
-    // instead of log2(n), so PriorityEncoder returns (width-1-log2(n)) and the mask is far too small.
-    val isPow2 = (n & (n - 1.U)) === 0.U
-    val shouldWrap = (value === (n - 1.U))
-    val notPow2Val = Mux(shouldWrap, 0.U, value + 1.U)
-    Mux(isPow2, (value + 1.U) & (n - 1.U), notPow2Val)
+    val next = value + 1.U          // Chisel UInt '+' keeps max(width) -- no width growth
+    Mux(next >= n, 0.U, next)
   }
 }
 
@@ -243,16 +246,11 @@ object WrapDec
   
   // "n" is the number of increments, so we wrap at n-1.
   // dynamic version that would be synthesized to HW
+  // [reconf-fix 2026-08-13] Uniform wrap, same rationale as WrapInc above. The added
+  // (value >= n) term also re-ranges a pointer left outside the window by a runtime shrink.
   def apply(value: UInt, n: UInt): UInt = {
     assert(n =/= 0.U, "n in WrapInc/WrapDec cannot be zero")
-    // For power-of-2 n: (value-1) & (n-1) handles the 0→(n-1) wrap via UInt underflow
-    // (0.U - 1.U wraps to all-ones; ANDed with n-1 gives n-1 correctly).
-    // PriorityEncoder(Reverse(n)) was wrong for the same reason as WrapInc: leading zeros
-    // in a wide UInt place the MSB at the wrong reversed position.
-    val isPow2 = (n & (n - 1.U)) === 0.U
-    val shouldWrap = (value === 0.U)
-    val notPow2Val = Mux(shouldWrap, n - 1.U, value - 1.U)
-    Mux(isPow2, (value - 1.U) & (n - 1.U), notPow2Val)
+    Mux(value === 0.U || value >= n, n - 1.U, value - 1.U)
   }
 }
 
@@ -799,14 +797,97 @@ object appendModuleTag {
 
 // corefuzzing — IFT Phase 2
 /**
+ * Compress a linear cycle count into a 3-bit log2 bucket.
+ *
+ *   0 -> 0    1 -> 1    2 -> 2    3-4 -> 3
+ *   5-8 -> 4  9-16 -> 5  17-32 -> 6  >32 -> 7
+ *
+ * Shared by the IFT duration counters (cf_cntd_deny_count,
+ * cf_stall_cycles_rob) so the bridge and the log parser
+ * decode one table rather than three scales.
+ *
+ * Rationale for log rather than linear: the dynamic range of these stalls is not
+ * known a priori and the parameters that drive it are themselves fuzzed
+ * (numIssueSlots sweeps 32/24/16/8, numRobEntries likewise), so a linear field
+ * would saturate silently on exactly the configs of interest.  Buckets 0-2 are
+ * exact, which is where the measured mass sits: 96.5% of issue-contention denials
+ * are 1 cycle.  ">32" is an honest bucket, unlike the old 4-bit field where 15 was
+ * indistinguishable from truncation.
+ *
+ * Cheap by construction: the wide linear counters live at dispatch (coreWidth
+ * instances) and in the issue slots, and this compresses ONCE at capture, so the
+ * encoder is not replicated per uop.
+ */
+object OcInRange extends CoreFuzzingConstants {
+  /** True when a producer's op_count is close enough to be reconstructed exactly from
+    * the low inflOpCountWidthCF bits stored in an InfluencerEntry.
+    *
+    * Software recovers the producer as `own - ((own - stored) mod 2^W)`, which is exact
+    * iff the true distance is < 2^W.  Beyond that it silently returns the WRONG producer
+    * -- it fabricates an edge rather than dropping one, which for a flow-discovery tool
+    * is the expensive direction to fail in.
+    *
+    * Detecting it does NOT need the 16-bit subtract the truncation exists to avoid: a
+    * producer always precedes its consumer, so
+    *
+    *     distance < 2^W   <=>   producer>>W == own>>W  ||  producer>>W == (own>>W) - 1
+    *
+    * With a 16-bit counter and W=10 that is a 6-bit equality pair plus a 6-bit decrement.
+    * Wrap is handled for free by UInt arithmetic.
+    */
+  def apply(producer: UInt, own: UInt)(implicit p: Parameters): Bool = {
+    val w = inflOpCountWidthCF
+    val prod_hi = producer.pad(uopIDCounterWidthCF)(uopIDCounterWidthCF - 1, w)
+    val own_hi  = own.pad(uopIDCounterWidthCF)(uopIDCounterWidthCF - 1, w)
+    (prod_hi === own_hi) || (prod_hi === (own_hi - 1.U))
+  }
+}
+
+object SatDropped {
+  /** Saturating add into the 2-bit cf_infl_dropped counter.
+    *
+    * Replaces the old sticky cf_infl_overflow Bool, which said "influencers were
+    * discarded" but never how many -- so a record that lost one was indistinguishable
+    * from one that lost seven.  It fires on 15.4% of all records and 40.3% of
+    * secret-carrying ones (run_00016), which is what makes influence counts floors
+    * rather than totals, and it is the only way to tell whether numInfluencerSlotsCF
+    * is now sufficient.
+    *
+    * Linear, not Log2Bucket, unlike the three duration counters: the actionable
+    * question is "how many more slots would have sufficed", whose answer lives in the
+    * 1-3 range, and a log bucket would blur 2 and 3 together.  A log encoding would
+    * also need a linear shadow counter, and this one lives IN THE UOP (drops
+    * accumulate across fetch -> dispatch -> issue -> LSU) so there is nowhere cheap to
+    * keep one.
+    */
+  def apply(cur: UInt, n: UInt): UInt = {
+    val sum = cur +& n
+    Mux(sum > 3.U, 3.U(2.W), sum(1, 0))
+  }
+}
+
+object Log2Bucket {
+  def apply(n: UInt): UInt = {
+    // buckets 0-2 exact; thereafter the position of the highest set bit
+    MuxCase(7.U(3.W), Seq(
+      (n <   1.U) -> 0.U(3.W),
+      (n <   2.U) -> 1.U(3.W),
+      (n <   3.U) -> 2.U(3.W),
+      (n <   5.U) -> 3.U(3.W),
+      (n <   9.U) -> 4.U(3.W),
+      (n <  17.U) -> 5.U(3.W),
+      (n <  33.U) -> 6.U(3.W)))
+  }
+}
+
+/**
  * Append one influencer entry to a uop's cf_influencer_list.
- * Finds the first empty slot; if all full, sets cf_infl_overflow instead.
+ * Finds the first empty slot; if all full, adds to cf_infl_dropped instead.
  * Returns a modified Wire copy of the uop; the original is unchanged.
  */
 object addInfluencer extends CoreFuzzingConstants {
   def apply(uop: boom.v3.common.MicroOp, op_count: UInt, infl_type: UInt,
-            is_atk: Bool = false.B, is_secret: Bool = false.B,
-            deny_count: UInt = 0.U)
+            is_atk: Bool = false.B, is_secret: Bool = false.B)
            (implicit p: Parameters): boom.v3.common.MicroOp = {
     val out = WireInit(uop)
     // PopCount is equivalent to PriorityEncoder here because slots are always filled
@@ -865,7 +946,23 @@ object addInfluencerBatch extends CoreFuzzingConstants {
     val n_dyn  = numInfluencerSlotsCF
     val base_idx = PopCount(VecInit(uop.cf_influencer_list.take(n_dyn).map(_.valid)))
 
-    val cond_bits = candidates.map(_.cond)
+    // ── Duplicate suppression ────────────────────────────────────────────────
+    // A candidate repeating an influence already held -- same producer op_count AND
+    // same type -- adds nothing and costs a slot.  With numInfluencerSlotsCF = 4 that
+    // is half the list: on run_00012 the idx load held {ty9:oc0, ty10:oc0, ty9:oc0,
+    // ty10:oc0} -- two exact copies -- and the REG_DATAFLOW entry carrying a real
+    // producer was the one lost.
+    //
+    // Parallel comparators, independent of the prefix sums: one equality per
+    // (candidate, slot) plus a 4-way OR.  Off the prefix-sum chain, output registered.
+    val dup_of_existing: Seq[Bool] = candidates.map { c =>
+      VecInit(uop.cf_influencer_list.take(n_dyn).map { e =>
+        e.valid && e.infl_type === c.infl_type_int.U &&
+        e.op_count === c.op_count.pad(inflOpCountWidthCF)(inflOpCountWidthCF - 1, 0)
+      }).asUInt.orR
+    }
+
+    val cond_bits = candidates.zip(dup_of_existing).map { case (c, d) => c.cond && !d }
 
     // prefix(k) = number of candidates before k that fired
     val prefix: Seq[UInt] = candidates.indices.map { k =>
