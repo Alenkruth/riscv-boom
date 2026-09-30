@@ -895,22 +895,51 @@ object addInfluencer extends CoreFuzzingConstants {
     val nDyn = numInfluencerSlotsCF
     val base_idx = PopCount(VecInit(uop.cf_influencer_list.take(nDyn).map(_.valid)))
     val has_empty = base_idx < nDyn.U
-    when (!uop.cf_infl_overflow) {
+    when (uop.cf_infl_dropped === 0.U) {
       when (has_empty) {
         // Static outer loop avoids a dynamic Vec write (PriorityEncoder + mux tree).
         for (k <- 0 until nDyn) {
           when (base_idx === k.U) {
             out.cf_influencer_list(k).valid      := true.B
-            out.cf_influencer_list(k).op_count   := op_count
+            // truncate to the low bits — software reconstructs against the consuming
+            // record\'s own op_count (see inflOpCountWidthCF in CoreFuzzing.scala)
+            out.cf_influencer_list(k).op_count   := op_count.pad(inflOpCountWidthCF)(inflOpCountWidthCF-1, 0)
+            // Range check: exact iff the producer and consumer agree on the bits above
+            // the stored window, or differ by one.  op_count === 0 is the secret-source
+            // sentinel and is not a real producer, so it is exempt.
+            when (op_count =/= 0.U && !OcInRange(op_count, uop.cf_op_count_id)) {
+              out.cf_infl_oc_aliased := true.B
+            }
             out.cf_influencer_list(k).infl_type  := infl_type
             out.cf_influencer_list(k).is_atk     := is_atk
             out.cf_influencer_list(k).is_secret  := is_secret
-            out.cf_influencer_list(k).deny_count := deny_count
+            // [R1c 2026-09-05] Only VALUE-carrying edges promote to attacker DATA taint.
+            // NOTE THE ASYMMETRY: there is NO is_secret twin of this line -- the secret side
+            // never promotes blanket from an edge (cf_secret_propagation is set only at
+            // channel-appropriate sites).  The attacker side had a blanket promotion the
+            // secret side deliberately avoided: the aggregate bug at its root.
+            // PROVEN: control PC 0x800016c4 (ld array1_sz, never attacker-written) was
+            // 637/644 = 99% attacker-influenced and EVERY edge was ty3 MEM_HOL -- the
+            // attacker merely DELAYED that load.  Observability != dataflow.  The edge is
+            // still recorded; it just cannot masquerade as data influence.
+            // [BROADATK 2026-09-08] The value-type gate is REMOVED.  EVERY attacker edge
+            // sets cf_attacker_influence, whatever its type.  A victim executing in the
+            // shadow of an attacker branch that updated the GHR is influenced; so is a
+            // victim stalled behind an attacker's divide, or denied issue by an attacker
+            // uop.  Those are attacker edges and they now flag influence.
+            //
+            // THIS REVERSES R1c, and its measurement stands: control PC 0x800016c4 was
+            // 637/644 attacker-influenced with every edge ty3 MEM_HOL.  That is no longer
+            // read as contamination -- the attacker really did delay that load 637 times.
+            // The bit answers "was this uop influenced at all"; WHICH channel, and whether
+            // it was dataflow, is answered by cf_influencer_list (infl_type + is_atk),
+            // which is strictly more informative.  Ask the vector, not the bit, when the
+            // question is "did the attacker supply the DATA": ty in {0,1,17} with is_atk.
             when (is_atk) { out.cf_attacker_influence := true.B }
           }
         }
       } .otherwise {
-        out.cf_infl_overflow := true.B
+        out.cf_infl_dropped := SatDropped(uop.cf_infl_dropped, 1.U)
       }
     }
     out
@@ -972,29 +1001,67 @@ object addInfluencerBatch extends CoreFuzzingConstants {
 
     val total_new = PopCount(VecInit(cond_bits))
 
-    when (!uop.cf_infl_overflow && base_idx +& total_new > n_dyn.U) {
-      out.cf_infl_overflow := true.B
+    when (uop.cf_infl_dropped === 0.U && base_idx +& total_new > n_dyn.U) {
+      // exact overflow amount -- base_idx +& total_new is already computed above
+      out.cf_infl_dropped := SatDropped(uop.cf_infl_dropped, base_idx +& total_new - n_dyn.U)
     }
 
-    // Iterate over all slots (STATIC indices).
-    // For each literal slot s, determine which candidate (if any) targets it.
-    // Candidate k targets slot s iff: cond[k] && base_idx + prefix[k] == s
+    // ── Rolling index ────────────────────────────────────────────────────────
+    // The list must overwrite the OLDEST entry, not refuse the newest.  Append-and-
+    // drop keeps whatever arrived first, and what arrives first is the front-end
+    // BPD/BTB influence broadcast by the fetch buffer with op_count = 0 -- it names no
+    // producer and can never form an edge.  The late REG_DATAFLOW candidate, the only
+    // one carrying a real producer, was discarded; on run_00012 that cost 3 of 10
+    // secret accesses their entire downstream chain.
+    //
+    // Roll the write index over instead: slot = (base_idx + prefix) mod n_dyn.  With
+    // n_dyn a power of two that is a bit-select, so it costs NOTHING -- no shifter, no
+    // data movement, no extra state.  A full list at base_idx = 4 sends the next
+    // candidate to slot 0, the oldest, and onward from there.
+    //
+    // The cf_infl_dropped gate is also gone from the write: it froze the list after
+    // any drop, which is exactly backwards once later entries can displace earlier
+    // ones.  It still gates the DROP COUNTER below, which is only a report.
+    // Only the NEWEST n_dyn firing candidates may write.  Two candidates whose
+    // prefixes differ by exactly n_dyn would otherwise wrap onto the same slot and
+    // break the one-hot property Mux1H depends on -- with ~8 candidates that is
+    // reachable.  Keeping the last n_dyn is both the fix and the intended semantics:
+    // newest wins.  Their prefixes are n_dyn consecutive values, so mod n_dyn they
+    // map to n_dyn distinct slots and writers is one-hot by construction.
+    val wrap = log2Ceil(n_dyn)
+    val newest: Seq[Bool] = candidates.indices.map { k =>
+      cond_bits(k) && (prefix(k) +& n_dyn.U >= total_new)
+    }
     for (s <- 0 until n_dyn) {
       val writers: Seq[Bool] = candidates.zipWithIndex.map { case (c, k) =>
-        c.cond && !uop.cf_infl_overflow && (base_idx + prefix(k) === s.U)
+        newest(k) && ((base_idx +& prefix(k))(wrap - 1, 0) === s.U)
       }
       val any_write = writers.reduce(_ || _)
       // writers is one-hot by construction (prefix sums ensure at most one candidate per slot),
       // so Mux1H (OR-based) is equivalent to MuxCase (priority) but ~2 LUT levels shallower.
       when (any_write) {
         out.cf_influencer_list(s).valid     := true.B
-        out.cf_influencer_list(s).op_count  := Mux1H(writers, candidates.map(_.op_count))
+        // .pad first: a candidate's op_count may be a 1-bit literal (e.g. the
+        // preg_only INFL_REG_DATAFLOW candidate passes 0.U), which would make the
+        // Mux1H result narrower than inflOpCountWidthCF and the extract illegal.
+        out.cf_influencer_list(s).op_count  := Mux1H(writers, candidates.map(_.op_count.pad(inflOpCountWidthCF)))(inflOpCountWidthCF-1, 0)
+        val s_oc = Mux1H(writers, candidates.map(_.op_count.pad(uopIDCounterWidthCF)))
+        when (s_oc =/= 0.U && !OcInRange(s_oc, uop.cf_op_count_id)) {
+          out.cf_infl_oc_aliased := true.B
+        }
         out.cf_influencer_list(s).infl_type := Mux1H(writers, candidates.map(_.infl_type_int.U))
         out.cf_influencer_list(s).is_atk    := Mux1H(writers, candidates.map(_.is_atk))
         out.cf_influencer_list(s).is_secret := Mux1H(writers, candidates.map(_.is_secret))
       }
     }
 
+    // [R1c 2026-09-05] see addInfluencer above.  infl_type_int is a Scala compile-time
+    // constant, so non-value candidates vanish at ELABORATION -- zero hardware.
+    // [BROADATK 2026-09-08] No type gate -- see addInfluencer above.  This one line is
+    // what makes MEM_HOL(3), REG_PRESSURE(4), ROB/LDQ/STQ_FULL(5/6/7), MEM_ORDER(8),
+    // BPD(9), BTB(10), RAS(11), CACHE_EVICTION(12), DTLB(14), ITLB(15), ICACHE(16),
+    // FU_BUSY(18), GHIST(19) and CONTROL_FLOW(20) flag attacker influence, since every
+    // one of those channels funnels through addInfluencerBatch.
     candidates.zip(cond_bits).foreach { case (c, f) =>
       when (f && c.is_atk) { out.cf_attacker_influence := true.B }
     }

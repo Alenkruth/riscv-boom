@@ -252,6 +252,39 @@ class RegisterRead(
     if (numReadPorts > 0) exe_reg_rs1_data(w) := bypassed_rs1_data(w)
     if (numReadPorts > 1) exe_reg_rs2_data(w) := bypassed_rs2_data(w)
     if (numReadPorts > 2) exe_reg_rs3_data(w) := rrd_rs3_data(w)
+    // corefuzzing: an operand carries taint only if the instruction actually READS
+    // that operand from THIS register file.  Without these guards a stale prs index
+    // leaks another register's taint (see the rtype note on the class parameters).
+    val rs1_reads_reg = rrd_uops(w).lrs1_rtype === rtype
+    val rs2_reads_reg = rrd_uops(w).lrs2_rtype === rtype
+    val rs3_reads_reg = rrd_uops(w).frs3_en
+    if (numReadPorts > 0) exe_reg_rs1_secret(w) := bypassed_rs1_secret(w) && rs1_reads_reg
+    if (numReadPorts > 1) exe_reg_rs2_secret(w) := bypassed_rs2_secret(w) && rs2_reads_reg
+    // same rtype guard as the secret path: an operand the uop does not read must not
+    // contribute its stale prs index's taint.
+    if (numReadPorts > 0) exe_reg_rs1_atk(w) := bypassed_rs1_atk(w) && rs1_reads_reg
+    if (numReadPorts > 1) exe_reg_rs2_atk(w) := bypassed_rs2_atk(w) && rs2_reads_reg
+    if (numReadPorts > 2) exe_reg_rs3_secret(w) := rrd_rs3_secret(w) && rs3_reads_reg  // rs3 (FP) is not bypassed
+      // taint-follows-data: the consumer is tagged AT THE MOMENT the tainted value
+      // reaches it -- i.e. here, where the bypass/RF operand taint resolves.  This is
+      // before execute and before writeback, so an op that is squashed mid-flight has
+      // already been tagged and its [FLUSH] record shows the transient flow.
+      exe_reg_uops(w).cf_secret_propagation := rrd_uops(w).cf_secret_propagation ||
+        (if (numReadPorts > 0) bypassed_rs1_secret(w) && rs1_reads_reg else false.B) ||
+        (if (numReadPorts > 1) bypassed_rs2_secret(w) && rs2_reads_reg else false.B) ||
+        (if (numReadPorts > 2) rrd_rs3_secret(w)      && rs3_reads_reg else false.B)
+      // [BROADATK 2026-09-08] The attacker twin of the line above, which had NO
+      // counterpart.  This is the stage that tags an op AT THE MOMENT a tainted operand
+      // reaches it -- before execute and before writeback -- so an op SQUASHED mid-flight
+      // is already tagged and its [FLUSH] record shows the transient flow.  That matters
+      // directly for spectre: the interesting gadget ops are precisely the squashed ones,
+      // and the only other minting site (rob.scala:1132, at writeback) never sees them.
+      // Same rtype guard as the secret path: an operand the uop does not read must not
+      // contribute its stale prs index's taint.  rs3 carries no attacker taint (there is
+      // no bypassed_rs3_atk -- rs3 is the FP third operand, secret path only).
+      exe_reg_uops(w).cf_attacker_influence := rrd_uops(w).cf_attacker_influence ||
+        (if (numReadPorts > 0) bypassed_rs1_atk(w) && rs1_reads_reg else false.B) ||
+        (if (numReadPorts > 1) bypassed_rs2_atk(w) && rs2_reads_reg else false.B)
     if (enableSFBOpt)     exe_reg_pred_data(w) := bypassed_pred_data(w)
     // ASSUMPTION: rs3 is FPU which is NOT bypassed
   }
