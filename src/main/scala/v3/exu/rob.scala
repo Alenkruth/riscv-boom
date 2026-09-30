@@ -400,16 +400,16 @@ class Rob(
     //   wb:    pending bit + full influencer list per row (writeback merge — Fix opt#1)
     val sprob_infl_pending    = RegInit(VecInit(Seq.fill(numRobRows)(false.B)))
     val ic_pending_valid      = RegInit(VecInit(Seq.fill(numRobRows)(false.B)))
-    val ic_pending_winner_op  = Reg(Vec(numRobRows, UInt(uopIDCounterWidthCF.W)))
+    val ic_pending_winner_op  = Reg(Vec(numRobRows, UInt(inflOpCountWidthCF.W)))  // [NARROW]
     val ic_pending_winner_atk = Reg(Vec(numRobRows, Bool()))
     val ic_pending_winner_sec = Reg(Vec(numRobRows, Bool()))
-    val ic_pending_deny_cnt   = Reg(Vec(numRobRows, UInt(4.W)))
+    val ic_pending_infl_type  = Reg(Vec(numRobRows, UInt(inflTypeWidthCF.W)))
     // wb_infl pending: captures influencer list from writeback responses.
     // Drains 1/cycle via PriorityEncoder (same pattern as sprob/ic).
     // If a second wb_resp hits the same row while pending, overflow is set.
     val wb_infl_pending       = RegInit(VecInit(Seq.fill(numRobRows)(false.B)))
     val wb_infl_list          = Reg(Vec(numRobRows, Vec(numInfluencerSlotsCF, new InfluencerEntry)))
-    val wb_infl_overflow      = Reg(Vec(numRobRows, Bool()))
+    val wb_infl_overflow      = Reg(Vec(numRobRows, UInt(2.W)))
 
     // IFT bridge: per-row pending bits for squashed IFT-active entries.
     // Set in branch-kill loop when rob_val && IFT-active; cleared in per-bank drain.

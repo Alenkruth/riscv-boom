@@ -37,23 +37,31 @@ case class IssueParams(
 
 // corefuzzing: bundle carrying per-cycle winner info to a losing issue slot
 class IssueContentionInfo(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
-  val winner_op_count = UInt(uopIDCounterWidthCF.W)
+  val winner_op_count = UInt(inflOpCountWidthCF.W)   // [NARROW] see micro-op.scala
   val winner_is_atk   = Bool()
   val winner_is_sec   = Bool()
 }
 
 // corefuzzing: bundle sent from issue unit → ROB when a slot issues with accumulated contention
 class IssueContentionUpdate(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
+  // O1 (corefuzzing): which influence this update reports.  The ROB used to hardcode
+  // INFL_ISSUE_CONTENTION, so a non-pipelined FU blocking issue had nowhere to be
+  // reported.  Carrying the type reuses the whole existing bus, pending table and
+  // drain -- no second path.
+  val infl_type       = UInt(inflTypeWidthCF.W)
   val rob_idx         = UInt(robAddrSz.W)
-  val winner_op_count = UInt(uopIDCounterWidthCF.W)
+  val winner_op_count = UInt(inflOpCountWidthCF.W)   // [NARROW] see micro-op.scala
   val winner_is_atk   = Bool()
   val winner_is_sec   = Bool()
-  val deny_count      = UInt(4.W)
+  val deny_count      = UInt(6.W)   // linear cycles; ROB compresses to a 3-bit log bucket
 }
 
 // corefuzzing: bundle driven into each issue slot to notify it of a cross-domain winner
 class IssueContendInput(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
-  val winner_op_count = UInt(uopIDCounterWidthCF.W)
+  // O1: which influence this denial represents -- issue-PORT contention, or a
+  // non-pipelined FU still occupied.  Carried so the ROB can type the entry.
+  val infl_type       = UInt(inflTypeWidthCF.W)
+  val winner_op_count = UInt(inflOpCountWidthCF.W)   // [NARROW] see micro-op.scala
   val winner_is_atk   = Bool()
   val winner_is_sec   = Bool()
 }

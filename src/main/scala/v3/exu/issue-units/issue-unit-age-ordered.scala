@@ -195,7 +195,10 @@ class IssueUnitCollapsing(
   for (w <- 0 until issueWidth) {
     // Compute winner info unconditionally; gate with io.iss_valids(w) via AND.
     val winner_domain = io.iss_uops(w).cf_domain_id
-    val winner_op     = io.iss_uops(w).cf_op_count_id
+    // [NARROW 2026-09-10] truncate explicitly to the contention field's width; the
+      // ty=2 edge discarded these bits anyway (rob.scala:715), so cutting here keeps
+      // it visible instead of relying on an implicit Chisel width truncation.
+      val winner_op     = io.iss_uops(w).cf_op_count_id(inflOpCountWidthCF-1, 0)
     val winner_is_atk = io.iss_uops(w).cf_domain_id === 1.U
     val winner_is_sec = io.iss_uops(w).cf_secret_access || io.iss_uops(w).cf_secret_propagation
     for (i <- 0 until numIssueSlots) {

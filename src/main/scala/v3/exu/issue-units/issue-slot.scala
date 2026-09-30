@@ -112,10 +112,14 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
   // corefuzzing: per-slot ISSUE_CONTENTION accumulation registers.
   // Declared here (before out_uop assignments) so they can be referenced in out_uop.
   val cf_cntd_valid      = RegInit(false.B)
-  val cf_cntd_winner_op  = Reg(UInt(uopIDCounterWidthCF.W))
+  val cf_cntd_winner_op  = Reg(UInt(inflOpCountWidthCF.W))   // [NARROW] see micro-op.scala
   val cf_cntd_winner_atk = RegInit(false.B)
   val cf_cntd_winner_sec = RegInit(false.B)
-  val cf_cntd_deny_count = RegInit(0.U(4.W))
+  // O1: the influence type latched with the denial (ISSUE_CONTENTION or FU_BUSY)
+  val cf_cntd_infl_type  = RegInit(INFL_ISSUE_CONTENTION.U(inflTypeWidthCF.W))
+  // 6 bits linear here so the shared log bucket has real range above 32; the ROB
+  // compresses to 3 bits once at capture rather than needing an encoder per slot.
+  val cf_cntd_deny_count = RegInit(0.U(6.W))
   // Next-cycle combinational shadows — default to current register values.
   // A when-block below adds the cf_contend_in override.
   // out_uop uses nc_cntd_* so same-cycle denials are inherited across collapsing shifts.

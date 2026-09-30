@@ -254,17 +254,53 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   // cf_spec_branch_op_id: cf_op_count_id of the first (lowest br_tag index) attacker-domain
   //   branch under which this uop is speculated.  Zero when cf_spec_branch_is_atk=false.
   val cf_spec_branch_is_atk    = Bool()
-  val cf_spec_branch_op_id     = UInt(uopIDCounterWidthCF.W)
+  // LOW specBranchOpIdWidthCF bits of the speculating branch's op_count_id; software
+  // reconstructs against this uop's own cf_op_count_id.  Bounded by construction (the
+  // distance cannot exceed the speculation window) -- measured max across five
+  // workloads is 76, so 8 bits carries a 3.4x margin.
+  val cf_spec_branch_op_id     = UInt(specBranchOpIdWidthCF.W)
   val cf_spec_branch_is_secret = Bool()  // any outstanding branch in br_mask was from secret domain
 
   // Issue-slot contention carry: accumulated INFL_ISSUE_CONTENTION state that survives
   // collapsing-queue shifts.  Set in issue-slot, propagated via out_uop → in_uop.
   // Consumed when the slot fires cf_contend_out on grant.
   val cf_cntd_valid      = Bool()
-  val cf_cntd_winner_op  = UInt(uopIDCounterWidthCF.W)
+  val cf_cntd_winner_op  = UInt(inflOpCountWidthCF.W)  // [NARROW 2026-09-10] was
+                                                       // uopIDCounterWidthCF (16b).  The
+  // ty=2 edge truncates to inflOpCountWidthCF anyway (rob.scala:715:
+  // `ic_pending_winner_op.pad(inflOpCountWidthCF)(inflOpCountWidthCF-1,0)`), so the top
+  // 6 bits were carried through EVERY pipeline stage, ROB row and LSU queue entry and
+  // then discarded at the last step.  Narrowing is provably lossless for anything that
+  // reaches software.
   val cf_cntd_winner_atk = Bool()
   val cf_cntd_winner_sec = Bool()
-  val cf_cntd_deny_count = UInt(4.W)
+  // Cycles this uop was denied an issue port by a cross-domain instruction, as a
+  // 3-bit Log2Bucket.  Was replicated into every influencer slot; a uop holds at
+  // most one INFL_ISSUE_CONTENTION entry, so it belongs here.
+  val cf_cntd_deny_count = UInt(3.W)
+  // Dispatch-stall duration, same 3-bit Log2Bucket scale as cf_cntd_deny_count.
+  // [DOCFIX 2026-09-12] STALE CLAIM REMOVED.  This said INFL_ROB_FULL is "the dominant
+  // structural influence in the log (392,138 entries in run_00016)".  At the shipped geometry
+  // it fires ZERO times -- 0 in 2.7M records of spectre_v2/btb2, and 0 across 8 dedicated
+  // microbenchmarks.  A 256-entry ROB does not fill at decodeWidth=4.  It fires only when the
+  // ROB is shrunk via CSR 0xbc2 (idx 5 = 32 entries), reaching ~5.5k.  Note it is then mutually
+  // exclusive with INFL_REG_PRESSURE.  See claude-artifacts/53-open-gaps.md (B4).
+  // INFL_ROB_FULL was purely binary -- you knew a uop was blocked at dispatch,
+  // never for how long.  Counted linearly at dispatch (coreWidth instances, ~24
+  // flops) and compressed once at capture, so no encoder is replicated per uop.
+  // NOTE: there is deliberately no INFL_MEM_HOL equivalent.  dis_hol_ldq/stq are
+  // gated on dis_fire, i.e. MEM_HOL marks "dispatched WHILE a cross-domain entry
+  // sat at the queue head" -- the uop does not stall, so there is no dispatch-side
+  // duration to count.  Measuring it would need an LSU-side counter.
+  val cf_stall_cycles_rob = UInt(3.W)
+  // Cycles the STQ head entry had already held the head when this uop dispatched, same
+  // 3-bit Log2Bucket scale.  This is the head-of-line duration INFL_MEM_HOL lacks.
+  // Note MEM_HOL itself is gated on dis_fire and, for its LDQ variant (64.7% of its
+  // 290,714 records in run_00016), checks a head that does not gate cacheable load
+  // execution -- only fullness and uncacheable wakeup.  Loads are ordered by OLDER
+  // STORES via st_dep_mask, which clears as stq_head advances, so the STQ head is the
+  // structure that actually blocks.  This counter measures that.
+  val cf_stall_cycles_stq = UInt(3.W)
 
   // Do we allocate a branch tag for this?
   // SFB branches don't get a mask, they get a predicate bit
