@@ -187,11 +187,27 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val refill_done = refill_one_beat && d_done
   tl_out.d.ready := true.B
   require (edge_out.manager.minLatency > 0)
-  val replacer_LRU = outer.icacheParams.replacement_LRU
-  val replacer_RAND = outer.icacheParams.replacement_RAND
-  val repl_way_raw = if (isDM) 0.U else ( if (true) replacer_LRU.way else replacer_RAND.way)
-  // Clamp replacement way to active ways (prevent evicting outside active region)
-  val repl_way = Mux(repl_way_raw < cf_icache_active_ways, repl_way_raw, 0.U)
+  // [icache way fix 2026-08-22] repl_way used to come from `icacheParams.replacement_LRU`, a
+  // PseudoLRU whose `state_reg` is assigned ONLY inside `.access()` -- which this file never
+  // called.  The register had no driver, firtool folded it to its reset value, and repl_way
+  // became a constant 0: ways 1..N-1 were never written (netlist showed
+  // dataArrayB0Way_1..7_rw_wmode = 1'h0) and the I$ ran 4 KB DIRECT-MAPPED in *every*
+  // configuration, baseline included.  See claude-artifacts/11-icache-way-bug.md.
+  //
+  // Restore upstream rocket-chip's stateless random victim (rocket/ICache.scala:406) and MASK --
+  // not clamp -- it into the active region.  cacheWayOptions = Seq(8,4,2,1) are all powers of
+  // two, so `& (active-1)` is exact and keeps the victim uniform across the active ways; the old
+  // `Mux(raw < active, raw, 0)` would have piled every out-of-range victim onto way 0.  This is
+  // the same idiom the D$ already uses correctly (dcache.scala:1068-1070).
+  //
+  // The explicit bit-extract pins the width to log2Ceil(nWays): repl_way feeds
+  // Cat(repl_way, refill_idx) into vb_array below, and cf_icache_active_ways is a 4-bit literal
+  // vector, so an un-truncated `&` would widen repl_way and index outside the valid-bit vector.
+  // `random.LFSR` is qualified because freechips.rocketchip.util._ is also in scope (cf. tage.scala).
+  val repl_way = if (isDM) 0.U else {
+    val repl_way_raw = random.LFSR(16, refill_done)(log2Ceil(nWays) - 1, 0)
+    (repl_way_raw & (cf_icache_active_ways - 1.U))(log2Ceil(nWays) - 1, 0)
+  }
 
   // Masked set index for tag/data array reads (s0 stage uses virtual addr)
   val s0_set_idx_masked = (s0_vaddr(untagBits-1, blockOffBits) & icache_set_mask)(idxBits-1, 0)

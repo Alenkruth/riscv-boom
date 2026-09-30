@@ -43,6 +43,11 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
     val is_br = Bool()
     val tag   = UInt(tagSz.W)
     val ctr   = UInt(2.W)
+    // O4 (corefuzzing): the FA micro-BTB had NO domain or secret tracking, so an
+    // attacker-written (or secret-dependent) micro-BTB target was invisible.  Stored
+    // per way/slot alongside the tag -- this bank is PC-tagged, so provenance is exact.
+    val domain = UInt(1.W)
+    val secret = Bool()
   }
 
   class MicroBTBPredictMeta extends Bundle {
@@ -74,6 +79,8 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
   })
   val s1_hits     = s1_hit_ohs.map { oh => oh.reduce(_||_) }
   val s1_hit_ways = s1_hit_ohs.map { oh => PriorityEncoder(oh) }
+  val s1_ubtb_domain_mismatch = Wire(Vec(bankWidth, Bool()))
+  val s1_ubtb_secret_mismatch = Wire(Vec(bankWidth, Bool()))
 
   for (w <- 0 until bankWidth) {
     val entry_meta = meta(s1_hit_ways(w))(w)
@@ -94,6 +101,11 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
     }
     chunks.reduce(_^_)
   }
+  // O4: report as BTB state (composer ORs f3_btb_*_mismatch across all banks).
+  // Two RegNexts to land at f3, matching btb.scala's timing.
+  io.f3_btb_domain_mismatch := RegNext(RegNext(s1_ubtb_domain_mismatch.reduce(_||_)))
+  io.f3_btb_secret_mismatch := RegNext(RegNext(s1_ubtb_secret_mismatch.reduce(_||_)))
+
   s1_meta.write_way := Mux(s1_hits.reduce(_||_),
     PriorityEncoder(s1_hit_ohs.map(_.asUInt).reduce(_|_)),
     alloc_way)

@@ -98,9 +98,13 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
   val lo_us  = SyncReadMem(nRows, Vec(bankWidth, Bool()))
   val table  = SyncReadMem(nRows, Vec(bankWidth, UInt(tageEntrySz.W)))
   // corefuzzing: domain shadow — records the domain of the fetch that last wrote each row
-  val table_domain  = SyncReadMem(nRows, Vec(bankWidth, UInt(1.W)))
+  // OPT (audit rank 3): domain and secret were two separate single-bit SyncReadMems,
+  // instantiated PER TAGE TABLE -- 14 memory instances across 7 tables where 7 two-bit
+  // ones do the same job.  Both had identical index, write mask, reset behaviour and
+  // read enable, so packing them into one {domain, secret} word is exactly equivalent
+  // and halves the address-decode/port logic.
+  val table_shadow  = SyncReadMem(nRows, Vec(bankWidth, UInt(2.W)))
   // corefuzzing: secret shadow — records whether the fetch that last wrote each row was secret
-  val table_secret  = SyncReadMem(nRows, Vec(bankWidth, Bool()))
 
   val mems = Seq((f"tage_l$histLength", nRows, bankWidth * tageEntrySz))
 
@@ -111,10 +115,11 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
   val s2_req_rlous = lo_us.read(s1_hashed_idx, io.f1_req_valid)
   val s2_req_rhits = VecInit(s2_req_rtage.map(e => e.valid && e.tag === s2_tag && !doing_reset))
   // corefuzzing: domain shadow read — same index/enable as main table
-  val s2_req_rdomain  = table_domain.read(s1_hashed_idx, io.f1_req_valid)
+  val s2_req_rshadow  = table_shadow.read(s1_hashed_idx, io.f1_req_valid)
+  val s2_req_rdomain  = VecInit(s2_req_rshadow.map(_(1,1)))
   val s2_fetch_domain = RegNext(io.f1_req_domain_id)
   // corefuzzing: secret shadow read — same index/enable
-  val s2_req_rsecret  = table_secret.read(s1_hashed_idx, io.f1_req_valid)
+  val s2_req_rsecret  = VecInit(s2_req_rshadow.map(_(0)))
 
   for (w <- 0 until bankWidth) {
     // This bit indicates the TAGE table matched here
@@ -145,22 +150,16 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
     Mux(doing_reset, ~(0.U(bankWidth.W))                                , io.update_mask.asUInt).asBools
   )
 
-  // corefuzzing: write domain shadow in parallel with main table
-  table_domain.write(
+  // corefuzzing: write {domain, secret} shadow in parallel with the main table.
+  // IFT gate: with ENABLE_IFT=false the secret bit is a constant 0, which firtool folds
+  // away -- the same dead-state elimination the split version relied on, minus a memory.
+  val shadow_secret_bit = if (ENABLE_IFT) io.update_cf_is_secret else false.B
+  table_shadow.write(
     Mux(doing_reset, reset_idx, update_idx),
-    Mux(doing_reset, VecInit(Seq.fill(bankWidth)(0.U(1.W))), VecInit(Seq.fill(bankWidth)(io.update_cf_domain_id))),
+    Mux(doing_reset, VecInit(Seq.fill(bankWidth)(0.U(2.W))),
+                     VecInit(Seq.fill(bankWidth)(Cat(io.update_cf_domain_id, shadow_secret_bit)))),
     Mux(doing_reset, ~(0.U(bankWidth.W)), io.update_mask.asUInt).asBools
   )
-  // corefuzzing: write secret shadow in parallel — true if fetch packet had s_acc/s_prop
-  // IFT gate: elided when ENABLE_IFT=false; table_secret SRAM becomes dead state
-  // with no write driver → FIRRTL DCE removes it.
-  if (ENABLE_IFT) {
-    table_secret.write(
-      Mux(doing_reset, reset_idx, update_idx),
-      Mux(doing_reset, VecInit(Seq.fill(bankWidth)(false.B)), VecInit(Seq.fill(bankWidth)(io.update_cf_is_secret))),
-      Mux(doing_reset, ~(0.U(bankWidth.W)), io.update_mask.asUInt).asBools
-    )
-  }
 
   val update_hi_wdata = Wire(Vec(bankWidth, Bool()))
   hi_us.write(
@@ -413,6 +412,7 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
     }
 
   }
+
 
 
   for (i <- 0 until tageNTables) {

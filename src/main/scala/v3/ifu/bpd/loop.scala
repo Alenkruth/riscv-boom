@@ -34,6 +34,12 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     val age   = UInt(3.W)
     val p_cnt = UInt(10.W)
     val s_cnt = UInt(10.W)
+    // O4 (corefuzzing): the loop predictor had NO domain or secret tracking.  A
+    // secret-dependent loop TRIP COUNT is a real channel -- the predicted exit
+    // encodes it.  Stored per entry alongside the tag; this bank is PC-tagged, so
+    // provenance is exact.
+    val domain = UInt(1.W)
+    val secret = Bool()
   }
 
   class LoopBranchPredictorColumn extends Module {
@@ -54,6 +60,12 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       val update_idx   = Input(UInt())
       val update_resolve_dir = Input(Bool())
       val update_meta  = Input(new LoopMeta)
+      // O4: provenance of the update, and the mismatch this column observes at f3
+      val update_domain = Input(UInt(1.W))
+      val update_secret = Input(Bool())
+      val f3_req_domain = Input(UInt(1.W))
+      val f3_domain_mismatch = Output(Bool())
+      val f3_secret_mismatch = Output(Bool())
     })
 
     val doing_reset = RegInit(true.B)
@@ -74,6 +86,11 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       io.update_meta.s_cnt,
       f3_entry.s_cnt)
     val f3_tag   = RegNext(io.f2_req_idx(tagSz+log2Ceil(nSets)-1,log2Ceil(nSets)))
+    // O4: qualified on the column's OWN tag match -- the same condition the prediction
+    // path uses below -- so a mismatch is reported only when the prediction genuinely
+    // came from this entry.
+    io.f3_domain_mismatch := (f3_entry.tag === f3_tag) && (f3_entry.domain =/= io.f3_req_domain)
+    io.f3_secret_mismatch := (f3_entry.tag === f3_tag) && f3_entry.secret
 
     io.f3_pred := io.f3_pred_in
     io.f3_meta.s_cnt := f3_scnt
@@ -164,6 +181,8 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
         wentry.p_cnt := io.update_meta.s_cnt
       }
 
+      wentry.domain := io.update_domain
+      wentry.secret := io.update_secret
       entries(io.update_idx) := wentry
     } .elsewhen (io.update_repair && !doing_reset) {
       when (tag_match && !(f4_fire && io.update_idx === f4_idx)) {
@@ -185,6 +204,10 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   override val metaSz = f3_meta.asUInt.getWidth
 
   val update_meta = s1_update.bits.meta.asTypeOf(Vec(bankWidth, new LoopMeta))
+  // O4: the loop predictor is a direction predictor, so it reports as BPD state.
+  // composer.scala ORs f3_bpd_*_mismatch across banks -- no new influencer type needed.
+  io.f3_bpd_domain_mismatch := columns.map(_.io.f3_domain_mismatch).reduce(_||_)
+  io.f3_bpd_secret_mismatch := columns.map(_.io.f3_secret_mismatch).reduce(_||_)
 
   for (w <- 0 until bankWidth) {
     columns(w).io.f2_req_valid := s2_valid
@@ -193,6 +216,9 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       RegNext(io.resp_in(0).f2(w).predicted_pc.valid && io.resp_in(0).f2(w).is_br))
 
     columns(w).io.f3_pred_in  := io.resp_in(0).f3(w).taken
+    columns(w).io.update_domain := s1_update.bits.cf_domain_id
+    columns(w).io.update_secret := s1_update.bits.cf_is_secret
+    columns(w).io.f3_req_domain := RegNext(RegNext(s1_domain))
     io.resp.f3(w).taken       := columns(w).io.f3_pred
 
     columns(w).io.update_mispredict      := (s1_update.valid &&

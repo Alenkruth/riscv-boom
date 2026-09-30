@@ -64,6 +64,23 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
 
   val ras_idx = UInt(log2Ceil(nRasEntries).W)
 
+  // C3 (corefuzzing): GHR taint.  A single bit, like the PHT shadow, meaning "this
+  // history contains a bit contributed by a secret-dependent branch".
+  //
+  // These live INSIDE GlobalHistory deliberately: the bundle is snapshotted per FTQ
+  // entry and restored on redirect, so a squashed secret-dependent branch rolls its
+  // tag back along with the history bit it contributed.  A tag held outside would
+  // survive a rollback the history itself discarded.
+  //
+  // Untaint is COUNTER-GATED rather than ad-hoc.  Unlike BTB/PHT entries the GHR has
+  // no per-entry ownership, so nothing overwrites the tag; instead the contributed bit
+  // simply shifts out.  The horizon is therefore globalHistoryLength (64 here), which
+  // is also the longest TAGE table history (tables: 2,4,8,16,16,32,64) -- past that the
+  // bit cannot influence any prediction.  A new secret-dependent branch resets the
+  // counter, re-extending the window.
+  val secret_tag = Bool()
+  val secret_ctr = UInt(log2Ceil(globalHistoryLength + 1).W)
+
   def histories(bank: Int) = {
     if (nBanks == 1) {
       old_history
@@ -79,6 +96,9 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
     }
   }
 
+  // NOTE: secret_tag/secret_ctr are deliberately EXCLUDED from ===.  They are IFT
+  // metadata, not architectural history; including them would make two identical
+  // histories compare unequal and perturb the predictor's own repair logic.
   def ===(other: GlobalHistory): Bool = {
     ((old_history === other.old_history) &&
      (new_saw_branch_not_taken === other.new_saw_branch_not_taken) &&
@@ -90,7 +110,8 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
   def update(branches: UInt, cfi_taken: Bool, cfi_is_br: Bool, cfi_idx: UInt,
     cfi_valid: Bool, addr: UInt,
     cfi_is_call: Bool, cfi_is_ret: Bool,
-    rasActive: UInt = nRasEntries.U): GlobalHistory = {
+    rasActive: UInt = nRasEntries.U,
+    cfi_is_secret: Bool = false.B): GlobalHistory = {
     val cfi_idx_fixed = cfi_idx(log2Ceil(fetchWidth)-1,0)
     val cfi_idx_oh = UIntToOH(cfi_idx_fixed)
     val new_history = Wire(new GlobalHistory)
@@ -129,6 +150,16 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
 
       }
     }
+    // C3: a branch that shifts the history advances the counter; a secret-dependent
+    // branch sets the tag and restarts the window; the tag clears once the contributed
+    // bit has aged past globalHistoryLength.
+    val shifted = cfi_valid && cfi_is_br
+    val aged    = secret_ctr >= globalHistoryLength.U
+    new_history.secret_ctr := Mux(cfi_is_secret, 0.U,
+                              Mux(shifted && !aged, secret_ctr + 1.U, secret_ctr))
+    new_history.secret_tag := Mux(cfi_is_secret, true.B,
+                              Mux(aged, false.B, secret_tag))
+
     new_history.ras_idx := Mux(cfi_valid && cfi_is_call, WrapInc(ras_idx, rasActive),
                            Mux(cfi_valid && cfi_is_ret , WrapDec(ras_idx, rasActive), ras_idx))
     new_history

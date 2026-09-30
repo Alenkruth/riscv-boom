@@ -384,16 +384,28 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
   when (io.redirect.valid) {
     enq_ptr    := WrapInc(io.redirect.bits, cf_ftq_active)
-    // Reset bpd_ptr to the redirect point on ANY redirect (not just quiesce).
-    // After a redirect, enq_ptr jumps backwards to WrapInc(redirect.bits). If
-    // bpd_ptr was ahead of that point (e.g. after a mispredict in a small FTQ),
-    // bpd_ptr > new_enq_ptr causes full=true AND stale BPD updates for invalidated
-    // entries. Both corrupt the predictor (leading to thread_entry spin with small
-    // FTQ configs). Setting bpd_ptr := redirect.bits here ensures bpd_ptr is always
-    // one slot behind new enq_ptr, so full=false and no stale updates are sent.
-    // Cost: valid BPD updates for entries [old_bpd_ptr, redirect.bits) are skipped,
-    // slightly degrading predictor quality but never causing correctness failures.
-    bpd_ptr    := io.redirect.bits
+    // [CF-FIX 2026-08-07, doc 34] bpd_ptr is the TRAILING pointer: the bpd_ptr-based
+    // `full` check is what stops enqueue from lapping entries still referenced by
+    // in-flight uops.  The previous code teleported it FORWARD on EVERY redirect
+    // (`bpd_ptr := io.redirect.bits`, to cure a small-FTQ full-deadlock after
+    // resize/quiesce pointer resets).  That destroyed the lap protection: wrong-path
+    // runahead fetch could wrap the FTQ and OVERWRITE the entry of a branch stalled
+    // on cold-miss operands; its eventual (correct) mispredict-recovery redirect then
+    // read the NEW occupant's PC from get_pc(1) and steered the front end to a bogus
+    // address that COMMITTED — the post-restore illegal-control-flow bug (both
+    // flavors; captured live: BRRES misp=1 ftq=8 -> REDIR ftqpc=0x140b4).
+    // Correct rule: on a normal redirect bpd_ptr must NOT move (upstream semantics —
+    // the redirecting entry is always inside [bpd_ptr, enq_ptr), so it stays validly
+    // trailing).  Only when that invariant is ALREADY broken (reachable only through
+    // FTQ-resize/quiesce pointer resets — the deadlock the old code patched) is
+    // bpd_ptr clamped to the redirect point.
+    val bpd_trailing_valid =
+      Mux(bpd_ptr <= enq_ptr,
+          (io.redirect.bits >= bpd_ptr) && (io.redirect.bits < enq_ptr),
+          (io.redirect.bits >= bpd_ptr) || (io.redirect.bits < enq_ptr))
+    when (!bpd_trailing_valid) {
+      bpd_ptr  := io.redirect.bits
+    }
 
     when (io.brupdate.b2.mispredict) {
     val new_cfi_idx = (io.brupdate.b2.uop.pc_lob ^

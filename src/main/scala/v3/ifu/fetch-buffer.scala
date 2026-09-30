@@ -152,15 +152,23 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // Rotate `in` (numEntries-wide tail pointer, one-hot) left by k positions within the active segment.
   // Parameterized from fetchBufferEntryOptions — no hardcoded sizes.
   // k is a Scala Int (compile-time constant), so all bit-slice bounds are elaboration-time constants.
+  // Guard: only the RECONF path iterates fetchBufferEntryOptions; non-reconf configs may have
+  // numEntries smaller than some options (e.g., LargeBoom: numEntries=24 < 64), which would
+  // produce negative pad values and cause a Chisel elaboration error.
   def rotateLeft(in: UInt, k: Int) = {
-    val cases = fetchBufferEntryOptions.zipWithIndex.map { case (n, idx) =>
-      val pad = numEntries - n
-      val rotated = if (pad == 0) Cat(in(n-k-1, 0), in(n-1, n-k))
-                    else Cat(0.U(pad.W), in(n-k-1, 0), in(n-1, n-k))
-      (io.cf_fb_idx === idx.U) -> rotated
+    if (!ENABLE_RECONF) {
+      // Fixed size: rotate within the hardware-built numEntries only.
+      Cat(in(numEntries-k-1, 0), in(numEntries-1, numEntries-k))
+    } else {
+      val cases = fetchBufferEntryOptions.zipWithIndex.map { case (n, idx) =>
+        val pad = numEntries - n
+        val rotated = if (pad == 0) Cat(in(n-k-1, 0), in(n-1, n-k))
+                      else Cat(0.U(pad.W), in(n-k-1, 0), in(n-1, n-k))
+        (io.cf_fb_idx === idx.U) -> rotated
+      }
+      val r = MuxCase(0.U(numEntries.W), cases)
+      Mux(r.orR, r, 1.U(numEntries.W))
     }
-    val r = MuxCase(0.U(numEntries.W), cases)
-    Mux(r.orR, r, 1.U(numEntries.W))
   }
 
   // this mechanism is fine as long as the rotations are done with respect with the current buffer dimensions
@@ -268,9 +276,8 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     in_uops(i).cf_secret_transmission  := false.B
     in_uops(i).cf_single_step          := false.B
     in_uops(i).cf_influencer_list      := 0.U.asTypeOf(in_uops(i).cf_influencer_list)
-    in_uops(i).cf_infl_overflow        := false.B
+    in_uops(i).cf_infl_dropped         := 0.U
     in_uops(i).cf_src_tainted          := false.B
-    in_uops(i).cf_taint_producer_op    := 0.U
   }
 
   // corefuzzing: inject fetch-side influencers in parallel using addInfluencerBatch.
@@ -288,7 +295,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   val fb_base_tmpl = Wire(in_uops(0).cloneType)
   fb_base_tmpl := in_uops(0)
   fb_base_tmpl.cf_influencer_list    := 0.U.asTypeOf(in_uops(0).cf_influencer_list)
-  fb_base_tmpl.cf_infl_overflow      := false.B
+  fb_base_tmpl.cf_infl_dropped       := 0.U
   // Break combinational cycle: addInfluencerBatch reads cf_attacker_influence via WireInit,
   // and the result is written back to in_uops.cf_attacker_influence.  Zero it here so the
   // batch output depends only on candidate conditions, not on its own output.
@@ -326,7 +333,13 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
 
   // Advance head pointer (numRows-wide one-hot) by one row within the active segment.
   // Parameterized from fetchBufferEntryOptions — no hardcoded sizes.
+  // Guard: same negative-pad hazard as rotateLeft; non-reconf configs use fixed-size rotation.
   def inc(ptr: UInt) = {
+    if (!ENABLE_RECONF) {
+      // Fixed size: rotate the numRows-wide one-hot by 1 position.
+      if (numRows == 1) ptr
+      else Cat(ptr(numRows-2, 0), ptr(numRows-1))
+    } else {
     val cases = fetchBufferEntryOptions.zipWithIndex.map { case (n, idx) =>
       val rows = n / coreWidth
       val pad  = numRows - rows
@@ -337,6 +350,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     }
     val r = MuxCase(0.U(numRows.W), cases)
     Mux(r.orR, r, 1.U(numRows.W))
+    }
   }
 
   // Use rotateLeft(enq_idx, 1) to advance the numEntries-wide entry-level tail pointer by one entry
