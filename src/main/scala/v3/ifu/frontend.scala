@@ -295,6 +295,7 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
   val ras_domain_mismatch    = Bool()  // RAS return addr pushed by different domain
   val bpd_domain_mismatch    = Bool()  // TAGE entry last updated by different domain
   val btb_domain_mismatch    = Bool()  // BTB entry last written by different domain
+  val btb_target_xdom        = Bool()  // BTB-predicted JALR target is cross-domain (branch-target-injection)
   val cf_fetch_domain        = UInt(1.W) // domain of this fetch packet (for FTQ/bpdupdate)
   // corefuzzing: secret shadow mismatch — predictor entry was trained by secret instruction
   val bpd_secret_mismatch    = Bool()
@@ -1056,6 +1057,22 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // corefuzzing: BPD/BTB domain and secret mismatches from the prediction response
   f3_fetch_bundle.bpd_domain_mismatch := f3_bpd_resp.io.deq.bits.bpd_domain_mismatch
   f3_fetch_bundle.btb_domain_mismatch := f3_bpd_resp.io.deq.bits.btb_domain_mismatch
+  // corefuzzing: BTB TARGET-domain edge (branch-target-injection, doc 67 Part A).
+  // btb_domain_mismatch tracks the INSTALLER's domain; the BTI attack rides the
+  // branch->TARGET jump instead. Here: a BTB-predicted JALR whose predicted target is in
+  // a different domain than the fetch. cf_attacker_start/end are the same range used for
+  // f3_fetch_is_attacker. Meaningful (attack) occurrences are SQUASHED (spec=1): a benign
+  // cross-domain indirect call commits; a poisoned mispredicted one appears as [FLUSH].
+  val f3_btb_pred_target = f3_targs(f3_fetch_bundle.cfi_idx.bits)
+  val f3_btb_target_is_attacker = (io.cpu.cf_attacker_start_addr =/= 0.U) &&
+    (f3_btb_pred_target >= io.cpu.cf_attacker_start_addr) &&
+    (f3_btb_pred_target <  io.cpu.cf_attacker_end_addr)
+  f3_fetch_bundle.btb_target_xdom := (
+    f3_fetch_bundle.cfi_idx.valid &&
+    (f3_fetch_bundle.cfi_type === CFI_JALR) &&
+    !f3_fetch_bundle.cfi_is_ret &&   // exclude returns (jalr x0) -- those are RAS co-location, not BTI
+    (f3_btb_target_is_attacker =/= f3_fetch_is_attacker)
+  )
   f3_fetch_bundle.bpd_secret_mismatch := f3_bpd_resp.io.deq.bits.bpd_secret_mismatch
   f3_fetch_bundle.btb_secret_mismatch := f3_bpd_resp.io.deq.bits.btb_secret_mismatch
   // corefuzzing: record the fetch domain for the FTQ bpdupdate path

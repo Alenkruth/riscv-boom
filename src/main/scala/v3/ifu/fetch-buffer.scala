@@ -275,6 +275,10 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     in_uops(i).cf_secret_propagation   := false.B
     in_uops(i).cf_secret_transmission  := false.B
     in_uops(i).cf_single_step          := false.B
+    // doc 67 Part B: carry "this ret's RAS-predicted top was cross-domain" to the ROB, where
+    // the RAS edge is raised ONLY if the ret then mispredicts (real ret2spec) -- not at fetch
+    // on every cross-domain call (that was the co-location pollution).
+    in_uops(i).cf_ras_pred_xdom        := io.enq.bits.ras_domain_mismatch && in_uops(i).taken
     in_uops(i).cf_influencer_list      := 0.U.asTypeOf(in_uops(i).cf_influencer_list)
     in_uops(i).cf_infl_dropped         := 0.U
     in_uops(i).cf_src_tainted          := false.B
@@ -305,11 +309,14 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   val fb_post = addInfluencerBatch(fb_base_tmpl, Seq(
     InfluencerCandidate(io.enq.bits.icache_domain_mismatch, 0.U, INFL_ICACHE_STATE, any_is_victim, false.B),
     InfluencerCandidate(io.enq.bits.icache_secret_mismatch, 0.U, INFL_ICACHE_STATE, false.B,       true.B),
-    InfluencerCandidate(io.enq.bits.ras_domain_mismatch,    0.U, INFL_RAS_STATE,    any_is_victim, false.B),
+    // doc 67 Part B: ras_domain_mismatch influencer REMOVED from fetch (co-location pollution
+    // -- fired on every cross-domain call). RAS edge is now raised at the ROB only when a
+    // cross-domain ret MISPREDICTS (cf_ras_pred_xdom + b2.mispredict). ras_pop_secret stays.
     InfluencerCandidate(ras_pop_secret,                      0.U, INFL_RAS_STATE,    false.B,       true.B),
     InfluencerCandidate(io.enq.bits.bpd_domain_mismatch,    0.U, INFL_BPD_STATE,    any_is_victim, false.B),
     InfluencerCandidate(io.enq.bits.bpd_secret_mismatch,    0.U, INFL_BPD_STATE,    false.B,       true.B),
     InfluencerCandidate(io.enq.bits.btb_domain_mismatch,    0.U, INFL_BTB_STATE,    any_is_victim, false.B),
+    InfluencerCandidate(io.enq.bits.btb_target_xdom,        0.U, INFL_BTB_TARGET_INJECT, any_is_victim, false.B),
     InfluencerCandidate(io.enq.bits.btb_secret_mismatch,    0.U, INFL_BTB_STATE,    false.B,       true.B),
     InfluencerCandidate(io.enq.bits.itlb_domain_mismatch,   0.U, INFL_ITLB_STATE,   any_is_victim, false.B),
     InfluencerCandidate(io.enq.bits.itlb_secret_mismatch,   0.U, INFL_ITLB_STATE,   false.B,       true.B),

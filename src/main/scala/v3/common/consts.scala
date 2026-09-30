@@ -295,6 +295,7 @@ trait ScalarOpConstants
     uop.cf_secret_transmission  := false.B
     uop.cf_op_count_id          := 0.U
     uop.cf_single_step          := false.B
+    uop.cf_ras_pred_xdom        := false.B
     uop.cf_fu_bitmap            := 0.U
     uop.cf_influencer_list      := 0.U.asTypeOf(uop.cf_influencer_list)
     uop.cf_infl_dropped         := 0.U

@@ -280,6 +280,7 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
                                // Wraps at 65536. Provides comfortable headroom for all current workloads.
 
   val cf_single_step          = Bool()      // set when the micro-op is single-stepped (quiesce mode)
+  val cf_ras_pred_xdom        = Bool()      // ret whose RAS-predicted top was cross-domain (doc 67 Part B); RAS edge raised at ret-mispredict in ROB
 
   // Bitmap of all pipeline modules this uop has visited (one bit per module, see CoreFuzzingConstants)
   val cf_fu_bitmap            = UInt(numModules.W)

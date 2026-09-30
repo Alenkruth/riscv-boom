@@ -625,6 +625,33 @@ class Rob(
       }
     }
 
+    // [RASGATE doc 67 Part B] RAS cross-domain edge, MISPREDICT-GATED. The fetch-time
+    // ras_domain_mismatch influencer was removed (it fired on every benign cross-domain
+    // call = co-location pollution). Raise INFL_RAS_STATE only when a ret whose RAS-predicted
+    // top was cross-domain (cf_ras_pred_xdom, set in fetch-buffer) actually MISPREDICTS --
+    // a real ret2spec. is_atk = the ret was fetched in the victim domain (cf_domain_id==0):
+    // a victim ret steered to an attacker-controlled target. op_count 0, like the old edge.
+    when (io.brupdate.b2.mispredict &&
+          MatchBank(GetBankIdx(io.brupdate.b2.uop.rob_idx))) {
+      val ras_ridx = GetRowIdx(io.brupdate.b2.uop.rob_idx)
+      when (rob_val(ras_ridx) && rob_uop(ras_ridx).cf_ras_pred_xdom) {
+        val ras_base = PopCount(VecInit(rob_uop(ras_ridx).cf_influencer_list.map(_.valid)))
+        when (ras_base < numInfluencerSlotsCF.U) {
+          for (k <- 0 until numInfluencerSlotsCF) {
+            when (ras_base === k.U) {
+              rob_uop(ras_ridx).cf_influencer_list(k).valid     := true.B
+              rob_uop(ras_ridx).cf_influencer_list(k).op_count  := 0.U
+              rob_uop(ras_ridx).cf_influencer_list(k).infl_type := INFL_RAS_STATE.U
+              rob_uop(ras_ridx).cf_influencer_list(k).is_atk    := (rob_uop(ras_ridx).cf_domain_id === 0.U)
+              rob_uop(ras_ridx).cf_influencer_list(k).is_secret := false.B
+            }
+          }
+        } .otherwise {
+          rob_uop(ras_ridx).cf_infl_dropped := SatDropped(rob_uop(ras_ridx).cf_infl_dropped, 1.U)
+        }
+      }
+    }
+
     for (upd <- io.cf_lsu_s_tx_upd) {
       when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx))) {
         val cidx = GetRowIdx(upd.bits.rob_idx)
