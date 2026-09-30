@@ -1324,48 +1324,41 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     RegEnable(rob.io.rob_head_is_secret,dis_valids(w) && !dis_fire(w) && ren_stalls(w)))
   for (w <- 0 until coreWidth) {
     val pre = rename_stage.io.ren2_uops(w)  // cycle-free base
-    // Taint paths:
-    //   is_any_tainted  — tainted source from OTHER domain (domain=0 instr reading atk-written reg):
-    //                     fires INFL_REG_DATAFLOW with is_atk=true (cross-domain attack influence).
-    //   is_sec_tainted  — tainted source that had s_acc/s_prop: fires cf_secret_propagation.
-    //                     NO domain gate: attacker instructions propagating secret data also get s_prop.
-    //   reg_df_fire     — fires INFL_REG_DATAFLOW for BOTH cross-domain and same-domain-secret cases.
-    //   reg_df_is_atk   — true ONLY for cross-domain cases (is_any_tainted). Same-domain secret
-    //                     propagation uses is_atk=false, is_secret=true to distinguish it clearly.
-    //   preg_src_secret — source preg was secret-tainted in-flight (preg_secret set, taint_table not yet).
-    //                     Catches the case where producer's TLB fired AFTER consumer's dispatch but
-    //                     BEFORE consumer's dispatch checks. Fires separate candidate with op_count=0.
-    val is_any_tainted  = dis_uops(w).cf_src_tainted && dis_uops(w).cf_domain_id === 0.U
-    val is_sec_tainted  = dis_uops(w).cf_src_tainted && dis_uops(w).cf_taint_producer_is_secret
-    val reg_df_fire     = is_any_tainted || is_sec_tainted
-    val reg_df_is_atk   = is_any_tainted && dis_uops(w).cf_taint_producer_is_atk
-    // In-flight preg_secret: check at dispatch whether source regs are already secret-tainted
-    // (set by TLB stage of an in-flight producer that hasn't committed yet).
-    // Only fire if not already covered by reg_df_fire (avoids duplicate INFL_REG_DATAFLOW entries).
-    val fpre = if (usingFPU) fp_rename_stage.io.ren2_uops(w) else NullMicroOp()
-    val preg_src_secret_int = preg_secret(pre.prs1) || preg_secret(pre.prs2)
-    val preg_src_secret_fp  = if (usingFPU) {
-      (fp_preg_secret(fpre.prs1) && (dis_uops(w).lrs1_rtype === RT_FLT)) ||
-      (fp_preg_secret(fpre.prs2) && (dis_uops(w).lrs2_rtype === RT_FLT)) ||
-      (fp_preg_secret(fpre.prs3) && dis_uops(w).frs3_en)
-    } else false.B
-    val preg_src_secret = preg_src_secret_int || preg_src_secret_fp
-    val preg_only_fire  = preg_src_secret && !reg_df_fire
+    // corefuzzing: REG_DATAFLOW is no longer raised here.  It was driven from the
+    // rename-stage taint/producer tables, which are gone (taint-follows-data).  The
+    // influencer is now raised at WRITEBACK, when the taint actually arrives with the
+    // value: core.scala's cf_s_prop_rob_upd sets the ROB row's sprob pending bit and
+    // rob.scala drains it into an INFL_REG_DATAFLOW entry.  Dispatch is too early to
+    // know the taint, which is precisely why the table version needed speculation.
 
     // Fix 2: implicit flow via secret-dependent branch also sets s_prop.
     // cf_spec_branch_is_secret=true means an outstanding branch in br_mask was itself
     // s_acc or s_prop; this instruction's execution path encodes the secret outcome.
-    when (is_sec_tainted || preg_src_secret || dis_uops(w).cf_spec_branch_is_secret) {
+    when (dis_uops(w).cf_spec_branch_is_secret || cf_ctrl_secret_ctx) {
       dis_uops(w).cf_secret_propagation := true.B
     }
+    // (no context-based attacker marking -- see the note at the brinfos loop)
+    // FIX 2: the implicit tag now carries an EDGE.  Previously this set s_prop with no
+    // influencer, so downstream could not tell control-dependence from observability
+    // taint -- which is exactly why it could not be used to separate the true sink
+    // store from the false spill.  INFL_CONTROL_FLOW is an OBSERVABILITY-class edge in
+    // ift_semantics terms: no bits move, the path itself carries the secret.
 
     // Steps 1–5: inject dispatch-level influencers in parallel using addInfluencerBatch.
     // All candidates are evaluated from the same base (pre) simultaneously.
     // Step 6 (INFL_ISSUE_CONTENTION) is injected at issue time via ROB update bus.
     // G-HOL fix: also fire when the queue head carries secret taint (same-domain case)
-    val dis_hol_ldq = dis_fire(w) && dis_uops(w).uses_ldq && io.lsu.ldq_head_valid &&
+    // [HOLFIX 2026-09-08] Added `*_head_blocked`.  The old condition asked only whether a
+    // cross-domain op was PRESENT at the queue head -- and asked it on dis_fire, which is
+    // true exactly when this uop was NOT blocked.  So the edge fired on coexistence, never
+    // on blocking, and the attacker's loads sit at the LDQ head continuously: control PC
+    // 0x800016c4 came out 637/644 attacker-influenced with every edge ty3 MEM_HOL.
+    // Being at the head means nothing unless the head is actually holding the line, so the
+    // head must not yet have succeeded.  INFL_LDQ_FULL(6) remains the separate, structural
+    // "could not allocate" channel -- this one is specifically "the head is stuck".
+    val dis_hol_ldq = dis_fire(w) && dis_uops(w).uses_ldq && io.lsu.ldq_head_blocked &&
                       (io.lsu.ldq_head_domain =/= dis_uops(w).cf_domain_id || io.lsu.ldq_head_is_secret)
-    val dis_hol_stq = dis_fire(w) && dis_uops(w).uses_stq && io.lsu.stq_head_valid &&
+    val dis_hol_stq = dis_fire(w) && dis_uops(w).uses_stq && io.lsu.stq_head_blocked &&
                       (io.lsu.stq_head_domain =/= dis_uops(w).cf_domain_id || io.lsu.stq_head_is_secret)
     val dis_hol_any   = dis_hol_ldq || dis_hol_stq
     val hol_head_op   = Mux(dis_hol_ldq, io.lsu.ldq_head_op_count,      io.lsu.stq_head_op_count)

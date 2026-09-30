@@ -154,9 +154,27 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   val stq_head_is_secret = Output(Bool())      // stq_head had s_acc=1 or s_prop=1
   val ldq_head_valid     = Output(Bool())      // ldq_head entry is occupied
   val stq_head_valid     = Output(Bool())      // stq_head entry is occupied
+  // [HOLFIX 2026-09-08] Occupied is NOT blocking.  INFL_MEM_HOL previously fired whenever
+  // a cross-domain op merely SAT at the queue head while a victim dispatched -- and it
+  // fired on dis_fire, i.e. exactly when the victim was NOT blocked.  Pure coexistence,
+  // no mechanism.  MEASURED consequence: control PC 0x800016c4 was 637/644 "attacker
+  // influenced" and every single edge was ty3 MEM_HOL.
+  // These say the head has NOT completed, so entries behind it genuinely cannot retire --
+  // which is what head-of-line blocking means.
+  val ldq_head_blocked   = Output(Bool())      // head occupied AND not yet succeeded
+  val stq_head_blocked   = Output(Bool())      // head occupied AND not yet succeeded
+  // corefuzzing: how long the CURRENT stq_head entry has occupied the head, in cycles
+  // (saturating).  The STQ drains in order from the head, and a load's st_dep_mask bits
+  // clear only as stq_head advances (lsu.scala st_dep_mask update), so a store parked at
+  // the head genuinely holds younger loads AND younger stores.  This is the head-of-line
+  // duration that INFL_MEM_HOL never carried.  Residency only -- the consumer's domain is
+  // not known here, so the core applies the cross-domain/secret test at capture.
+  val stq_hol_cycles     = Output(UInt(6.W))
   // corefuzzing: TLB-stage FTQ secret updates — fires when s_acc determined at address resolution
   // One port per memWidth; fires even for speculatively-executed (later squashed) memory ops
   val cf_secret_ftq_updates = Output(Vec(memWidth, Valid(UInt(log2Ceil(ftqSz).W))))
+  // [MEMORD 2026-09-08] ty=8 MEM_ORDER edge -> ROB, so it survives the order-fail flush.
+  val cf_memord_upd = Output(Vec(memWidth, Valid(new CF_MemOrdUpdate)))
   // corefuzzing: direct ROB s_acc update at TLB stage — sets cf_secret_access in the ROB entry
   // immediately when the effective address is found to be in the secret range, without waiting
   // for the dcache response.  Enables correct s_acc in [FLUSH] for speculative secret loads.
@@ -538,6 +556,21 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     stq(stq_head).bits.uop.cf_secret_access || stq(stq_head).bits.uop.cf_secret_propagation, false.B)
   io.core.ldq_head_valid     := ldq(ldq_head).valid
   io.core.stq_head_valid     := stq(stq_head).valid
+  // [HOLFIX] `succeeded` = the D$ has acked; until then the head holds the line.
+  io.core.ldq_head_blocked   := ldq(ldq_head).valid && !ldq(ldq_head).bits.succeeded
+  io.core.stq_head_blocked   := stq(stq_head).valid && !stq(stq_head).bits.succeeded
+  // corefuzzing: head-of-line residency counter.  ONE counter for the whole LSU -- it
+  // tracks the head slot, not per-entry -- so this is 6 flops plus a compare, not
+  // numStqEntries counters.  Reset when the head advances; saturate rather than wrap so
+  // a long block reads as ">32" after Log2Bucket instead of aliasing to a small value.
+  val stq_hol_cycles_r = RegInit(0.U(6.W))
+  val stq_head_prev    = RegNext(stq_head)
+  when (stq_head =/= stq_head_prev) {
+    stq_hol_cycles_r := 0.U
+  } .elsewhen (stq(stq_head).valid) {
+    stq_hol_cycles_r := Mux(stq_hol_cycles_r === 63.U, 63.U, stq_hol_cycles_r + 1.U)
+  }
+  io.core.stq_hol_cycles     := stq_hol_cycles_r
 
   io.dmem.force_order   := io.core.fence_dmem
   io.core.fencei_rdy    := !stq_nonempty && io.dmem.ordered
