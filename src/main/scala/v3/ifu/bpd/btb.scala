@@ -178,9 +178,9 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   if (ENABLE_CF_DEBUG_PRINTF) {
     for (w <- 0 until bankWidth) {
       when (s1_hits(w) && (s1_domain === 1.U || s1_req_rdomain(s1_hit_ways(w))(w) === 1.U)) {
-        printf("\n[BTBMH] w=%d edom=%d fdom=%d mism=%d\n",
-          w.U, s1_req_rdomain(s1_hit_ways(w))(w), s1_domain,
-          (s1_req_rdomain(s1_hit_ways(w))(w) =/= s1_domain))
+        // [CFNOISE-COMMENTED] printf("\n[BTBMH] w=%d edom=%d fdom=%d mism=%d\n",
+          // [CFNOISE-COMMENTED] w.U, s1_req_rdomain(s1_hit_ways(w))(w), s1_domain,
+          // [CFNOISE-COMMENTED] (s1_req_rdomain(s1_hit_ways(w))(w) =/= s1_domain))
       }
     }
   }

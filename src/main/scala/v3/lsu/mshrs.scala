@@ -320,10 +320,10 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     // secret=1 and oc=0 (seen in t38 pre-MEMIDFIX) had no owning op.  RESOLVED: same
     // root cause as the attacker-load bug; t38 now shows secret=1 oc=1169/1879.
     if (ENABLE_CF_DEBUG_PRINTF) {
-      printf("\n[MSHRALLOC] domain=%d sec=%d oc=%d cmd=%d pf=%d isread=%d iswrite=%d\n",
-        io.req.uop.cf_domain_id, io.req.uop.cf_secret_access, io.req.uop.cf_op_count_id,
-        io.req.uop.mem_cmd, isPrefetch(io.req.uop.mem_cmd),
-        isRead(io.req.uop.mem_cmd), isWrite(io.req.uop.mem_cmd))
+      // [CFNOISE-COMMENTED] printf("\n[MSHRALLOC] domain=%d sec=%d oc=%d cmd=%d pf=%d isread=%d iswrite=%d\n",
+        // [CFNOISE-COMMENTED] io.req.uop.cf_domain_id, io.req.uop.cf_secret_access, io.req.uop.cf_op_count_id,
+        // [CFNOISE-COMMENTED] io.req.uop.mem_cmd, isPrefetch(io.req.uop.mem_cmd),
+        // [CFNOISE-COMMENTED] isRead(io.req.uop.mem_cmd), isWrite(io.req.uop.mem_cmd))
     }
     req := io.req
     val old_coh   = io.req.old_meta.coh

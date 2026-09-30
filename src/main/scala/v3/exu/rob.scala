@@ -475,12 +475,12 @@ class Rob(
       // (the first, kill-clears-pending, is [A6PROBE] at the kill site).
       if (ENABLE_CF_DEBUG_PRINTF) {
         when (ift_squash_pending(rob_tail) && io.cf_debug_rob_enable) {
-          printf("[A6PROBE2] reuse-before-squash-drain row=%d old_pc=0x%x old_oc=%d s_acc=%d s_prop=%d s_tx=%d infl_valid=%d new_pc=0x%x\n",
-            rob_tail, rob_uop(rob_tail).debug_pc, rob_uop(rob_tail).cf_op_count_id,
-            rob_uop(rob_tail).cf_secret_access, rob_uop(rob_tail).cf_secret_propagation,
-            rob_uop(rob_tail).cf_secret_transmission,
-            PopCount(VecInit(rob_uop(rob_tail).cf_influencer_list.map(_.valid))),
-            io.enq_uops(w).debug_pc)
+          // [CFNOISE-COMMENTED] printf("[A6PROBE2] reuse-before-squash-drain row=%d old_pc=0x%x old_oc=%d s_acc=%d s_prop=%d s_tx=%d infl_valid=%d new_pc=0x%x\n",
+            // [CFNOISE-COMMENTED] rob_tail, rob_uop(rob_tail).debug_pc, rob_uop(rob_tail).cf_op_count_id,
+            // [CFNOISE-COMMENTED] rob_uop(rob_tail).cf_secret_access, rob_uop(rob_tail).cf_secret_propagation,
+            // [CFNOISE-COMMENTED] rob_uop(rob_tail).cf_secret_transmission,
+            // [CFNOISE-COMMENTED] PopCount(VecInit(rob_uop(rob_tail).cf_influencer_list.map(_.valid))),
+            // [CFNOISE-COMMENTED] io.enq_uops(w).debug_pc)
         }
       }
       // IFT bridge: clear stale squash-pending bit so an old killed entry doesn't
@@ -1075,12 +1075,12 @@ class Rob(
           if (ENABLE_CF_DEBUG_PRINTF) {
             when (rob_val(i) && io.cf_debug_rob_enable &&
                   (sprob_infl_pending(i) || ic_pending_valid(i) || wb_infl_pending(i))) {
-              printf("[A6PROBE] kill-with-pending pc=0x%x oc=%d sprob=%d ic=%d wb=%d wb_valid=%d s_acc=%d s_prop=%d s_tx=%d\n",
-                rob_uop(i).debug_pc, rob_uop(i).cf_op_count_id,
-                sprob_infl_pending(i), ic_pending_valid(i), wb_infl_pending(i),
-                PopCount(VecInit(wb_infl_list(i).map(_.valid))),
-                rob_uop(i).cf_secret_access, rob_uop(i).cf_secret_propagation,
-                rob_uop(i).cf_secret_transmission)
+              // [CFNOISE-COMMENTED] printf("[A6PROBE] kill-with-pending pc=0x%x oc=%d sprob=%d ic=%d wb=%d wb_valid=%d s_acc=%d s_prop=%d s_tx=%d\n",
+                // [CFNOISE-COMMENTED] rob_uop(i).debug_pc, rob_uop(i).cf_op_count_id,
+                // [CFNOISE-COMMENTED] sprob_infl_pending(i), ic_pending_valid(i), wb_infl_pending(i),
+                // [CFNOISE-COMMENTED] PopCount(VecInit(wb_infl_list(i).map(_.valid))),
+                // [CFNOISE-COMMENTED] rob_uop(i).cf_secret_access, rob_uop(i).cf_secret_propagation,
+                // [CFNOISE-COMMENTED] rob_uop(i).cf_secret_transmission)
             }
           }
           // corefuzzing: clear pending influencer bits so the drain doesn't

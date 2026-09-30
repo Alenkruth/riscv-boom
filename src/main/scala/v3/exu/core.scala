@@ -242,14 +242,14 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   if (ENABLE_CF_DEBUG_PRINTF) {
     when (b2.mispredict) {
       // Print: PC, inst, cfi_type, br_tag, rob_idx, taken, jalr_target (if any)
-      printf("[SPECULATIVE][MISPREDICT] pc=0x%x inst=0x%x cfi=%d br_tag=%d rob_idx=%d taken=%d target=0x%x\n",
-        Sext.apply(oldest_mispredict.uop.debug_pc(vaddrBits-1,0), xLen),
-        oldest_mispredict.uop.debug_inst,
-        oldest_mispredict.cfi_type,
-        oldest_mispredict.uop.br_tag,
-        oldest_mispredict.uop.rob_idx,
-        oldest_mispredict.taken,
-        b2.jalr_target)
+      // [CFNOISE-COMMENTED] printf("[SPECULATIVE][MISPREDICT] pc=0x%x inst=0x%x cfi=%d br_tag=%d rob_idx=%d taken=%d target=0x%x\n",
+        // [CFNOISE-COMMENTED] Sext.apply(oldest_mispredict.uop.debug_pc(vaddrBits-1,0), xLen),
+        // [CFNOISE-COMMENTED] oldest_mispredict.uop.debug_inst,
+        // [CFNOISE-COMMENTED] oldest_mispredict.cfi_type,
+        // [CFNOISE-COMMENTED] oldest_mispredict.uop.br_tag,
+        // [CFNOISE-COMMENTED] oldest_mispredict.uop.rob_idx,
+        // [CFNOISE-COMMENTED] oldest_mispredict.taken,
+        // [CFNOISE-COMMENTED] b2.jalr_target)
     }
   }
 
@@ -535,11 +535,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // emitted, so neither the printf nor its argument cone reaches synthesis.
   if (ENABLE_CF_DEBUG_PRINTF) {
     when (cf_quiesce_core || qs_state =/= QS_IDLE) {
-      printf("[QS] st=%d af=%d sf=%d fc=%d rc=%d pds=%d (rob=%d lsq=%d nmem=%d fri=%d fb=%d dec=%d dis=%d) flush=%d fp=%d\n",
-        qs_state, allow_fetch, qs_saw_flush, qs_fetch_cnt, qs_retry_cnt, pipeline_drained_strict,
-        rob.io.empty, io.lsu.queues_empty, io.lsu.no_pending_mem, io.lsu.fencei_rdy,
-        fetch_buffer_empty, decode_stage_empty, dispatch_stage_empty,
-        rob.io.flush.valid, io.ifu.fetchpacket.valid)
+      // [CFNOISE-COMMENTED] printf("[QS] st=%d af=%d sf=%d fc=%d rc=%d pds=%d (rob=%d lsq=%d nmem=%d fri=%d fb=%d dec=%d dis=%d) flush=%d fp=%d\n",
+        // [CFNOISE-COMMENTED] qs_state, allow_fetch, qs_saw_flush, qs_fetch_cnt, qs_retry_cnt, pipeline_drained_strict,
+        // [CFNOISE-COMMENTED] rob.io.empty, io.lsu.queues_empty, io.lsu.no_pending_mem, io.lsu.fencei_rdy,
+        // [CFNOISE-COMMENTED] fetch_buffer_empty, decode_stage_empty, dispatch_stage_empty,
+        // [CFNOISE-COMMENTED] rob.io.flush.valid, io.ifu.fetchpacket.valid)
     }
   }
 
@@ -1015,14 +1015,14 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
         uop.cf_influencer_list(k).is_atk,
         uop.cf_influencer_list(k).is_secret
       ))
-      printf(decFlushFmt, (Seq[Bits](
-        Sext(uop.debug_pc(vaddrBits-1,0), xLen), uop.debug_inst,
-        uop.cf_domain_id, uop.cf_speculated, uop.cf_attacker_influence,
-        uop.cf_secret_access, uop.cf_secret_propagation, uop.cf_secret_transmission,
-        uop.cf_op_count_id, uop.cf_spec_branch_is_atk, uop.cf_spec_branch_op_id,
-        fl, floc,
-        uop.cf_fu_bitmap, 1.U, inflBitmapFromList(uop.cf_influencer_list), uop.cf_infl_dropped, uop.cf_cntd_deny_count, uop.cf_stall_cycles_rob, uop.cf_stall_cycles_stq, uop.cf_infl_oc_aliased
-      ) ++ inflArgs): _*)
+      // [CFNOISE-COMMENTED] printf(decFlushFmt, (Seq[Bits](
+        // [CFNOISE-COMMENTED] Sext(uop.debug_pc(vaddrBits-1,0), xLen), uop.debug_inst,
+        // [CFNOISE-COMMENTED] uop.cf_domain_id, uop.cf_speculated, uop.cf_attacker_influence,
+        // [CFNOISE-COMMENTED] uop.cf_secret_access, uop.cf_secret_propagation, uop.cf_secret_transmission,
+        // [CFNOISE-COMMENTED] uop.cf_op_count_id, uop.cf_spec_branch_is_atk, uop.cf_spec_branch_op_id,
+        // [CFNOISE-COMMENTED] fl, floc,
+        // [CFNOISE-COMMENTED] uop.cf_fu_bitmap, 1.U, inflBitmapFromList(uop.cf_influencer_list), uop.cf_infl_dropped, uop.cf_cntd_deny_count, uop.cf_stall_cycles_rob, uop.cf_stall_cycles_stq, uop.cf_infl_oc_aliased
+      // [CFNOISE-COMMENTED] ) ++ inflArgs): _*)
     }
     for (w <- 0 until coreWidth) {
       // corefuzzing [FLUSH] decode-stage log — compile-time gated (see ENABLE_CF_DEBUG_PRINTF).
@@ -1086,8 +1086,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   cf_ill_cyc := cf_ill_cyc + 1.U
   for (w <- 0 until coreWidth) {
     when (dec_xcpts(w)) {
-      printf("[ILL] cyc=%d pc=0x%x inst=0x%x cause=%d\n",
-             cf_ill_cyc, dec_uops(w).debug_pc, dec_uops(w).inst, dec_uops(w).exc_cause)
+      // [CFNOISE-COMMENTED] printf("[ILL] cyc=%d pc=0x%x inst=0x%x cause=%d\n",
+             // [CFNOISE-COMMENTED] cf_ill_cyc, dec_uops(w).debug_pc, dec_uops(w).inst, dec_uops(w).exc_cause)
     }
   }
 
@@ -2373,7 +2373,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
         // corefuzzing
         // Print single-step flag for debug
         when (rob.io.commit.uops(w).cf_single_step) {
-          printf(" [SSTEP]")
+          // [CFNOISE-COMMENTED] printf(" [SSTEP]")
         }
         */
 
@@ -2463,7 +2463,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
           // Print the single-step marker separately (preserves prior visible tag)
           when (rob.io.commit.uops(w).cf_single_step) {
-            printf("[SSTEP] ")
+            // [CFNOISE-COMMENTED] printf("[SSTEP] ")
           }
 
           // [CNTDPROBE 2026-09-10] TEMPORARY -- proof obligation for deleting the
@@ -2544,10 +2544,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
         //   printf("%x", new_ghist(globalHistoryLength-i-1))
         // }
         // printf("\n")
-        printf("%x %x %x %x %x %x\n",
-          rob.io.commit.uops(w).debug_fsrc, rob.io.commit.uops(w).taken,
-          rob.io.commit.uops(w).is_br, rob.io.commit.uops(w).is_jal,
-          rob.io.commit.uops(w).is_jalr, Sext(rob.io.commit.uops(w).debug_pc(vaddrBits-1,0), xLen))
+        // [CFNOISE-COMMENTED] printf("%x %x %x %x %x %x\n",
+          // [CFNOISE-COMMENTED] rob.io.commit.uops(w).debug_fsrc, rob.io.commit.uops(w).taken,
+          // [CFNOISE-COMMENTED] rob.io.commit.uops(w).is_br, rob.io.commit.uops(w).is_jal,
+          // [CFNOISE-COMMENTED] rob.io.commit.uops(w).is_jalr, Sext(rob.io.commit.uops(w).debug_pc(vaddrBits-1,0), xLen))
 
       }
       new_ghist = Mux(rob.io.commit.arch_valids(w) && rob.io.commit.uops(w).is_br,

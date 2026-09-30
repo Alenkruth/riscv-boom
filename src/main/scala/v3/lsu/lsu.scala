@@ -1109,7 +1109,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     // emitted, so neither the printf nor its argument cone reaches synthesis.
     if (ENABLE_CF_DEBUG_PRINTF) {
       when (io.dmem.req.valid && (io.dmem.req.bits(w).bits.addr === 0.U) && io.core.cf_debug_lsu_enable) {
-          printf("[LSU] lsu out valid and dmem.req.bits(%d).bits.addr - 0x%x\n", w.U, io.dmem.req.bits(w).bits.addr)
+          // [CFNOISE-COMMENTED] printf("[LSU] lsu out valid and dmem.req.bits(%d).bits.addr - 0x%x\n", w.U, io.dmem.req.bits(w).bits.addr)
       }
     }
   }
@@ -1947,10 +1947,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // The general hole -- no logging for ANY exception-squashed uop -- is a separate,
   // larger fix (emit a record on the s_rollback walk) and is written up as such.
   when (ld_xcpt_valid) {
-    val mo = io.core.cf_memord_upd(0)
-    printf("[MEMORD] order_fail rob_idx=%d ldq_head=%d oc=%d prod_oc=%d atk=%d sec=%d valid=%d\n",
-      ld_xcpt_uop.rob_idx, ldq_head, ld_xcpt_uop.cf_op_count_id,
-      mo.bits.prod_op_count, mo.bits.is_atk, mo.bits.is_secret, mo.valid)
+    // [CFNOISE-COMMENTED] val mo = io.core.cf_memord_upd(0)
+    // [CFNOISE-COMMENTED] printf("[MEMORD] order_fail rob_idx=%d ldq_head=%d oc=%d prod_oc=%d atk=%d sec=%d valid=%d\n",
+      // [CFNOISE-COMMENTED] ld_xcpt_uop.rob_idx, ldq_head, ld_xcpt_uop.cf_op_count_id,
+      // [CFNOISE-COMMENTED] mo.bits.prod_op_count, mo.bits.is_atk, mo.bits.is_secret, mo.valid)
   }
 
 
@@ -2410,8 +2410,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         val addr   = Mux(commit_store, stq(idx).bits.addr.bits, ldq(idx).bits.addr.bits)
         val stdata = Mux(commit_store, stq(idx).bits.data.bits, 0.U)
         val wbdata = Mux(commit_store, stq(idx).bits.debug_wb_data, ldq(idx).bits.debug_wb_data)
-        printf("MT %x %x %x %x %x %x %x\n",
-          io.core.tsc_reg, uop.uopc, uop.mem_cmd, uop.mem_size, addr, stdata, wbdata)
+        // [CFNOISE-COMMENTED] printf("MT %x %x %x %x %x %x %x\n",
+          // [CFNOISE-COMMENTED] io.core.tsc_reg, uop.uopc, uop.mem_cmd, uop.mem_size, addr, stdata, wbdata)
       }
     }
 

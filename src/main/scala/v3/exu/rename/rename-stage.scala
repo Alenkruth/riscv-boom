@@ -165,14 +165,14 @@ abstract class AbstractRenameStage(
           ren_fu.cf_influencer_list(k).is_atk,
           ren_fu.cf_influencer_list(k).is_secret
         ))
-        printf(renBrFmt, (Seq[Bits](
-          Sext.apply(ren_fu.debug_pc(vaddrBits-1,0), xLen), ren_fu.debug_inst,
-          ren_fu.cf_domain_id, ren_fu.cf_speculated, ren_fu.cf_attacker_influence,
-          ren_fu.cf_secret_access, ren_fu.cf_secret_propagation, ren_fu.cf_secret_transmission,
-          ren_fu.cf_op_count_id, ren_fu.cf_spec_branch_is_atk, ren_fu.cf_spec_branch_op_id,
-          fl_cross_domain, fl_op_count,
-          ren_fu.cf_fu_bitmap, 2.U, inflBitmapFromList(ren_fu.cf_influencer_list), ren_fu.cf_infl_dropped, ren_fu.cf_cntd_deny_count, ren_fu.cf_stall_cycles_rob, ren_fu.cf_stall_cycles_stq, ren_fu.cf_infl_oc_aliased
-        ) ++ renBrArgs): _*)
+        // [CFNOISE-COMMENTED] printf(renBrFmt, (Seq[Bits](
+          // [CFNOISE-COMMENTED] Sext.apply(ren_fu.debug_pc(vaddrBits-1,0), xLen), ren_fu.debug_inst,
+          // [CFNOISE-COMMENTED] ren_fu.cf_domain_id, ren_fu.cf_speculated, ren_fu.cf_attacker_influence,
+          // [CFNOISE-COMMENTED] ren_fu.cf_secret_access, ren_fu.cf_secret_propagation, ren_fu.cf_secret_transmission,
+          // [CFNOISE-COMMENTED] ren_fu.cf_op_count_id, ren_fu.cf_spec_branch_is_atk, ren_fu.cf_spec_branch_op_id,
+          // [CFNOISE-COMMENTED] fl_cross_domain, fl_op_count,
+          // [CFNOISE-COMMENTED] ren_fu.cf_fu_bitmap, 2.U, inflBitmapFromList(ren_fu.cf_influencer_list), ren_fu.cf_infl_dropped, ren_fu.cf_cntd_deny_count, ren_fu.cf_stall_cycles_rob, ren_fu.cf_stall_cycles_stq, ren_fu.cf_infl_oc_aliased
+        // [CFNOISE-COMMENTED] ) ++ renBrArgs): _*)
       }
     }
 
@@ -190,14 +190,14 @@ abstract class AbstractRenameStage(
             r_uop.cf_influencer_list(k).is_atk,
             r_uop.cf_influencer_list(k).is_secret
           ))
-          printf(renKillFmt, (Seq[Bits](
-            Sext.apply(r_uop.debug_pc(vaddrBits-1,0), xLen), r_uop.debug_inst,
-            r_uop.cf_domain_id, r_uop.cf_speculated, r_uop.cf_attacker_influence,
-            r_uop.cf_secret_access, r_uop.cf_secret_propagation, r_uop.cf_secret_transmission,
-            r_uop.cf_op_count_id, r_uop.cf_spec_branch_is_atk, r_uop.cf_spec_branch_op_id,
-            0.U, 0.U,  // fl=0 floc=0: ROB flush has no flushing branch
-            r_uop.cf_fu_bitmap, 2.U, inflBitmapFromList(r_uop.cf_influencer_list), r_uop.cf_infl_dropped, r_uop.cf_cntd_deny_count, r_uop.cf_stall_cycles_rob, r_uop.cf_stall_cycles_stq, r_uop.cf_infl_oc_aliased
-          ) ++ renKillArgs): _*)
+          // [CFNOISE-COMMENTED] printf(renKillFmt, (Seq[Bits](
+            // [CFNOISE-COMMENTED] Sext.apply(r_uop.debug_pc(vaddrBits-1,0), xLen), r_uop.debug_inst,
+            // [CFNOISE-COMMENTED] r_uop.cf_domain_id, r_uop.cf_speculated, r_uop.cf_attacker_influence,
+            // [CFNOISE-COMMENTED] r_uop.cf_secret_access, r_uop.cf_secret_propagation, r_uop.cf_secret_transmission,
+            // [CFNOISE-COMMENTED] r_uop.cf_op_count_id, r_uop.cf_spec_branch_is_atk, r_uop.cf_spec_branch_op_id,
+            // [CFNOISE-COMMENTED] 0.U, 0.U,  // fl=0 floc=0: ROB flush has no flushing branch
+            // [CFNOISE-COMMENTED] r_uop.cf_fu_bitmap, 2.U, inflBitmapFromList(r_uop.cf_influencer_list), r_uop.cf_infl_dropped, r_uop.cf_cntd_deny_count, r_uop.cf_stall_cycles_rob, r_uop.cf_stall_cycles_stq, r_uop.cf_infl_oc_aliased
+          // [CFNOISE-COMMENTED] ) ++ renKillArgs): _*)
         }
       }
       r_valid := false.B
