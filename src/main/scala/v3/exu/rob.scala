@@ -1084,6 +1084,52 @@ class Rob(
         rob_uop(rob_row).cf_fu_bitmap :=
           rob_uop(rob_row).cf_fu_bitmap | wb_uop_i.cf_fu_bitmap
         when (wb_uop_i.cf_attacker_influence)  { rob_uop(rob_row).cf_attacker_influence   := true.B }
+        // [GHISTFIELD] carry the GHR window counters; take the LARGER value, which is the
+        // more recent arming (the counter is set to globalHistoryLength and decays).
+        when (wb_uop_i.cf_atk_branch_ctr > rob_uop(rob_row).cf_atk_branch_ctr) {
+          rob_uop(rob_row).cf_atk_branch_ctr := wb_uop_i.cf_atk_branch_ctr }
+        when (wb_uop_i.cf_sec_branch_ctr > rob_uop(rob_row).cf_sec_branch_ctr) {
+          rob_uop(rob_row).cf_sec_branch_ctr := wb_uop_i.cf_sec_branch_ctr }
+        // [R0 2026-09-04] ATTACKER: record the RESULT's attacker taint on the instruction.
+        // Mirrors the secret side, which at writeback takes sec1 = wb.bits.secret and emits
+        // cf_s_prop_rob_upd (core.scala:2136-2152).  Before this, wbresp.bits.taint_atk had
+        // exactly ONE consumer -- the regfile write at core.scala:1949 -- so attacker taint
+        // flowed through FUs and registers but was NEVER recorded on any instruction: it was
+        // invisible in the commit log and could not seed spec_branch_atk_table.  That, not the
+        // memory round-trip, is why the whole spectre-v1 gadget logged atk=0.
+        // This is the VALUE's own taint (a specific channel), NOT an aggregate -- do not
+        // widen it to cf_attacker_influence || domain, which is how the secret side became
+        // an aggregate.  Gated on a real integer register write (mirrors core.scala's int_wb)
+        // so a store/branch cannot inherit a result taint that is not its own.
+        // The RESULT's attacker taint as WRITTEN TO THE REGISTER FILE.  Must mirror
+        // core.scala:1949 exactly:
+        //     taint_atk := wbresp.bits.taint_atk || (uop.cf_domain_id =/= 0.U)
+        // The ownership seed (|| domain) is applied AT THE REGFILE WRITE, not inside
+        // wbresp.bits.taint_atk.  A first version of this fix read the un-seeded
+        // wb_resps(i).bits.taint_atk and therefore recorded nothing for domain-1
+        // producers -- MEASURED: the dom-1 load feeding a0 (0x80003308) stayed atk=0.
+        // This is the SAME write event, not a downstream re-application of the OR
+        // (doc 16 sec.A forbids the latter, and that is what made the secret side an
+        // aggregate).  Recording it here means exactly: "this instruction produced a
+        // value the register file considers attacker-influenced".
+        val wb_res_atk = io.wb_resps(i).bits.taint_atk ||
+                         (wb_uop_i.cf_domain_id =/= 0.U)
+        // [FPRTYPE 2026-09-08] Was `dst_rtype === RT_FIX`, i.e. INTEGER DESTINATIONS ONLY.
+        // An FP instruction has dst_rtype === RT_FLT, so a `fadd.d` reading an
+        // attacker-tainted FP register could NEVER get cf_attacker_influence here, no
+        // matter how correct the FP datapath was.  MEASURED by t33_fp_atk_taint: the
+        // `fld` showed atk=1 (its flag is set in the LSU by the memdf influencer,
+        // lsu.scala:1919, and carried through by the ungated :1105 below), but both
+        // dependent `fadd.d` showed atk=0 while the control stayed clean.
+        // Every other link was already intact and verified: fregfile read port ->
+        // fregister_read rs1_taint_atk -> execution-unit:545 -> FPUUnit:879/899 ->
+        // execution-unit:606 fresp -> fp-pipeline:325 wakeup -> core:2088 wb_resps.
+        // This guard was the only break.  RT_FLT is the symmetric completion; rf_wen and
+        // ldst_val still gate, so stores/branches are excluded exactly as before.
+        when (wb_res_atk && wb_uop_i.rf_wen && wb_uop_i.ldst_val &&
+              (wb_uop_i.dst_rtype === RT_FIX || wb_uop_i.dst_rtype === RT_FLT)) {
+          rob_uop(rob_row).cf_attacker_influence := true.B
+        }
         when (wb_uop_i.cf_secret_access)       { rob_uop(rob_row).cf_secret_access        := true.B }
         when (wb_uop_i.cf_secret_transmission) { rob_uop(rob_row).cf_secret_transmission  := true.B }
         when (wb_uop_i.cf_secret_propagation)  { rob_uop(rob_row).cf_secret_propagation   := true.B }
