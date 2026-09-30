@@ -25,10 +25,12 @@ import boom.v3.util.{BoomCoreStringPrefix, appendModuleTag, addInfluencer, addIn
 // import test
 // import freechips.rocketchip.rocket.constants.CoreFuzzingConstants
 
-class BoomWritebackUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCacheModule()(p) {
+class BoomWritebackUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCacheModule()(p)
+  with HasBoomExtendedTag   // [reconf-fix] cfTagLSB / cfIdxLowBits
+{
   val io = IO(new Bundle {
-    val req = Flipped(Decoupled(new WritebackReq(edge.bundle))) // input
-    val meta_read = Decoupled(new L1MetaReadReq) // ready - in, rest - output
+    val req = Flipped(Decoupled(new BoomWritebackReq(edge.bundle))) // input
+    val meta_read = Decoupled(new BoomL1MetaRdReq) // ready - in, rest - output
     val resp = Output(Bool())
     val idx = Output(Valid(UInt()))
     val data_req = Decoupled(new L1DataReadReq) // ready - in, rest - output
@@ -39,7 +41,7 @@ class BoomWritebackUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1Hella
   })
 
   // refillCycles = cacheDataBeats (I think it is the number of cycles it takes to access an entire cache block)
-  val req = Reg(new WritebackReq(edge.bundle))
+  val req = Reg(new BoomWritebackReq(edge.bundle))
   val s_invalid :: s_fill_buffer :: s_lsu_release :: s_active :: s_grant :: Nil = Enum(5)
   val state = RegInit(s_invalid)
   val r1_data_req_fired = RegInit(false.B)
@@ -65,7 +67,9 @@ class BoomWritebackUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1Hella
   io.lsu_release.bits := DontCare
 
 
-  val r_address = Cat(req.tag, req.idx) << blockOffBits
+  // [reconf-fix] extended tag overlaps the full index on bits 12:10, so slice the index
+  // to its low log2(minSets)=4 bits: block addr = Cat(tag, idx[3:0]) (spec 31 overlap rule).
+  val r_address = Cat(req.tag, req.idx(log2Ceil(dcacheSetOptions.min)-1, 0)) << blockOffBits
   val id = cfg.nMSHRs
   val probeResponse = edge.ProbeAck(
                           fromSource = id.U,
@@ -147,13 +151,15 @@ class BoomWritebackUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1Hella
   }
 }
 
-class BoomProbeUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCacheModule()(p) {
+class BoomProbeUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCacheModule()(p)
+  with HasBoomExtendedTag   // [reconf-fix] cfTagLSB / cfIdxLowBits
+{
   val io = IO(new Bundle {
     val req = Flipped(Decoupled(new TLBundleB(edge.bundle)))
     val rep = Decoupled(new TLBundleC(edge.bundle))
-    val meta_read = Decoupled(new L1MetaReadReq)
-    val meta_write = Decoupled(new L1MetaWriteReq)
-    val wb_req = Decoupled(new WritebackReq(edge.bundle))
+    val meta_read = Decoupled(new BoomL1MetaRdReq)
+    val meta_write = Decoupled(new BoomL1MetaWriteReq)
+    val wb_req = Decoupled(new BoomWritebackReq(edge.bundle))
     val way_en = Input(UInt(nWays.W))
     val wb_rdy = Input(Bool()) // Is writeback unit currently busy? If so need to retry meta read when its done
     val mshr_rdy = Input(Bool()) // Is MSHR ready for this request to proceed?
@@ -176,7 +182,7 @@ class BoomProbeUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCach
   // E for errors and error signaling
   val req = Reg(new TLBundleB(edge.bundle))
   val req_idx = req.address(idxMSB, idxLSB)
-  val req_tag = req.address >> untagBits
+  val req_tag = req.address >> cfTagLSB   // [reconf-fix] extended tag
 
   val way_en = Reg(UInt())
   val tag_matches = way_en.orR
@@ -268,7 +274,118 @@ class BoomProbeUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCach
 }
 
 class BoomL1MetaReadReq(implicit p: Parameters) extends BoomBundle()(p) {
-  val req = Vec(memWidth, new L1MetaReadReq)
+  val req = Vec(memWidth, new BoomL1MetaRdReq)
+}
+
+// ==== [reconf-fix 2026-08-06] Extended tag for runtime set reconfiguration =========
+// See claude-artifacts/31-extended-tag-spec.md.
+//
+// PROBLEM: the index moves with the geometry (addr[12:6] & mask, dcacheMaskIdx) but
+// rocket's untagBits is pinned at 13, so for any geometry below 128 sets the bits
+// between the two boundaries (addr[12:10]) live in NEITHER the index nor the tag.
+// Two distinct blocks could then share (row, tag).  `full_idx_snap` existed as a
+// side-channel to recover that identity; it is deleted by this change.
+//
+// FIX: start the tag at the MINIMUM-geometry boundary, so it always covers every bit
+// above the smallest index.  cfTagLSB = blockOffBits + log2(min sets) = 6 + 4 = 10.
+//   Theorem 1 (identity): every mask is >= 0xF, so row[3:0] == addr[9:6] always;
+//     therefore block address == Cat(tag, row[3:0]) and (tag,row) is exact.
+//   Theorem 2 (victim):  a victim's full index == Cat(victim_tag[2:0], row[3:0]),
+//     which is how old_idx is derived now that full_idx_snap is gone.
+// OVERLAP RULE: tag covers addr[MSB:10] and the full index covers addr[12:6], so they
+// share bits 12:10.  Every address rebuilt from (tag, idx) must slice idx to its low
+// log2(minSets)=4 bits: Cat(tag, idx(3,0)).
+//
+// Cost: tag widens by 3 bits (+3Kbit) and full_idx_snap disappears (-7Kbit) => net less
+// hardware, no new pipeline stages.  BOOM-local: rocket-chip is not modified.  Rocket's
+// L1MetadataArray is generic over T <: L1Metadata, and a wider tag cannot be obtained by
+// subclassing L1Metadata, hence the local bundle + array copy below.
+trait HasBoomExtendedTag extends freechips.rocketchip.util.CoreFuzzingConstants {
+  this: HasL1HellaCacheParameters =>
+  def cfIdxLowBits = log2Ceil(dcacheSetOptions.min)               // 4
+  def cfTagLSB     = blockOffBits + cfIdxLowBits                  // 10
+  def cfTagBits    = paddrBits - cfTagLSB                         // 3 wider than tagBits
+}
+
+class BoomL1Metadata(implicit p: Parameters) extends L1HellaCacheBundle()(p)
+  with HasBoomExtendedTag
+{
+  val coh = new ClientMetadata
+  val tag = UInt(cfTagBits.W)
+}
+
+object BoomL1Metadata {
+  def apply(tag: Bits, coh: ClientMetadata)(implicit p: Parameters) = {
+    val meta = Wire(new BoomL1Metadata)
+    meta.tag := tag
+    meta.coh := coh
+    meta
+  }
+}
+
+class BoomL1MetaWriteReq(implicit p: Parameters) extends L1HellaCacheBundle()(p)
+  with HasBoomExtendedTag
+{
+  val idx    = UInt(idxBits.W)
+  val way_en = UInt(nWays.W)
+  val tag    = UInt(cfTagBits.W)
+  val data   = new BoomL1Metadata
+}
+
+// [reconf-fix] The extended tag also crosses module boundaries inside these bundles.
+// Rocket's versions pin `tag` to tagBits, and Chisel's := silently truncates/zero-extends
+// UInts, so leaving them would corrupt the tag WITHOUT any elaboration error.
+class BoomL1MetaRdReq(implicit p: Parameters) extends L1HellaCacheBundle()(p)
+  with HasBoomExtendedTag
+{
+  val idx    = UInt(idxBits.W)
+  val way_en = UInt(nWays.W)
+  val tag    = UInt(cfTagBits.W)
+}
+
+class BoomWritebackReq(val params: freechips.rocketchip.tilelink.TLBundleParameters)(implicit p: Parameters)
+  extends L1HellaCacheBundle()(p) with HasBoomExtendedTag
+{
+  val tag       = Bits(cfTagBits.W)
+  val idx       = Bits(idxBits.W)
+  val source    = UInt(params.sourceBits.W)
+  val param     = UInt(freechips.rocketchip.tilelink.TLPermissions.cWidth.W)
+  val way_en    = Bits(nWays.W)
+  val voluntary = Bool()
+}
+
+// Verbatim behaviour of rocket's L1MetadataArray (HellaCache.scala:360-393); the only
+// change is the relaxed type bound, since the array never inspects .tag/.coh -- it uses
+// cloneType/getWidth and io.read.bits.{idx,way_en} only.
+class BoomL1MetadataArray[T <: Data](onReset: () => T)(implicit p: Parameters)
+  extends L1HellaCacheModule()(p)
+{
+  val rstVal = onReset()
+  val io = IO(new Bundle {
+    val read  = Flipped(Decoupled(new BoomL1MetaRdReq))
+    val write = Flipped(Decoupled(new BoomL1MetaWriteReq))
+    val resp  = Output(Vec(nWays, rstVal.cloneType))
+  })
+
+  val rst_cnt = RegInit(0.U(log2Up(nSets+1).W))
+  val rst     = rst_cnt < nSets.U
+  val waddr   = Mux(rst, rst_cnt, io.write.bits.idx)
+  val wdata   = Mux(rst, rstVal, io.write.bits.data.asInstanceOf[T]).asUInt
+  val wmask   = Mux(rst || (nWays == 1).B, (-1).S, io.write.bits.way_en.asSInt).asBools
+  val rmask   = Mux(rst || (nWays == 1).B, (-1).S, io.read.bits.way_en.asSInt).asBools
+  when (rst) { rst_cnt := rst_cnt + 1.U }
+
+  val metabits  = rstVal.getWidth
+  val tag_array = SyncReadMem(nSets, Vec(nWays, UInt(metabits.W)))
+
+  val wen = rst || io.write.valid
+  when (wen) {
+    tag_array.write(waddr, VecInit.fill(nWays)(wdata), wmask)
+  }
+  io.resp := tag_array.read(io.read.bits.idx, io.read.fire).map(_.asTypeOf(chiselTypeOf(rstVal)))
+
+  io.read.ready  := !wen
+  io.write.ready := !rst
 }
 
 class BoomL1DataReadReq(implicit p: Parameters) extends BoomBundle()(p) {
@@ -330,12 +447,17 @@ class BoomDuplicatedDataArray(implicit p: Parameters) extends AbstractBoomDataAr
   val nBanks = 1 // adding to help with the prints during compile
   
   val waddr = io.write.bits.addr >> rowOffBits
-  val cf_idx_mask = -1.S(idxBits.W).asUInt
-  val cf_idx_z_mask = 0.U(idxBits.W)
-  val cf_set_mask = -1.S(5.W).asUInt
-  val cf_idx = ((waddr & cf_idx_mask) & cf_set_mask)(4, 0)
-  val cf_waddr_tagbits = waddr >> idxBits
-  val cf_waddr = (cf_waddr_tagbits << idxBits) | cf_idx 
+  // [dead-code 2026-08-13] cf_idx_mask / cf_set_mask / cf_idx / cf_waddr were computed here
+  // but NEVER USED -- the SRAM below is written with the raw `waddr`, which is already
+  // set-masked upstream by dcacheMaskAddr() (:683).  Kept as comments rather than deleted
+  // because the HARDCODED 5-bit cf_set_mask (= 32 sets) reads like a live geometry bug and
+  // cost real debugging time during the 2026-08 reconfiguration investigation.
+  //   val cf_idx_mask      = -1.S(idxBits.W).asUInt
+  //   val cf_idx_z_mask    = 0.U(idxBits.W)
+  //   val cf_set_mask      = -1.S(5.W).asUInt
+  //   val cf_idx           = ((waddr & cf_idx_mask) & cf_set_mask)(4, 0)
+  //   val cf_waddr_tagbits = waddr >> idxBits
+  //   val cf_waddr         = (cf_waddr_tagbits << idxBits) | cf_idx
 
   // for (w <- 0 until memWidth) {
   //   when(io.read(w).valid && io.cf_debug_dcache_enable) {
@@ -349,11 +471,16 @@ class BoomDuplicatedDataArray(implicit p: Parameters) extends AbstractBoomDataAr
   for (j <- 0 until memWidth) {
 
     val raddr = io.read(j).bits.addr >> rowOffBits
-    val cf_ridx_mask = -1.S(idxBits.W).asUInt
-    val cf_rset_mask = -1.S(5.W).asUInt
-    val cf_ridx = (raddr & cf_ridx_mask) & cf_rset_mask
-    val cf_raddr_tagbits = raddr >> idxBits
-    val cf_raddr = Cat(cf_raddr_tagbits, cf_ridx)    
+    // [dead-code 2026-08-13] read-side twin of the write-side block above: cf_ridx/cf_raddr
+    // were computed but NEVER USED -- the array is read with the raw `raddr`, already
+    // set-masked upstream by dcacheMaskAddr() (:683).  Kept as comments because the
+    // hardcoded 5-bit cf_rset_mask reads like a live 32-set geometry bug and cost real
+    // debugging time.  FIRRTL DCE'd them regardless.
+    //   val cf_ridx_mask     = -1.S(idxBits.W).asUInt
+    //   val cf_rset_mask     = -1.S(5.W).asUInt
+    //   val cf_ridx          = (raddr & cf_ridx_mask) & cf_rset_mask
+    //   val cf_raddr_tagbits = raddr >> idxBits
+    //   val cf_raddr         = Cat(cf_raddr_tagbits, cf_ridx)
      
     for (w <- 0 until nWays) {
       val array = DescribedSRAM(
@@ -492,6 +619,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   with HasL1HellaCacheParameters
   with HasBoomCoreParameters
   with freechips.rocketchip.util.CoreFuzzingConstants
+  with HasBoomExtendedTag   // [reconf-fix] cfTagLSB / cfTagBits / cfIdxLowBits
 {
   implicit val edge = outer.node.edges.out(0)
   val (tl_out, _) = outer.node.out(0)
@@ -515,21 +643,49 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   // Block size (cacheBlockBytes) is NOT reconfigurable per user requirement.
   val dcacheSetOptionsVec = VecInit(dcacheSetOptions.map(_.U))
   val cacheWayOptionsVec  = VecInit(cacheWayOptions.map(_.U))
-  val cf_dcache_active_sets = dcacheSetOptionsVec(io.lsu.cf_dcache_set_conf)
-  val cf_dcache_active_ways = cacheWayOptionsVec(io.lsu.cf_dcache_way_conf)
-  val dcache_set_mask = cf_dcache_active_sets - 1.U
 
-  // full_idx_snap: per-way SyncReadMem storing the FULL (unmasked) set index addr[12:6] of the
-  // block last filled into each (masked-set, way) slot.  Used in two ways:
-  //   1. Tag check: s1_full_idx_match prevents false hits between two addresses that alias to
-  //      the same masked set but differ in bits [12:10] (they have the same tag since those bits
-  //      fall below untagBits=13, but the stored full_idx disambiguates them).
-  //   2. Writeback address: s2_repl_full_idx_snap is passed to the MSHR as old_idx so the
-  //      TL Release uses the evicted block's physical set index, not the miss request's index.
-  // ISA safety: at full config (active_sets=128), dcache_set_mask=0x7F and full_idx=masked_idx
-  // for all DRAM addresses (addr[12:6] < 128 always), so full_idx_match is always true —
-  // no behavior change at full config.
-  val full_idx_snap = Seq.fill(nWays)(SyncReadMem(nSets, UInt(idxBits.W)))
+  // ==== [reconf-fix 2026-08-06] Config commit gate ==========================
+  // The 0xbc1 CSR value is a REQUEST; it is applied to the live mapping only on a
+  // cycle with no cache transaction in flight.
+  //
+  // WHY (proven on waveform, doc 28/30): io.lsu.ordered (below) is
+  // `mshrs.fence_rdy && !s1_valid && !s2_valid` — it has NO writeback-unit term, so a
+  // software FENCE returns while a voluntary writeback is still in the WB unit.  The
+  // csrw then changed the mask underneath it and the WB's data read (dcacheMaskAddr on
+  // wb.io.data_req) fetched the WRONG physical row, writing that data back under the
+  // evicted block's address: L2 ended up holding sweep-region zeros for a live line.
+  // L2-initiated probes (continuous TSI tohost polling) are the same hazard and cannot
+  // be ordered by any software fence.  Staging + apply-on-idle closes both.
+  //
+  // Only these two registers drive the live geometry.  cf_dcache_repl_conf is
+  // deliberately NOT staged: a policy change remaps nothing, and dcache_clean()
+  // depends on it taking effect immediately.
+  // Timing/area: 2x2b of state; the idle term is an AND of existing quasi-static
+  // signals; nothing is added to the s0-s2 datapath.  In a build without
+  // reconfiguration these become plain wires off the (tied-off) CSR, so the whole
+  // gate constant-folds out of the netlist.
+  // The update logic lives further down (search "[reconf-fix] config commit"), after
+  // mshrs/wb/prober/s1_valid/s2_valid exist; only the state is declared here because
+  // the mask below consumes it.
+  val cfg_set_applied = if (ENABLE_RECONF) RegInit(0.U(2.W))
+                        else WireDefault(io.lsu.cf_dcache_set_conf)
+  val cfg_way_applied = if (ENABLE_RECONF) RegInit(0.U(2.W))
+                        else WireDefault(io.lsu.cf_dcache_way_conf)
+  // Staged = a geometry change has been requested but not yet applied.  Level-derived
+  // (no CSR write pulse needed): the CSR value only moves on a write, and the flag
+  // self-clears when the values match again.
+  val cfg_change = (io.lsu.cf_dcache_set_conf =/= cfg_set_applied) ||
+                   (io.lsu.cf_dcache_way_conf =/= cfg_way_applied)
+
+  val cf_dcache_active_sets = dcacheSetOptionsVec(cfg_set_applied)
+  val cf_dcache_active_ways = cacheWayOptionsVec(cfg_way_applied)
+  val dcache_set_mask = cf_dcache_active_sets - 1.U
+  // Deferred assignment: driven in the "[reconf-fix] config commit" block below.
+  val cfg_apply_now = WireDefault(false.B)
+
+  // [reconf-fix 2026-08-06] full_idx_snap DELETED.  It existed only to recover the
+  // identity bits that fell between the masked index and the pinned tag; the extended
+  // tag (cfTagLSB=10) now carries them, so (row, tag) is exact -- Theorem 1, spec 31.
 
   // Mask just the set-index bits [untagBits-1 : blockOffBits] in a physical address.
   def dcacheMaskIdx(addr: UInt): UInt =
@@ -549,16 +705,27 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   val prober = Module(new BoomProbeUnit)
   val mshrs = Module(new BoomMSHRFile)
   mshrs.io.clear_all    := io.lsu.force_order
+  // [restored 2026-09-05] driver destroyed by an over-greedy probe strip; recovered from
+  // the pre-damage elaborated Verilog, which named it exactly:
+  //   .io_clear_prefetch_all (cfg_change)   @[dcache.scala:677:68]
+  // [reconf-fix] staged geometry change retires parked prefetches (see mshrs.scala:596).
+  mshrs.io.clear_prefetch_all := cfg_change
+  // [restored 2026-09-05] also destroyed by the probe strip; recovered from the
+  // pre-damage Verilog: .io_dcache_set_mask (_dcache_set_mask_T) @[dcache.scala:682:47]
+  mshrs.io.dcache_set_mask := dcache_set_mask
   mshrs.io.brupdate     := io.lsu.brupdate
   mshrs.io.exception    := io.lsu.exception
   mshrs.io.rob_pnr_idx  := io.lsu.rob_pnr_idx
   mshrs.io.rob_head_idx := io.lsu.rob_head_idx
 
   // tags
-  def onReset = L1Metadata(0.U, ClientMetadata.onReset)
-  val meta = Seq.fill(memWidth) { Module(new L1MetadataArray(onReset _)) }
-  val metaWriteArb = Module(new Arbiter(new L1MetaWriteReq, 2))
-  // 0 goes to MSHR refills, 1 goes to prober
+  // [reconf-fix] BOOM-local metadata carrying the extended tag (see HasBoomExtendedTag).
+  def onReset = BoomL1Metadata(0.U, ClientMetadata.onReset)
+  val meta = Seq.fill(memWidth) { Module(new BoomL1MetadataArray(onReset _)) }
+  // [reconf-fix Phase C] 3rd write port = invalidate-all walker (reconf builds
+  // only — baseline elaborates the identical 2-port arbiter).
+  val metaWriteArb = Module(new Arbiter(new BoomL1MetaWriteReq, if (ENABLE_RECONF) 3 else 2))
+  // 0 goes to MSHR refills, 1 goes to prober, 2 (reconf only) invalidate walker
   val metaReadArb = Module(new Arbiter(new BoomL1MetaReadReq, 6))
   // 0 goes to MSHR replays, 1 goes to prober, 2 goes to wb, 3 goes to MSHR meta read,
   // 4 goes to pipeline, 5 goes to prefetcher
@@ -663,7 +830,8 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
 val mshr_read_req = Wire(Vec(memWidth, new BoomDCacheReq))
 mshr_read_req             := DontCare
 mshr_read_req(0).uop      := NullMicroOp
-mshr_read_req(0).addr     := Cat(mshrs.io.meta_read.bits.tag, mshrs.io.meta_read.bits.idx) << blockOffBits
+mshr_read_req(0).addr     := Cat(mshrs.io.meta_read.bits.tag,
+                                 mshrs.io.meta_read.bits.idx(cfIdxLowBits-1, 0)) << blockOffBits  // [reconf-fix] overlap
 mshr_read_req(0).data     := DontCare
 mshr_read_req(0).is_hella := false.B
 metaReadArb.io.in(3).valid       := mshrs.io.meta_read.valid
@@ -677,7 +845,10 @@ val wb_fire = wb.io.meta_read.fire && wb.io.data_req.fire
 val wb_req = Wire(Vec(memWidth, new BoomDCacheReq))
 wb_req             := DontCare
 wb_req(0).uop      := NullMicroOp
-wb_req(0).addr     := Cat(wb.io.meta_read.bits.tag, wb.io.data_req.bits.addr)
+// [reconf-fix] data_req.addr is {idx[6:0], off[5:0]}; keep only {idx[3:0], off[5:0]} so the
+// extended tag supplies bits 12:10 exactly once.
+wb_req(0).addr     := Cat(wb.io.meta_read.bits.tag,
+                          wb.io.data_req.bits.addr(cfIdxLowBits+blockOffBits-1, 0))
 wb_req(0).data     := DontCare
 wb_req(0).is_hella := false.B
 // Tag read for write-back
@@ -699,7 +870,8 @@ val prober_fire  = prober.io.meta_read.fire
 val prober_req   = Wire(Vec(memWidth, new BoomDCacheReq))
 prober_req             := DontCare
 prober_req(0).uop      := NullMicroOp
-prober_req(0).addr     := Cat(prober.io.meta_read.bits.tag, prober.io.meta_read.bits.idx) << blockOffBits// offsetBits
+prober_req(0).addr     := Cat(prober.io.meta_read.bits.tag,
+                              prober.io.meta_read.bits.idx(cfIdxLowBits-1, 0)) << blockOffBits  // [reconf-fix] overlap
 prober_req(0).data     := DontCare
 prober_req(0).is_hella := false.B
 // Tag read for prober
@@ -773,37 +945,26 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
 
   // tag check
   def wayMap[T <: Data](f: Int => T) = VecInit((0 until nWays).map(f))
-  val s1_tag_eq_way = widthMap(i => wayMap((w: Int) => meta(i).io.resp(w).tag === (s1_addr(i) >> untagBits)).asUInt)
+  // [reconf-fix] compare from cfTagLSB(10), not untagBits(13): the tag must cover every
+  // bit above the SMALLEST index so (row, tag) is exact at every geometry (Theorem 1).
+  val s1_tag_eq_way = widthMap(i => wayMap((w: Int) => meta(i).io.resp(w).tag === (s1_addr(i) >> cfTagLSB)).asUInt)
 
-  // Read full_idx_snap in s0 (triggered by metaReadArb fire); result is in s1.
-  // Index: same masked idx used for the meta read for each lane.
-  // Value: the full (unmasked) addr[12:6] of the block stored in that (way, masked-set) slot.
-  val s1_full_idx_snap = VecInit(Seq.tabulate(nWays)(way =>
-    VecInit(Seq.tabulate(memWidth)(lane =>
-      full_idx_snap(way).read(
-        metaReadArb.io.out.bits.req(lane).idx,
-        metaReadArb.io.out.fire
-      )
-    ))
-  ))
-  // s1_full_idx_match(lane)(way): the stored full set index matches the current request's full
-  // set index. Prevents false hits between addresses that alias to the same masked set but
-  // differ in the masked-out bits (addr[12:10] for 16-set config, etc.).
-  val s1_full_idx_match = widthMap(lane =>
-    VecInit((0 until nWays).map(way =>
-      s1_full_idx_snap(way)(lane) === s1_addr(lane)(untagBits-1, blockOffBits)
-    ))
-  )
+  // [reconf-fix] s1_full_idx_snap / s1_full_idx_match DELETED (see above): the tag
+  // comparison alone now disambiguates lines sharing a masked row.
 
   val s1_tag_match_way = widthMap(i =>
                          Mux(s1_type === t_replay, s1_replay_way_en,
                          Mux(s1_type === t_wb,     s1_wb_way_en,
                          Mux(s1_type === t_mshr_meta_read, s1_mshr_meta_read_way_en,
-                           // Gate ways >= cf_dcache_active_ways AND require full-idx match to
-                           // prevent false hits between aliased addresses in the same masked set.
-                           wayMap((w: Int) => s1_tag_eq_way(i)(w) && meta(i).io.resp(w).coh.isValid() && (w.U < cf_dcache_active_ways) && s1_full_idx_match(i)(w)).asUInt))))
+                           // Gate ways >= cf_dcache_active_ways.  The extended tag makes the
+                           // tag compare sufficient to disambiguate same-row lines, so the
+                           // old full_idx_match conjunct is gone (spec 31, Corollary 1).
+                           wayMap((w: Int) => s1_tag_eq_way(i)(w) && meta(i).io.resp(w).coh.isValid() && (w.U < cf_dcache_active_ways)).asUInt))))
 
-  val s1_wb_idx_matches = widthMap(i => (s1_addr(i)(untagBits-1,blockOffBits) === wb.io.idx.bits) && wb.io.idx.valid)
+  // [reconf-fix 2026-08-12] Compare PHYSICAL rows: the WB unit occupies a masked row,
+  // so at a reduced set count an aliasing access must also be nacked.
+  val s1_wb_idx_matches = widthMap(i => ((s1_addr(i)(untagBits-1,blockOffBits) & dcache_set_mask(idxBits-1,0)) ===
+                                         (wb.io.idx.bits & dcache_set_mask(idxBits-1,0))) && wb.io.idx.valid)
 
   val s2_req   = RegNext(s1_req)
   val s2_type  = RegNext(s1_type)
@@ -899,41 +1060,51 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   val lru_state_mem  = SyncReadMem(nSets, UInt(lru_replacer.nBits.W))
   val plru_state_mem = SyncReadMem(nSets, UInt(plru_replacer.nBits.W))
 
-  // Read LRU/PLRU state for the s1 set address; result arrives at s2
-  val s1_set_for_repl = dcacheMaskIdx(s1_req(0).addr)
-  val s2_lru_state    = lru_state_mem.read(s1_set_for_repl,  s1_valid(0))
-  val s2_plru_state   = plru_state_mem.read(s1_set_for_repl, s1_valid(0))
+  // [reconf-fix doc 35] Per-lane replacement-state path.  memWidth=2, so each memory
+  // lane reads its OWN set's state (2 read ports on each SyncReadMem), computes its OWN
+  // victim, and updates through a single lane-arbitrated write port (below).  Previously
+  // the whole path was hardwired to lane 0: lane-1 hits never refreshed recency and a
+  // lane-1-only miss wrote its allocation into lane 0's set state (cross-set pollution).
+  // This is a fidelity/determinism fix, NOT a correctness fix (any victim is
+  // architecturally safe — dirty evictions write back, lookups search every way).
+  // Read LRU/PLRU state for each lane's s1 set address; result arrives at s2.
+  val s1_set_for_repl = widthMap(w => dcacheMaskIdx(s1_req(w).addr))
+  val s2_lru_state    = widthMap(w => lru_state_mem.read(s1_set_for_repl(w),  s1_valid(w)))
+  val s2_plru_state   = widthMap(w => plru_state_mem.read(s1_set_for_repl(w), s1_valid(w)))
 
-  // Compute victim way (one-hot) at s2 for each policy, clamped to active ways
-  val s2_random_way_en = UIntToOH(replacer.way & (cf_dcache_active_ways - 1.U))
-  val s2_lru_way_en    = UIntToOH(lru_replacer.get_replace_way(s2_lru_state)   & (cf_dcache_active_ways - 1.U))
-  val s2_plru_way_en   = UIntToOH(plru_replacer.get_replace_way(s2_plru_state) & (cf_dcache_active_ways - 1.U))
-  val s2_repl_way_raw  = MuxLookup(io.lsu.cf_dcache_repl_conf, s2_random_way_en)(Seq(
-    1.U -> s2_lru_way_en,
-    2.U -> s2_plru_way_en
-  ))
-  // MSHR way-collision fix: if the chosen way is already claimed by a pending MSHR,
-  // pick an alternative way that is not currently occupied.
+  // Compute victim way (one-hot) at s2 for each policy, clamped to active ways, per lane
+  val s2_random_way_en = widthMap(w => UIntToOH(replacer.way & (cf_dcache_active_ways - 1.U)))
+  val s2_lru_way_en    = widthMap(w => UIntToOH(lru_replacer.get_replace_way(s2_lru_state(w))   & (cf_dcache_active_ways - 1.U)))
+  val s2_plru_way_en   = widthMap(w => UIntToOH(plru_replacer.get_replace_way(s2_plru_state(w)) & (cf_dcache_active_ways - 1.U)))
+  val s2_repl_way_raw  = widthMap(w => MuxLookup(io.lsu.cf_dcache_repl_conf, s2_random_way_en(w))(Seq(
+    1.U -> s2_lru_way_en(w),
+    2.U -> s2_plru_way_en(w)
+  )))
+  // MSHR way-collision fix (same policy, now per lane): if a lane's chosen way is already
+  // claimed by a pending MSHR, pick the first free way instead.
+  // NOTE: pending_way_mask is a GLOBAL union of pending ways across ALL sets (separate
+  // perf item, doc 35 §4) — deliberately left global; only victim selection is per-lane.
   val s2_pending_mask  = mshrs.io.pending_way_mask
-  // One bit per active way: bit w set iff w < cf_dcache_active_ways.
-  // Must NOT use (cf_dcache_active_ways - 1) here — that is a numerical mask for an
-  // index, not a one-hot bitmask. e.g. for 2 active ways: need 0b11, not 0b01.
+  // One bit per active way: bit w set iff w < cf_dcache_active_ways (one-hot bitmask,
+  // NOT the numeric (ways-1) index mask — e.g. 2 active ways need 0b11, not 0b01).
   val s2_active_mask   = VecInit((0 until nWays).map(w => w.U < cf_dcache_active_ways)).asUInt
   val s2_avail_ways    = (~s2_pending_mask)(nWays-1,0) & s2_active_mask
-  // If the chosen way is pending AND there are free alternatives, use the first free way.
-  // If all active ways are pending, s2_way_avail goes false and the MSHR valid is gated
-  // below — the LSU nacks the miss and retries next cycle rather than allocating two
-  // MSHRs to the same way (which would corrupt each other's fill data).
-  val s2_way_avail = s2_avail_ways.orR || !(s2_repl_way_raw & s2_pending_mask).orR
-  val s2_replaced_way_en = Mux(
-    (s2_repl_way_raw & s2_pending_mask).orR && s2_avail_ways.orR,
+  // Per lane: way available unless this lane's chosen way is pending with no free
+  // alternative.  When all active ways are pending, s2_way_avail(w) goes false and the
+  // MSHR valid is gated below (the LSU nacks + retries rather than double-allocating a way).
+  val s2_way_avail = widthMap(w => s2_avail_ways.orR || !(s2_repl_way_raw(w) & s2_pending_mask).orR)
+  val s2_replaced_way_en = widthMap(w => Mux(
+    (s2_repl_way_raw(w) & s2_pending_mask).orR && s2_avail_ways.orR,
     PriorityEncoderOH(s2_avail_ways),
-    s2_repl_way_raw)
-  val s2_repl_meta = widthMap(i => Mux1H(s2_replaced_way_en, wayMap((w: Int) => RegNext(meta(i).io.resp(w))).toSeq))
-  // Full set index of the evicted block: needed so MSHR passes the correct physical idx to WB.
-  val s2_repl_full_idx_snap = widthMap(i =>
-    Mux1H(s2_replaced_way_en, (0 until nWays).map(way => RegNext(s1_full_idx_snap(way)(i))))
-  )
+    s2_repl_way_raw(w)))
+  val s2_repl_meta = widthMap(i => Mux1H(s2_replaced_way_en(i), wayMap((w: Int) => RegNext(meta(i).io.resp(w))).toSeq))
+  // [reconf-fix] Full set index of the evicted block, reconstructed from its own tag
+  // (Theorem 2, spec 31): F_victim = Cat(tag[2:0], row[3:0]).  row[3:0] == addr[9:6]
+  // at every geometry because the smallest mask is 0xF, so this is exact.  The WB unit
+  // needs the FULL 7-bit index for its data-array read; the Release address slices it.
+  val s2_repl_full_idx = widthMap(i =>
+    Cat(s2_repl_meta(i).tag(idxBits-cfIdxLowBits-1, 0),
+        dcacheMaskIdx(s2_req(i).addr)(cfIdxLowBits-1, 0)))
 
   // nack because of incoming probe
   val s2_nack_hit    = RegNext(VecInit(s1_nack))
@@ -943,7 +1114,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // Nack if no MSHR is ready OR if no active cache way is available (all active ways
   // are pending in other MSHRs).  The second condition gates the MSHR valid below, so
   // without also nacking here the LSU would wait for a response that was never issued.
-  val s2_nack_miss   = widthMap(w => s2_valid(w) && !s2_hit(w) && (!mshrs.io.req(w).ready || !s2_way_avail))
+  val s2_nack_miss   = widthMap(w => s2_valid(w) && !s2_hit(w) && (!mshrs.io.req(w).ready || !s2_way_avail(w)))
   // Bank conflict on data arrays
   val s2_nack_data   = widthMap(w => data.io.nacks(w))
   // Can't allocate MSHR for same set currently being written back
@@ -969,7 +1140,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
                             !s2_nack_victim(w)    &&
                             !s2_nack_data(w)      &&
                             !s2_nack_wb(w)        &&
-                             s2_way_avail         &&
+                             s2_way_avail(w)      &&
                              s2_type.isOneOf(t_lsu, t_prefetch)             &&
                             !IsKilledByBranch(io.lsu.brupdate, s2_req(w).uop) &&
                             !(io.lsu.exception && s2_req(w).uop.uses_ldq)   &&
@@ -982,11 +1153,11 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     mshrs.io.req(w).bits.uop.br_mask := GetNewBrMask(io.lsu.brupdate, s2_req(w).uop)
     mshrs.io.req(w).bits.addr        := s2_req(w).addr
     mshrs.io.req(w).bits.tag_match   := s2_tag_match(w)
-    mshrs.io.req(w).bits.old_meta    := Mux(s2_tag_match(w), L1Metadata(s2_repl_meta(w).tag, s2_hit_state(w)), s2_repl_meta(w))
+    mshrs.io.req(w).bits.old_meta    := Mux(s2_tag_match(w), BoomL1Metadata(s2_repl_meta(w).tag, s2_hit_state(w)), s2_repl_meta(w))  // [reconf-fix] extended-tag metadata
     // old_idx: full (unmasked) set index of the evicted block, used by MSHR for the correct
     // TL Release address.  At full config full_idx == masked_idx so this is a no-op.
-    mshrs.io.req(w).bits.old_idx     := s2_repl_full_idx_snap(w)
-    mshrs.io.req(w).bits.way_en      := Mux(s2_tag_match(w), s2_tag_match_way(w), s2_replaced_way_en)
+    mshrs.io.req(w).bits.old_idx     := s2_repl_full_idx(w)
+    mshrs.io.req(w).bits.way_en      := Mux(s2_tag_match(w), s2_tag_match_way(w), s2_replaced_way_en(w))
 
     mshrs.io.req(w).bits.data        := s2_req(w).data
     mshrs.io.req(w).bits.is_hella    := s2_req(w).is_hella
@@ -995,26 +1166,32 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
 
   mshrs.io.meta_resp.valid      := !s2_nack_hit(0) || prober.io.mshr_wb_rdy
   mshrs.io.meta_resp.bits       := Mux1H(s2_tag_match_way(0), RegNext(meta(0).io.resp))
-  // Update replacement state on MSHR miss allocation
-  when (mshrs.io.req.map(_.fire).reduce(_||_)) {
-    replacer.miss  // advances global LFSR (no-op for LRU/PLRU internal state_reg)
-    val s2_set_miss  = dcacheMaskIdx(s2_req(0).addr)
-    val s2_alloc_way = OHToUInt(s2_replaced_way_en)
+  // [reconf-fix doc 35] Per-lane replacement-state update through a SINGLE arbitrated
+  // write port.  Each lane contributes an update request: a miss allocates its victim
+  // way, a hit refreshes its accessed way (a lane can't be both — mshr.req.fire needs
+  // !hit).  Lane 0 wins when both lanes update the same cycle; dropping lane 1's update
+  // is a heuristic loss only (victim selection stays valid), and dcache_clean()'s sweep
+  // is serialized (one miss outstanding) so a clean never drops an update — preserving
+  // the sweep's per-set coverage guarantee.  One write port on each state mem (no 2W).
+  // replacer.miss advances the global random LFSR on ANY miss (policy-independent).
+  when (mshrs.io.req.map(_.fire).reduce(_||_)) { replacer.miss }
+  val s2_lsu_hit    = widthMap(w => s2_valid(w) && s2_hit(w) && s2_type === t_lsu && !s2_nack(w))
+  val s2_repl_upd   = widthMap(w => (mshrs.io.req(w).fire || s2_lsu_hit(w)) && io.lsu.cf_dcache_repl_conf =/= 0.U)
+  // [reconf-fix doc35 ROOT CAUSE] advance state with the POLICY-CHOSEN victim (pre-MSHR-override
+  // s2_repl_way_raw), NOT the post-override allocated way — else a PLRU fixpoint
+  // (get_next_state(0x7d,way0)==0x7d) freezes the set state and victim collapses to way 0. See
+  // reg-based version notes. Identical when no override fires.
+  val s2_repl_way   = widthMap(w => Mux(mshrs.io.req(w).fire,
+                                        OHToUInt(s2_repl_way_raw(w)),
+                                        OHToUInt(s2_tag_match_way(w)(nWays-1, 0))))
+  when (s2_repl_upd.reduce(_||_)) {
+    val uw  = PriorityEncoder(s2_repl_upd)                 // lane 0 priority
+    val set = dcacheMaskIdx(s2_req(uw).addr)
+    val way = s2_repl_way(uw)
     when (io.lsu.cf_dcache_repl_conf === 1.U) {
-      lru_state_mem.write(s2_set_miss, lru_replacer.get_next_state(s2_lru_state, s2_alloc_way))
+      lru_state_mem.write(set, lru_replacer.get_next_state(s2_lru_state(uw), way))
     } .elsewhen (io.lsu.cf_dcache_repl_conf === 2.U) {
-      plru_state_mem.write(s2_set_miss, plru_replacer.get_next_state(s2_plru_state, s2_alloc_way))
-    }
-  }
-  // Update LRU/PLRU state on cache hit (to track access recency for future evictions)
-  val s2_lsu_hit = s2_valid(0) && s2_hit(0) && s2_type === t_lsu && !s2_nack(0)
-  when (s2_lsu_hit && io.lsu.cf_dcache_repl_conf =/= 0.U) {
-    val s2_set_hit = dcacheMaskIdx(s2_req(0).addr)
-    val s2_hit_way = OHToUInt(s2_tag_match_way(0)(nWays-1, 0))
-    when (io.lsu.cf_dcache_repl_conf === 1.U) {
-      lru_state_mem.write(s2_set_hit, lru_replacer.get_next_state(s2_lru_state, s2_hit_way))
-    } .otherwise {
-      plru_state_mem.write(s2_set_hit, plru_replacer.get_next_state(s2_plru_state, s2_hit_way))
+      plru_state_mem.write(set, plru_replacer.get_next_state(s2_plru_state(uw), way))
     }
   }
   tl_out.a <> mshrs.io.mem_acquire
@@ -1054,10 +1231,48 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // Override meta write idx to use masked set
   metaWriteArb.io.in(0).bits.idx := mshrs.io.meta_write.bits.idx & dcache_set_mask(idxBits-1, 0)
 
+  // ==== [reconf-fix Phase C] L1 invalidate-all walker (RESTORE ONLY) =========
+  // `csrw 0xbc4, 0x2` starts a full-array meta wipe through the normal meta
+  // write port (arb port 2 = lowest priority: MSHR/prober writes win per-cycle
+  // and the walk just stretches — bounded, since the restore context is
+  // quiescent).  DISCARDS dirty data with NO writeback: legal only in the
+  // checkpoint-restore flow, where every cached line is doomed and DRAM is
+  // about to be re-loaded.  Misuse during normal execution loses committed
+  // stores — restore-only discipline (see CSR definition, parameters.scala).
+  // The walk deliberately covers ALL nSets physical rows and ALL nWays ways
+  // regardless of the active geometry: rows/ways stranded outside the active
+  // range are exactly the restore hazard being cleared.  The extended-tag and
+  // IFT per-way structures are deliberately NOT cleared — they are consulted
+  // only on valid hits/victims, and fills overwrite them.
+  // Busy is exported to the core (0xbcd[17]) and holds io.lsu.ordered low
+  // (below), so `csrw 0xbc4,0x2; fence` blocks until the walk completes — the
+  // contract r30 and the DTM restore sequence rely on.
+  val dcache_wipe_busy = if (ENABLE_RECONF) {
+    val wipe_active = RegInit(false.B)
+    val wipe_cnt    = RegInit(0.U(log2Ceil(nSets).W))
+    val wipe_start  = io.lsu.cf_cachectl_wen && io.lsu.cf_cachectl_wdata(1) && !wipe_active
+    when (wipe_start) { wipe_active := true.B; wipe_cnt := 0.U }
+    metaWriteArb.io.in(2).valid         := wipe_active
+    metaWriteArb.io.in(2).bits          := DontCare
+    metaWriteArb.io.in(2).bits.idx      := wipe_cnt
+    metaWriteArb.io.in(2).bits.way_en   := ~0.U(nWays.W)
+    metaWriteArb.io.in(2).bits.tag      := 0.U
+    metaWriteArb.io.in(2).bits.data.tag := 0.U
+    metaWriteArb.io.in(2).bits.data.coh := ClientMetadata.onReset
+    when (metaWriteArb.io.in(2).fire) {
+      wipe_cnt := wipe_cnt + 1.U
+      when (wipe_cnt === (nSets-1).U) { wipe_active := false.B }
+    }
+    // busy includes the trigger cycle itself so the FENCE after the csrw can
+    // never sample `ordered` high in the gap before wipe_active rises.
+    wipe_active || wipe_start
+  } else false.B
+  io.lsu.cf_dcache_wipe_busy := dcache_wipe_busy
+
   tl_out.e <> mshrs.io.mem_finish
 
   // writebacks
-  val wbArb = Module(new Arbiter(new WritebackReq(edge.bundle), 2))
+  val wbArb = Module(new Arbiter(new BoomWritebackReq(edge.bundle), 2))
   // 0 goes to prober, 1 goes to MSHR evictions
   wbArb.io.in(0)       <> prober.io.wb_req
   wbArb.io.in(1)       <> mshrs.io.wb_req
@@ -1153,15 +1368,25 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       // corefuzzing: ift_store_meta writes are collected per-way and merged after the
       // memWidth loop so each SyncReadMem sees exactly ONE write port (Vivado dissolves
       // multi-writer SyncReadMem into FFs — Synth 8-4767).  See merged write below.
-      when (!is_load) {
+      when (is_store) {
         val s2_set   = dcacheMaskIdx(s2_req(w).addr)
-        val entry    = mkIftEntry(uop_dom, s2_req(w).uop.cf_op_count_id,
-                         s2_req(w).uop.cf_secret_propagation || s2_req(w).uop.cf_secret_access)
+        // [STEP1b] per-DOUBLEWORD last-writer-wins.  This store updates ONLY the DW it
+        // writes; every other DW's bit is carried through unchanged from the current entry.
+        // That is NOT accumulation: within its own chunk the newest store wins outright, so
+        // a clean store genuinely clears its chunk.  It simply cannot clear chunks it never
+        // touched -- which is the bug R1f was working around by OR-ing the whole line.
+        // domain stays ownership-only; atk/secret are the content questions.
+        val sub_oh    = cfSubOH(s2_req(w).addr)
+        val st_atk    = uop_dom.orR || s2_req(w).uop.cf_attacker_influence
+        val st_sec    = s2_req(w).uop.cf_secret_propagation || s2_req(w).uop.cf_secret_access
+        val new_atk_m = (iftAtkMask(s2_store_entry) & ~sub_oh) | Mux(st_atk, sub_oh, 0.U)
+        val new_sec_m = (iftSecMask(s2_store_entry) & ~sub_oh) | Mux(st_sec, sub_oh, 0.U)
+        val entry     = mkIftStore(s2_req(w).uop.cf_op_count_id, new_sec_m, new_atk_m)
         for (way <- 0 until nWays) {
           when (s2_tag_match_way(w)(way)) {
-            ift_sm_wr_valid(way)(w) := true.B
-            ift_sm_wr_idx(way)(w)   := s2_set
-            ift_sm_wr_data(way)(w)  := entry
+            ift_sm_wr_valid(way)(w + 1) := true.B
+            ift_sm_wr_idx(way)(w + 1)   := s2_set
+            ift_sm_wr_data(way)(w + 1)  := entry
           }
         }
       }
@@ -1202,20 +1427,10 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     }
   }
 
-  // Update full_idx_snap at MSHR fill time: store the FULL (unmasked) set index of the newly
-  // filled block.  Written at the MASKED idx slot so future reads with the same masked idx
-  // see the full idx and can reject aliases (full_idx_match check in tag compare).
-  // Only MSHR fills create new blocks; prober writes only change coherence state, so the
-  // existing full_idx entry remains valid (same physical block, just different coh state).
-  when (mshrs.io.cf_meta_write_fill.valid) {
-    val fill_idx_masked = mshrs.io.cf_meta_write_fill.bits.idx & dcache_set_mask(idxBits-1, 0)
-    val fill_idx_full   = mshrs.io.cf_meta_write_fill.bits.idx
-    for (way <- 0 until nWays) {
-      when (mshrs.io.cf_meta_write_fill.bits.way_en(way)) {
-        full_idx_snap(way).write(fill_idx_masked, fill_idx_full)
-      }
-    }
-  }
+  // [reconf-fix 2026-08-06] full_idx_snap fill-update DELETED along with the array
+  // itself (see the note near the top of this file): the tag now carries the extra
+  // 3 bits, so there is no snapshot to maintain.  Restored 2026-09-05 after an
+  // accidental splice from HEAD reintroduced it.
 
   val uncache_resp = Wire(Valid(new BoomDCacheResp))
   // corefuzzing: stamp dcacheTagCF into MSHR (miss) responses and mark secret_transmission
