@@ -439,12 +439,40 @@ abstract class PipelinedFunctionalUnit(
     // Same field set as the pipelined branch above. Has no register storage to
     // save, but consistent with the pipelined branch and lets the synthesizer
     // propagate constants out of the FU's resp.uop.
-    io.resp.bits.uop.cf_domain_id               := 0.U
+    //
+    // [MEMIDFIX 2026-09-09] EXCEPT for the MemAddrCalc unit, which must keep
+    // cf_domain_id and cf_op_count_id.  Its resp.uop becomes the LSU's exe_req, then
+    // exe_tlb_uop -> exe_tlb_uop_cf -> the D$ request for the will_fire_load_incoming
+    // path, and the D$ writes a refilled line's IFT tag FROM THAT uop
+    // (dcache -> mshrs req.uop -> cf_req_domain/_op_count).  Zeroing them here made
+    // every load-miss fill anonymous: the line came back tagged domain=0 oc=0, so an
+    // attacker who only READS a line never marked it -- and Prime+Probe primes with
+    // loads.
+    //
+    // MEASURED (t11_cache_evict, same line 0x80003280, same run):
+    //     src=3(store_commit)  domain=1 oc=1205   <- STQ-sourced uop, intact
+    //     src=1(load_incoming) domain=0 oc=0      <- this zeroing
+    // and across t37: 332/332 load_incoming stripped, while 1002/1002 load_wakeup and
+    // 132/132 store_commit were intact (those read the LDQ/STQ entry written at
+    // dispatch, never passing through this unit).
+    //
+    // COST: none.  numStages == 0 here, so there is no register storage -- the comment
+    // above says as much.  This only withholds constant propagation for two fields in
+    // one unit.  cf_secret_access is NOT in this list and already survives, which is
+    // why secret-tagged lines were tagged while attacker-tagged lines were not.
+    // [G1 2026-09-09] gated on ENABLE_IFT.  Preserving these two fields is only useful
+    // when DIFT is compiled in; a non-IFT build must still zero them so the synthesizer
+    // can constant-fold fields nothing reads.  Convention follows dcache.scala:1511.
+    if (!(isMemAddrCalcUnit && ENABLE_IFT)) {
+      io.resp.bits.uop.cf_domain_id             := 0.U
+      io.resp.bits.uop.cf_op_count_id           := 0.U
+    }
     io.resp.bits.uop.cf_speculated               := false.B
-    io.resp.bits.uop.cf_op_count_id              := 0.U
     io.resp.bits.uop.cf_single_step              := false.B
     io.resp.bits.uop.cf_src_tainted              := false.B
     io.resp.bits.uop.cf_spec_branch_is_atk       := false.B
+    io.resp.bits.uop.cf_atk_branch_ctr       := 0.U
+    io.resp.bits.uop.cf_sec_branch_ctr       := 0.U
     io.resp.bits.uop.cf_spec_branch_op_id        := 0.U
     io.resp.bits.uop.cf_spec_branch_is_secret    := false.B
     io.resp.bits.uop.cf_cntd_valid               := false.B
