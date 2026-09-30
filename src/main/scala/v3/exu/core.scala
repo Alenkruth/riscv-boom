@@ -2256,60 +2256,140 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
           priv,
           Sext(rob.io.commit.uops(w).debug_pc(vaddrBits-1,0), xLen))
         printf_inst(rob.io.commit.uops(w))
+        // CF EXTRAS (corefuzzing additions to the commit log). Gated by
+        // ENABLE_CF_DEBUG_PRINTF: when false, the commit log emits ONLY the
+        // spike-standard fields (priv, pc, inst, rd, wdata) so it can be diffed
+        // byte-for-byte against spike. Everything in here is a corefuzzing artifact.
+        // ALSO gated by ENABLE_IFT: this block reads cf_* fields and the rename
+        // stage's com_late_taint_any, which are only meaningful under IFT. This
+        // is the IFT dependence that used to sit on the OUTER commit-log gate
+        // (~line 2105); moving it here lets a non-IFT build emit the
+        // spike-standard commit log while keeping the IFT-only cone elided.
+        if (ENABLE_CF_DEBUG_PRINTF && ENABLE_IFT) {
 
-        // New: Print corefuzzing fields. This prints a compact, human-
-        // readable summary containing domain, speculation/attacker/secret
-        // flags, op count, single-step, taint modules (up to 5), and the
-        // predispatch taint queue (up to 5). Each taint entry is shown as
-        // module:type:opcount. If some fields are zero, they will print as
-        // zeros.
-        // Fix 5b: OR in late-detected s_prop from retroactive commit-time taint check.
-        // Merge INT and FP rename stages: either may detect late taint on source regs.
-        val com_late_merged = rename_stage.io.com_late_taint_any(w) ||
-          (if (usingFPU) fp_rename_stage.io.com_late_taint_any(w) else false.B)
-        val com_s_prop_final = rob.io.commit.uops(w).cf_secret_propagation || com_late_merged
-        // Fix 5c: commit-time s_tx for stores/loads whose secret taint was only
-        // detected retroactively.  Uses com_late_merged (no dst_rtype guard)
-        // because stores have dst_rtype=RT_X and would be missed by com_late_taint.
-        val com_late_s_tx = com_late_merged &&
-                            !rob.io.commit.uops(w).cf_secret_access &&
-                            (rob.io.commit.uops(w).uses_stq || rob.io.commit.uops(w).uses_ldq)
-        val com_s_tx_final = rob.io.commit.uops(w).cf_secret_transmission || com_late_s_tx
-        printf(" CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_sec=%d spec_oc=%d) ",
-          rob.io.commit.uops(w).cf_domain_id,
-          rob.io.commit.uops(w).cf_speculated,
-          rob.io.commit.uops(w).cf_attacker_influence,
-          rob.io.commit.uops(w).cf_secret_access,
-          com_s_prop_final,
-          com_s_tx_final,
-          rob.io.commit.uops(w).cf_op_count_id,
-          rob.io.commit.uops(w).cf_spec_branch_is_atk,
-          rob.io.commit.uops(w).cf_spec_branch_is_secret,
-          rob.io.commit.uops(w).cf_spec_branch_op_id)
+          // New: Print corefuzzing fields. This prints a compact, human-
+          // readable summary containing domain, speculation/attacker/secret
+          // flags, op count, single-step, taint modules (up to 5), and the
+          // predispatch taint queue (up to 5). Each taint entry is shown as
+          // module:type:opcount. If some fields are zero, they will print as
+          // zeros.
+          // Fix 5b: OR in late-detected s_prop from retroactive commit-time taint check.
+          // Merge INT and FP rename stages: either may detect late taint on source regs.
+          val com_late_merged = rename_stage.io.com_late_taint_any(w) ||
+            (if (usingFPU) fp_rename_stage.io.com_late_taint_any(w) else false.B)
+          val com_s_prop_final = rob.io.commit.uops(w).cf_secret_propagation || com_late_merged
+          // Fix 5c: commit-time s_tx for stores/loads whose secret taint was only
+          // detected retroactively.  Uses com_late_merged (no dst_rtype guard)
+          // because stores have dst_rtype=RT_X and would be missed by com_late_taint.
+          val com_late_s_tx = com_late_merged &&
+                              !rob.io.commit.uops(w).cf_secret_access &&
+                              (rob.io.commit.uops(w).uses_stq || rob.io.commit.uops(w).uses_ldq)
+          val com_s_tx_final = rob.io.commit.uops(w).cf_secret_transmission || com_late_s_tx
+          // pdst/prs1/prs2 + rtypes: the register operands, so the parser can rebuild the
+          // dataflow graph itself.  A secret access resolves at TLB, long after its
+          // consumers renamed, so a victim-only secret chain has no dispatch-time edge to
+          // record; logging what each uop read and wrote lets the taint be derived after
+          // the fact.  rtypes matter because unused prs fields still hold stale pregs.
+          // [CFMOVE 2026-09-08] FU/INFL_FU/OVF/dcy/srob/sstq/alias moved INSIDE CF(...).
+          // They are all cf_* uop taint state and belong with the rest of it; they were
+          // split across two printfs, which also opened a window for the MEMTRACE printf
+          // to interleave BETWEEN them and corrupt records.  parse_ift_log.py was made
+          // position-independent to follow this, not the other way round.
+          printf(" CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_sec=%d spec_oc=%d pdst=%d prs1=%d prs2=%d rt1=%d rt2=%d brmask=0x%x brtag=%d abr=%d sbr=%d FU=0x%x INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d) ",
+            rob.io.commit.uops(w).cf_domain_id,
+            rob.io.commit.uops(w).cf_speculated,
+            rob.io.commit.uops(w).cf_attacker_influence,
+            rob.io.commit.uops(w).cf_secret_access,
+            com_s_prop_final,
+            com_s_tx_final,
+            rob.io.commit.uops(w).cf_op_count_id,
+            rob.io.commit.uops(w).cf_spec_branch_is_atk,
+            rob.io.commit.uops(w).cf_spec_branch_is_secret,
+            rob.io.commit.uops(w).cf_spec_branch_op_id,
+            rob.io.commit.uops(w).pdst,
+            rob.io.commit.uops(w).prs1,
+            rob.io.commit.uops(w).prs2,
+            rob.io.commit.uops(w).lrs1_rtype,
+            rob.io.commit.uops(w).lrs2_rtype,
+            // [BRMASK 2026-09-08] The full speculation shadow, and this uop's own branch
+            // tag.  spec_oc names only ONE branch and picks it by PriorityEncoder over
+            // br_tag -- i.e. LOWEST TAG, not oldest, and tags wrap.  br_mask is the exact
+            // SET of branches this uop speculates under, so software can reconstruct the
+            // tag->branch binding from mask transitions: a bit APPEARING in successive
+            // uops marks where that branch was allocated; the bit CLEARING everywhere
+            // marks its resolution, after which the tag is REUSED BY A DIFFERENT BRANCH.
+            // A parser that does not treat "bit cleared from all masks" as the tag's death
+            // will attribute a shadow to a branch that retired long before -- the same
+            // slot-reuse trap the ROB op_count guards protect against.
+            rob.io.commit.uops(w).br_mask,
+            rob.io.commit.uops(w).br_tag,
+            // [GHISTFIELD] GHR window counters: globalHistoryLength - value = branch
+            // retirements back to the branch that tainted the history.
+            rob.io.commit.uops(w).cf_atk_branch_ctr,
+            rob.io.commit.uops(w).cf_sec_branch_ctr,
+            rob.io.commit.uops(w).cf_fu_bitmap,
+            inflBitmapFromList(rob.io.commit.uops(w).cf_influencer_list),
+            rob.io.commit.uops(w).cf_infl_dropped,
+            rob.io.commit.uops(w).cf_cntd_deny_count,
+            rob.io.commit.uops(w).cf_stall_cycles_rob,
+            rob.io.commit.uops(w).cf_stall_cycles_stq,
+            rob.io.commit.uops(w).cf_infl_oc_aliased)
 
-        // Print the single-step marker separately (preserves prior visible tag)
-        when (rob.io.commit.uops(w).cf_single_step) {
-          printf("[SSTEP] ")
+          // Print the single-step marker separately (preserves prior visible tag)
+          when (rob.io.commit.uops(w).cf_single_step) {
+            printf("[SSTEP] ")
+          }
+
+          // [CNTDPROBE 2026-09-10] TEMPORARY -- proof obligation for deleting the
+          // cf_cntd_winner_* uop fields (18b: op 16, atk 1, sec 1).
+          //
+          // Claim: they are a redundant second copy of what the ty=2
+          // INFL_ISSUE_CONTENTION edge already carries.  Both are written from the SAME
+          // ic_pending_winner_* registers (rob.scala:715-718 for the edge, :726-727 for
+          // the uop fields), so they must agree bit-for-bit.
+          //
+          // They appear in NO existing log -- not on the bridge, not in any printf -- so
+          // the claim cannot be checked against retained logs; it needs one run with them
+          // printed.  FALSIFIABLE: any record carrying a ty=2 edge where
+          //   edge.op_count != low inflOpCountWidthCF bits of winner_op,  OR
+          //   edge.is_atk   != winner_atk,                                OR
+          //   edge.is_secret!= winner_sec
+          // refutes the claim and the fields stay.  DELETE THIS PROBE once it passes.
+       // [PROBE-STRIPPED 2026-09-10] CNTD probe -- proof DISCHARGED (verify_cntd_redundancy.py:
+          // the cf_cntd_* fields are live in issue-slot.scala:429-433 slot migration, so they
+          // are KEPT, not reclaimed).  Commented out: it is not hardware and it slows the sim.
+          // if (ENABLE_CF_DEBUG_PRINTF) {
+            // // Gate v2: cf_cntd_valid is NEVER true at commit (measured: 0 probe lines
+            // // against 1,057 ty=2 edges), so gating on it sampled nothing.  Gate on the
+            // // fields under test instead -- any record where they carry data.
+            // when (rob.io.commit.uops(w).cf_cntd_winner_op =/= 0.U ||
+                  // rob.io.commit.uops(w).cf_cntd_winner_atk ||
+                  // rob.io.commit.uops(w).cf_cntd_winner_sec ||
+                  // rob.io.commit.uops(w).cf_cntd_valid) {
+              // printf("\n[CNTD] oc=%d wop=%d watk=%d wsec=%d\n",
+                // rob.io.commit.uops(w).cf_op_count_id,
+                // rob.io.commit.uops(w).cf_cntd_winner_op,
+                // rob.io.commit.uops(w).cf_cntd_winner_atk,
+                // rob.io.commit.uops(w).cf_cntd_winner_sec)
+            // }
+          // }
+
+          // Print module bitmap, INFL_FU bitmap, and influencer slots (single atomic printf)
+          val comInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d}"}.mkString(" ")
+          // [CFMOVE] scalars moved into CF() above; this printf is now the influencer
+          // VECTOR only -- a list, parsed by INFL_ENTRY_RE, not a CF scalar field.
+          val comFmt = comInflFmt
+          val comInflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
+            rob.io.commit.uops(w).cf_influencer_list(k).valid,
+            rob.io.commit.uops(w).cf_influencer_list(k).op_count,
+            rob.io.commit.uops(w).cf_influencer_list(k).infl_type,
+            rob.io.commit.uops(w).cf_influencer_list(k).is_atk,
+            rob.io.commit.uops(w).cf_influencer_list(k).is_secret
+          ))
+          printf(comFmt, comInflArgs: _*)
+          // END MOD: commit CF prints
+          // ---------------------------------------------------------------------
         }
-
-        // Print module bitmap, INFL_FU bitmap, and influencer slots (single atomic printf)
-        val comInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d,dc=%d}"}.mkString(" ")
-        val comFmt = s"FU=0x%x INFL_FU=0x%x OVF=%d $comInflFmt"
-        val comInflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
-          rob.io.commit.uops(w).cf_influencer_list(k).valid,
-          rob.io.commit.uops(w).cf_influencer_list(k).op_count,
-          rob.io.commit.uops(w).cf_influencer_list(k).infl_type,
-          rob.io.commit.uops(w).cf_influencer_list(k).is_atk,
-          rob.io.commit.uops(w).cf_influencer_list(k).is_secret,
-          rob.io.commit.uops(w).cf_influencer_list(k).deny_count
-        ))
-        printf(comFmt, (Seq[Bits](
-          rob.io.commit.uops(w).cf_fu_bitmap,
-          inflBitmapFromList(rob.io.commit.uops(w).cf_influencer_list),
-          rob.io.commit.uops(w).cf_infl_overflow
-        ) ++ comInflArgs): _*)
-        // END MOD: commit CF prints
-        // ---------------------------------------------------------------------
         when (rob.io.commit.uops(w).dst_rtype === RT_FIX && rob.io.commit.uops(w).ldst =/= 0.U) {
           printf(" x%d 0x%x\n",
             rob.io.commit.uops(w).ldst,
