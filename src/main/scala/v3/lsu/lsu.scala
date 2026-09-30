@@ -57,7 +57,7 @@ import boom.v3.exu.{BrUpdateInfo, Exception, FuncUnitResp, CommitSignals, ExeUni
 
 // fore corefuzzing - SpeculativePRintf and Sext
 import boom.v3.util.{BoolToChar, AgePriorityEncoder, IsKilledByBranch, GetNewBrMask, WrapInc, IsOlder, UpdateBrMask, SpeculativePrintf}
-import boom.v3.util.{Sext, appendModuleTag, addInfluencer, addInfluencerBatch, InfluencerCandidate}
+import boom.v3.util.{Sext, appendModuleTag, addInfluencer, addInfluencerBatch, InfluencerCandidate, SatDropped}
 
 class LSUExeIO(implicit p: Parameters) extends BoomBundle()(p)
 {
@@ -113,6 +113,12 @@ with CoreFuzzingConstants
   val cf_dcache_set_conf  = Output(UInt(dcacheParamsWidthCF.W))
   val cf_dcache_way_conf  = Output(UInt(dcacheParamsWidthCF.W))
   val cf_dcache_repl_conf = Output(UInt(dcacheParamsWidthCF.W))
+  // [reconf-fix Phase C] L1 invalidate-all walker (CSR 0xbc4, RESTORE-ONLY):
+  // write pulse + wdata (bit1 = discard walk), and busy back-channel to core
+  // (published as 0xbcd[17]).  Constant-tied in the baseline flavor → pruned.
+  val cf_cachectl_wen     = Output(Bool())
+  val cf_cachectl_wdata   = Output(UInt(2.W))
+  val cf_dcache_wipe_busy = Input(Bool())
 
   val perf = Input(new Bundle {
     val acquire = Bool()
@@ -158,13 +164,11 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   // corefuzzing: preg_secret early update — fires at TLB stage when load hits secret range.
   // Enables in-flight consumers to receive s_prop before the producer commits (avoids needing
   // a fence.i between the secret load and its consumers).  Bit index = pdst of the load.
-  val cf_preg_secret_upd = Output(Vec(memWidth, Valid(new CF_PregSecretUpd)))
 
   // Gap 1 fix (DOC:23): live preg_secret read port — core exposes integer preg_secret so the
   // TLB stage can check whether the load's source address register is already secret-tainted
   // at issue time.  By the time a load reaches AGU, its source has written back (wakeup),
   // so preg_secret[prs1] reflects the full writeback-transitive taint chain P1→Pn.
-  val cf_preg_secret  = Input(Vec(numIntPhysRegs, Bool()))
   // Gap 1 fix (DOC:23): direct ROB s_tx update at TLB stage (mirrors cf_s_acc_rob_upd).
   // Without this, squashed probe loads never show s_tx=1 in bridge records because the
   // pipeline uop's cf_secret_transmission wire is discarded when the instruction is killed.
@@ -182,6 +186,14 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   val clr_bsy_cf_bitmap = Output(Vec(memWidth + 1, UInt(numModules.W)))
   // corefuzzing: cf_secret_transmission for stores, sent with clr_bsy
   val clr_bsy_cf_stx    = Output(Vec(memWidth + 1, Bool()))
+  // corefuzzing: a store consuming a tainted register must show s_prop in its COMMIT
+  // record.  It cannot arrive by the usual route: the ROB's s_prop comes from writeback
+  // resps gated `rf_wen && dst_rtype===RT_FIX && ldst_val`, and a store has rf_wen=false
+  // -- the same exclusion that hides branch conditions.  MEASURED on both attacks: the
+  // final store of each gadget chain (v1 sb x15,-17(x8); v3 sd x15,-24(x8)) showed
+  // s_prop=0 while every other chain member was tagged.  clr_bsy is the path stores DO
+  // use, so carry it there (mirrors clr_bsy_cf_stx).
+  val clr_bsy_cf_sprop  = Output(Vec(memWidth + 1, Bool()))
 
   // Speculatively safe load (barring memory ordering failure)
   val clr_unsafe      = Output(Vec(memWidth, Valid(UInt(robAddrSz.W))))
@@ -218,6 +230,10 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   val cf_dcache_set_conf  = Input(UInt(dcacheParamsWidthCF.W))
   val cf_dcache_way_conf  = Input(UInt(dcacheParamsWidthCF.W))
   val cf_dcache_repl_conf = Input(UInt(dcacheParamsWidthCF.W))
+  // [reconf-fix Phase C] 0xbc4 invalidate walker trigger + 0xbcd[17] busy
+  val cf_cachectl_wen     = Input(Bool())
+  val cf_cachectl_wdata   = Input(UInt(2.W))
+  val cf_dcache_wipe_busy = Output(Bool())
 
   val perf        = Output(new Bundle {
     val acquire = Bool()
@@ -249,6 +265,11 @@ class LDQEntry(implicit p: Parameters) extends BoomBundle()(p)
   val addr                = Valid(UInt(coreMaxAddrBits.W))
   val addr_is_virtual     = Bool() // Virtual address, we got a TLB miss
   val addr_is_uncacheable = Bool() // Uncacheable, wait until head of ROB to execute
+  // corefuzzing: taint of the ADDRESS operand (rs1) only -- NOT the uop's aggregate
+  // cf_secret_propagation, which also accumulates forwarding and observability taint.
+  val addr_is_secret      = Bool()
+  // corefuzzing: ATTACKER taint of the address operand.  Same rule, same source.
+  val addr_is_atk         = Bool()
 
   val executed            = Bool() // load sent to memory, reset by NACKs
   val succeeded           = Bool()
@@ -268,6 +289,18 @@ class STQEntry(implicit p: Parameters) extends BoomBundle()(p)
 {
   val addr                = Valid(UInt(coreMaxAddrBits.W))
   val addr_is_virtual     = Bool() // Virtual address, we got a TLB miss
+  // corefuzzing: taint of the ADDRESS operand (rs1) only.  See LDQEntry.
+  val addr_is_secret      = Bool()
+  val addr_is_atk         = Bool()
+  // corefuzzing: taint of the store's DATA operand (rs2) only.  Kept separate from
+  // the uop's aggregate cf_secret_propagation, which also carries fetch/observability
+  // taint and says nothing about the VALUE being stored.
+  val data_is_secret      = Bool()
+  // corefuzzing: ATTACKER taint of the store's DATA operand (rs2).
+  val data_is_atk         = Bool()
+  // corefuzzing: was this store's ADDRESS inside the secret range?  Recorded at TLB
+  // time so the s_tx decision can be made later, at clr_bsy, when the DATA is known.
+  val addr_in_secret      = Bool()
   val data                = Valid(UInt(xLen.W))
 
   val committed           = Bool() // committed by ROB
@@ -289,8 +322,21 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // Runtime LDQ/STQ size selection via CSR index
   val ldqOptionsVec = VecInit(ldQueueEntryOptions.map(_.U))
   val stqOptionsVec = VecInit(stQueueEntryOptions.map(_.U))
-  val cf_ldq_active = ldqOptionsVec(io.core.cf_ldq_idx)
-  val cf_stq_active = stqOptionsVec(io.core.cf_stq_idx)
+  // [reconf-fix 2026-08-13] DEFERRED RESIZE.
+  // Previously cf_ldq_active/cf_stq_active tracked the CSR combinationally, so a write to
+  // 0x7c4 shrank the queue *underneath live entries*. Any pointer already >= the new size is
+  // then outside the active window, and WrapInc's non-power-of-2 path (wrap only on the exact
+  // equality value === n-1) can never bring it back -> the head never reaches the ROB's
+  // expected slot -> permanent deadlock. Observed on FPGA: cfg09/cfg11 (LDQ/STQ 48->24) commit
+  // ~11.5k instructions after the write and then stop forever. Power-of-2 sizes only escaped
+  // because their masking path re-ranges a stray pointer by accident.
+  // The CSR is now a REQUEST: the queue adopts the new geometry only while fully drained, so
+  // no entry or pointer can be stranded. Registered output also takes the option mux off the
+  // LSQ's critical comparator path (see the update in the "adopt pending geometry" block).
+  val cf_ldq_idx_applied = RegInit(0.U(io.core.cf_ldq_idx.getWidth.W))
+  val cf_stq_idx_applied = RegInit(0.U(io.core.cf_stq_idx.getWidth.W))
+  val cf_ldq_active = ldqOptionsVec(cf_ldq_idx_applied)
+  val cf_stq_active = stqOptionsVec(cf_stq_idx_applied)
 
   val ldq = Reg(Vec(numLdqEntries, Valid(new LDQEntry)))
   val stq = Reg(Vec(numStqEntries, Valid(new STQEntry)))
@@ -395,17 +441,16 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       // IFT LUT optimization (Change 8): zero cf_* fields not read by LSU logic.
       // PRESERVED: cf_op_count_id, cf_domain_id (head reads), cf_secret_access,
       //   cf_secret_propagation (head + TLB update), cf_secret_transmission (TLB update),
-      //   cf_fu_bitmap (set above, merged at TLB+commit), cf_influencer_list + cf_infl_overflow
+      //   cf_fu_bitmap (set above, merged at TLB+commit), cf_influencer_list + cf_infl_dropped
       //   (addInfluencer calls in DTLB/ordering-violation/STL-forward paths).
       // rob_uop holds the dispatch-time IFT state independently.
       ldq(ld_enq_idx).bits.uop.cf_speculated               := false.B
       ldq(ld_enq_idx).bits.uop.cf_attacker_influence       := false.B
       ldq(ld_enq_idx).bits.uop.cf_single_step              := false.B
       ldq(ld_enq_idx).bits.uop.cf_src_tainted              := false.B
-      ldq(ld_enq_idx).bits.uop.cf_taint_producer_op        := 0.U
-      ldq(ld_enq_idx).bits.uop.cf_taint_producer_is_atk    := false.B
-      ldq(ld_enq_idx).bits.uop.cf_taint_producer_is_secret := false.B
       ldq(ld_enq_idx).bits.uop.cf_spec_branch_is_atk       := false.B
+      ldq(ld_enq_idx).bits.uop.cf_atk_branch_ctr       := 0.U
+      ldq(ld_enq_idx).bits.uop.cf_sec_branch_ctr       := 0.U
       ldq(ld_enq_idx).bits.uop.cf_spec_branch_op_id        := 0.U
       ldq(ld_enq_idx).bits.uop.cf_spec_branch_is_secret    := false.B
       ldq(ld_enq_idx).bits.uop.cf_cntd_valid               := false.B
@@ -417,6 +462,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq(ld_enq_idx).bits.st_dep_mask     := next_live_store_mask
 
       ldq(ld_enq_idx).bits.addr.valid      := false.B
+      ldq(ld_enq_idx).bits.addr_is_secret  := false.B
+      ldq(ld_enq_idx).bits.addr_is_atk    := false.B
       ldq(ld_enq_idx).bits.executed        := false.B
       ldq(ld_enq_idx).bits.succeeded       := false.B
       ldq(ld_enq_idx).bits.order_fail      := false.B
@@ -442,10 +489,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       stq(st_enq_idx).bits.uop.cf_attacker_influence       := false.B
       stq(st_enq_idx).bits.uop.cf_single_step              := false.B
       stq(st_enq_idx).bits.uop.cf_src_tainted              := false.B
-      stq(st_enq_idx).bits.uop.cf_taint_producer_op        := 0.U
-      stq(st_enq_idx).bits.uop.cf_taint_producer_is_atk    := false.B
-      stq(st_enq_idx).bits.uop.cf_taint_producer_is_secret := false.B
       stq(st_enq_idx).bits.uop.cf_spec_branch_is_atk       := false.B
+      stq(st_enq_idx).bits.uop.cf_atk_branch_ctr       := 0.U
+      stq(st_enq_idx).bits.uop.cf_sec_branch_ctr       := 0.U
       stq(st_enq_idx).bits.uop.cf_spec_branch_op_id        := 0.U
       stq(st_enq_idx).bits.uop.cf_spec_branch_is_secret    := false.B
       stq(st_enq_idx).bits.uop.cf_cntd_valid               := false.B
@@ -454,6 +500,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       stq(st_enq_idx).bits.uop.cf_cntd_winner_sec          := false.B
       stq(st_enq_idx).bits.uop.cf_cntd_deny_count          := 0.U
       stq(st_enq_idx).bits.addr.valid := false.B
+      stq(st_enq_idx).bits.addr_is_secret := false.B
+      stq(st_enq_idx).bits.addr_is_atk   := false.B
+      stq(st_enq_idx).bits.data_is_secret := false.B
+      stq(st_enq_idx).bits.data_is_atk   := false.B
+      stq(st_enq_idx).bits.addr_in_secret := false.B
       stq(st_enq_idx).bits.data.valid := false.B
       stq(st_enq_idx).bits.committed  := false.B
       stq(st_enq_idx).bits.succeeded  := false.B
@@ -875,6 +926,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // corefuzzing: uop copies with dtlbTagCF bit set and cf_secret_access detected via physical address
   // Two-stage wire pattern avoids combinational cycle: Stage 1 = base mods, Stage 2 = influencer.
   val exe_tlb_uop_cf = Wire(Vec(memWidth, new MicroOp()))
+  // corefuzzing: `in_secret` is computed inside the TLB-stage loop below, but the STQ
+  // address write lives in a LATER, separate for(w) block.  Export it per-way so the
+  // store can record whether its ADDRESS landed in the secret range (Case A).
+  val exe_tlb_in_secret = Wire(Vec(memWidth, Bool()))
   for (w <- 0 until memWidth) {
     // Stage 1: bitmap + secret_access, based on exe_tlb_uop (register-backed, no feedback)
     val uop_tlb_base = WireInit(exe_tlb_uop(w))
@@ -905,31 +960,49 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     // preg_secret early update: mark the physical destination register as secret-tainted.
     // This fires 1+ cycles before writeback, allowing consumers that are issued immediately
     // after the load to see the taint at their issue-grant check cycle.
-    io.core.cf_preg_secret_upd(w).valid             := exe_tlb_valid(w) && is_secret_load
-    io.core.cf_preg_secret_upd(w).bits.pdst         := exe_tlb_uop(w).pdst
-    io.core.cf_preg_secret_upd(w).bits.is_fp        := exe_tlb_uop(w).dst_rtype === RT_FLT
     // Live preg_secret check for both store data registers and load address registers.
     // The dispatch-time cf_secret_propagation snapshot misses tight-wave cases where the
     // source register's secret load dispatched just before this instruction (its TLB hadn't
     // fired at dispatch, so preg_secret wasn't set yet). By TLB time the load has written
     // back and preg_secret[prs1/prs2] is up to date.
-    val prs1_live_secret = io.core.cf_preg_secret(exe_tlb_uop(w).prs1)
-    val prs2_live_secret = io.core.cf_preg_secret(exe_tlb_uop(w).prs2)
+    // taint-follows-data: cf_secret_propagation is now set at BYPASS (register-read),
+    // when the tainted operand actually reaches this op.  The old prs1/prs2 table
+    // lookups existed only to patch the dispatch-time snapshot missing tight-wave
+    // cases; bypass-time tagging has no such gap, so the table is not needed.
+    val prs1_live_secret = false.B
+    val prs2_live_secret = false.B
     val data_reg_secret  = exe_tlb_uop(w).cf_secret_propagation || prs1_live_secret || prs2_live_secret
     // s_tx Case A: store carrying secret-dependent data to a non-secret memory address.
     //   The secret escapes to attacker-accessible memory (anything outside the secret range).
-    val is_secret_bearing_store = exe_tlb_uop(w).uses_stq && !in_secret &&
-                                   (exe_tlb_uop(w).cf_secret_access || data_reg_secret)
+    exe_tlb_in_secret(w) := in_secret
     // s_tx Case B: load where the effective address is derived from secret-propagated data
     //   AND the address is outside the secret range (attacker-accessible memory).
     //   The secret controls which non-secret memory location is accessed, leaking it via address
     //   pattern (e.g., cache timing: load from mem[secret_value + base]).
     //   Exclude loads to secret-range addresses: if the pointer happens to land in secret memory,
     //   the access stays within the secure domain and is not observable by the attacker.
-    val addr_reg_secret  = data_reg_secret
+    // 2026-09-03 -- was `data_reg_secret`, i.e. exe_tlb_uop(w).cf_secret_propagation.
+    // That is the uop's AGGREGATE taint: it accumulates store-to-load forwarding,
+    // BPD/BTB observability edges and dispatch-time state, none of which say anything
+    // about the ADDRESS.  Using it here asserted "this load's address is secret-derived"
+    // for any load that merely RECEIVED a secret.  MEASURED on t18: the spill reload
+    // `lbu a5,-17(s0)` -- address s0, a provably clean frame pointer -- carried s_tx on
+    // 481 of its commits, and s_tx totalled 6559 against 256 real secret accesses.
+    // The address operand's own taint is on exe_req.bits.secret (the AGU forwards
+    // rs1_secret); retries do not read exe_req, so they take the bit stored with the
+    // address in their queue entry.  Structure mirrors exe_tlb_vaddr above.
+    val addr_reg_secret  = Mux(will_fire_load_incoming(w) || will_fire_stad_incoming(w) ||
+                               will_fire_sta_incoming(w), exe_req(w).bits.secret,
+                           Mux(will_fire_load_retry(w),   ldq_retry_e.bits.addr_is_secret,
+                           Mux(will_fire_sta_retry(w),    stq_retry_e.bits.addr_is_secret,
+                                                          false.B)))
     val is_secret_addr_load = exe_tlb_uop(w).uses_ldq && addr_reg_secret && !in_secret
+    // is_secret_bearing_store REMOVED here: it was computed from the aggregate and the
+    // store's data is not knowable at TLB time.  The store's s_tx is now raised at
+    // clr_bsy (Case A above).  Leaving it here would let the aggregate back in via
+    // rob.scala:1037, which ORs the uop bit into the ROB entry.
     uop_tlb_base.cf_secret_transmission := exe_tlb_uop(w).cf_secret_transmission ||
-                                           is_secret_bearing_store || is_secret_addr_load
+                                           is_secret_addr_load
     // Gap 1 fix: emit direct ROB write-back for s_tx at TLB time.
     // Without this, a squashed probe load's ROB entry never shows s_tx=1 because the
     // pipeline uop wire is discarded when the instruction is killed before commit.
@@ -982,6 +1055,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   io.dmem.cf_dcache_way_conf  := io.core.cf_dcache_way_conf
   io.dmem.cf_dcache_repl_conf := io.core.cf_dcache_repl_conf
   io.dmem.cf_debug_dcache_enable := io.core.cf_debug_dcache_enable && io.core.cf_debug_lsu_enable
+  // [reconf-fix Phase C] invalidate-walker trigger down, busy back up
+  io.dmem.cf_cachectl_wen      := io.core.cf_cachectl_wen
+  io.dmem.cf_cachectl_wdata    := io.core.cf_cachectl_wdata
+  io.core.cf_dcache_wipe_busy  := io.dmem.cf_dcache_wipe_busy
 
   // defaults
   io.dmem.brupdate       := io.core.brupdate
@@ -1013,6 +1090,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     io.dmem.s1_kill(w) := false.B
 
     when (will_fire_load_incoming(w)) {
+      // if (ENABLE_CF_DEBUG_PRINTF) cf_dreq_src(w)         := 1.U
       dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w)
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
       dmem_req(w).bits.uop   := exe_tlb_uop_cf(w) // corefuzzing: use IFT-tagged uop
@@ -1020,6 +1098,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       s0_executing_loads(ldq_incoming_idx(w)) := dmem_req_fire(w)
       assert(!ldq_incoming_e(w).bits.executed)
     } .elsewhen (will_fire_load_retry(w)) {
+      // if (ENABLE_CF_DEBUG_PRINTF) cf_dreq_src(w)         := 2.U
       dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w)
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
       dmem_req(w).bits.uop   := exe_tlb_uop_cf(w) // corefuzzing: use IFT-tagged uop
@@ -1027,6 +1106,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       s0_executing_loads(ldq_retry_idx) := dmem_req_fire(w)
       assert(!ldq_retry_e.bits.executed)
     } .elsewhen (will_fire_store_commit(w)) {
+      // if (ENABLE_CF_DEBUG_PRINTF) cf_dreq_src(w)            := 3.U
       dmem_req(w).valid         := true.B
       dmem_req(w).bits.addr     := stq_commit_e.bits.addr.bits
       dmem_req(w).bits.data     := (new freechips.rocketchip.rocket.StoreGen(
@@ -1034,6 +1114,21 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                     stq_commit_e.bits.data.bits,
                                     coreDataBytes)).data
       dmem_req(w).bits.uop      := stq_commit_e.bits.uop
+      // The line tag records "is this line's content attacker-influenced".  The storing
+      // uop's DOMAIN answers that only for a direct attacker store; a victim storing
+      // attacker-DERIVED data is equally influence.  data_is_atk is the value's own taint,
+      // captured at STD arrival -- not an aggregate.
+      // [R1a 2026-09-05] The line tag must carry the STORED VALUE's taint ONLY.
+      // Was: `uop.cf_attacker_influence || data_is_atk`.  The comment above already
+      // said "not an aggregate" -- and then OR'd the aggregate in anyway.  5th instance
+      // of an aggregate standing in for a specific channel.
+      // PROVEN 2026-09-05: after R0 widened cf_attacker_influence (16k -> 113k), the
+      // victim's own store of array1_sz marked that line attacker-owned, so EVERY later
+      // load of array1_sz fired memdf_fire -- control PC 0x800016c4 went 245/245 = 100%
+      // attacker-influenced for a value the attacker never wrote.
+      // data_is_atk is captured at STD arrival from the store DATA operand's own taint,
+      // which is exactly "is this line's content attacker-derived".
+      dmem_req(w).bits.uop.cf_attacker_influence := stq_commit_e.bits.data_is_atk
 
       stq_execute_head                     := Mux(dmem_req_fire(w),
                                                 WrapInc(stq_execute_head, cf_stq_active),
@@ -1041,6 +1136,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
       stq(stq_execute_head).bits.succeeded := false.B
     } .elsewhen (will_fire_load_wakeup(w)) {
+      // if (ENABLE_CF_DEBUG_PRINTF) cf_dreq_src(w)         := 4.U
       dmem_req(w).valid      := true.B
       dmem_req(w).bits.addr  := ldq_wakeup_e.bits.addr.bits
       dmem_req(w).bits.uop   := ldq_wakeup_e.bits.uop
@@ -1088,12 +1184,24 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq(ldq_idx).bits.addr.bits           := Mux(exe_tlb_miss(w), exe_tlb_vaddr(w), exe_tlb_paddr(w))
       ldq(ldq_idx).bits.uop.pdst            := exe_tlb_uop(w).pdst
       ldq(ldq_idx).bits.addr_is_virtual     := exe_tlb_miss(w)
+      when (will_fire_load_incoming(w)) {
+        ldq(ldq_idx).bits.addr_is_secret    := exe_req(w).bits.secret  // rs1 taint at the AGU
+        ldq(ldq_idx).bits.addr_is_atk       := exe_req(w).bits.taint_atk
+      }
       ldq(ldq_idx).bits.addr_is_uncacheable := exe_tlb_uncacheable(w) && !exe_tlb_miss(w)
       // corefuzzing: write IFT flags computed in TLB stage back to LDQ entry.
       // Required because will_fire_load_wakeup bypasses TLB and uses the LDQ entry UOP
       // directly as the dcache request UOP; without this write-back, IFT bits computed
       // in the TLB stage (cf_secret_access, dtlb FU bit, cf_secret_transmission) are lost
       // on dcache nack + wakeup replay paths.
+      // corefuzzing: the entry uop is frozen at ENQUEUE (dispatch); under
+      // taint-follows-data the taint is not known then.  cf_secret_access /
+      // cf_secret_transmission were already refreshed here -- cf_secret_propagation was
+      // simply missing, which left ldq_head_is_secret permanently false and
+      // INFL_MEM_HOL / INFL_STL_FORWARD with no secret flag.  exe_tlb_uop is the ISSUED
+      // uop, so this is the register-read-resolved taint, not a dispatch snapshot.
+      ldq(ldq_idx).bits.uop.cf_secret_propagation  :=
+        ldq(ldq_idx).bits.uop.cf_secret_propagation || exe_tlb_uop_cf(w).cf_secret_propagation
       ldq(ldq_idx).bits.uop.cf_secret_access       :=
         ldq(ldq_idx).bits.uop.cf_secret_access || exe_tlb_uop_cf(w).cf_secret_access
       ldq(ldq_idx).bits.uop.cf_secret_transmission :=
@@ -1114,7 +1222,15 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       stq(stq_idx).bits.addr.bits  := Mux(exe_tlb_miss(w), exe_tlb_vaddr(w), exe_tlb_paddr(w))
       stq(stq_idx).bits.uop.pdst   := exe_tlb_uop(w).pdst // Needed for AMOs
       stq(stq_idx).bits.addr_is_virtual := exe_tlb_miss(w)
+      when (will_fire_sta_incoming(w) || will_fire_stad_incoming(w)) {
+        stq(stq_idx).bits.addr_is_secret := exe_req(w).bits.secret    // rs1 taint at the AGU
+        stq(stq_idx).bits.addr_is_atk    := exe_req(w).bits.taint_atk
+      }
+      stq(stq_idx).bits.addr_in_secret := exe_tlb_in_secret(w)
       // corefuzzing: write IFT flags computed in TLB stage into STQ so clr_bsy carries them to ROB
+      // same omission on the store path (see the LDQ note above)
+      stq(stq_idx).bits.uop.cf_secret_propagation  :=
+        stq(stq_idx).bits.uop.cf_secret_propagation || exe_tlb_uop_cf(w).cf_secret_propagation
       stq(stq_idx).bits.uop.cf_secret_transmission :=
         stq(stq_idx).bits.uop.cf_secret_transmission || exe_tlb_uop_cf(w).cf_secret_transmission
       stq(stq_idx).bits.uop.cf_secret_access :=
@@ -1288,6 +1404,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val clr_bsy_cf_bmap  = Reg(Vec(memWidth, UInt(numModules.W)))
   // corefuzzing: carry cf_secret_transmission from STQ uop to ROB
   val clr_bsy_cf_stx_r = RegInit(widthMap(w => false.B))
+  val clr_bsy_cf_sprop_r = RegInit(widthMap(w => false.B))
 
   for (w <- 0 until memWidth) {
     clr_bsy_valid      (w) := false.B
@@ -1295,6 +1412,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     clr_bsy_brmask     (w) := 0.U
     clr_bsy_cf_bmap    (w) := 0.U
     clr_bsy_cf_stx_r   (w) := false.B
+    clr_bsy_cf_sprop_r (w) := false.B
 
 
     when (fired_stad_incoming(w)) {
@@ -1306,7 +1424,16 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       clr_bsy_brmask     (w) := GetNewBrMask(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
       // corefuzzing: capture live stq cf_fu_bitmap (updated in EXE stage with dtlb/dcache bits)
       clr_bsy_cf_bmap    (w) := stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.uop.cf_fu_bitmap
-      clr_bsy_cf_stx_r   (w) := stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.uop.cf_secret_transmission
+      // Case A (2026-09-03): decide the store's s_tx HERE, not at the TLB stage.
+      // clr_bsy fires once BOTH halves of the store have landed, so data_is_secret is
+      // valid; the TLB stage could not know it for a split STA/STD, which is why the
+      // old code fell back to the uop's aggregate cf_secret_propagation and marked any
+      // store inside a tainted region as a transmission (e.g. `sd s0,40(sp)`, x507,
+      // spilling a provably CLEAN s0).  A transmission is secret DATA reaching a
+      // non-secret address -- both facts now live in the entry.
+      clr_bsy_cf_sprop_r (w) := stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.data_is_secret
+      clr_bsy_cf_stx_r   (w) := stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.data_is_secret &&
+                               !stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.addr_in_secret
     } .elsewhen (fired_sta_incoming(w)) {
       clr_bsy_valid      (w) := mem_stq_incoming_e(w).valid            &&
                                 mem_stq_incoming_e(w).bits.data.valid  &&
@@ -1316,7 +1443,16 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       clr_bsy_rob_idx    (w) := mem_stq_incoming_e(w).bits.uop.rob_idx
       clr_bsy_brmask     (w) := GetNewBrMask(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
       clr_bsy_cf_bmap    (w) := stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.uop.cf_fu_bitmap
-      clr_bsy_cf_stx_r   (w) := stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.uop.cf_secret_transmission
+      // Case A (2026-09-03): decide the store's s_tx HERE, not at the TLB stage.
+      // clr_bsy fires once BOTH halves of the store have landed, so data_is_secret is
+      // valid; the TLB stage could not know it for a split STA/STD, which is why the
+      // old code fell back to the uop's aggregate cf_secret_propagation and marked any
+      // store inside a tainted region as a transmission (e.g. `sd s0,40(sp)`, x507,
+      // spilling a provably CLEAN s0).  A transmission is secret DATA reaching a
+      // non-secret address -- both facts now live in the entry.
+      clr_bsy_cf_sprop_r (w) := stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.data_is_secret
+      clr_bsy_cf_stx_r   (w) := stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.data_is_secret &&
+                               !stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.addr_in_secret
     } .elsewhen (fired_std_incoming(w)) {
       clr_bsy_valid      (w) := mem_stq_incoming_e(w).valid                 &&
                                 mem_stq_incoming_e(w).bits.addr.valid       &&
@@ -1326,13 +1462,23 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       clr_bsy_rob_idx    (w) := mem_stq_incoming_e(w).bits.uop.rob_idx
       clr_bsy_brmask     (w) := GetNewBrMask(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
       clr_bsy_cf_bmap    (w) := stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.uop.cf_fu_bitmap
-      clr_bsy_cf_stx_r   (w) := stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.uop.cf_secret_transmission
+      // Case A (2026-09-03): decide the store's s_tx HERE, not at the TLB stage.
+      // clr_bsy fires once BOTH halves of the store have landed, so data_is_secret is
+      // valid; the TLB stage could not know it for a split STA/STD, which is why the
+      // old code fell back to the uop's aggregate cf_secret_propagation and marked any
+      // store inside a tainted region as a transmission (e.g. `sd s0,40(sp)`, x507,
+      // spilling a provably CLEAN s0).  A transmission is secret DATA reaching a
+      // non-secret address -- both facts now live in the entry.
+      clr_bsy_cf_sprop_r (w) := stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.data_is_secret
+      clr_bsy_cf_stx_r   (w) := stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.data_is_secret &&
+                               !stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.addr_in_secret
     } .elsewhen (fired_sfence(w)) {
       clr_bsy_valid      (w) := (w == 0).B // SFence proceeds down all paths, only allow one to clr the rob
       clr_bsy_rob_idx    (w) := mem_incoming_uop(w).rob_idx
       clr_bsy_brmask     (w) := GetNewBrMask(io.core.brupdate, mem_incoming_uop(w))
       clr_bsy_cf_bmap    (w) := mem_incoming_uop(w).cf_fu_bitmap
       clr_bsy_cf_stx_r   (w) := false.B
+    clr_bsy_cf_sprop_r (w) := false.B
     } .elsewhen (fired_sta_retry(w)) {
       clr_bsy_valid      (w) := mem_stq_retry_e.valid            &&
                                 mem_stq_retry_e.bits.data.valid  &&
@@ -1343,6 +1489,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       clr_bsy_brmask     (w) := GetNewBrMask(io.core.brupdate, mem_stq_retry_e.bits.uop)
       clr_bsy_cf_bmap    (w) := stq(mem_stq_retry_e.bits.uop.stq_idx).bits.uop.cf_fu_bitmap
       clr_bsy_cf_stx_r   (w) := stq(mem_stq_retry_e.bits.uop.stq_idx).bits.uop.cf_secret_transmission
+      clr_bsy_cf_sprop_r (w) := stq(mem_stq_retry_e.bits.uop.stq_idx).bits.data_is_secret
     }
 
     io.core.clr_bsy(w).valid          := clr_bsy_valid(w) &&
@@ -1358,11 +1505,13 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val stdf_clr_bsy_brmask   = Reg(UInt(maxBrCount.W))
   val stdf_clr_bsy_cf_bmap  = Reg(UInt(numModules.W))
   val stdf_clr_bsy_cf_stx   = RegInit(false.B)
+  val stdf_clr_bsy_cf_sprop = RegInit(false.B)
   stdf_clr_bsy_valid    := false.B
   stdf_clr_bsy_rob_idx  := 0.U
   stdf_clr_bsy_brmask   := 0.U
   stdf_clr_bsy_cf_bmap  := 0.U
   stdf_clr_bsy_cf_stx   := false.B
+  stdf_clr_bsy_cf_sprop := false.B
   when (fired_stdf_incoming) {
     val s_idx = mem_stdf_uop.stq_idx
     stdf_clr_bsy_valid   := stq(s_idx).valid                 &&
@@ -1374,6 +1523,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     stdf_clr_bsy_brmask  := GetNewBrMask(io.core.brupdate, mem_stdf_uop)
     stdf_clr_bsy_cf_bmap := stq(s_idx).bits.uop.cf_fu_bitmap
     stdf_clr_bsy_cf_stx  := stq(s_idx).bits.uop.cf_secret_transmission
+    stdf_clr_bsy_cf_sprop := stq(s_idx).bits.data_is_secret
   }
 
 
@@ -1384,6 +1534,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   io.core.clr_bsy(memWidth).bits            := stdf_clr_bsy_rob_idx
   io.core.clr_bsy_cf_bitmap(memWidth)       := stdf_clr_bsy_cf_bmap
   io.core.clr_bsy_cf_stx(memWidth)         := stdf_clr_bsy_cf_stx
+  io.core.clr_bsy_cf_sprop(memWidth)       := stdf_clr_bsy_cf_sprop
 
 
 
@@ -1811,7 +1962,21 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       // corefuzzing: STL forwarding — two explicit stages to avoid combinational feedback.
       // Stage 1: cross-domain influencer injection (input: forward_uop only — no cycle).
       val stl_infl_uop = stq_e.bits.uop
-      val stl_store_is_secret = stl_infl_uop.cf_secret_access || stl_infl_uop.cf_secret_propagation
+      // 2026-09-03 -- was `stl_infl_uop.cf_secret_propagation`, the store uop's AGGREGATE
+      // taint.  Store-to-load forwarding hands the LOADED REGISTER the store's VALUE, so
+      // the taint it confers must be the DATA taint; the aggregate also carries fetch-time
+      // and observability taint that says nothing about the value.
+      // MEASURED on t18: `sd s0,40(sp)` (0x8000150c) stores a CLEAN s0 but sits inside the
+      // secret function, so its aggregate bit is 1.  `ld s0,40(sp)` (0x80001560) forwarded
+      // that bit and wrote s0 TAINTED -- 515 times.  Every stack access derived from that
+      // frame pointer then looked secret-derived (PROBE J: reqsec=1 on 1790 stack loads),
+      // which is where the false s_tx came from.  PROBE N proved the register file itself
+      // is correct (0% stale taint), so the defect was the value handed to it.
+      val stl_store_is_secret = stl_infl_uop.cf_secret_access || stq_e.bits.data_is_secret
+      // ATTACKER: forwarding hands the loaded register the store's VALUE, so it also
+      // hands over that value's attacker taint.  data_is_atk, not the uop's domain --
+      // an attacker-written value forwarded into victim code is influence, not ownership.
+      val stl_store_is_atk    = stq_e.bits.data_is_atk
       val fwd_s1 = WireInit(forward_uop)
       when (data_ready && live && (forward_uop.cf_domain_id =/= stl_infl_uop.cf_domain_id)) {
         fwd_s1 := addInfluencer(forward_uop, stl_infl_uop.cf_op_count_id, INFL_STL_FORWARD.U,
@@ -1839,7 +2004,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       io.core.exe(w).iresp.bits.uop  := fwd_uop_cf
       io.core.exe(w).fresp.bits.uop  := fwd_uop_cf
       io.core.exe(w).iresp.bits.data := loadgen.data
+      io.core.exe(w).iresp.bits.secret := stl_store_is_secret
+      io.core.exe(w).iresp.bits.taint_atk := stl_store_is_atk
       io.core.exe(w).fresp.bits.data := loadgen.data
+      io.core.exe(w).fresp.bits.secret := stl_store_is_secret
+      io.core.exe(w).fresp.bits.taint_atk := stl_store_is_atk
 
       when (data_ready && live) {
         ldq(f_idx).bits.succeeded := data_ready
@@ -2180,6 +2349,23 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   // Queues empty when both LDQ and STQ are empty
   io.core.queues_empty := ldq_empty && stq_empty
+
+  //-------------------------------------------------------------
+  // [reconf-fix 2026-08-13] Adopt a pending LSQ geometry change (CSR 0x7c4) ONLY while the
+  // queue is fully drained. See the cf_*_idx_applied declaration for the failure this fixes.
+  // Stricter than ldq_empty/stq_empty above: EVERY pointer must be coincident, not just the
+  // commit head, because a resize must leave no pointer outside the new active window.
+  // stq_execute_head/stq_commit_head lag stq_head while stores drain to memory, so they are
+  // checked explicitly. Cost is one 3-bit register per queue; the compare reuses pointers that
+  // are already live, and cf_*_active becomes a registered value (one mux level off the
+  // WrapInc/full-compare path). If a queue never drains the resize simply waits -- LSQs empty
+  // constantly in practice, and waiting is always safe where corrupting is not.
+  val ldq_drained = (ldq_head === ldq_tail)
+  val stq_drained = (stq_head === stq_tail) && (stq_execute_head === stq_tail) &&
+                    (stq_commit_head === stq_tail)
+  when (ldq_drained) { cf_ldq_idx_applied := io.core.cf_ldq_idx }
+  when (stq_drained) { cf_stq_idx_applied := io.core.cf_stq_idx }
+
   // this could be in a better place, but okay
   // No pending memory when we have drained LSU queues and no in-flight requests
   io.core.no_pending_mem := io.core.queues_empty && !io.dmem.req.valid
