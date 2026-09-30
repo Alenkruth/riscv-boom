@@ -1305,24 +1305,83 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // corefuzzing: per-way IFT metadata BRAMs (FPGA-friendly, single writer each).
   //   ift_fill_meta  — written by MSHR fills only; tracks which domain last BROUGHT IN each line (timing channel → INFL_CACHE_EVICTION)
   //   ift_store_meta — written by store hits only; tracks which domain last STORED to each line  (data channel   → INFL_MEM_DATAFLOW)
-  // Entry bit layout: [iftEntryBits-1]=secret  [iftEntryBits-2]=domain  [iftEntryBits-3:0]=op_count
-  val iftEntryBits = 1 + 1 + uopIDCounterWidthCF
-  def mkIftEntry(domain: UInt, op_count: UInt, secret: Bool): UInt = Cat(secret, domain, op_count)
-  def iftDomain(e: UInt)  : UInt = e(uopIDCounterWidthCF)
-  def iftOpCount(e: UInt) : UInt = e(uopIDCounterWidthCF - 1, 0)
-  def iftSecret(e: UInt)  : Bool = e(uopIDCounterWidthCF + 1)
+  // Entry bit layout: [n+2]=atk  [n+1]=secret  [n]=domain  [n-1:0]=op_count   (n = uopIDCounterWidthCF)
+  //
+  // [R1e 2026-09-05] `atk` is a DEDICATED bit, exactly parallel to `secret`.
+  // Before this, attacker influence was folded into the `domain` field
+  // (`uop_dom | cf_attacker_influence`), CONFLATING two different questions:
+  //   domain = WHO stored this line (ownership)
+  //   atk    = is this line's CONTENT attacker-derived (influence)
+  // A victim (domain 0) storing attacker-derived data is influence WITHOUT ownership,
+  // and the union made iftDomain lie about who wrote the line.  Now separate.
+  //
+  // ASSUMED BEHAVIOUR -- documented deliberately; verify before relying on it:
+  //  * [STEP1b] atk/secret are PER-DOUBLEWORD masks with LAST-WRITER-WINS per chunk.
+  //    No accumulation.  A store clears its own DW if its data is clean; it cannot
+  //    clear DWs it never wrote.  A refill rewrites all 8.  Supersedes R1f.
+  //  * Sub-DOUBLEWORD precision is still coarse: sb/sh/sw set or clear the whole 8-byte
+  //    chunk they land in, so a clean byte store CAN still clear a tainted byte sharing
+  //    its doubleword.  ACCEPTED -- byte-granular masks would be 8x the state.
+  //  * Fills carry atk = (fill domain === 1), i.e. OWNERSHIP ONLY.  The MSHR has no
+  //    content-influence bit, so attacker-influenced DATA arriving via refill is still
+  //    untracked (STEP 4 narrows this; the L2/DRAM has no tag so it cannot fully close).
+  //  * KNOWN HAZARD: s2_store_entry is read in s1 and written in s2, so two stores to
+  //    the same line in consecutive cycles may miss one update (STEP 5).  Can only
+  //    LOSE taint, never fabricate it.
+  //  * ift_fill_meta stays LINE-level: eviction really is a whole-line property.
+  val CF_SUBLINE     = dcacheParams.blockBytes / 8        // 8 doublewords per 64B line
+  // [METASLIM 2026-09-08] The two arrays carried the SAME 33-bit entry, but each reads
+  // only a subset -- verified by enumerating every accessor call site:
+  //   ift_fill_meta  reads domain (:1400), op_count (:1412), secMask (:1412).
+  //                  NOTHING reads its atkMask -> 8 dead bits per entry.
+  //   ift_store_meta reads atkMask/atkAt, secMask/secretAt, op_count.
+  //                  NOTHING reads its domain -> 1 dead bit per entry.
+  // `grep iftAtkMask(s2_fill_entry)` and `grep iftDomain(s2_store_entry)` both return
+  // nothing.  This is coherent with the design note above: a fill has no per-doubleword
+  // attacker story (eviction is a whole-line property), and a store's "which domain"
+  // question is already answered by its atkMask.
+  //
+  // Split into two formats.  nSets=128, nWays=8:
+  //   fill  128*25*8 = 25,600 b  (was 33,792)
+  //   store 128*32*8 = 32,768 b  (was 33,792)
+  //   saved 9,216 b of 67,584 = 13.6%
+  // CAVEAT, not papered over: these are SyncReadMem.  If Vivado maps them to BRAM the
+  // realised saving may be ZERO (BRAM comes in fixed widths); the 13.6% is real only for
+  // distributed/LUT RAM, which 128-deep arrays usually get.  Believe the post-synthesis
+  // utilisation report, not this comment.
+  val iftFillBits    = CF_SUBLINE + 1 + uopIDCounterWidthCF        // {secMask, domain, opcount}
+  val iftStoreBits   = CF_SUBLINE + CF_SUBLINE + uopIDCounterWidthCF // {atkMask, secMask, opcount}
+  def cfSubIdx(addr: UInt): UInt = addr(log2Up(dcacheParams.blockBytes)-1, 3)
+  def cfSubOH(addr: UInt): UInt  = UIntToOH(cfSubIdx(addr))(CF_SUBLINE-1, 0)
 
-  val ift_fill_meta  = Seq.fill(nWays)(SyncReadMem(nSets, UInt(iftEntryBits.W)))
-  val ift_store_meta = Seq.fill(nWays)(SyncReadMem(nSets, UInt(iftEntryBits.W)))
+  // ---- FILL format: {secMask[CF_SUBLINE], domain[1], op_count} ----
+  def mkIftFill(domain: UInt, op_count: UInt, secMask: UInt): UInt =
+    Cat(secMask(CF_SUBLINE-1,0), domain, op_count)
+  def iftFillDomain(e: UInt) : UInt = e(uopIDCounterWidthCF)
+  def iftFillOpCount(e: UInt): UInt = e(uopIDCounterWidthCF - 1, 0)
+  def iftFillSecMask(e: UInt): UInt = e(uopIDCounterWidthCF + CF_SUBLINE, uopIDCounterWidthCF + 1)
+
+  // ---- STORE format: {atkMask[CF_SUBLINE], secMask[CF_SUBLINE], op_count} ----
+  def mkIftStore(op_count: UInt, secMask: UInt, atkMask: UInt): UInt =
+    Cat(atkMask(CF_SUBLINE-1,0), secMask(CF_SUBLINE-1,0), op_count)
+  def iftOpCount(e: UInt) : UInt = e(uopIDCounterWidthCF - 1, 0)
+  def iftSecMask(e: UInt) : UInt = e(uopIDCounterWidthCF + CF_SUBLINE - 1, uopIDCounterWidthCF)
+  def iftAtkMask(e: UInt) : UInt = e(uopIDCounterWidthCF + 2*CF_SUBLINE - 1, uopIDCounterWidthCF + CF_SUBLINE)
+  // per-access accessors: test only the doubleword this access touches
+  def iftSecretAt(e: UInt, addr: UInt): Bool = (iftSecMask(e) & cfSubOH(addr)).orR
+  def iftAtkAt(e: UInt, addr: UInt)   : Bool = (iftAtkMask(e) & cfSubOH(addr)).orR
+
+  val ift_fill_meta  = Seq.fill(nWays)(SyncReadMem(nSets, UInt(iftFillBits.W)))
+  val ift_store_meta = Seq.fill(nWays)(SyncReadMem(nSets, UInt(iftStoreBits.W)))
 
   // Per-way ift_store_meta write staging: collect from all memWidth ports, merge into
   // a single write per way after the loop.  Prevents Vivado Synth 8-4767 "multiple
   // writes via different ports" which dissolves SyncReadMem into FFs.
-  val ift_sm_wr_valid = Seq.fill(nWays)(Wire(Vec(memWidth, Bool())))
-  val ift_sm_wr_idx   = Seq.fill(nWays)(Wire(Vec(memWidth, UInt(idxBits.W))))
-  val ift_sm_wr_data  = Seq.fill(nWays)(Wire(Vec(memWidth, UInt(iftEntryBits.W))))
+  val ift_sm_wr_valid = Seq.fill(nWays)(Wire(Vec(memWidth + 1, Bool())))
+  val ift_sm_wr_idx   = Seq.fill(nWays)(Wire(Vec(memWidth + 1, UInt(idxBits.W))))
+  val ift_sm_wr_data  = Seq.fill(nWays)(Wire(Vec(memWidth + 1, UInt(iftStoreBits.W))))
   for (way <- 0 until nWays) {
-    ift_sm_wr_valid(way) := VecInit(Seq.fill(memWidth)(false.B))
+    ift_sm_wr_valid(way) := VecInit(Seq.fill(memWidth + 1)(false.B))
     ift_sm_wr_idx(way)   := DontCare
     ift_sm_wr_data(way)  := DontCare
   }
@@ -1417,6 +1476,30 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     cache_resp(w).bits.is_hella := s2_req(w).is_hella
   }
 
+  // [FILLINIT 2026-09-07] A refill MUST clear this line's store-metadata.
+  // ift_store_meta is a SyncReadMem with NO reset and is written by STORE HITS ONLY,
+  // so a line that is filled but never stored to carries RANDOM metadata -- and
+  // memdf_fire / memsec_fire read exactly that array on every load hit.  MEASURED:
+  // t31 v3, whose control block runs BEFORE any attacker code and shares no cache
+  // line with it, still showed 614/1792 = 34% of its instructions attacker-tainted,
+  // with 928 of 967 tainted records carrying NO influencer at all -- taint with no
+  // edge behind it, i.e. garbage metadata reaching the writeback taint path.
+  //
+  // ZERO is the correct value, not the fill's own taint: a refill brings a line that
+  // nothing in THIS cache has stored to, so its store-provenance is empty.  Step 4
+  // wrote Fill(CF_SUBLINE, domain === 1) here instead -- the REQUESTER's ownership --
+  // which is why it regressed (ty17 atk=1 925 -> 460): it wiped real per-DW bits and
+  // set false ones.  Right idea, wrong value.
+  // Refill takes slot 0 so the existing PriorityEncoder gives it priority: a fill
+  // installs a NEW tag, so any store racing it is on the tag being evicted.
+  for (way <- 0 until nWays) {
+    when (mshrs.io.cf_meta_write_fill.valid && mshrs.io.cf_meta_write_fill.bits.way_en(way)) {
+      ift_sm_wr_valid(way)(0) := true.B
+      ift_sm_wr_idx(way)(0)   := mshrs.io.cf_meta_write_fill.bits.idx & dcache_set_mask(idxBits-1, 0)
+      ift_sm_wr_data(way)(0)  := 0.U(iftStoreBits.W)  // clean: no store has touched this line
+    }
+  }
+
   // corefuzzing: merged single-writer for ift_store_meta (one write port per way).
   // Two stores from different memWidth ports cannot hit the same set+way simultaneously,
   // so we merge with priority encoding.  This enables Vivado LUTRAM inference.
@@ -1437,9 +1520,40 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     // corefuzzing: update ift_fill_meta at MSHR fill completion (meta_write), one way at a time.
     when (mshrs.io.cf_meta_write_fill.valid) {
       val fill_idx = mshrs.io.cf_meta_write_fill.bits.idx & dcache_set_mask(idxBits-1, 0)
-      val entry    = mkIftEntry(mshrs.io.cf_meta_write_fill.bits.domain,
-                                mshrs.io.cf_meta_write_fill.bits.op_count,
-                                mshrs.io.cf_meta_write_fill.bits.secret)
+      // [FILLPROBE 2026-09-09] Settle whether an ATTACKER LOAD tags a line.
+      // t11 fires ty=12 when the attacker STORES but not when it LOADS, which the RTL
+      // says should not matter: both meta_write.valid sites are STATE-based
+      // (s_meta_clear / s_meta_write_req), neither is store-gated, and cf_req_domain is
+      // just req.uop.cf_domain_id -- the same field cf_req_secret reads for the secret
+      // path, which DOES work on loads.  So either the attacker's load never misses, or
+      // the fill happens with the wrong domain.  This prints every fill so we can tell
+      // which.  +verbose-gated; costs nothing in a normal run.
+      // [WAYPROBE 2026-09-09] way_en added.  A set-conflict sweep can only evict the
+      // target if it actually REPLACES every way of that set.  The replacement state is
+      // read at S1 (lru/plru_state_mem.read(s1_set_for_repl)) and written at S2 with no
+      // bypass, so back-to-back same-set accesses -- exactly what a stride sweep does --
+      // read stale state.  If the sweep's fills land on only 1-2 distinct ways, that is
+      // why the target survives and why every "attacker loads do not tag" result so far
+      // measured a HIT.  Printing the way makes eviction provable instead of assumed.
+      // way_en printed as a RAW BITMASK, not OHToUInt: OHToUInt(0) == 0, so an empty
+      // way_en (no way written at all) is indistinguishable from "way 0" -- exactly the
+      // ambiguity left open by the TrueLRU result (1/8 ways, all reading as way 0).
+      if (ENABLE_CF_DEBUG_PRINTF) {
+        printf("\n[FILL] idx=%d wayen=0x%x tag=0x%x domain=%d secret=%d oc=%d\n",
+          fill_idx, mshrs.io.cf_meta_write_fill.bits.way_en,
+          mshrs.io.cf_meta_write_fill.bits.tag,
+          mshrs.io.cf_meta_write_fill.bits.domain,
+          mshrs.io.cf_meta_write_fill.bits.secret,
+          mshrs.io.cf_meta_write_fill.bits.op_count)
+      }
+      // [R1e] fills: atk = ownership of the filling domain only (see ASSUMED BEHAVIOUR).
+      // [STEP1b] a refill REPLACES the whole line, so every DW mask bit is set from the
+      // fill's own taint via Fill(CF_SUBLINE, bit).  This is the "clean full-line rewrite
+      // clears it" case, and it is why the per-DW masks need no decay anywhere else.
+      // [METASLIM] the 4th argument (atkMask) is GONE -- it had no reader.
+      val entry    = mkIftFill(mshrs.io.cf_meta_write_fill.bits.domain,
+                               mshrs.io.cf_meta_write_fill.bits.op_count,
+                               Fill(CF_SUBLINE, mshrs.io.cf_meta_write_fill.bits.secret.asUInt))
       for (way <- 0 until nWays) {
         when (mshrs.io.cf_meta_write_fill.bits.way_en(way)) {
           ift_fill_meta(way).write(fill_idx, entry)
@@ -1528,7 +1642,47 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   dataWriteArb.io.in(0).bits.way_en := s3_way
 
 
-  io.lsu.ordered := mshrs.io.fence_rdy && !s1_valid.reduce(_||_) && !s2_valid.reduce(_||_)
+  // ==== [RECONSTRUCTED 2026-09-05] ====================================================
+  // FULL INCIDENT + EVERY ASSUMPTION: claude-artifacts/40-dcache-delete-incident-20260905.md
+  // ASSUMPTIONS HERE (may bite):
+  //  (a) dcache_idle's term list is transcribed from elaborated Verilog; the Scala
+  //      spelling `!s1_valid.reduce(_||_)` is INFERRED.  Re-check if memWidth changes.
+  //  (b) This block's PLACEMENT is chosen, not recovered.  Chisel is order-insensitive
+  //      for these connections and the canonical Verilog diff is 0, but the original
+  //      sat at source lines 1506-1521, not necessarily exactly here.
+  //  (c) geom_changed may originally have been one RegNext of a tuple; same hardware.
+  // This block was destroyed by an over-greedy probe strip and was NOT in git (HEAD is
+  // 242 lines behind this working tree).  Recovered by transcription from the elaborated
+  // pre-damage Verilog, which preserves both the logic and the source line numbers:
+  //   dcache_idle      @[dcache.scala:1506:43, :1507:39, :1508:43, :1509:{23,41,46,49,67}]
+  //   cfg_*_applied    @[dcache.scala:1512:23, :1513:23]
+  //   geom_changed     @[dcache.scala:1519:52, :1520:52]
+  //   assert           @[dcache.scala:1521:11]  (assertion text is verbatim from the Verilog)
+  // Reference kept at /data/akrish/BACKUP-20260905-dcache-recovery/refverilog/.
+  // Acceptance test: normalised Verilog diff vs that reference must be ZERO.
+
+  // ordered must also go low while a geometry change is staged or a wipe is in flight,
+  // otherwise a fence could retire across a reconfiguration.
+  io.lsu.ordered := mshrs.io.fence_rdy && !s1_valid.reduce(_||_) && !s2_valid.reduce(_||_) &&
+                    !cfg_change && !dcache_wipe_busy
+
+  // The cache is idle when no MSHR is outstanding, no writeback/probe is pending, and
+  // nothing is in flight in s1/s2.  A staged geometry change is applied ONLY here.
+  val dcache_idle = mshrs.io.cache_idle &&
+                    wb.io.req.ready &&
+                    prober.io.req.ready &&
+                    !s1_valid.reduce(_||_) && !s2_valid.reduce(_||_)
+
+  when (cfg_change && dcache_idle) {
+    cfg_set_applied := io.lsu.cf_dcache_set_conf
+    cfg_way_applied := io.lsu.cf_dcache_way_conf
+  }
+
+  val geom_changed = (cfg_set_applied =/= RegNext(cfg_set_applied)) ||
+                     (cfg_way_applied =/= RegNext(cfg_way_applied))
+  assert(!(geom_changed && !RegNext(dcache_idle)),
+    "D$ geometry changed while the cache was not idle")
+  // ==== end reconstructed block =======================================================
 
   override def toString: String = BoomCoreStringPrefix(
     "==L1-DCache==",
