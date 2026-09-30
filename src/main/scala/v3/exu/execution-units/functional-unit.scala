@@ -304,34 +304,57 @@ abstract class PipelinedFunctionalUnit(
   // corefuzzing
   // helper to dump uop directly (modules have xLen and vaddrBits in scope)
   def dumpUop(unit: String, uop: MicroOp, enabled: Bool): Unit = {
-    // Modified: call new overload that accepts MicroOp to include cf_* fields in dumps
-    // Old call (kept for traceability):
-    // SpeculativePrintf.dump(unit, Sext.apply(uop.debug_pc(vaddrBits-1,0), xLen), uop.debug_inst, uop.is_rvc, enabled)
-    SpeculativePrintf.dump(unit, Sext.apply(uop.debug_pc(vaddrBits-1,0), xLen), uop.debug_inst, uop.is_rvc, enabled, uop)
+    // Compile-time gated: when ENABLE_CF_DEBUG_PRINTF is false this body is never
+    // elaborated, so the [SPECULATIVE][EXU] printf and its whole logic cone
+    // (debug_pc/debug_inst/cf_* reads) never reach the FIRRTL. The signature is
+    // unchanged, so every call site and FU subclass is untouched.
+    if (ENABLE_CF_DEBUG_PRINTF) {
+      // Modified: call new overload that accepts MicroOp to include cf_* fields in dumps
+      // Old call (kept for traceability):
+      // SpeculativePrintf.dump(unit, Sext.apply(uop.debug_pc(vaddrBits-1,0), xLen), uop.debug_inst, uop.is_rvc, enabled)
+      SpeculativePrintf.dump(unit, Sext.apply(uop.debug_pc(vaddrBits-1,0), xLen), uop.debug_inst, uop.is_rvc, enabled, uop)
+    }
   }
 
   if (numStages > 0) {
     val r_valids = RegInit(VecInit(Seq.fill(numStages) { false.B }))
     val r_uops   = Reg(Vec(numStages, new MicroOp()))
+    // corefuzzing (taint-follows-data): taint pipelined alongside the uop so a
+    // multi-cycle unit's result carries the taint of the operands it consumed.
+    val r_secret = Reg(Vec(numStages, Bool()))
+    val r_atk    = Reg(Vec(numStages, Bool()))
 
     // handle incoming request
     r_valids(0) := io.req.valid && !IsKilledByBranch(io.brupdate, io.req.bits.uop) && !io.req.bits.kill
     r_uops(0)   := io.req.bits.uop
     r_uops(0).br_mask := GetNewBrMask(io.brupdate, io.req.bits.uop)
+    r_secret(0) := io.req.bits.rs1_secret || io.req.bits.rs2_secret || io.req.bits.rs3_secret
+    // [SEEDFIX] see the note at r_atk_alu.
+    r_atk(0)    := io.req.bits.rs1_taint_atk || io.req.bits.rs2_taint_atk || (io.req.bits.uop.cf_domain_id =/= 0.U)
 
     // IFT LUT optimization: zero cf_* fields not read by the FU pipeline or by
     // the ROB wb_resps merge handler. PRESERVED fields (used downstream):
     //   cf_fu_bitmap (FU OR's its own bit; rob.scala wb_resps OR-merges)
     //   cf_attacker_influence, cf_secret_access, cf_secret_transmission,
     //     cf_secret_propagation (rob.scala wb_resps conditional set-true)
-    //   cf_influencer_list, cf_infl_overflow (rob.scala wb_infl_pending capture)
+    //   cf_influencer_list, cf_infl_dropped (rob.scala wb_infl_pending capture)
     // Stage 0 zeros propagate to stages 1..numStages-1 via r_uops(i):=r_uops(i-1).
-    r_uops(0).cf_domain_id               := 0.U
+    // [A3 2026-09-10] Do NOT zero identity on IFT builds.  MEMIDFIX fixed only the
+    // numStages==0 pass-through (MemAddrCalc); this is the PIPELINED branch, and fdiv
+    // has the same pattern.  A uop whose domain/op_count is erased here reaches the ROB
+    // writeback merge anonymous, so any influencer edge or ROB update keyed on those
+    // fields names the wrong op -- the same failure MEMIDFIX fixed one layer down.
+    // Gated on ENABLE_IFT so non-IFT builds still constant-fold both fields away.
+    if (!ENABLE_IFT) {
+      r_uops(0).cf_domain_id               := 0.U
+      r_uops(0).cf_op_count_id              := 0.U
+    }
     r_uops(0).cf_speculated               := false.B
-    r_uops(0).cf_op_count_id              := 0.U
     r_uops(0).cf_single_step              := false.B
     r_uops(0).cf_src_tainted              := false.B
     r_uops(0).cf_spec_branch_is_atk       := false.B
+    r_uops(0).cf_atk_branch_ctr       := 0.U
+    r_uops(0).cf_sec_branch_ctr       := 0.U
     r_uops(0).cf_spec_branch_op_id        := 0.U
     r_uops(0).cf_spec_branch_is_secret    := false.B
     r_uops(0).cf_cntd_valid               := false.B
@@ -610,19 +633,38 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
 
   val r_val  = RegInit(VecInit(Seq.fill(numStages) { false.B }))
   val r_data = Reg(Vec(numStages, UInt(xLen.W)))
+  // corefuzzing: ALU result taint, pipelined with the result it belongs to
+  val r_secret_alu = Reg(Vec(numStages, Bool()))
+  val r_atk_alu    = Reg(Vec(numStages, Bool()))
   val r_pred = Reg(Vec(numStages, Bool()))
   val alu_out = Mux(io.req.bits.uop.is_sfb_shadow && io.req.bits.pred_data,
     Mux(io.req.bits.uop.ldst_is_rs1, io.req.bits.rs1_data, io.req.bits.rs2_data),
     Mux(io.req.bits.uop.uopc === uopMOV, io.req.bits.rs2_data, alu.io.out))
   r_val (0) := io.req.valid
   r_data(0) := Mux(io.req.bits.uop.is_sfb_br, pc_sel === PC_BRJMP, alu_out)
+  r_secret_alu(0) := io.req.bits.rs1_secret || io.req.bits.rs2_secret
+  // [SEEDFIX 2026-09-07] Seed the OWNERSHIP bit at OPERAND CAPTURE, so it rides the
+  // existing taint pipeline and reaches BOTH the regfile write and the BYPASS.
+  // core.scala:1977 / regfile.scala:79 apply `|| cf_domain_id =/= 0` only when WRITING
+  // the regfile, but register-read's bypass forwards the FU RESPONSE -- so a consumer
+  // whose operand arrives by bypass saw the UNSEEDED value and dropped the taint.
+  // MEASURED (t31): `mv a0,a5` in attacker code 140/140 tainted; the very next victim
+  // instruction `mv a5,a0`, reading that same register via bypass, 0/114.  Attacker
+  // influence therefore travelled by OWNERSHIP and through MEMORY only, and died at the
+  // first cross-domain register hand-off.  spectre-v1 never saw it: its index travels
+  // through attacker-WRITTEN memory, never the bypass.
+  r_atk_alu(0)    := io.req.bits.rs1_taint_atk || io.req.bits.rs2_taint_atk || (io.req.bits.uop.cf_domain_id =/= 0.U)
   r_pred(0) := io.req.bits.uop.is_sfb_shadow && io.req.bits.pred_data
   for (i <- 1 until numStages) {
     r_val(i)  := r_val(i-1)
     r_data(i) := r_data(i-1)
+    r_secret_alu(i) := r_secret_alu(i-1)
+    r_atk_alu(i)    := r_atk_alu(i-1)
     r_pred(i) := r_pred(i-1)
   }
   io.resp.bits.data := r_data(numStages-1)
+  io.resp.bits.secret := r_secret_alu(numStages-1)
+  io.resp.bits.taint_atk := r_atk_alu(numStages-1)
   io.resp.bits.predicated := r_pred(numStages-1)
   // Bypass
   // for the ALU, we can bypass same cycle as compute
@@ -665,6 +707,33 @@ class MemAddrCalcUnit(implicit p: Parameters)
 
   val store_data = io.req.bits.rs2_data
 
+  // corefuzzing: the taint rides the VALUE that forms the address.  rs1_data is the
+  // address operand and its taint arrives on the same request; without this the value
+  // reaches the LSU and the secret bit is silently dropped here.  A load cannot execute
+  // until this operand is ready, so this is exactly the moment its taint is known --
+  // no wakeup snooping or retroactive bus is needed.
+  io.resp.bits.secret := io.req.bits.rs1_secret
+  // [SEEDFIX] see the note at r_atk_alu.
+  io.resp.bits.taint_atk := io.req.bits.rs1_taint_atk || io.req.bits.rs2_taint_atk || (io.req.bits.uop.cf_domain_id =/= 0.U)
+  io.resp.bits.data_secret := io.req.bits.rs2_secret
+  io.resp.bits.data_taint_atk := io.req.bits.rs2_taint_atk
+// [PROBE STRIPPED 2026-09-11] A1PROBE2 -- diagnostic only, purpose discharged.
+  // // [A1PROBE2 2026-09-11] TEMPORARY.  A1 is CONFIRMED (199,008 store records, 0 with s_prop=1)
+  // // but its recorded cause -- "no rs2 bypass cases" -- was REFUTED: the cases exist, the
+  // // bypass network carries `secret`/`taint_atk`, and today's Verilog shows an uncollapsed rs2
+  // // mux.  Every static link is wired, so the death point is NOT located.  Print, for STORE
+  // // uops only, what actually arrives at the AGU and what leaves it.  Three outcomes, three
+  // // different fixes: rs2sec=0 => the producer/bypass never delivered it; rs2sec=1 & dsec=0 =>
+  // // lost in this unit; both 1 => lost downstream of the AGU.
+  // if (ENABLE_CF_DEBUG_PRINTF) {
+    // when (io.req.valid && io.req.bits.uop.uses_stq) {
+      // printf("\n[A1AGU] pc=0x%x prs2=%d rs2sec=%d rs2atk=%d dsec=%d datk=%d sprop=%d\n",
+        // io.req.bits.uop.debug_pc, io.req.bits.uop.prs2,
+        // io.req.bits.rs2_secret, io.req.bits.rs2_taint_atk,
+        // io.resp.bits.data_secret, io.resp.bits.data_taint_atk,
+        // io.req.bits.uop.cf_secret_propagation)
+    // }
+  // }
   io.resp.bits.addr := effective_address
   io.resp.bits.data := store_data
 
@@ -832,13 +901,29 @@ abstract class IterativeFunctionalUnit(dataWidth: Int)(implicit p: Parameters)
     do_kill := IsKilledByBranch(io.brupdate, io.req.bits.uop) || io.req.bits.kill
     r_uop := io.req.bits.uop
     r_uop.br_mask := GetNewBrMask(io.brupdate, io.req.bits.uop)
+    r_secret := io.req.bits.rs1_secret || io.req.bits.rs2_secret || io.req.bits.rs3_secret
+    // [SEEDFIX] see the note at r_atk_alu.
+    r_atk    := io.req.bits.rs1_taint_atk || io.req.bits.rs2_taint_atk || (io.req.bits.uop.cf_domain_id =/= 0.U)
   } .otherwise {
     do_kill := IsKilledByBranch(io.brupdate, r_uop) || io.req.bits.kill
     r_uop.br_mask := GetNewBrMask(io.brupdate, r_uop)
   }
 
+  // O1: publish occupancy taint.  `!io.req.ready` is exactly "this non-pipelined unit
+  // is still working", driven by the sub-unit (e.g. div.io.req.ready).  r_uop/r_secret
+  // already hold the occupant's identity and taint for the whole latency, so this
+  // needs no new state -- only exposure.
+  io.cf_fu_busy.valid        := !io.req.ready
+  // truncate explicitly: cf_op_count_id is uopIDCounterWidthCF wide, and only the low
+  // inflOpCountWidthCF bits are ever stored (see the port declaration above).
+  io.cf_fu_busy.bits.op_count := r_uop.cf_op_count_id(inflOpCountWidthCF-1, 0)
+  io.cf_fu_busy.bits.is_atk   := r_uop.cf_domain_id =/= 0.U
+  io.cf_fu_busy.bits.is_sec   := r_secret || r_uop.cf_secret_access || r_uop.cf_secret_propagation
+
   // assumes at least one pipeline register between request and response
   io.resp.bits.uop := r_uop
+  io.resp.bits.secret := r_secret
+  io.resp.bits.taint_atk := r_atk
 }
 
 /**
