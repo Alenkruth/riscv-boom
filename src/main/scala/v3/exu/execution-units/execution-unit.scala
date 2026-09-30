@@ -38,6 +38,13 @@ class ExeUnitResp(val dataWidth: Int)(implicit p: Parameters) extends BoomBundle
   with HasBoomUOP
 {
   val data = Bits(dataWidth.W)
+  // corefuzzing (taint-follows-data): the taint accompanying this result, on both
+  // the writeback and bypass paths.  Replaces the preg_secret lookup entirely --
+  // a consumer no longer asks "is register N tainted", the taint arrives with the
+  // operand, so it cannot be stale and cannot be inherited by a reallocated preg.
+  val secret      = Bool()
+  // corefuzzing: attacker taint travelling with this result (see FuncUnitResp.taint_atk)
+  val taint_atk   = Bool()
   val predicated = Bool() // Was this predicated off?
   val fflags = new ValidIO(new FFlagsResp) // write fflags to ROB // TODO: Do this better
 }
@@ -99,9 +106,17 @@ abstract class ExecutionUnit(
   val hasFpiu          : Boolean       = false,
   val hasRocc          : Boolean       = false
   )(implicit p: Parameters) extends BoomModule
+  with freechips.rocketchip.util.CoreFuzzingConstants   // O1: uopIDCounterWidthCF for cf_fu_busy
 {
 
   val io = IO(new Bundle {
+    // O1 (corefuzzing): aggregated occupancy taint of this unit's NON-PIPELINED FUs.
+    // Pipelined FUs never assert it, so this is invalid for ALU/mul/FPU-only units.
+    val cf_fu_busy = Output(Valid(new Bundle {
+      val op_count = UInt(uopIDCounterWidthCF.W)
+      val is_atk   = Bool()
+      val is_sec   = Bool()
+    }))
     val fu_types = Output(Bits(FUC_SZ.W))
 
     val req      = Flipped(new DecoupledIO(new FuncUnitReq(dataWidth)))
@@ -140,6 +155,12 @@ abstract class ExecutionUnit(
   })
 
   io.req.ready := false.B
+
+  // O1: invalid unless this unit contains a non-pipelined FU (overridden below).
+  io.cf_fu_busy.valid      := false.B
+  io.cf_fu_busy.bits       := DontCare
+  io.cf_fu_busy.bits.is_atk := false.B
+  io.cf_fu_busy.bits.is_sec := false.B
 
   if (writesIrf)   {
     io.iresp.valid := false.B
@@ -284,6 +305,11 @@ class ALUExeUnit(
     alu.io.req.bits.kill     := io.req.bits.kill
     alu.io.req.bits.rs1_data := io.req.bits.rs1_data
     alu.io.req.bits.rs2_data := io.req.bits.rs2_data
+    alu.io.req.bits.rs1_secret := io.req.bits.rs1_secret
+    alu.io.req.bits.rs2_secret := io.req.bits.rs2_secret
+    alu.io.req.bits.rs1_taint_atk := io.req.bits.rs1_taint_atk
+    alu.io.req.bits.rs2_taint_atk := io.req.bits.rs2_taint_atk
+    alu.io.req.bits.rs3_secret := io.req.bits.rs3_secret
     alu.io.req.bits.rs3_data := DontCare
     alu.io.req.bits.pred_data := io.req.bits.pred_data
     alu.io.resp.ready := DontCare
@@ -312,6 +338,11 @@ class ALUExeUnit(
     rocc.io.req.bits.kill     := io.req.bits.kill
     rocc.io.req.bits.rs1_data := io.req.bits.rs1_data
     rocc.io.req.bits.rs2_data := io.req.bits.rs2_data
+    rocc.io.req.bits.rs1_secret := io.req.bits.rs1_secret
+    rocc.io.req.bits.rs2_secret := io.req.bits.rs2_secret
+    rocc.io.req.bits.rs1_taint_atk := io.req.bits.rs1_taint_atk
+    rocc.io.req.bits.rs2_taint_atk := io.req.bits.rs2_taint_atk
+    rocc.io.req.bits.rs3_secret := io.req.bits.rs3_secret
     rocc.io.brupdate          := io.brupdate // We should assert on this somewhere
     rocc.io.status            := io.status
     rocc.io.exception         := io.com_exception
@@ -321,6 +352,8 @@ class ALUExeUnit(
     io.ll_iresp.valid         := rocc.io.resp.valid
     io.ll_iresp.bits.uop      := rocc.io.resp.bits.uop
     io.ll_iresp.bits.data     := rocc.io.resp.bits.data
+    io.ll_iresp.bits.secret   := rocc.io.resp.bits.secret
+    io.ll_iresp.bits.taint_atk := rocc.io.resp.bits.taint_atk
   }
 
 
@@ -333,6 +366,11 @@ class ALUExeUnit(
     imul.io.req.bits.uop      := io.req.bits.uop
     imul.io.req.bits.rs1_data := io.req.bits.rs1_data
     imul.io.req.bits.rs2_data := io.req.bits.rs2_data
+    imul.io.req.bits.rs1_secret := io.req.bits.rs1_secret
+    imul.io.req.bits.rs2_secret := io.req.bits.rs2_secret
+    imul.io.req.bits.rs1_taint_atk := io.req.bits.rs1_taint_atk
+    imul.io.req.bits.rs2_taint_atk := io.req.bits.rs2_taint_atk
+    imul.io.req.bits.rs3_secret := io.req.bits.rs3_secret
     imul.io.req.bits.kill     := io.req.bits.kill
     imul.io.brupdate := io.brupdate
     //corefuzzing
@@ -358,6 +396,8 @@ class ALUExeUnit(
     queue.io.enq.bits.uop    := ifpu.io.resp.bits.uop
     queue.io.enq.bits.data   := ifpu.io.resp.bits.data
     queue.io.enq.bits.predicated := ifpu.io.resp.bits.predicated
+    queue.io.enq.bits.secret := ifpu.io.resp.bits.secret
+    queue.io.enq.bits.taint_atk := ifpu.io.resp.bits.taint_atk
     queue.io.enq.bits.fflags := ifpu.io.resp.bits.fflags
     queue.io.brupdate := io.brupdate
     queue.io.flush := io.req.bits.kill
@@ -372,6 +412,8 @@ class ALUExeUnit(
   val div_resp_val = WireInit(false.B)
   if (hasDiv) {
     div = Module(new DivUnit(xLen))
+    // O1: the int divider is the non-pipelined unit in this exe unit
+    io.cf_fu_busy := div.io.cf_fu_busy
     div.io <> DontCare
     div.io.req.valid           := io.req.valid && io.req.bits.uop.fu_code_is(FU_DIV) && hasDiv.B
     div.io.req.bits.uop        := io.req.bits.uop
@@ -425,6 +467,11 @@ class ALUExeUnit(
       (f.io.resp.valid, f.io.resp.bits.data)).toSeq)
     io.iresp.bits.predicated := PriorityMux(iresp_fu_units.map(f =>
       (f.io.resp.valid, f.io.resp.bits.predicated)).toSeq)
+      // taint selected by the SAME priority as the data
+      io.iresp.bits.secret := PriorityMux(iresp_fu_units.map(f =>
+        (f.io.resp.valid, f.io.resp.bits.secret)).toSeq)
+      io.iresp.bits.taint_atk := PriorityMux(iresp_fu_units.map(f =>
+        (f.io.resp.valid, f.io.resp.bits.taint_atk)).toSeq)
 
     // pulled out for critical path reasons
     // TODO: Does this make sense as part of the iresp bundle?
@@ -493,6 +540,11 @@ class FPUExeUnit(
     fpu.io.req.bits.uop      := io.req.bits.uop
     fpu.io.req.bits.rs1_data := io.req.bits.rs1_data
     fpu.io.req.bits.rs2_data := io.req.bits.rs2_data
+    fpu.io.req.bits.rs1_secret := io.req.bits.rs1_secret
+    fpu.io.req.bits.rs2_secret := io.req.bits.rs2_secret
+    fpu.io.req.bits.rs1_taint_atk := io.req.bits.rs1_taint_atk
+    fpu.io.req.bits.rs2_taint_atk := io.req.bits.rs2_taint_atk
+    fpu.io.req.bits.rs3_secret := io.req.bits.rs3_secret
     fpu.io.req.bits.rs3_data := io.req.bits.rs3_data
     fpu.io.req.bits.pred_data := false.B
     fpu.io.req.bits.kill     := io.req.bits.kill
@@ -514,10 +566,17 @@ class FPUExeUnit(
   fdiv_resp_fflags.valid := false.B
   if (hasFdiv) {
     fdivsqrt = Module(new FDivSqrtUnit())
+    // O1: fdiv/fsqrt is the non-pipelined unit in this exe unit
+    io.cf_fu_busy := fdivsqrt.io.cf_fu_busy
     fdivsqrt.io.req.valid         := io.req.valid && io.req.bits.uop.fu_code_is(FU_FDV)
     fdivsqrt.io.req.bits.uop      := io.req.bits.uop
     fdivsqrt.io.req.bits.rs1_data := io.req.bits.rs1_data
     fdivsqrt.io.req.bits.rs2_data := io.req.bits.rs2_data
+    fdivsqrt.io.req.bits.rs1_secret := io.req.bits.rs1_secret
+    fdivsqrt.io.req.bits.rs2_secret := io.req.bits.rs2_secret
+    fdivsqrt.io.req.bits.rs1_taint_atk := io.req.bits.rs1_taint_atk
+    fdivsqrt.io.req.bits.rs2_taint_atk := io.req.bits.rs2_taint_atk
+    fdivsqrt.io.req.bits.rs3_secret := io.req.bits.rs3_secret
     fdivsqrt.io.req.bits.rs3_data := DontCare
     fdivsqrt.io.req.bits.pred_data := false.B
     fdivsqrt.io.req.bits.kill     := io.req.bits.kill
@@ -543,6 +602,8 @@ class FPUExeUnit(
   io.fresp.bits.uop    := PriorityMux(fu_units.map(f => (f.io.resp.valid,
                                                          f.io.resp.bits.uop)).toSeq)
   io.fresp.bits.data:= PriorityMux(fu_units.map(f => (f.io.resp.valid, f.io.resp.bits.data)).toSeq)
+  io.fresp.bits.secret := PriorityMux(fu_units.map(f => (f.io.resp.valid, f.io.resp.bits.secret)).toSeq)
+  io.fresp.bits.taint_atk := PriorityMux(fu_units.map(f => (f.io.resp.valid, f.io.resp.bits.taint_atk)).toSeq)
   io.fresp.bits.fflags := Mux(fpu_resp_val, fpu_resp_fflags, fdiv_resp_fflags)
 
   // Outputs (Write Port #1) -- FpToInt Queuing Unit -----------------------
@@ -558,6 +619,8 @@ class FPUExeUnit(
     queue.io.enq.bits.uop    := fpu.io.resp.bits.uop
     queue.io.enq.bits.data   := fpu.io.resp.bits.data
     queue.io.enq.bits.predicated := fpu.io.resp.bits.predicated
+    queue.io.enq.bits.secret := fpu.io.resp.bits.secret
+    queue.io.enq.bits.taint_atk := fpu.io.resp.bits.taint_atk
     queue.io.enq.bits.fflags := fpu.io.resp.bits.fflags
     queue.io.brupdate          := io.brupdate
     queue.io.flush           := io.req.bits.kill
@@ -569,6 +632,8 @@ class FPUExeUnit(
     fp_sdq.io.enq.valid      := io.req.valid && io.req.bits.uop.uopc === uopSTA && !IsKilledByBranch(io.brupdate, io.req.bits.uop)
     fp_sdq.io.enq.bits.uop   := io.req.bits.uop
     fp_sdq.io.enq.bits.data  := ieee(io.req.bits.rs2_data)
+    fp_sdq.io.enq.bits.secret := io.req.bits.rs2_secret
+    fp_sdq.io.enq.bits.taint_atk := io.req.bits.rs2_taint_atk
     fp_sdq.io.enq.bits.predicated := false.B
     fp_sdq.io.enq.bits.fflags := DontCare
     fp_sdq.io.brupdate         := io.brupdate

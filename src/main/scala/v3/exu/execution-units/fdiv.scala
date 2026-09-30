@@ -137,9 +137,6 @@ class FDivSqrtUnit(implicit p: Parameters)
     r_buffer_req.uop.cf_cntd_winner_atk          := false.B
     r_buffer_req.uop.cf_cntd_winner_sec          := false.B
     r_buffer_req.uop.cf_cntd_deny_count          := 0.U
-    r_buffer_req.uop.cf_taint_producer_op        := 0.U
-    r_buffer_req.uop.cf_taint_producer_is_atk    := false.B
-    r_buffer_req.uop.cf_taint_producer_is_secret := false.B
     r_buffer_fin.viewAsSupertype(new tile.FPUCtrlSigs) := fdiv_decoder.io.sigs
 
     r_buffer_fin.rm := Mux(ImmGenRm(io.req.bits.uop.imm_packed) === 7.U, io.fcsr_rm, ImmGenRm(io.req.bits.uop.imm_packed))
@@ -209,9 +206,6 @@ class FDivSqrtUnit(implicit p: Parameters)
     r_divsqrt_uop.cf_cntd_winner_atk          := false.B
     r_divsqrt_uop.cf_cntd_winner_sec          := false.B
     r_divsqrt_uop.cf_cntd_deny_count          := 0.U
-    r_divsqrt_uop.cf_taint_producer_op        := 0.U
-    r_divsqrt_uop.cf_taint_producer_is_atk    := false.B
-    r_divsqrt_uop.cf_taint_producer_is_secret := false.B
   }
 
   //-----------------------------------------
@@ -249,9 +243,6 @@ class FDivSqrtUnit(implicit p: Parameters)
     r_out_uop.cf_cntd_winner_atk          := false.B
     r_out_uop.cf_cntd_winner_sec          := false.B
     r_out_uop.cf_cntd_deny_count          := 0.U
-    r_out_uop.cf_taint_producer_op        := 0.U
-    r_out_uop.cf_taint_producer_is_atk    := false.B
-    r_out_uop.cf_taint_producer_is_secret := false.B
     r_out_wdata_double := sanitizeNaN(divsqrt.io.out, tile.FType.D)
     r_out_flags_double := divsqrt.io.exceptionFlags
 

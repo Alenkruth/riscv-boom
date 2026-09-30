@@ -31,6 +31,11 @@ class RegisterFileReadPortIO(val addrWidth: Int, val dataWidth: Int)(implicit p:
 {
   val addr = Input(UInt(addrWidth.W))
   val data = Output(UInt(dataWidth.W))
+  // corefuzzing (taint-follows-data): taint travelling WITH this value. Held in a
+  // parallel 1-bit Mem on the same address, so it is RAM like the data -- unlike the
+  // old preg_secret Vec-of-Reg, whose every read inferred a numPregs:1 mux.
+  val secret    = Output(Bool())
+  val taint_atk = Output(Bool())
 }
 
 /**
@@ -43,6 +48,10 @@ class RegisterFileWritePort(val addrWidth: Int, val dataWidth: Int)(implicit p: 
 {
   val addr = UInt(addrWidth.W)
   val data = UInt(dataWidth.W)
+  // corefuzzing: taint written by the SAME port that writes the value, so a
+  // reallocated register cannot inherit a stale bit.
+  val secret    = Bool()
+  val taint_atk = Bool()
 }
 
 /**
@@ -57,6 +66,19 @@ object WritePort
      wport.valid     := enq.valid && enq.bits.uop.dst_rtype === rtype
      wport.bits.addr := enq.bits.uop.pdst
      wport.bits.data := enq.bits.data
+     wport.bits.secret    := enq.bits.secret
+     // taint_atk is a property of the WRITER, not of the data, so it is taken from
+     // the producing uop's domain here rather than pipelined through every FU stage.
+     // This is exactly INFL_REG_DATAFLOW's stated intent: "victim reads physical reg
+     // written by attacker uop".
+     // corefuzzing: attacker taint now FOLLOWS DATA as well as recording ownership.
+     // Ownership alone ("which domain wrote this") cannot express STEERING: in spectre-v1
+     // the whole gadget runs in domain=0 because the mispredicted bounds check is the
+     // VICTIM's code -- the attacker only supplies the index.  ORing the propagated
+     // operand taint makes a value derived from attacker-written data carry the tag.
+     wport.bits.taint_atk := enq.bits.taint_atk || (enq.bits.uop.cf_domain_id =/= 0.U)
+     // s0/sp carry taint (PROBE J: reqsec=1 on every stack load), and `addi s0,sp,N`
+     // propagates rs1, so one taint on sp is self-sustaining.  Print the writer.
      enq.ready       := true.B
      wport
   }
@@ -115,17 +137,28 @@ class RegisterFileSynthesizable(
   // --------------------------------------------------------------
 
   val regfile = Mem(numRegisters, UInt(registerWidth.W))
+  // corefuzzing taint shadow: {taint_atk, secret}, packed beside the data in RAM.
+  // Deliberately TWO bits, not three.  The influencer's producer op_count is NOT
+  // carried: it is recovered in post-processing from the logged pregs
+  // (ift-tests/preg_dataflow.py), so paying inflOpCountWidthCF bits per read port,
+  // write port and FU stage would buy nothing.  `secret` must be in hardware --
+  // it depends on the execute-time TLB range check, which no log field implies --
+  // and `taint_atk` rides along for downstream cross-domain attribution.
+  val cfTaintW = 2   // {taint_atk, secret}
+  val regfile_secret = Mem(numRegisters, UInt(cfTaintW.W))
 
   // --------------------------------------------------------------
   // Read ports.
 
   val read_data = Wire(Vec(numReadPorts, UInt(registerWidth.W)))
+  val read_secret = Wire(Vec(numReadPorts, UInt(cfTaintW.W)))
 
   // Register the read port addresses to give a full cycle to the RegisterRead Stage (if desired).
   val read_addrs = io.read_ports.map(p => RegNext(p.addr))
 
   for (i <- 0 until numReadPorts) {
-    read_data(i) := regfile(read_addrs(i))
+    read_data(i)   := regfile(read_addrs(i))
+      read_secret(i) := regfile_secret(read_addrs(i))
   }
 
   // --------------------------------------------------------------
@@ -146,12 +179,21 @@ class RegisterFileSynthesizable(
         x.bits.addr === read_addrs(i))
 
       val bypass_data = Mux1H(VecInit(bypass_ens.toSeq), VecInit(bypassable_wports.map(_.bits.data).toSeq))
+        // taint rides the SAME bypass select as the data
+        // taint rides the SAME bypass select as the data
+        val bypass_taint = Mux1H(VecInit(bypass_ens.toSeq),
+          VecInit(bypassable_wports.map(x => Cat(x.bits.taint_atk, x.bits.secret)).toSeq))
+        val sel_taint = Mux(bypass_ens.reduce(_|_), bypass_taint, read_secret(i))
 
-      io.read_ports(i).data := Mux(bypass_ens.reduce(_|_), bypass_data, read_data(i))
+      io.read_ports(i).data   := Mux(bypass_ens.reduce(_|_), bypass_data,   read_data(i))
+        io.read_ports(i).secret    := sel_taint(0)
+        io.read_ports(i).taint_atk := sel_taint(1)
     }
   } else {
     for (i <- 0 until numReadPorts) {
-      io.read_ports(i).data := read_data(i)
+      io.read_ports(i).data   := read_data(i)
+        io.read_ports(i).secret    := read_secret(i)(0)
+        io.read_ports(i).taint_atk := read_secret(i)(1)
     }
   }
 
@@ -161,6 +203,7 @@ class RegisterFileSynthesizable(
   for (wport <- io.write_ports) {
     when (wport.valid) {
       regfile(wport.bits.addr) := wport.bits.data
+      regfile_secret(wport.bits.addr) := Cat(wport.bits.taint_atk, wport.bits.secret)
     }
   }
 

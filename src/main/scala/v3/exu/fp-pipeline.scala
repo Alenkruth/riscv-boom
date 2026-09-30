@@ -86,7 +86,8 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
                          exe_units.withFilter(_.readsFrf).map(x => 3).toSeq,
                          0, // No bypass for FP
                          0,
-                         fLen+1))
+                         fLen+1,
+                         RT_FLT))   // corefuzzing: this stage reads the FP regfile
 
   require (exe_units.count(_.readsFrf) == issue_unit.issueWidth)
   require (exe_units.numFrfWritePorts + numLlPorts == numWakeupPorts)
@@ -171,6 +172,24 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
     issue_wakeup.valid := writeback.valid
     issue_wakeup.bits.pdst  := writeback.bits.uop.pdst
     issue_wakeup.bits.poisoned := false.B
+    issue_wakeup.bits.secret   := writeback.bits.secret
+  }
+  // O1: the FP issue unit's non-pipelined unit (fdivsqrt) sits in this pipeline;
+  // aggregate its occupancy taint here.
+  {
+    val fbusy = (0 until exe_units.length).map(exe_units(_)).filter(_.hasFdiv)
+    if (fbusy.isEmpty) {
+      issue_unit.io.cf_fu_busy.valid := false.B
+      issue_unit.io.cf_fu_busy.bits  := DontCare
+      issue_unit.io.cf_fu_busy.bits.is_atk := false.B
+      issue_unit.io.cf_fu_busy.bits.is_sec := false.B
+    } else {
+      val sel = PriorityEncoderOH(VecInit(fbusy.map(_.io.cf_fu_busy.valid)).asUInt)
+      issue_unit.io.cf_fu_busy.valid          := fbusy.map(_.io.cf_fu_busy.valid).reduce(_||_)
+      issue_unit.io.cf_fu_busy.bits.op_count  := Mux1H(sel, fbusy.map(_.io.cf_fu_busy.bits.op_count))
+      issue_unit.io.cf_fu_busy.bits.is_atk    := Mux1H(sel, fbusy.map(_.io.cf_fu_busy.bits.is_atk))
+      issue_unit.io.cf_fu_busy.bits.is_sec    := Mux1H(sel, fbusy.map(_.io.cf_fu_busy.bits.is_sec))
+    }
   }
   issue_unit.io.pred_wakeup_port.valid := false.B
   issue_unit.io.pred_wakeup_port.bits := DontCare
@@ -181,7 +200,9 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
 
   // Register Read <- Issue (rrd <- iss)
   fregister_read.io.rf_read_ports <> fregfile.io.read_ports
-  fregister_read.io.prf_read_ports map { port => port.data := false.B }
+  // FP pipeline has no predicate file; tie off both the value and its taint.
+  fregister_read.io.prf_read_ports map { port =>
+    port.data := false.B; port.secret := false.B; port.taint_atk := false.B }
 
   fregister_read.io.iss_valids <> iss_valids
   fregister_read.io.iss_uops := iss_uops

@@ -41,7 +41,15 @@ class RegisterRead(
                         // numTotalReadPorts)
   numTotalBypassPorts: Int,
   numTotalPredBypassPorts: Int,
-  registerWidth: Int
+  registerWidth: Int,
+  // corefuzzing: which register file this stage reads.  Used ONLY to guard operand
+  // taint.  prs1/prs2/prs3 are NOT cleared for sources an instruction does not have
+  // -- they still hold whatever preg the slot last carried -- so reading taint from
+  // them manufactures secret taint on instructions with no secret source (observed:
+  // `auipc` at opcount 0, no register operands, tagged s_prop=1).  The bypass cases
+  // below already carry this guard; the MuxCase FALLBACK to the raw regfile read did
+  // not, which is where the false taint entered.
+  rtype: UInt = RT_FIX
 )(implicit p: Parameters) extends BoomModule
 {
   val io = IO(new Bundle {
@@ -72,6 +80,13 @@ class RegisterRead(
   val exe_reg_rs2_data = Reg(Vec(issueWidth, Bits(registerWidth.W)))
   val exe_reg_rs3_data = Reg(Vec(issueWidth, Bits(registerWidth.W)))
   val exe_reg_pred_data = Reg(Vec(issueWidth, Bool()))
+  val exe_reg_rs1_secret = Reg(Vec(issueWidth, Bool()))
+  val exe_reg_rs2_secret = Reg(Vec(issueWidth, Bool()))
+  // corefuzzing: ATTACKER taint, plumbed identically to the secret taint.  Needed so a
+  // STEERED gadget is attributable: without it the regfile's taint_atk is never read back.
+  val exe_reg_rs1_atk = Reg(Vec(issueWidth, Bool()))
+  val exe_reg_rs2_atk = Reg(Vec(issueWidth, Bool()))
+  val exe_reg_rs3_secret = Reg(Vec(issueWidth, Bool()))
 
   //-------------------------------------------------------------
   // hook up inputs
@@ -94,10 +109,23 @@ class RegisterRead(
   val rrd_rs1_data   = Wire(Vec(issueWidth, Bits(registerWidth.W)))
   val rrd_rs2_data   = Wire(Vec(issueWidth, Bits(registerWidth.W)))
   val rrd_rs3_data   = Wire(Vec(issueWidth, Bits(registerWidth.W)))
+  // corefuzzing (taint-follows-data): taint mirrors the data at every stage.
+  val rrd_rs1_secret = Wire(Vec(issueWidth, Bool()))
+  val rrd_rs2_secret = Wire(Vec(issueWidth, Bool()))
+  val rrd_rs1_atk = Wire(Vec(issueWidth, Bool()))
+  val rrd_rs2_atk = Wire(Vec(issueWidth, Bool()))
+  val rrd_rs3_secret = Wire(Vec(issueWidth, Bool()))
   val rrd_pred_data  = Wire(Vec(issueWidth, Bool()))
   rrd_rs1_data := DontCare
   rrd_rs2_data := DontCare
   rrd_rs3_data := DontCare
+  // default FALSE, not DontCare: an undriven taint is X and would propagate as
+  // real taint through the OR in the functional units.
+  rrd_rs1_secret := VecInit(Seq.fill(issueWidth)(false.B))
+  rrd_rs2_secret := VecInit(Seq.fill(issueWidth)(false.B))
+  rrd_rs1_atk := VecInit(Seq.fill(issueWidth)(false.B))
+  rrd_rs2_atk := VecInit(Seq.fill(issueWidth)(false.B))
+  rrd_rs3_secret := VecInit(Seq.fill(issueWidth)(false.B))
   rrd_pred_data := DontCare
 
   io.prf_read_ports := DontCare
@@ -122,8 +150,13 @@ class RegisterRead(
     if (enableSFBOpt) io.prf_read_ports(w).addr := pred_addr
 
     if (numReadPorts > 0) rrd_rs1_data(w) := Mux(RegNext(rs1_addr === 0.U), 0.U, io.rf_read_ports(idx+0).data)
+    if (numReadPorts > 0) rrd_rs1_secret(w) := io.rf_read_ports(idx+0).secret
     if (numReadPorts > 1) rrd_rs2_data(w) := Mux(RegNext(rs2_addr === 0.U), 0.U, io.rf_read_ports(idx+1).data)
+    if (numReadPorts > 1) rrd_rs2_secret(w) := io.rf_read_ports(idx+1).secret
+    if (numReadPorts > 0) rrd_rs1_atk(w) := io.rf_read_ports(idx).taint_atk
+    if (numReadPorts > 1) rrd_rs2_atk(w) := io.rf_read_ports(idx+1).taint_atk
     if (numReadPorts > 2) rrd_rs3_data(w) := Mux(RegNext(rs3_addr === 0.U), 0.U, io.rf_read_ports(idx+2).data)
+    if (numReadPorts > 2) rrd_rs3_secret(w) := io.rf_read_ports(idx+2).secret
 
     if (enableSFBOpt) rrd_pred_data(w) := Mux(RegNext(io.iss_uops(w).is_sfb_shadow), io.prf_read_ports(w).data, false.B)
 
@@ -153,12 +186,21 @@ class RegisterRead(
   val bypassed_rs2_data = Wire(Vec(issueWidth, Bits(registerWidth.W)))
   val bypassed_pred_data = Wire(Vec(issueWidth, Bool()))
   bypassed_pred_data := DontCare
+  val bypassed_rs1_secret = Wire(Vec(issueWidth, Bool()))
+  val bypassed_rs2_secret = Wire(Vec(issueWidth, Bool()))
+  val bypassed_rs1_atk = Wire(Vec(issueWidth, Bool()))
+  val bypassed_rs2_atk = Wire(Vec(issueWidth, Bool()))
 
   for (w <- 0 until issueWidth) {
     val numReadPorts = numReadPortsArray(w)
     var rs1_cases = Array((false.B, 0.U(registerWidth.W)))
     var rs2_cases = Array((false.B, 0.U(registerWidth.W)))
     var pred_cases = Array((false.B, 0.U(1.W)))
+    // taint cases use the IDENTICAL predicates as the data cases
+    var rs1_secret_cases = Array((false.B, false.B))
+    var rs2_secret_cases = Array((false.B, false.B))
+    var rs1_atk_cases = Array((false.B, false.B))
+    var rs2_atk_cases = Array((false.B, false.B))
 
     val prs1       = rrd_uops(w).prs1
     val lrs1_rtype = rrd_uops(w).lrs1_rtype
@@ -174,6 +216,14 @@ class RegisterRead(
         && bypass.bits.uop.dst_rtype === RT_FIX && lrs1_rtype === RT_FIX && (prs1 =/= 0.U), bypass.bits.data))
       rs2_cases ++= Array((bypass.valid && (prs2 === bypass.bits.uop.pdst) && bypass.bits.uop.rf_wen
         && bypass.bits.uop.dst_rtype === RT_FIX && lrs2_rtype === RT_FIX && (prs2 =/= 0.U), bypass.bits.data))
+      rs1_secret_cases ++= Array((bypass.valid && (prs1 === bypass.bits.uop.pdst) && bypass.bits.uop.rf_wen
+        && bypass.bits.uop.dst_rtype === RT_FIX && lrs1_rtype === RT_FIX && (prs1 =/= 0.U), bypass.bits.secret))
+      rs2_secret_cases ++= Array((bypass.valid && (prs2 === bypass.bits.uop.pdst) && bypass.bits.uop.rf_wen
+        && bypass.bits.uop.dst_rtype === RT_FIX && lrs2_rtype === RT_FIX && (prs2 =/= 0.U), bypass.bits.secret))
+      rs1_atk_cases ++= Array((bypass.valid && (prs1 === bypass.bits.uop.pdst) && bypass.bits.uop.rf_wen
+        && bypass.bits.uop.dst_rtype === RT_FIX && lrs1_rtype === RT_FIX && (prs1 =/= 0.U), bypass.bits.taint_atk))
+      rs2_atk_cases ++= Array((bypass.valid && (prs2 === bypass.bits.uop.pdst) && bypass.bits.uop.rf_wen
+        && bypass.bits.uop.dst_rtype === RT_FIX && lrs2_rtype === RT_FIX && (prs2 =/= 0.U), bypass.bits.taint_atk))
     }
 
     for (b <- 0 until numTotalPredBypassPorts)
@@ -184,6 +234,10 @@ class RegisterRead(
 
     if (numReadPorts > 0) bypassed_rs1_data(w)  := MuxCase(rrd_rs1_data(w), rs1_cases)
     if (numReadPorts > 1) bypassed_rs2_data(w)  := MuxCase(rrd_rs2_data(w), rs2_cases)
+    if (numReadPorts > 0) bypassed_rs1_secret(w) := MuxCase(rrd_rs1_secret(w), rs1_secret_cases)
+    if (numReadPorts > 1) bypassed_rs2_secret(w) := MuxCase(rrd_rs2_secret(w), rs2_secret_cases)
+    if (numReadPorts > 0) bypassed_rs1_atk(w) := MuxCase(rrd_rs1_atk(w), rs1_atk_cases)
+    if (numReadPorts > 1) bypassed_rs2_atk(w) := MuxCase(rrd_rs2_atk(w), rs2_atk_cases)
     if (enableSFBOpt)     bypassed_pred_data(w) := MuxCase(rrd_pred_data(w), pred_cases)
   }
 

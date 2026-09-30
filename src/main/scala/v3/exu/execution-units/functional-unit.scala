@@ -91,6 +91,19 @@ class FuncUnitReq(val dataWidth: Int)(implicit p: Parameters) extends BoomBundle
   val rs1_data = UInt(dataWidth.W)
   val rs2_data = UInt(dataWidth.W)
   val rs3_data = UInt(dataWidth.W) // only used for FMA units
+  // corefuzzing: per-operand taint.  Kept per-operand rather than pre-OR'd because
+  // the LSU needs to know specifically whether the ADDRESS operand was secret.
+  val rs1_secret = Bool()
+  // corefuzzing: ATTACKER taint of the operands, carried beside the secret taint.
+  // Without this the regfile's taint_atk is written but never read back, so attacker
+  // influence cannot follow data -- and a STEERED gadget (attacker supplies the index,
+  // victim's own code reads the secret) is indistinguishable from the program legitimately
+  // touching its own secret.  spectre-v1 is exactly that shape: the whole gadget runs in
+  // domain=0 and carried atk=0 on every record.
+  val rs1_taint_atk = Bool()
+  val rs2_taint_atk = Bool()
+  val rs2_secret = Bool()
+  val rs3_secret = Bool()
   val pred_data = Bool()
 
   val kill = Bool() // kill everything
@@ -106,6 +119,26 @@ class FuncUnitResp(val dataWidth: Int)(implicit p: Parameters) extends BoomBundl
 {
   val predicated = Bool() // Was this response from a predicated-off instruction
   val data = UInt(dataWidth.W)
+  // corefuzzing (taint-follows-data): the taint accompanying this result.  The FU
+  // combines the taints of the operands it actually consumed; it then rides the
+  // bypass and writeback paths with the value, so a consumer is tainted at the
+  // moment it receives the data rather than by looking anything up.
+  //
+  // This carries everything the INFL_REG_DATAFLOW influencer needs, replacing the
+  // rename-stage tables (taint_table / producer_table / producer_domain_table /
+  // producer_secret_table) and their per-branch snapshots.  Snapshot/rollback is
+  // not needed here at all: taint travelling with data cannot survive a squash,
+  // because the data does not.
+  val secret      = Bool()
+  // corefuzzing: taint of the STORE DATA operand (rs2), kept SEPARATE from .secret
+  // which carries the ADDRESS operand's taint.  The LSU needs both independently:
+  // address taint -> s_tx (address-derived load); data taint -> STQ entry + dcache
+  // line tag, which is what lets taint survive a spill/reload.
+  val data_secret = Bool()
+  // corefuzzing: ATTACKER taint of the store DATA operand (rs2), mirroring data_secret.
+  val data_taint_atk = Bool()
+  // corefuzzing: attacker taint of the RESULT (see FuncUnitReq.rs1_taint_atk).
+  val taint_atk   = Bool()
   val fflags = new ValidIO(new FFlagsResp)
   val addr = UInt((vaddrBits+1).W) // only for maddr -> LSU
   val mxcpt = new ValidIO(UInt((freechips.rocketchip.rocket.Causes.all.max+2).W)) //only for maddr->LSU
@@ -128,6 +161,14 @@ class BrResolutionInfo(implicit p: Parameters) extends BoomBundle
 
   val jalr_target = UInt(vaddrBitsExtended.W)
   val target_offset = SInt()
+  // corefuzzing: taint of the branch's CONDITION operands, carried on resolution.
+  // A branch has rf_wen=false, so it never appears as a writeback resp -- the site
+  // that computes `sec1` (core.scala, gated on rf_wen && dst_rtype===RT_FIX &&
+  // ldst_val) structurally EXCLUDES branches.  Resolution is the only place the
+  // condition's taint exists, so it has to travel with brinfo.
+  val cond_secret = Bool()
+  // attacker taint of the CONDITION -- steering, not ownership.  See the branch unit.
+  val cond_atk    = Bool()
 }
 
 class BrUpdateInfo(implicit p: Parameters) extends BoomBundle
@@ -174,6 +215,22 @@ abstract class FunctionalUnit(
 
     val bypass = Output(Vec(numBypassStages, Valid(new ExeUnitResp(dataWidth))))
 
+    // O1 (corefuzzing): occupancy taint.  A non-pipelined unit (div, fdivsqrt) holds
+    // its issue slot for ~20-30 cycles; an independent op needing that unit cannot
+    // issue at all, so no winner/loser pair exists and INFL_ISSUE_CONTENTION -- which
+    // requires both -- can never fire.  That made variable-latency arithmetic an
+    // invisible timing channel.  Pipelined units leave this invalid by construction.
+    val cf_fu_busy = Output(Valid(new Bundle {
+      // OPT (audit rank 2): inflOpCountWidthCF, not uopIDCounterWidthCF.  The influencer
+      // entry stores only the LOW inflOpCountWidthCF bits (micro-op.scala:41) and the
+      // parser reconstructs the rest, so the upper bits were routed out of every
+      // non-pipelined FU and through the aggregation mux tree only to be discarded.
+      // Behaviour-preserving by construction: the stored value is unchanged.
+      val op_count = UInt(inflOpCountWidthCF.W)
+      val is_atk   = Bool()
+      val is_sec   = Bool()
+    }))
+
     // only used by the fpu unit
     val fcsr_rm = if (needsFcsr) Input(UInt(tile.FPConstants.RM_SZ.W)) else null
 
@@ -190,6 +247,15 @@ abstract class FunctionalUnit(
   val cf_debug_exu_enable = Input(Bool())
 
   })
+
+  // O1: invalid unless a non-pipelined unit overrides below.
+  io.cf_fu_busy.valid := false.B
+  io.cf_fu_busy.bits  := DontCare
+  io.cf_fu_busy.bits.is_atk := false.B
+  io.cf_fu_busy.bits.is_sec := false.B
+  // Only the AGU carries a store-data operand; every other FU leaves this false.
+  io.resp.bits.data_secret := false.B
+  io.resp.bits.data_taint_atk := false.B
 
   io.bypass.foreach { b => b.valid := false.B; b.bits := DontCare }
 
@@ -273,9 +339,6 @@ abstract class PipelinedFunctionalUnit(
     r_uops(0).cf_cntd_winner_atk          := false.B
     r_uops(0).cf_cntd_winner_sec          := false.B
     r_uops(0).cf_cntd_deny_count          := 0.U
-    r_uops(0).cf_taint_producer_op        := 0.U
-    r_uops(0).cf_taint_producer_is_atk    := false.B
-    r_uops(0).cf_taint_producer_is_secret := false.B
 
     // corefuzzing: set the FU bitmap bit and detect attacker-secret coexistence at stage 0
     {
@@ -303,9 +366,12 @@ abstract class PipelinedFunctionalUnit(
   r_valids(i) := r_valids(i-1) && !IsKilledByBranch(io.brupdate, r_uops(i-1)) && !io.req.bits.kill
   r_uops(i)   := r_uops(i-1)
   r_uops(i).br_mask := GetNewBrMask(io.brupdate, r_uops(i-1))
+      r_secret(i) := r_secret(i-1)
+      r_atk(i)    := r_atk(i-1)
 
       if (numBypassStages > 0) {
         io.bypass(i-1).bits.uop := r_uops(i-1)
+        io.bypass(i-1).bits.secret := r_secret(i-1)
       }
     }
 
@@ -315,13 +381,17 @@ abstract class PipelinedFunctionalUnit(
     io.resp.bits.predicated := false.B
     io.resp.bits.uop := r_uops(numStages-1)
     io.resp.bits.uop.br_mask := GetNewBrMask(io.brupdate, r_uops(numStages-1))
+    io.resp.bits.secret := r_secret(numStages-1)
+    io.resp.bits.taint_atk := r_atk(numStages-1)
 
     // bypassing (TODO allow bypass vector to have a different size from numStages)
     if (numBypassStages > 0 && earliestBypassStage == 0) {
       io.bypass(0).bits.uop := io.req.bits.uop
+      io.bypass(0).bits.secret := io.req.bits.rs1_secret || io.req.bits.rs2_secret || io.req.bits.rs3_secret
 
       for (i <- 1 until numBypassStages) {
         io.bypass(i).bits.uop := r_uops(i-1)
+        io.bypass(i).bits.secret := r_secret(i-1)
       }
     }
     // corefuzzing
@@ -359,9 +429,6 @@ abstract class PipelinedFunctionalUnit(
     io.resp.bits.uop.cf_cntd_winner_atk          := false.B
     io.resp.bits.uop.cf_cntd_winner_sec          := false.B
     io.resp.bits.uop.cf_cntd_deny_count          := 0.U
-    io.resp.bits.uop.cf_taint_producer_op        := 0.U
-    io.resp.bits.uop.cf_taint_producer_is_atk    := false.B
-    io.resp.bits.uop.cf_taint_producer_is_secret := false.B
 
     // corefuzzing
     // Non-destructive logging for non-pipelined functional unit kills
@@ -482,6 +549,13 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
   brinfo.cfi_type       := Mux(is_jalr, CFI_JALR,
                            Mux(is_br  , CFI_BR, CFI_X))
   brinfo.taken          := is_taken
+  // rs1/rs2 ARE the condition for a conditional branch; for jalr rs1 is the target
+  // register, which is equally a control-influencing value.
+  brinfo.cond_secret    := io.req.bits.rs1_secret || io.req.bits.rs2_secret
+  // ATTACKER STEERING: a mispredict is attacker-caused when the branch's own condition
+  // is attacker-derived.  Ownership cannot express this -- spectre-v1's bounds check is
+  // victim code that the attacker merely feeds.
+  brinfo.cond_atk       := io.req.bits.rs1_taint_atk || io.req.bits.rs2_taint_atk
   brinfo.pc_sel         := pc_sel
 
   brinfo.jalr_target    := DontCare
@@ -556,9 +630,12 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
   require (numBypassStages >= 1)
   io.bypass(0).valid := io.req.valid
   io.bypass(0).bits.data := Mux(io.req.bits.uop.is_sfb_br, pc_sel === PC_BRJMP, alu_out)
+  // taint of the ALU result = OR of its source taints, on the bypass path
+  io.bypass(0).bits.secret := io.req.bits.rs1_secret || io.req.bits.rs2_secret
   for (i <- 1 until numStages) {
     io.bypass(i).valid := r_val(i-1)
     io.bypass(i).bits.data := r_data(i-1)
+    io.bypass(i).bits.secret := r_secret_alu(i-1)
   }
 
   // Exceptions
@@ -743,6 +820,9 @@ abstract class IterativeFunctionalUnit(dataWidth: Int)(implicit p: Parameters)
     dataWidth = dataWidth)
 {
   val r_uop = Reg(new MicroOp())
+  // corefuzzing: taint held for the duration of the iterative op
+  val r_secret = Reg(Bool())
+  val r_atk    = Reg(Bool())
 
   val do_kill = Wire(Bool())
   do_kill := io.req.bits.kill // irrelevant default
