@@ -262,6 +262,15 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
       fregfile.io.write_ports(w_cnt).valid     := eu.io.fresp.valid && eu.io.fresp.bits.uop.rf_wen
       fregfile.io.write_ports(w_cnt).bits.addr := eu.io.fresp.bits.uop.pdst
       fregfile.io.write_ports(w_cnt).bits.data := eu.io.fresp.bits.data
+      fregfile.io.write_ports(w_cnt).bits.secret := eu.io.fresp.bits.secret
+      // [FPTAINT 2026-09-08] Was OWNERSHIP ONLY -- it dropped fresp.bits.taint_atk, so any
+      // attacker- or secret-derived value passing through an FP register lost its taint.
+      // The LSU computes fresp.bits.taint_atk correctly (lsu.scala:2009, including the
+      // memory-dataflow term the merge fix enabled) and it was discarded one hop later.
+      // Mirrors the integer path at core.scala:1977.  Note the SECRET line above already
+      // takes the propagated value -- only the attacker side was broken.
+      fregfile.io.write_ports(w_cnt).bits.taint_atk := eu.io.fresp.bits.taint_atk ||
+                                                      (eu.io.fresp.bits.uop.cf_domain_id =/= 0.U)
       eu.io.fresp.ready                        := true.B
       when (eu.io.fresp.valid) {
         assert(eu.io.fresp.ready, "No backpressuring the FPU")
