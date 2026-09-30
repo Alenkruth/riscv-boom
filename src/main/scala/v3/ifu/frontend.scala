@@ -580,9 +580,22 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   if (ENABLE_IFT) {
     when (s1_tlb_just_filled) {
       // Use RegNext of vpn_idx/domain since the miss was serviced the previous cycle
-      itlb_shadow_domain(RegNext(s1_vpn_idx)) := RegNext(s1_fetch_domain).asBool
-      itlb_shadow_valid(RegNext(s1_vpn_idx))  := true.B
-      itlb_shadow_secret(RegNext(s1_vpn_idx)) := RegNext(s1_fetch_is_secret)
+      // [ITLBFIX 2026-09-11] Use the CURRENT vpn/domain, not RegNext.
+      //
+      // PROVEN by the [ITLBFILL] probe -- the fill for the attacker's page prints
+      //     now= 6 prev= 0 dom=1 prevdom=0 vpc=0x80006000 prevpc=0x0
+      // i.e. the page that just filled is slot 6 in domain 1, but RegNext wrote slot 0 with
+      // domain 0.  `prevpc` is literally zero, so RegNext is capturing stale state rather than
+      // the missing page: on `s1_tlb_just_filled` the PREVIOUS cycle was the MISS, during which
+      // s1_vpc/s1_vpn_idx are not the resolved page.  now != prev on ALL SIX fills observed.
+      //
+      // Consequence of the old form: the shadow slot for the page you later HIT is never the
+      // slot the fill wrote, so `itlb_shadow_valid(s1_vpn_idx)` was false at every hit
+      // (measured: 28/28) and INFL_ITLB_STATE could never assert -- which is why that channel
+      // has never fired in any workload.
+      itlb_shadow_domain(s1_vpn_idx) := s1_fetch_domain.asBool
+      itlb_shadow_valid(s1_vpn_idx)  := true.B
+      itlb_shadow_secret(s1_vpn_idx) := s1_fetch_is_secret
     }
     // Flush shadow on sfence (shadow_valid gates secret reads so no separate secret flush needed)
     when (tlb.io.sfence.valid) {
@@ -593,6 +606,36 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s1_itlb_mismatch = s1_valid && !s1_tlb_miss &&
     itlb_shadow_valid(s1_vpn_idx) &&
     (itlb_shadow_domain(s1_vpn_idx) =/= s1_fetch_domain)
+// [PROBE STRIPPED 2026-09-11] ITLBPROBE -- diagnostic only, purpose discharged.
+  // // [ITLBPROBE 2026-09-11] TEMPORARY.  ITLB_STATE has never fired.  The superpage explanation
+  // // was implemented (4 KiB-mapping the code) and REFUTED: the fix took effect (cycles
+  // // 9,784,396 -> 10,013,506) and the channel stayed at 0, with the cross-domain condition
+  // // demonstrably created (attacker domain=1 at 0x80006004..18, victim domain=0 at 0x80006038,
+  // // same page).  So measure instead of theorising again.
+  // //   FILL -- was the shadow ever WRITTEN, and with which domain?
+  // //   HIT  -- on a hitting fetch, what does the shadow hold vs the fetch domain?
+  // // Together: "never written" / "wrong domain" / "written but never hit cross-domain" /
+  // // "mismatch asserts but is lost downstream".
+  // if (ENABLE_CF_DEBUG_PRINTF) {
+    // when (s1_tlb_just_filled) {
+      // // [ITLBFILL2] print BOTH indices.  The fill writes RegNext(s1_vpn_idx) on the premise
+      // // that "the miss was serviced the previous cycle" (:582).  If s1_vpc ADVANCES during the
+      // // page walk instead of holding the missing PC, RegNext captures the wrong page and the
+      // // domain of page A is written into the slot for page B -- which is what the first probe
+      // // implied (fills at idx 0/4 only, while every attacker hit reads idx 6).
+      // // now  = index of the page being fetched THIS cycle (the one that just hit)
+      // // prev = index actually written by the fill
+      // printf("\n[ITLBFILL] now=%d prev=%d dom=%d prevdom=%d vpc=0x%x prevpc=0x%x\n",
+        // s1_vpn_idx, RegNext(s1_vpn_idx), s1_fetch_domain, RegNext(s1_fetch_domain),
+        // s1_vpc, RegNext(s1_vpc))
+    // }
+    // when (s1_valid && !s1_tlb_miss &&
+          // (s1_fetch_domain === 1.U || itlb_shadow_domain(s1_vpn_idx))) {
+      // printf("\n[ITLBHIT] idx=%d shval=%d shdom=%d fdom=%d mism=%d vpc=0x%x\n",
+        // s1_vpn_idx, itlb_shadow_valid(s1_vpn_idx), itlb_shadow_domain(s1_vpn_idx),
+        // s1_fetch_domain, s1_itlb_mismatch, s1_vpc)
+    // }
+  // }
   val s2_itlb_mismatch = RegNext(s1_itlb_mismatch, false.B)
   // Secret mismatch: hit in ITLB but shadow was written during a secret instruction fetch
   val s1_itlb_secret_mismatch = s1_valid && !s1_tlb_miss &&
