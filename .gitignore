@@ -13,3 +13,6 @@ lib
 util/csmith/output/
 util/csmith/csmith/
 *.swo
+*.pre-*
+*.probed-working
+.scala-build/
