@@ -109,6 +109,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     // corefuzzing: domain of the stored request — valid while MSHR is active, used at meta_write time
     val cf_req_domain   = Output(UInt(1.W))
     val cf_req_op_count = Output(UInt(uopIDCounterWidthCF.W))
+    val cf_req_pc12     = Output(UInt(inflPcBitsCF.W))   // [PCPROV] filler PC[13:2] (wire off req.uop)
     val cf_req_secret   = Output(Bool())
   })
 
@@ -211,6 +212,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   // corefuzzing: expose stored request domain for fill-completion tracking in dcache
   io.cf_req_domain   := req.uop.cf_domain_id
   io.cf_req_op_count := req.uop.cf_op_count_id
+  io.cf_req_pc12     := req.uop.debug_pc(inflPcBitsCF + 1, 2)   // [PCPROV]
   // [SECFIX 2026-09-07] The refill blankets this bit across ALL 8 DWs of the line
   // (dcache.scala Fill(CF_SUBLINE, ...)), so it must describe the DATA, not the
   // REQUESTER.  cf_secret_access = the TLB says this ADDRESS is in the secret range,
@@ -709,7 +711,8 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
       val idx      = UInt(idxBits.W)
       val way_en   = UInt(nWays.W)
       val domain   = UInt(1.W)
-      val op_count = UInt(uopIDCounterWidthCF.W)
+      val op_count = UInt(uopIDCounterWidthCF.W)   // kept for the [FILL] printf only
+      val pc12     = UInt(inflPcBitsCF.W)          // [PCPROV] what the line metadata stores
       val secret   = Bool()
       // [TAGPROBE 2026-09-09] the line's TAG.  Needed because every taint-field-based
       // test for "did this access miss?" is circular when the field under investigation
@@ -920,6 +923,8 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
                                            VecInit(mshrs.map(_.io.cf_req_domain)))
   io.cf_meta_write_fill.bits.op_count := Mux1H(UIntToOH(meta_write_arb.io.chosen),
                                            VecInit(mshrs.map(_.io.cf_req_op_count)))
+  io.cf_meta_write_fill.bits.pc12     := Mux1H(UIntToOH(meta_write_arb.io.chosen),
+                                           VecInit(mshrs.map(_.io.cf_req_pc12)))   // [PCPROV]
   io.cf_meta_write_fill.bits.secret   := Mux1H(UIntToOH(meta_write_arb.io.chosen),
                                            VecInit(mshrs.map(_.io.cf_req_secret)))
 

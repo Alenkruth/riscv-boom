@@ -955,7 +955,12 @@ case class InfluencerCandidate(
   op_count:      UInt,
   infl_type_int: Int,   // Scala compile-time constant — enables constant-folding in addInfluencerBatch
   is_atk:        Bool,
-  is_secret:     Bool)
+  is_secret:     Bool,
+  // [PCPROV 2026-09-15] the op_count field carries PC[11:2] (and infl_type_int already
+  // encodes PC[13:12]) -- see CoreFuzzing.scala inflPcCode.  Scala-time so the range
+  // check below constant-folds away for these candidates: a PC is not an op_count and
+  // must not set cf_infl_oc_aliased.
+  is_pc:         Boolean = false)
 
 /**
  * Add multiple influencer entries to a uop in parallel (O(~10 gates) vs O(N*90) serial).
@@ -1045,9 +1050,15 @@ object addInfluencerBatch extends CoreFuzzingConstants {
         // preg_only INFL_REG_DATAFLOW candidate passes 0.U), which would make the
         // Mux1H result narrower than inflOpCountWidthCF and the extract illegal.
         out.cf_influencer_list(s).op_count  := Mux1H(writers, candidates.map(_.op_count.pad(inflOpCountWidthCF)))(inflOpCountWidthCF-1, 0)
-        val s_oc = Mux1H(writers, candidates.map(_.op_count.pad(uopIDCounterWidthCF)))
-        when (s_oc =/= 0.U && !OcInRange(s_oc, uop.cf_op_count_id)) {
-          out.cf_infl_oc_aliased := true.B
+        // [PCPROV] PC-typed candidates are excluded from the range check (their field
+        // is a PC, always exact); zip the Scala-time flag in so it folds to constants.
+        val oc_writers = (writers zip candidates).collect { case (wr, c) if !c.is_pc => wr }
+        val oc_cands   = candidates.filter(!_.is_pc)
+        if (oc_cands.nonEmpty) {
+          val s_oc = Mux1H(oc_writers, oc_cands.map(_.op_count.pad(uopIDCounterWidthCF)))
+          when (oc_writers.reduce(_ || _) && s_oc =/= 0.U && !OcInRange(s_oc, uop.cf_op_count_id)) {
+            out.cf_infl_oc_aliased := true.B
+          }
         }
         out.cf_influencer_list(s).infl_type := Mux1H(writers, candidates.map(_.infl_type_int.U))
         out.cf_influencer_list(s).is_atk    := Mux1H(writers, candidates.map(_.is_atk))
@@ -1096,6 +1107,9 @@ object inflBitmapFromList {
     15 -> (1 << 1),  // INFL_ITLB_STATE      → itlb
     16 -> (1 << 0),  // INFL_ICACHE_STATE    → icache
     17 -> (1 << 18), // INFL_MEM_DATAFLOW    → dcache (attacker store data read by victim)
+    // [PCPROV] PC[13:12] continuation codes of the two D$ types (CoreFuzzing.scala inflPcCode)
+    21 -> (1 << 18), 22 -> (1 << 18), 23 -> (1 << 18),   // INFL_CACHE_EVICTION_{1,2,3}
+    24 -> (1 << 18), 25 -> (1 << 18), 26 -> (1 << 18),   // INFL_MEM_DATAFLOW_{1,2,3}
   )
   def apply(infl_list: Vec[boom.v3.common.InfluencerEntry]): UInt = {
     val per_slot = infl_list.map { slot =>

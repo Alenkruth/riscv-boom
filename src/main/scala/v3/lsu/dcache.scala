@@ -1349,24 +1349,38 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // realised saving may be ZERO (BRAM comes in fixed widths); the 13.6% is real only for
   // distributed/LUT RAM, which 128-deep arrays usually get.  Believe the post-synthesis
   // utilisation report, not this comment.
-  val iftFillBits    = CF_SUBLINE + 1 + uopIDCounterWidthCF        // {secMask, domain, opcount}
-  val iftStoreBits   = CF_SUBLINE + CF_SUBLINE + uopIDCounterWidthCF // {atkMask, secMask, opcount}
+  // [PCPROV 2026-09-15] the producer field is the filler's / last storer's PC[13:2]
+  // (inflPcBitsCF = 12), not its op_count.  A line's age is unbounded, so an op_count
+  // wraps and aliases; a PC never goes stale.  The two D$ edge types carry it through
+  // the unchanged 18-bit slot as {op_count := PC[11:2], infl_type := base + PC[13:12]}
+  // -- see CoreFuzzing.scala inflPcCode.  Meta shrinks 16 -> 12 b per line per array.
+  //   fill  128*21*8 = 21,504 b   store 128*28*8 = 28,672 b   (-8,192 b vs op_count)
+  val iftFillBits    = CF_SUBLINE + 1 + inflPcBitsCF        // {secMask, domain, pc[13:2]}
+  val iftStoreBits   = CF_SUBLINE + CF_SUBLINE + inflPcBitsCF // {atkMask, secMask, pc[13:2]}
   def cfSubIdx(addr: UInt): UInt = addr(log2Up(dcacheParams.blockBytes)-1, 3)
   def cfSubOH(addr: UInt): UInt  = UIntToOH(cfSubIdx(addr))(CF_SUBLINE-1, 0)
 
-  // ---- FILL format: {secMask[CF_SUBLINE], domain[1], op_count} ----
-  def mkIftFill(domain: UInt, op_count: UInt, secMask: UInt): UInt =
-    Cat(secMask(CF_SUBLINE-1,0), domain, op_count)
-  def iftFillDomain(e: UInt) : UInt = e(uopIDCounterWidthCF)
-  def iftFillOpCount(e: UInt): UInt = e(uopIDCounterWidthCF - 1, 0)
-  def iftFillSecMask(e: UInt): UInt = e(uopIDCounterWidthCF + CF_SUBLINE, uopIDCounterWidthCF + 1)
+  // ---- FILL format: {secMask[CF_SUBLINE], domain[1], pc[13:2]} ----
+  def iftPcSlice(pc: UInt): UInt = pc(inflPcBitsCF + 1, 2)     // PC[13:2]
+  def mkIftFill(domain: UInt, pc12: UInt, secMask: UInt): UInt =
+    Cat(secMask(CF_SUBLINE-1,0), domain, pc12(inflPcBitsCF-1, 0))
+  def iftFillDomain(e: UInt) : UInt = e(inflPcBitsCF)
+  def iftFillPc(e: UInt)     : UInt = e(inflPcBitsCF - 1, 0)   // PC[13:2] of the filler
+  def iftFillSecMask(e: UInt): UInt = e(inflPcBitsCF + CF_SUBLINE, inflPcBitsCF + 1)
 
-  // ---- STORE format: {atkMask[CF_SUBLINE], secMask[CF_SUBLINE], op_count} ----
-  def mkIftStore(op_count: UInt, secMask: UInt, atkMask: UInt): UInt =
-    Cat(atkMask(CF_SUBLINE-1,0), secMask(CF_SUBLINE-1,0), op_count)
-  def iftOpCount(e: UInt) : UInt = e(uopIDCounterWidthCF - 1, 0)
-  def iftSecMask(e: UInt) : UInt = e(uopIDCounterWidthCF + CF_SUBLINE - 1, uopIDCounterWidthCF)
-  def iftAtkMask(e: UInt) : UInt = e(uopIDCounterWidthCF + 2*CF_SUBLINE - 1, uopIDCounterWidthCF + CF_SUBLINE)
+  // ---- STORE format: {atkMask[CF_SUBLINE], secMask[CF_SUBLINE], pc[13:2]} ----
+  def mkIftStore(pc12: UInt, secMask: UInt, atkMask: UInt): UInt =
+    Cat(atkMask(CF_SUBLINE-1,0), secMask(CF_SUBLINE-1,0), pc12(inflPcBitsCF-1, 0))
+  def iftPc(e: UInt)      : UInt = e(inflPcBitsCF - 1, 0)      // PC[13:2] of the last storer
+  def iftSecMask(e: UInt) : UInt = e(inflPcBitsCF + CF_SUBLINE - 1, inflPcBitsCF)
+  def iftAtkMask(e: UInt) : UInt = e(inflPcBitsCF + 2*CF_SUBLINE - 1, inflPcBitsCF + CF_SUBLINE)
+  // [PCPROV] one candidate per PC[13:12] value: infl_type_int must stay a Scala constant
+  // (the batch constant-folds on it), so the 2 high bits select among 4 static codes.
+  def pcCandidates(fire: Bool, pc12: UInt, base: Int, is_atk: Bool, is_secret: Bool): Seq[InfluencerCandidate] =
+    (0 until 4).map { hi =>
+      InfluencerCandidate(fire && pc12(inflPcBitsCF-1, inflPcBitsCF-2) === hi.U,
+                          pc12(inflPcBitsCF-3, 0), inflPcCode(base, hi), is_atk, is_secret, is_pc = true)
+    }
   // per-access accessors: test only the doubleword this access touches
   def iftSecretAt(e: UInt, addr: UInt): Bool = (iftSecMask(e) & cfSubOH(addr)).orR
   def iftAtkAt(e: UInt, addr: UInt)   : Bool = (iftAtkMask(e) & cfSubOH(addr)).orR
@@ -1436,11 +1450,12 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       // when the store is simultaneously attacker-domain AND secret-marked.
       val memsec_fire = is_load && iftSecretAt(s2_store_entry, s2_req(w).addr) && !memdf_fire
 
-      uop_resp_final := addInfluencerBatch(uop_resp_base, Seq(
-        InfluencerCandidate(evict_fire,  iftFillOpCount(s2_fill_entry),  INFL_CACHE_EVICTION, true.B,  iftFillSecMask(s2_fill_entry).orR),
-        InfluencerCandidate(memdf_fire,  iftOpCount(s2_store_entry), INFL_MEM_DATAFLOW,   true.B,  iftSecretAt(s2_store_entry, s2_req(w).addr)),
-        InfluencerCandidate(memsec_fire, iftOpCount(s2_store_entry), INFL_MEM_DATAFLOW,   false.B, true.B),
-      ))
+      // [PCPROV] 3 candidates -> 12: each D$ edge is one of four static type codes
+      // selected by the producer PC[13:12]; exactly one of each group of 4 can fire.
+      uop_resp_final := addInfluencerBatch(uop_resp_base,
+        pcCandidates(evict_fire,  iftFillPc(s2_fill_entry), INFL_CACHE_EVICTION, true.B,  iftFillSecMask(s2_fill_entry).orR) ++
+        pcCandidates(memdf_fire,  iftPc(s2_store_entry),    INFL_MEM_DATAFLOW,   true.B,  iftSecretAt(s2_store_entry, s2_req(w).addr)) ++
+        pcCandidates(memsec_fire, iftPc(s2_store_entry),    INFL_MEM_DATAFLOW,   false.B, true.B))
       // Set summary flags so writeback paths can skip scanning cf_influencer_list.
       when (memdf_fire)  { uop_resp_final.cf_mem_dataflow_atk := true.B }
       when (memsec_fire) { uop_resp_final.cf_mem_sec_dataflow  := true.B }
@@ -1461,7 +1476,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
         val st_sec    = s2_req(w).uop.cf_secret_propagation || s2_req(w).uop.cf_secret_access
         val new_atk_m = (iftAtkMask(s2_store_entry) & ~sub_oh) | Mux(st_atk, sub_oh, 0.U)
         val new_sec_m = (iftSecMask(s2_store_entry) & ~sub_oh) | Mux(st_sec, sub_oh, 0.U)
-        val entry     = mkIftStore(s2_req(w).uop.cf_op_count_id, new_sec_m, new_atk_m)
+        val entry     = mkIftStore(iftPcSlice(s2_req(w).uop.debug_pc), new_sec_m, new_atk_m)   // [PCPROV]
         for (way <- 0 until nWays) {
           when (s2_tag_match_way(w)(way)) {
             ift_sm_wr_valid(way)(w + 1) := true.B
@@ -1539,12 +1554,13 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       // way_en (no way written at all) is indistinguishable from "way 0" -- exactly the
       // ambiguity left open by the TrueLRU result (1/8 ways, all reading as way 0).
       if (ENABLE_CF_DEBUG_PRINTF) {
-        printf("\n[FILL] idx=%d wayen=0x%x tag=0x%x domain=%d secret=%d oc=%d\n",
+        printf("\n[FILL] idx=%d wayen=0x%x tag=0x%x domain=%d secret=%d oc=%d pc12=0x%x\n",
           fill_idx, mshrs.io.cf_meta_write_fill.bits.way_en,
           mshrs.io.cf_meta_write_fill.bits.tag,
           mshrs.io.cf_meta_write_fill.bits.domain,
           mshrs.io.cf_meta_write_fill.bits.secret,
-          mshrs.io.cf_meta_write_fill.bits.op_count)
+          mshrs.io.cf_meta_write_fill.bits.op_count,
+          mshrs.io.cf_meta_write_fill.bits.pc12)
       }
       // [R1e] fills: atk = ownership of the filling domain only (see ASSUMED BEHAVIOUR).
       // [STEP1b] a refill REPLACES the whole line, so every DW mask bit is set from the
@@ -1552,7 +1568,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       // clears it" case, and it is why the per-DW masks need no decay anywhere else.
       // [METASLIM] the 4th argument (atkMask) is GONE -- it had no reader.
       val entry    = mkIftFill(mshrs.io.cf_meta_write_fill.bits.domain,
-                               mshrs.io.cf_meta_write_fill.bits.op_count,
+                               mshrs.io.cf_meta_write_fill.bits.pc12,          // [PCPROV]
                                Fill(CF_SUBLINE, mshrs.io.cf_meta_write_fill.bits.secret.asUInt))
       for (way <- 0 until nWays) {
         when (mshrs.io.cf_meta_write_fill.bits.way_en(way)) {
