@@ -300,6 +300,29 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     grantack.valid := false.B
     refill_ctr := 0.U
     assert(rpq.io.enq.ready)
+    // [ALLOCPROBE 2026-09-09] Which uop actually allocates the MSHR, and what domain does
+    // it carry?  PROVEN downstream: an attacker STORE's fill carries domain=1 and the
+    // store's op_count, while an attacker LOAD's fill carries domain=0 and its op_count
+    // appears in NO fill -- even though the load misses, allocates, and commits with
+    // domain=1.  Both cf_req_domain and cf_req_op_count read this same req.uop, so the
+    // loss is here or upstream.  This prints the allocating uop so we can tell whether the
+    // load allocates with domain=0 (lost before the MSHR) or never allocates a PRIMARY at
+    // all (lands in the rpq as a secondary, where :158-167 explicitly clears cf fields).
+    // [ALLOCPROBE2 2026-09-09] print mem_cmd and is_prefetch, NOT just isRead/isWrite.
+    // TRAP this probe already caused once: M_XRD = "b00000" = 0, so a NullMicroOp (every
+    // opless request -- writeback, probe, MSHR meta-read; dcache.scala:832/847/872) has
+    // mem_cmd = 0 and reads back as isread=1.  The old probe therefore reported opless
+    // requests as "loads with a stripped op_count", which is NOT a defect and nearly sent
+    // us changing the rpq zeroing at :159/:172 for no reason.  mem_cmd disambiguates:
+    // 0=M_XRD 1=M_XWR 2=M_PFR 3=M_PFW.  secret is printed too, because a fill with
+    // secret=1 and oc=0 (seen in t38 pre-MEMIDFIX) had no owning op.  RESOLVED: same
+    // root cause as the attacker-load bug; t38 now shows secret=1 oc=1169/1879.
+    if (ENABLE_CF_DEBUG_PRINTF) {
+      printf("\n[MSHRALLOC] domain=%d sec=%d oc=%d cmd=%d pf=%d isread=%d iswrite=%d\n",
+        io.req.uop.cf_domain_id, io.req.uop.cf_secret_access, io.req.uop.cf_op_count_id,
+        io.req.uop.mem_cmd, isPrefetch(io.req.uop.mem_cmd),
+        isRead(io.req.uop.mem_cmd), isWrite(io.req.uop.mem_cmd))
+    }
     req := io.req
     val old_coh   = io.req.old_meta.coh
     req_needs_wb := old_coh.onCacheControl(M_FLUSH)._1 // does the line we are evicting need to be written back
@@ -688,6 +711,12 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
       val domain   = UInt(1.W)
       val op_count = UInt(uopIDCounterWidthCF.W)
       val secret   = Bool()
+      // [TAGPROBE 2026-09-09] the line's TAG.  Needed because every taint-field-based
+      // test for "did this access miss?" is circular when the field under investigation
+      // is the one being stripped: a fill whose op_count was lost cannot be matched to
+      // the op that caused it BY op_count.  The tag identifies the line directly and is
+      // independent of every cf_* field.
+      val tag      = UInt(cfTagBits.W)
     }))
   })
 

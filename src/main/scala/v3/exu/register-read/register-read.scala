@@ -302,6 +302,50 @@ class RegisterRead(
     if (numReadPorts > 0) io.exe_reqs(w).bits.rs1_data := exe_reg_rs1_data(w)
     if (numReadPorts > 1) io.exe_reqs(w).bits.rs2_data := exe_reg_rs2_data(w)
     if (numReadPorts > 2) io.exe_reqs(w).bits.rs3_data := exe_reg_rs3_data(w)
+    // Operand taints MUST be driven on every port, including ports this unit does
+    // not have.  io.exe_reqs(w).bits := DontCare above leaves an undriven field as
+    // X, and the FU ORs all three taints unconditionally -- so an undriven rs3 on a
+    // 2-read-port unit (the ALU) taints EVERY result.  Measured: 281,679 false
+    // s_prop events on a run with zero secret accesses.
+    io.exe_reqs(w).bits.rs1_secret := (if (numReadPorts > 0) exe_reg_rs1_secret(w) else false.B)
+    io.exe_reqs(w).bits.rs2_secret := (if (numReadPorts > 1) exe_reg_rs2_secret(w) else false.B)
+ // [PROBE STRIPPED 2026-09-11] A1PROBE2 -- diagnostic only, purpose discharged.
+    // // [A1PROBE2 2026-09-11] TEMPORARY -- the upstream half.  Separates "the regfile/bypass
+    // // never had the taint" from "it had it and register-read dropped it".  rrd = raw regfile
+    // // read, byp = after the bypass MuxCase, reads = the rs2_reads_reg qualifier.
+    // if (ENABLE_CF_DEBUG_PRINTF) {
+      // when (io.exe_reqs(w).valid && io.exe_reqs(w).bits.uop.uses_stq) {
+        // printf("\n[A1RR2] pc=0x%x prs2=%d rrd=%d byp=%d out=%d rt2=%d\n",
+          // io.exe_reqs(w).bits.uop.debug_pc, io.exe_reqs(w).bits.uop.prs2,
+          // (if (numReadPorts > 1) rrd_rs2_secret(w) else false.B),
+          // (if (numReadPorts > 1) bypassed_rs2_secret(w) else false.B),
+          // (if (numReadPorts > 1) exe_reg_rs2_secret(w) else false.B),
+          // io.exe_reqs(w).bits.uop.lrs2_rtype)
+      // }
+    // }
+      // [A1RR 2026-09-10] A1: a store's data operand shows data_sec=0 at STD arrival in
+      // ALL 28,341 samples.  Localised to here: this RegisterRead instance has ZERO
+      // bypass ports (RegisterRead.sv: io_bypass refs=0, vs 138 in RegisterRead_1.sv for
+      // the ALU path), so bypassed_rs2_secret collapses to the raw regfile read.  What is
+      // NOT yet explained is why that read is 0 -- the regfile has its own read-bypass for
+      // in-flight writes (regfile.scala:185-186), so a post-writeback read should carry
+      // the taint.  Print the three terms so the failing one is named, not guessed.
+   // [PROBE-STRIPPED 2026-09-10] A1RR -- A1 is CLOSED; probe retired.
+      // if (ENABLE_CF_DEBUG_PRINTF) {
+        // when (io.exe_reqs(w).valid && io.exe_reqs(w).bits.uop.uses_stq) {
+          // printf("\n[A1RR] w=%d oc=%d lrs2rt=%d rs2rdreg=%d rfsec=%d byp=%d out=%d prs2=%d\n",
+            // w.U, io.exe_reqs(w).bits.uop.cf_op_count_id,
+            // io.exe_reqs(w).bits.uop.lrs2_rtype,
+            // (if (numReadPorts > 1) (exe_reg_uops(w).lrs2_rtype === rtype) else false.B),
+            // (if (numReadPorts > 1) rrd_rs2_secret(w) else false.B),
+            // (if (numReadPorts > 1) bypassed_rs2_secret(w) else false.B),
+            // (if (numReadPorts > 1) exe_reg_rs2_secret(w) else false.B),
+            // io.exe_reqs(w).bits.uop.prs2)
+        // }
+      // }
+    io.exe_reqs(w).bits.rs1_taint_atk := (if (numReadPorts > 0) exe_reg_rs1_atk(w) else false.B)
+    io.exe_reqs(w).bits.rs2_taint_atk := (if (numReadPorts > 1) exe_reg_rs2_atk(w) else false.B)
+    io.exe_reqs(w).bits.rs3_secret := (if (numReadPorts > 2) exe_reg_rs3_secret(w) else false.B)
     if (enableSFBOpt)     io.exe_reqs(w).bits.pred_data := exe_reg_pred_data(w)
   }
 }

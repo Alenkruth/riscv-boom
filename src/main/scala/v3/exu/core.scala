@@ -1075,6 +1075,22 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
 
   // Frontend Exception Requests
+  // [ILLPROBE] r30 diagnosis: r30_flush_wipe takes mcause=2 (illegal instruction) at
+  // 0x80001358, whose encoding (0x00151793, slli a5,a0,0x1) is perfectly legal, then
+  // the handler recurses 1,066x on its own legal `jal`.  Print the CYCLE, the PC and
+  // the INSTRUCTION WORD the core actually decoded: if the word is not the one in the
+  // ELF, the frontend/I$ delivered garbage; if it matches, decode is rejecting a legal
+  // encoding.  The cycle also lets a later +dump-start window a small FST -- a full
+  // VCD of this run would be terabytes.
+  val cf_ill_cyc = RegInit(0.U(48.W))
+  cf_ill_cyc := cf_ill_cyc + 1.U
+  for (w <- 0 until coreWidth) {
+    when (dec_xcpts(w)) {
+      printf("[ILL] cyc=%d pc=0x%x inst=0x%x cause=%d\n",
+             cf_ill_cyc, dec_uops(w).debug_pc, dec_uops(w).inst, dec_uops(w).exc_cause)
+    }
+  }
+
   val xcpt_idx = PriorityEncoder(dec_xcpts)
   xcpt_pc_req.valid    := dec_xcpts.reduce(_||_)
   xcpt_pc_req.bits     := dec_uops(xcpt_idx).ftq_idx
@@ -1977,6 +1993,25 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
       iregfile.io.write_ports(w_cnt).valid     := wbIsValid(RT_FIX)
       iregfile.io.write_ports(w_cnt).bits.addr := wbpdst
+      iregfile.io.write_ports(w_cnt).bits.secret := wbresp.bits.secret
+   // [PROBE STRIPPED 2026-09-11] A1UP -- diagnostic only, purpose discharged.
+      // // [A1UP 2026-09-11] TEMPORARY.  The [A1AGU]/[A1RR2] probes localised A1 to UPSTREAM of
+      // // register-read: the secret bit is on a store's data register only 14 times in 223,239
+      // // samples, while ATTACKER taint reaches the same register through the identical bypass
+      // // structure 6,590 times.  So the question is whether PRODUCERS ever mark a value secret.
+      // // Print every integer writeback: if wbsec is ~never 1 while wbatk often is, the defect
+      // // is in whatever sets `secret` on a functional-unit result -- not in any bypass or
+      // // register-read path, which are now both exonerated by measurement.
+      // if (ENABLE_CF_DEBUG_PRINTF) {
+        // when (wbIsValid(RT_FIX)) {
+          // printf("\n[A1UP] pc=0x%x pdst=%d wbsec=%d wbatk=%d uacc=%d uprop=%d udom=%d\n",
+            // wbresp.bits.uop.debug_pc, wbpdst,
+            // wbresp.bits.secret, wbresp.bits.taint_atk,
+            // wbresp.bits.uop.cf_secret_access, wbresp.bits.uop.cf_secret_propagation,
+            // wbresp.bits.uop.cf_domain_id)
+        // }
+      // }
+      iregfile.io.write_ports(w_cnt).bits.taint_atk := wbresp.bits.taint_atk || (wbresp.bits.uop.cf_domain_id =/= 0.U)
       wbresp.ready := true.B
       if (exe_units(i).hasCSR) {
         iregfile.io.write_ports(w_cnt).bits.data := Mux(wbReadsCSR, csr.io.rw.rdata, wbdata)

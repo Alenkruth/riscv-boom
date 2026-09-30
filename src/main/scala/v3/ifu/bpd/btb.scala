@@ -169,6 +169,21 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
     s1_hits(w) && s1_req_rsecret(s1_hit_ways(w))(w).asBool
   }).reduce(_||_)
   // pipeline 2 cycles to f3 (s1→f2→f3)
+  // [BTBMAIN2 2026-09-11] TEMPORARY.  The BTB channel is PROVEN working: on t15 the probe
+  // showed 9 mismatches -> 9 edges, including one victim fetch hitting an ATTACKER-planted
+  // entry (the branch-target-injection direction).  Yet spectre-v2 -- the workload built to do
+  // BTI -- yields 0 edges in 1,365,332 records.  Two possibilities, and they differ in what
+  // they say about the attack: the attacker->victim alias is never FORMED, or it is formed and
+  // the victim never HITS it.  Print every hit involving the attacker domain on either side.
+  if (ENABLE_CF_DEBUG_PRINTF) {
+    for (w <- 0 until bankWidth) {
+      when (s1_hits(w) && (s1_domain === 1.U || s1_req_rdomain(s1_hit_ways(w))(w) === 1.U)) {
+        printf("\n[BTBMH] w=%d edom=%d fdom=%d mism=%d\n",
+          w.U, s1_req_rdomain(s1_hit_ways(w))(w), s1_domain,
+          (s1_req_rdomain(s1_hit_ways(w))(w) =/= s1_domain))
+      }
+    }
+  }
   io.f3_btb_domain_mismatch  := RegNext(RegNext(s1_btb_domain_mismatch))
   io.f3_btb_secret_mismatch  := RegNext(RegNext(s1_btb_secret_mismatch))
 

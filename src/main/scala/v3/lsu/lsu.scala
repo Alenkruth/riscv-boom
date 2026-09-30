@@ -1104,11 +1104,30 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   io.dmem.req.bits  := dmem_req
 
   for (w <- 0 until memWidth) {
-    when (io.dmem.req.valid && (io.dmem.req.bits(w).bits.addr === 0.U) && io.core.cf_debug_lsu_enable) {
-        printf("[LSU] lsu out valid and dmem.req.bits(%d).bits.addr - 0x%x\n", w.U, io.dmem.req.bits(w).bits.addr)
+    // corefuzzing [LSU] debug log
+    // Compile-time gated: when ENABLE_CF_DEBUG_PRINTF is false this block is never
+    // emitted, so neither the printf nor its argument cone reaches synthesis.
+    if (ENABLE_CF_DEBUG_PRINTF) {
+      when (io.dmem.req.valid && (io.dmem.req.bits(w).bits.addr === 0.U) && io.core.cf_debug_lsu_enable) {
+          printf("[LSU] lsu out valid and dmem.req.bits(%d).bits.addr - 0x%x\n", w.U, io.dmem.req.bits(w).bits.addr)
+      }
     }
   }
   val dmem_req_fire = widthMap(w => dmem_req(w).valid && io.dmem.req.fire)
+  // [DREQPROBE 2026-09-09] which will_fire path produced this D$ request.
+  // PROVEN 2026-09-09: the request that misses on cache_buf reaches the MSHR with
+  // domain=0 AND op_count=0 while the SAME load commits with domain=1 -- i.e. the
+  // request carries no op identity.  The address-derived cf_secret_access DOES survive
+  // (t38: domain=0 secret=1 oc=0), which is the signature of exe_tlb_uop being a
+  // NullMicroOp with the secret bit OR'd on afterwards.  This tag localises WHICH path
+  // is responsible instead of inferring it: 1=load_incoming 2=load_retry
+  // 3=store_commit 4=load_wakeup 5=hella_incoming 6=hella_wakeup 0=none.
+  // [C2 2026-09-10] DREQ probe RETIRED.  No tool consumed it (grep: zero consumers in
+  // ift-tests/*.py, fuzzer/*.py), and it cost ~4.4pp of parse recovery in ift-tests
+  // (87.4% with vs 91.8% without) by interleaving into other records' lines.  Gated, so
+  // this is a sim-speed and parse-fidelity change, not an area change.  Re-enable by
+  // uncommenting the wire, its 4 assignments, and the printf block below.
+  // val cf_dreq_src = WireInit(VecInit(Seq.fill(memWidth)(0.U(4.W))))
 
   val s0_executing_loads = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B)))
 
@@ -1208,6 +1227,18 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       dmem_req(w).bits.is_hella       := true.B
     }
 
+    // [DREQPROBE] every D$ request that actually fires, with its op identity.
+    // A line's IFT tag is written from THIS uop (dcache -> mshrs req.uop -> cf_req_*),
+    // so a request with src=N and domain=0/oc=0 names the exact path that drops it.
+    // if (ENABLE_CF_DEBUG_PRINTF) {
+      // when (dmem_req_fire(w) && io.core.cf_debug_lsu_enable) {
+        // printf("\n[DREQ] w=%d src=%d addr=0x%x cmd=%d domain=%d sec=%d oc=%d\n",
+          // w.U, cf_dreq_src(w), dmem_req(w).bits.addr, dmem_req(w).bits.uop.mem_cmd,
+          // dmem_req(w).bits.uop.cf_domain_id, dmem_req(w).bits.uop.cf_secret_access,
+          // dmem_req(w).bits.uop.cf_op_count_id)
+      // }
+    // }
+
     //-------------------------------------------------------------
     // Write Addr into the LAQ/SAQ
     when (will_fire_load_incoming(w) || will_fire_load_retry(w))
@@ -1288,6 +1319,50 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       stq(sidx).bits.data.bits  := Mux(will_fire_std_incoming(w) || will_fire_stad_incoming(w),
         exe_req(w).bits.data,
         io.core.fp_stdata.bits.data)
+      // STD TAINT (2026-09-03): a store is split STA (address, via AGU/TLB) and STD
+      // (data, this port).  lsu.scala:1171 refreshes the STQ entry's taint from the
+      // TLB path only -- i.e. from the ADDRESS operand -- so for `sb a5,-17(s0)` the
+      // tainted operand (the DATA, a5) never reached the entry and it stayed clean.
+      // That starved BOTH memory taint paths, which are otherwise correct:
+      //   - STL forward reads stq_e.bits.uop.cf_secret_propagation  (lsu.scala:1883)
+      //   - dcache line tag writes s2_req.uop.cf_secret_propagation (dcache.scala:1365)
+      // Consequence: taint did not survive a spill/reload, so a -O0 secret reloaded
+      // from the stack came back clean.  MEASURED: t18 had 0 tainted branches out of
+      // 27,241 while the same run showed 256 tainted registers.
+      // The data operand's taint rides in on .secret for both sources, so capture it
+      // here, monotone within the entry's lifetime (enqueue reassigns the whole uop).
+      stq(sidx).bits.uop.cf_secret_propagation := stq(sidx).bits.uop.cf_secret_propagation ||
+        Mux(will_fire_std_incoming(w) || will_fire_stad_incoming(w),
+            exe_req(w).bits.data_secret,   // rs2 taint, NOT .secret (that is the ADDRESS)
+            io.core.fp_stdata.bits.secret)
+      // and record it on its own, so consumers that mean "the VALUE is secret" do not
+      // have to read the aggregate uop bit (see stl_store_is_secret below).
+      stq(sidx).bits.data_is_secret :=
+        Mux(will_fire_std_incoming(w) || will_fire_stad_incoming(w),
+            exe_req(w).bits.data_secret,
+            io.core.fp_stdata.bits.secret)
+      // [A1PROBE 2026-09-10] A1: stores never carry s_prop, yet the clr_bsy path that is
+      // SUPPOSED to deliver it already exists and is complete
+      // (lsu:1521 -> lsu:1588 -> core:2141 -> rob:527) -- and 0 of 270,725 store records
+      // in spectre-v1 have s_prop=1.  So the taint dies BEFORE data_is_secret.  Print the
+      // operand taint at STD arrival: data_sec=0 here => upstream (regfile/bypass/rtype
+      // guard); data_sec=1 => downstream (clr_bsy never fires for a squashed store).
+   // [PROBE-STRIPPED 2026-09-10] A1STD -- A1 is CLOSED (store sink 0x80001760 recovered by
+      // preg_dataflow.py A1SINK, 6/6 chain).  Probe retired.
+      // if (ENABLE_CF_DEBUG_PRINTF) {
+        // when (io.core.cf_debug_lsu_enable) {
+          // printf("\n[A1STD] stq=%d std=%d stad=%d data_sec=%d data_atk=%d oc=%d\n",
+            // sidx, will_fire_std_incoming(w), will_fire_stad_incoming(w),
+            // exe_req(w).bits.data_secret, exe_req(w).bits.data_taint_atk,
+            // exe_req(w).bits.uop.cf_op_count_id)
+        // }
+      // }
+      // ATTACKER taint of the stored VALUE, captured at the same instant from the same
+      // operand.  rs2 is the data; the AGU forwards its attacker taint alongside rs1's.
+      stq(sidx).bits.data_is_atk :=
+        Mux(will_fire_std_incoming(w) || will_fire_stad_incoming(w),
+            exe_req(w).bits.data_taint_atk,
+            io.core.fp_stdata.bits.taint_atk)
       assert(!(stq(sidx).bits.data.valid),
         "[lsu] Incoming store is overwriting a valid data entry")
     }
@@ -1531,6 +1606,15 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     io.core.clr_bsy(w).bits           := clr_bsy_rob_idx(w)
     io.core.clr_bsy_cf_bitmap(w)      := clr_bsy_cf_bmap(w)
     io.core.clr_bsy_cf_stx(w)        := clr_bsy_cf_stx_r(w)
+ // [PROBE-STRIPPED 2026-09-10] A1CLR -- A1 is CLOSED; probe retired.
+    io.core.clr_bsy_cf_sprop(w)      := clr_bsy_cf_sprop_r(w)
+    // // [A1PROBE] downstream half: does the store's secret flag ever leave the LSU?
+    // if (ENABLE_CF_DEBUG_PRINTF) {
+      // when (io.core.clr_bsy(w).valid && io.core.cf_debug_lsu_enable) {
+        // printf("\n[A1CLR] w=%d sprop=%d stx=%d\n",
+          // w.U, clr_bsy_cf_sprop_r(w), clr_bsy_cf_stx_r(w))
+      // }
+    // }
   }
 
   val stdf_clr_bsy_valid    = RegInit(false.B)

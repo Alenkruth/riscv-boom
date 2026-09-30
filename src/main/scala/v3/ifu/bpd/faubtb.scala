@@ -91,6 +91,25 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
     s1_taken(w)      := !entry_meta.is_br || entry_meta.ctr(1)
 
     s1_meta.hits(w)     := s1_hits(w)
+    // O4: qualified on s1_hits -- this bank is tagged, so only a real hit means the
+    // prediction actually came from that entry.
+    s1_ubtb_domain_mismatch(w) := s1_hits(w) && (entry_meta.domain =/= s1_domain)
+ // [BTBPROBE RETIRED 2026-09-10] purpose discharged: proved the channel WORKS
+    // // [BTBPROBE 2026-09-10] TEMPORARY -- the hit half.  Printed on EVERY real hit, not only
+    // // on mismatch: "mismatch never fired" and "the uBTB never hit at all" look identical
+    // // downstream, and they have completely different fixes.  edom/fdom together say which.
+    // if (ENABLE_CF_DEBUG_PRINTF) {
+      // // Bounded to hits where EITHER side is the attacker domain.  Printing on every hit
+      // // would flood (the uBTB hits on most fetches; spectre-v2 already emits 133MB), while
+      // // this set is exactly the one that can produce a mismatch, and its absence is itself
+      // // the answer: no lines at all => the uBTB never hits under a cross-domain condition.
+      // when (s1_valid && s1_hits(w) && (s1_domain === 1.U || entry_meta.domain === 1.U)) {
+        // printf("\n[UBTBH] w=%d edom=%d fdom=%d mism=%d esec=%d\n",
+          // w.U, entry_meta.domain, s1_domain,
+          // s1_ubtb_domain_mismatch(w), entry_meta.secret)
+      // }
+    // }
+    s1_ubtb_secret_mismatch(w) := s1_hits(w) && entry_meta.secret
   }
   val alloc_way = {
     val r_metas = Cat(VecInit(meta.map(e => VecInit(e.map(_.tag)))).asUInt, s1_idx(tagSz-1,0))
@@ -153,6 +172,20 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
 
       meta(s1_update_write_way)(w).is_br := s1_update.bits.br_mask(w)
       meta(s1_update_write_way)(w).tag   := s1_update_idx
+      meta(s1_update_write_way)(w).domain := s1_update.bits.cf_domain_id
+   // [BTBPROBE RETIRED 2026-09-10] purpose discharged: proved the channel WORKS
+      // // [BTBPROBE 2026-09-10] TEMPORARY -- ty=10 BTB_STATE produced 0 edges on spectre-v2
+      // // (a matched branch-target-injection workload with 459,321 domain=1 records and
+      // // s_tx=100).  Slot pressure and the any_is_victim gate are already RULED OUT by data
+      // // (OVF=0 on 99.7% of records; ty=11 RAS uses the same gate and fired 40,340 times), so
+      // // either no entry is ever WRITTEN with domain=1, or no such entry is later HIT under
+      // // the other domain.  This probe answers the write half.
+      // if (ENABLE_CF_DEBUG_PRINTF) {
+        // printf("\n[UBTBW] way=%d w=%d dom=%d sec=%d tag=0x%x\n",
+          // s1_update_write_way, w.U, s1_update.bits.cf_domain_id,
+          // s1_update.bits.cf_is_secret, s1_update_idx)
+      // }
+      meta(s1_update_write_way)(w).secret := s1_update.bits.cf_is_secret
       meta(s1_update_write_way)(w).ctr   := Mux(!s1_update_meta.hits(w),
         Mux(was_taken, 3.U, 0.U),
         bimWrite(meta(s1_update_write_way)(w).ctr, was_taken)
