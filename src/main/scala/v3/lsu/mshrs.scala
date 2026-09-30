@@ -26,7 +26,7 @@ class BoomDCacheReqInternal(implicit p: Parameters) extends BoomDCacheReq()(p)
 {
   // miss info
   val tag_match = Bool()
-  val old_meta  = new L1Metadata
+  val old_meta  = new BoomL1Metadata   // [reconf-fix] extended tag
   // Full (unmasked) set index addr[12:6] of the evicted block, from full_idx_snap.
   // Used as wb_req.bits.idx so the TL Release targets the evicted block's physical address
   // rather than the miss request's (aliased) address.
@@ -41,6 +41,7 @@ class BoomDCacheReqInternal(implicit p: Parameters) extends BoomDCacheReq()(p)
 class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   with HasL1HellaCacheParameters
   with CoreFuzzingConstants
+  with HasBoomExtendedTag   // [reconf-fix] cfTagLSB / cfIdxLowBits
 {
   val io = IO(new Bundle {
     val id = Input(UInt())
@@ -70,13 +71,15 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     val mem_finish  = Decoupled(new TLBundleE(edge.bundle))
 
     val prober_state = Input(Valid(UInt(coreMaxAddrBits.W)))
+    // [reconf-fix 2026-08-12] active set mask, for PHYSICAL-row comparisons
+    val dcache_set_mask = Input(UInt(idxBits.W))
 
     val refill      = Decoupled(new L1DataWriteReq)
 
-    val meta_write  = Decoupled(new L1MetaWriteReq)
-    val meta_read   = Decoupled(new L1MetaReadReq)
-    val meta_resp   = Input(Valid(new L1Metadata))
-    val wb_req      = Decoupled(new WritebackReq(edge.bundle))
+    val meta_write  = Decoupled(new BoomL1MetaWriteReq)
+    val meta_read   = Decoupled(new BoomL1MetaRdReq)
+    val meta_resp   = Input(Valid(new BoomL1Metadata))   // [reconf-fix]
+    val wb_req      = Decoupled(new BoomWritebackReq(edge.bundle))
 
     // To inform the prefetcher when we are commiting the fetch of this line
     val commit_val  = Output(Bool())
@@ -97,6 +100,12 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     val wb_resp     = Input(Bool())
 
     val probe_rdy   = Output(Bool())
+    // [reconf-fix 2026-08-06] Strict idle indication for the D$ config-commit gate.
+    // NOT the same as fence_rdy: a fence tolerates a parked s_prefetch MSHR, but a
+    // geometry remap tolerates nothing (a parked MSHR holds a way/idx binding taken
+    // under the OLD mapping).  ENABLE_RECONF-only consumer; constant-folded away when
+    // the gate is not built.
+    val state_invalid = Output(Bool())
     // corefuzzing: domain of the stored request — valid while MSHR is active, used at meta_write time
     val cf_req_domain   = Output(UInt(1.W))
     val cf_req_op_count = Output(UInt(uopIDCounterWidthCF.W))
@@ -118,7 +127,8 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
 
   val req     = Reg(new BoomDCacheReqInternal)
   val req_idx = req.addr(untagBits-1, blockOffBits)
-  val req_tag = req.addr >> untagBits
+  // [reconf-fix] extended tag: covers every bit above the SMALLEST index (spec 31).
+  val req_tag = req.addr >> cfTagLSB
   val req_block_addr = (req.addr >> blockOffBits) << blockOffBits
   val req_needs_wb = RegInit(false.B)
 
@@ -145,11 +155,35 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   // IFT LUT optimization (Change 4): zero cf_* fields not needed by MSHR/rpq logic.
   // rpq reads mem_cmd, mem_size, mem_signed; passes uop through io.resp.bits.uop
   // back to wb_resps (same preservation list as FU pipeline Change 2).
+  //
+  // [A4 2026-09-10] VERIFIED SAFE -- do NOT "fix" this by preserving the fields.
+  // The concern was that this is the MEMIDFIX defect on the response path: a load that
+  // MISSES is replayed out of the rpq, so its response uop would carry domain=0/opcount=0
+  // and core.scala:1997
+  //     iregfile.write_ports.bits.taint_atk := wbresp.bits.taint_atk ||
+  //                                            (wbresp.bits.uop.cf_domain_id =/= 0.U)
+  // would then clear attacker taint for a MISSING attacker load while a HITTING one kept
+  // it -- which would gut Prime+Probe coverage, since priming misses by construction.
+  //
+  // It does not happen, because the LSU never forwards this uop.  lsu.scala:2090-2114 builds
+  // the load response as `merged_base_cf = WireInit(ldq_base_cf)` -- the LDQ's CANONICAL uop,
+  // which holds the true identity -- and then OR-merges only an explicit list from the
+  // response uop (cf_fu_bitmap, cf_secret_access, cf_secret_transmission,
+  // cf_mem_dataflow_atk, cf_mem_sec_dataflow, plus influencer slots).  cf_domain_id and
+  // cf_op_count_id are deliberately NOT in that list, so they keep the LDQ's values and the
+  // zeroing below is invisible downstream.  ldq_idx itself is not a cf_* field and survives,
+  // which is what makes the LDQ lookup work at all.
+  //
+  // The uncached path (:576, `io.resp.bits.uop := req.uop`) never passes through the rpq and
+  // is unaffected.  If lsu.scala:2092 ever stops basing the merge on the LDQ entry, this
+  // zeroing becomes a live attacker-taint bug -- that line is the load-bearing one.
   rpq.io.enq.bits.uop.cf_speculated               := false.B
   rpq.io.enq.bits.uop.cf_op_count_id              := 0.U
   rpq.io.enq.bits.uop.cf_single_step              := false.B
   rpq.io.enq.bits.uop.cf_src_tainted              := false.B
   rpq.io.enq.bits.uop.cf_spec_branch_is_atk       := false.B
+  rpq.io.enq.bits.uop.cf_atk_branch_ctr       := 0.U
+  rpq.io.enq.bits.uop.cf_sec_branch_ctr       := 0.U
   rpq.io.enq.bits.uop.cf_spec_branch_op_id        := 0.U
   rpq.io.enq.bits.uop.cf_spec_branch_is_secret    := false.B
   rpq.io.enq.bits.uop.cf_cntd_valid               := false.B
@@ -157,9 +191,6 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   rpq.io.enq.bits.uop.cf_cntd_winner_atk          := false.B
   rpq.io.enq.bits.uop.cf_cntd_winner_sec          := false.B
   rpq.io.enq.bits.uop.cf_cntd_deny_count          := 0.U
-  rpq.io.enq.bits.uop.cf_taint_producer_op        := 0.U
-  rpq.io.enq.bits.uop.cf_taint_producer_is_atk    := false.B
-  rpq.io.enq.bits.uop.cf_taint_producer_is_secret := false.B
   rpq.io.enq.bits.uop.cf_domain_id                := 0.U
   rpq.io.deq.ready := false.B
 
@@ -257,7 +288,8 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     // TODO: Use AcquirePerm if just doing permissions acquire
     io.mem_acquire.bits  := edge.AcquireBlock(
       fromSource      = io.id,
-      toAddress       = Cat(req_tag, req_idx) << blockOffBits,
+      // [reconf-fix] overlap rule: slice idx to its low log2(minSets) bits
+      toAddress       = Cat(req_tag, req_idx(cfIdxLowBits-1, 0)) << blockOffBits,
       lgSize          = lgCacheBlockBytes.U,
       growPermissions = grow_param)._2
     when (io.mem_acquire.fire) {
@@ -291,12 +323,12 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
                      !isWrite(rpq.io.deq.bits.uop.mem_cmd) &&
                      (rpq.io.deq.bits.uop.mem_cmd =/= M_XLR)) // LR should go through replay
     // drain all loads for now
-    val rp_addr = Cat(req_tag, req_idx, rpq.io.deq.bits.addr(blockOffBits-1,0))
+    val rp_addr = Cat(req_tag, req_idx(cfIdxLowBits-1, 0), rpq.io.deq.bits.addr(blockOffBits-1,0))
     val word_idx  = if (rowWords == 1) 0.U else rp_addr(log2Up(rowWords*coreDataBytes)-1, log2Up(wordBytes))
     val data      = io.lb_resp
     val data_word = data >> Cat(word_idx, 0.U(log2Up(coreDataBits).W))
     val loadgen = new LoadGen(rpq.io.deq.bits.uop.mem_size, rpq.io.deq.bits.uop.mem_signed,
-      Cat(req_tag, req_idx, rpq.io.deq.bits.addr(blockOffBits-1,0)),
+      Cat(req_tag, req_idx(cfIdxLowBits-1, 0), rpq.io.deq.bits.addr(blockOffBits-1,0)),
       data_word, false.B, wordBytes)
 
 
@@ -325,7 +357,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
       state := s_meta_read
     }
   } .elsewhen (state === s_meta_read) {
-    io.meta_read.valid := !io.prober_state.valid || !grantack.valid || (io.prober_state.bits(untagBits-1,blockOffBits) =/= req_idx)
+    io.meta_read.valid := !io.prober_state.valid || !grantack.valid || ((io.prober_state.bits(untagBits-1,blockOffBits) & io.dcache_set_mask) =/= (req_idx & io.dcache_set_mask))
     io.meta_read.bits.idx := req_idx
     io.meta_read.bits.tag := req_tag
     io.meta_read.bits.way_en := req.way_en
@@ -386,7 +418,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   } .elsewhen (state === s_drain_rpq) {
     io.replay <> rpq.io.deq
     io.replay.bits.way_en    := req.way_en
-    io.replay.bits.addr := Cat(req_tag, req_idx, rpq.io.deq.bits.addr(blockOffBits-1,0))
+    io.replay.bits.addr := Cat(req_tag, req_idx(cfIdxLowBits-1, 0), rpq.io.deq.bits.addr(blockOffBits-1,0))
     when (io.replay.fire && isWrite(rpq.io.deq.bits.uop.mem_cmd)) {
       // Set dirty bit
       val (is_hit, _, coh_on_hit) = new_coh.onAccess(rpq.io.deq.bits.uop.mem_cmd)
@@ -549,6 +581,7 @@ class LineBufferMeta(implicit p: Parameters) extends BoomBundle()(p)
 class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   with HasL1HellaCacheParameters
   with CoreFuzzingConstants
+  with HasBoomExtendedTag   // [reconf-fix] cfTagLSB
 {
   val io = IO(new Bundle {
     val req  = Flipped(Vec(memWidth, Decoupled(new BoomDCacheReqInternal))) // Req from s2 of DCache pipe
@@ -567,26 +600,43 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     val mem_finish   = Decoupled(new TLBundleE(edge.bundle))
 
     val refill     = Decoupled(new L1DataWriteReq)
-    val meta_write = Decoupled(new L1MetaWriteReq)
-    val meta_read  = Decoupled(new L1MetaReadReq)
-    val meta_resp  = Input(Valid(new L1Metadata))
+    val meta_write = Decoupled(new BoomL1MetaWriteReq)
+    val meta_read  = Decoupled(new BoomL1MetaRdReq)
+    val meta_resp  = Input(Valid(new BoomL1Metadata))   // [reconf-fix]
     val replay     = Decoupled(new BoomDCacheReqInternal)
     val prefetch   = Decoupled(new BoomDCacheReq)
-    val wb_req     = Decoupled(new WritebackReq(edge.bundle))
+    val wb_req     = Decoupled(new BoomWritebackReq(edge.bundle))
 
     val prober_state = Input(Valid(UInt(coreMaxAddrBits.W)))
 
     val clear_all = Input(Bool()) // Clears all uncommitted MSHRs to prepare for fence
+    // [reconf-fix 2026-08-06] Kill parked prefetch MSHRs while a D$ geometry change is
+    // staged.  A parked s_prefetch MSHR is not s_invalid, so without this the commit
+    // gate would never see an idle cache and the quiesce would hang.  Its line is
+    // already filled and GrantAck'd, so retiring it is pure state:=s_invalid with no
+    // protocol action.  ENABLE_RECONF-only producer (tied false otherwise).
+    val clear_prefetch_all = Input(Bool())
 
     val wb_resp   = Input(Bool())
 
     val fence_rdy = Output(Bool())
+    // [reconf-fix] all cacheable MSHRs strictly idle — gate condition for applying a
+    // staged D$ geometry change (IOMSHRs excluded: they never touch the cache arrays).
+    val cache_idle = Output(Bool())
     val probe_rdy = Output(Bool())
     // corefuzzing: union of way_en bits of all active MSHRs (one-hot per way).
     // Used by the dcache to avoid assigning two concurrent misses to the same way,
     // which would cause the second MSHR's refill to overwrite the first, making the
     // first MSHR's subsequent replay miss and trigger assert(!(s2_type===t_replay && !s2_hit)).
     val pending_way_mask = Output(UInt(nWays.W))
+    // [reconf-fix 2026-08-12] Active set mask (cf_dcache_active_sets-1), driven by the
+    // dcache.  The per-set exclusion below MUST compare the PHYSICAL row a line occupies,
+    // not the full untagged index: refills write `idx & dcache_set_mask` (dcache.scala
+    // :1211 / :1208), so at a reduced set count two addresses differing only in the
+    // dropped index bits land in the SAME row while an unmasked compare calls them
+    // different sets.  Both then allocate, both refill the same row, and one line's tag
+    // ends up over the other's data -- a silent wrong-data hit.
+    val dcache_set_mask = Input(UInt(idxBits.W))
     // corefuzzing: fill-completion event — fires when an MSHR meta_write completes
     val cf_meta_write_fill = Output(Valid(new Bundle {
       val idx      = UInt(idxBits.W)
@@ -656,11 +706,15 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
   val idx_match   = widthMap(w => idx_matches(w).reduce(_||_))
   val way_match   = widthMap(w => Mux1H(idx_matches(w), way_matches(w)))
 
-  val wb_tag_list = Wire(Vec(cfg.nMSHRs, UInt(tagBits.W)))
+  // [dead-code 2026-08-13] wb_tag_list was declared and written (one entry per MSHR from
+  // mshr.io.wb_req.bits.tag) but NEVER READ anywhere.  Removed to stop it reading like a
+  // live writeback-tag tracking structure; the writeback carries its own tag/idx per MSHR
+  // (io.wb_req.bits.tag / .idx), so nothing needs this list.
+  //   val wb_tag_list = Wire(Vec(cfg.nMSHRs, UInt(cfTagBits.W)))
 
-  val meta_write_arb = Module(new Arbiter(new L1MetaWriteReq           , cfg.nMSHRs))
-  val meta_read_arb  = Module(new Arbiter(new L1MetaReadReq            , cfg.nMSHRs))
-  val wb_req_arb     = Module(new Arbiter(new WritebackReq(edge.bundle), cfg.nMSHRs))
+  val meta_write_arb = Module(new Arbiter(new BoomL1MetaWriteReq       , cfg.nMSHRs))
+  val meta_read_arb  = Module(new Arbiter(new BoomL1MetaRdReq          , cfg.nMSHRs))
+  val wb_req_arb     = Module(new Arbiter(new BoomWritebackReq(edge.bundle), cfg.nMSHRs))
   val replay_arb     = Module(new Arbiter(new BoomDCacheReqInternal    , cfg.nMSHRs))
   val resp_arb       = Module(new Arbiter(new BoomDCacheResp           , cfg.nMSHRs + nIOMSHRs))
   val refill_arb     = Module(new Arbiter(new L1DataWriteReq           , cfg.nMSHRs))
@@ -681,13 +735,26 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
   val mshrs = (0 until cfg.nMSHRs) map { i =>
     val mshr = Module(new BoomMSHR)
     mshr.io.id := i.U(log2Ceil(cfg.nMSHRs).W)
+    mshr.io.dcache_set_mask := io.dcache_set_mask
 
     for (w <- 0 until memWidth) {
-      idx_matches(w)(i) := mshr.io.idx.valid && mshr.io.idx.bits === io.req(w).bits.addr(untagBits-1,blockOffBits)
-      tag_matches(w)(i) := mshr.io.tag.valid && mshr.io.tag.bits === io.req(w).bits.addr >> untagBits
+      // [reconf-fix 2026-08-12] Mask BOTH sides to the active geometry so "same set"
+      // means "same PHYSICAL row".  Refills write `idx & dcache_set_mask` (dcache.scala
+      // :1211/:1208), so at a reduced set count two addresses differing only in the
+      // dropped index bits share a row while an unmasked compare calls them different
+      // sets -- both allocate, both refill that row, and one line's tag ends up over the
+      // other's data (silent wrong-data hit).  Strictly more conservative: a coarser
+      // match only blocks a primary alloc or merges a secondary miss that also passes
+      // tag_matches, and it restores the one-MSHR-per-row invariant way_matches' Mux1H
+      // and the refill path rely on.
+      idx_matches(w)(i) := mshr.io.idx.valid &&
+                           (mshr.io.idx.bits & io.dcache_set_mask) ===
+                           (io.req(w).bits.addr(untagBits-1,blockOffBits) & io.dcache_set_mask)
+      // [reconf-fix] compare the extended tag (cfTagLSB), matching what the MSHR stores
+      tag_matches(w)(i) := mshr.io.tag.valid && mshr.io.tag.bits === io.req(w).bits.addr >> cfTagLSB
       way_matches(w)(i) := mshr.io.way.valid && mshr.io.way.bits === io.req(w).bits.way_en
     }
-    wb_tag_list(i) := mshr.io.wb_req.bits.tag
+    //   wb_tag_list(i) := mshr.io.wb_req.bits.tag   // [dead-code 2026-08-13] see decl
 
 
 
@@ -705,7 +772,8 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     // a probe to that prefetched line, all mshrs are in use
     mshr.io.clear_prefetch := ((io.clear_all && !req.valid)||
       (req.valid && idx_matches(req_idx)(i) && cacheable && !tag_match(req_idx)) ||
-      (req_is_probe && idx_matches(req_idx)(i)))
+      (req_is_probe && idx_matches(req_idx)(i)) ||
+      io.clear_prefetch_all)   // [reconf-fix] staged geometry change: retire parked prefetches
     mshr.io.brupdate       := io.brupdate
     mshr.io.exception    := io.exception
     mshr.io.rob_pnr_idx  := io.rob_pnr_idx
@@ -755,6 +823,11 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
   // picking the same replacement way for two concurrent misses to the same set.
   io.pending_way_mask := mshrs.map(m => Mux(m.io.way.valid, m.io.way.bits, 0.U)).reduce(_ | _)
 
+  // [reconf-fix 2026-08-06] Strict all-idle for the D$ config-commit gate.
+  // Compile-time gated: constant true when reconfiguration is not built, so the
+  // gate (and this reduction) vanish from the baseline netlist.
+  io.cache_idle := (if (ENABLE_RECONF) mshrs.map(_.io.state_invalid).reduce(_&&_) else true.B)
+
   // Try to round-robin the MSHRs
   val mshr_head      = RegInit(0.U(log2Ceil(cfg.nMSHRs).W))
   mshr_alloc_idx    := RegNext(AgePriorityEncoder(mshrs.map(m=>m.io.req_pri_rdy), mshr_head))
@@ -769,6 +842,7 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
   io.cf_meta_write_fill.valid         := meta_write_arb.io.out.fire
   io.cf_meta_write_fill.bits.idx      := meta_write_arb.io.out.bits.idx
   io.cf_meta_write_fill.bits.way_en   := meta_write_arb.io.out.bits.way_en
+  io.cf_meta_write_fill.bits.tag      := meta_write_arb.io.out.bits.data.tag
   io.cf_meta_write_fill.bits.domain   := Mux1H(UIntToOH(meta_write_arb.io.chosen),
                                            VecInit(mshrs.map(_.io.cf_req_domain)))
   io.cf_meta_write_fill.bits.op_count := Mux1H(UIntToOH(meta_write_arb.io.chosen),
