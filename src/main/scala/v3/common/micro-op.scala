@@ -191,7 +191,27 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   // adding the tag to the Microp to let it propagate through the pipeline once created
   val cf_domain_id            = UInt(iftTagWidth.W)
   val cf_speculated           = Bool()      // set when the micro-op is speculatively issued
-  val cf_attacker_influence   = Bool()      // set when the micro-op is either fetched/dispatched based on an attacker/secret dependent thread/micro-op
+  val cf_attacker_influence   = Bool()
+  // [GHISTFIELD 2026-09-08] Branch-history influence as a COUNTER-VALUED FIELD, not an
+  // influencer entry and not a bare flag.  0 = not armed; non-zero = the GHR holds a
+  // tainted branch outcome and `globalHistoryLength - value` is the number of branch
+  // retirements back to the branch that tainted it.
+  //
+  // WHY IT LEFT THE INFLUENCER VECTOR (measured on spectre, not on unit tests):
+  //   ty=19 became the highest-frequency edge (1,249,341 -- more than BPD's 793,107),
+  //   because the GHR window is armed almost continuously in a real attack.  It is LAST
+  //   in the fetch-buffer batch, so I expected append-and-drop to sacrifice it.  It does
+  //   not: 100% of records with OVF>0 still CARRY their ty=19, while only 60.8% of OVF=0
+  //   records do.  GHIST claims a slot at FETCH and survives; the edges actually lost are
+  //   the later, more precise ones -- REG_DATAFLOW / MEM_DATAFLOW arriving from writeback
+  //   and the LSU to find all four slots taken.  43,396 records lost a dataflow edge to a
+  //   window flag.  Drop rate went 0.107% -> 2.63% (25x).
+  //
+  // As a field it keeps the provenance (the counter) AND stops squatting a slot.
+  // A flag alone would have kept the slot free but thrown the provenance away; an edge
+  // alone kept the provenance but cost the slot.  This is both.
+  val cf_atk_branch_ctr = UInt(7.W)   // attacker-tainted GHR window counter
+  val cf_sec_branch_ctr = UInt(7.W)   // secret-tainted   GHR window counter      // set when the micro-op is either fetched/dispatched based on an attacker/secret dependent thread/micro-op
   val cf_secret_access        = Bool()      // set when the micro-op accesses a secret
   val cf_secret_propagation   = Bool()      // set when the micro-op is in the dependence chain of originating in a secret
   val cf_secret_transmission  = Bool()      // set when a secret dependent micro-op makes a update to a stateful unit

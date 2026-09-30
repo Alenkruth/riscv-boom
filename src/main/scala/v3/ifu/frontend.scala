@@ -299,6 +299,13 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
   // corefuzzing: secret shadow mismatch — predictor entry was trained by secret instruction
   val bpd_secret_mismatch    = Bool()
   val btb_secret_mismatch    = Bool()
+  // C3: this packet was predicted using a GHR that still holds a secret branch outcome
+  val ghist_secret           = Bool()
+  // [GHISTATK 2026-09-08] attacker twin: the GHR holds an attacker-determined outcome
+  val ghist_atk              = Bool()
+  // [GHISTOC] distance-to-arming-branch, carried as the influencer's op_count
+  val ghist_secret_ctr       = UInt(7.W)
+  val ghist_atk_ctr          = UInt(7.W)
   // corefuzzing: RAS pop was from a slot pushed by a secret call (retroactively tagged)
   val ras_pop_secret         = Bool()
 }
@@ -1101,6 +1108,22 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // corefuzzing: drive the fetch-throttle gate Wire now that fb is instantiated
   cf_fetch_throttle_gate := fb.io.fetch_throttle_gate
   val ftq = Module(new FetchTargetQueue)
+  // C3: assigned here (not beside the other f3_fetch_bundle connects at :1009)
+  // only because `ftq` is not in Scala scope until this line.  f3_fetch_bundle is a
+  // Wire, so the connect resolves regardless of textual position.
+  // C3 TOGGLE: held false so the address-taint fix (D) can be measured alone.
+  // Chisel constant-folds the whole ty=19 path away, so slot pressure and s_prop are
+  // untouched.  Flip to ftq.io.cf_ghist_secret_active to enable C3.
+  // [GHIST-ENABLE 2026-09-08] C3 re-enabled.  This was held false so the address-taint
+  // fix (D) could be measured in isolation; that experiment is long finished, and while
+  // it was parked Chisel constant-folded the ENTIRE ty=19 INFL_GHIST_STATE path away --
+  // the channel could never fire, in any workload, which is why it showed 0 occurrences
+  // across every log.  Enabling it restores secret-tainted global history as an
+  // influencer source.
+  f3_fetch_bundle.ghist_secret := ftq.io.cf_ghist_secret_active
+  f3_fetch_bundle.ghist_atk    := ftq.io.cf_ghist_atk_active
+  f3_fetch_bundle.ghist_secret_ctr := ftq.io.cf_ghist_secret_ctr_val
+  f3_fetch_bundle.ghist_atk_ctr    := ftq.io.cf_ghist_atk_ctr_val
   // corefuzzing: late secret update from FTQ — fires when a secret instruction commits from a
   // call-containing fetch packet, retroactively marking the pushed RAS slot as secret
   ras.io.late_write_secret_valid := ftq.io.cf_ras_secret_upd_valid

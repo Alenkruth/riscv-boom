@@ -148,6 +148,23 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   // export the RAS slot index so the frontend can mark ras_secret retroactively.
   val cf_ras_secret_upd_valid = Output(Vec(coreWidth + memWidth, Bool()))
   val cf_ras_secret_upd_idx   = Output(Vec(coreWidth + memWidth, UInt(log2Ceil(nRasEntries).W)))
+  // C3: the GHR still contains a secret-influenced branch outcome.  See the counter
+  // at the bpdupdate site for why this is a window and not a per-entry flag.
+  val cf_ghist_secret_active  = Output(Bool())
+  // [GHISTATK 2026-09-08] The attacker twin.  Spectre-v1's whole premise is the attacker
+  // MISTRAINING the predictor: N attacker branches commit before the mispredicted victim
+  // branch, so the GHR genuinely holds attacker-determined outcomes.  Without this the
+  // ty=19 candidate is hardcoded is_atk=false and that influence can never be recorded.
+  val cf_ghist_atk_active     = Output(Bool())
+  // [GHISTOC 2026-09-08] Export the COUNTER VALUES so the influencer edge can carry real
+  // provenance instead of oc=0.  The counter is armed to globalHistoryLength when the
+  // tainting branch retires and decrements once per retired branch, so
+  //     k = globalHistoryLength - ctr
+  // is exactly the number of branch retirements between the arming branch and this fetch.
+  // A parser/fuzzer walks back k branch retirements in the commit stream and lands on the
+  // branch that tainted the GHR.  7 bits into a 10-bit oc field.
+  val cf_ghist_secret_ctr_val = Output(UInt(log2Ceil(globalHistoryLength + 1).W))
+  val cf_ghist_atk_ctr_val    = Output(UInt(log2Ceil(globalHistoryLength + 1).W))
 
     val bpdupdate = Output(Valid(new BranchPredictionUpdate))
 
@@ -157,6 +174,18 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
   })
   val bpd_ptr    = RegInit(0.U(idx_sz.W))
+  // C3: branches remaining before the secret branch shifts out of the GHR (0 = clean)
+  val cf_ghist_secret_ctr = RegInit(0.U(log2Ceil(globalHistoryLength + 1).W))
+  io.cf_ghist_secret_active := cf_ghist_secret_ctr =/= 0.U
+  // [GHISTATK] Same window shape as the secret counter: a branch outcome is resident in
+  // the GHR for exactly globalHistoryLength subsequent branch shifts, so the taint is a
+  // WINDOW that decays precisely when the bit shifts out.  That is a liveness model of
+  // predictor state, NOT the sticky "attacker branched at some point" context doc 16
+  // sec.B forbids -- it decays on its own, deterministically.
+  val cf_ghist_atk_ctr = RegInit(0.U(log2Ceil(globalHistoryLength + 1).W))
+  io.cf_ghist_atk_active := cf_ghist_atk_ctr =/= 0.U
+  io.cf_ghist_secret_ctr_val := cf_ghist_secret_ctr
+  io.cf_ghist_atk_ctr_val    := cf_ghist_atk_ctr
   val deq_ptr    = RegInit(0.U(idx_sz.W))
   val enq_ptr    = RegInit(1.U(idx_sz.W))
 
@@ -368,6 +397,26 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     // corefuzzing: carry fetch domain and secret flag to BPD shadow writes
     io.bpdupdate.bits.cf_domain_id := bpd_entry.cf_fetch_domain
     io.bpdupdate.bits.cf_is_secret := bpd_entry.cf_fetch_secret
+    // C3 (2026-09-03): taint the GLOBAL HISTORY, not just the predictor rows.
+    // A branch outcome stays in a globalHistoryLength-bit GHR for exactly that many
+    // subsequent branch shifts, so the taint is a WINDOW, not a per-entry field.
+    // It cannot be attached at GlobalHistory.update(): that runs at ENQUEUE (:213)
+    // off `prev_entry`, a Reg snapshot taken at :232 where cf_fetch_secret is still
+    // false -- the secret bit is written later into ram(idx) (:247).  Verified, not
+    // assumed; wiring it there would have been inert.
+    // Here at bpd_ptr the retiring entry's true secret bit IS known, so: arm the
+    // window on a secret branch, age it by one on every other retired branch.
+    when (RegNext(do_commit_update) && io.bpdupdate.valid && io.bpdupdate.bits.cfi_is_br) {
+      cf_ghist_secret_ctr := Mux(bpd_entry.cf_fetch_secret,
+                                 globalHistoryLength.U,
+                                 Mux(cf_ghist_secret_ctr =/= 0.U, cf_ghist_secret_ctr - 1.U, 0.U))
+      // [GHISTATK] Armed by an ATTACKER-OWNED retiring branch.  cf_fetch_domain is already
+      // stored per FTQ entry (:70) and is already read at :375 for bpdupdate, so this
+      // costs the counter and a comparator -- NO new per-entry state.
+      cf_ghist_atk_ctr := Mux(bpd_entry.cf_fetch_domain === 1.U,
+                              globalHistoryLength.U,
+                              Mux(cf_ghist_atk_ctr =/= 0.U, cf_ghist_atk_ctr - 1.U, 0.U))
+    }
 
     first_empty := false.B
   }

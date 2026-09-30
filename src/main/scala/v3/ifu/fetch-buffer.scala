@@ -313,18 +313,51 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     InfluencerCandidate(io.enq.bits.btb_secret_mismatch,    0.U, INFL_BTB_STATE,    false.B,       true.B),
     InfluencerCandidate(io.enq.bits.itlb_domain_mismatch,   0.U, INFL_ITLB_STATE,   any_is_victim, false.B),
     InfluencerCandidate(io.enq.bits.itlb_secret_mismatch,   0.U, INFL_ITLB_STATE,   false.B,       true.B),
+    // C3 -- deliberately LAST.  addInfluencerBatch appends-and-drops into 4 slots, so
+    // position is priority.  The GHR window stays armed for up to globalHistoryLength
+    // branches, making this the highest-frequency candidate here; giving it an early
+    // slot would evict REG_DATAFLOW value edges, a loss no parser can undo.
+    // [GHISTOC 2026-09-08] oc is no longer 0.  It carries the GHR window counter, so the
+    // edge has real provenance: k = globalHistoryLength - oc is the number of branch
+    // retirements between the branch that tainted the GHR and this fetch, letting the
+    // parser/fuzzer walk back k retirements and name that branch.  This is what makes
+    // ty=19 a legitimate edge rather than a producer-less window flag -- and is why it
+    // stays in the influencer vector instead of becoming a uop bit.
+    // [GHISTFIELD 2026-09-08] Both INFL_GHIST_STATE candidates REMOVED -- they squatted a
+    // slot at fetch and caused later precise edges to be dropped (see micro-op.scala).
+    // The information now rides cf_atk_branch_ctr / cf_sec_branch_ctr, set below.
+    // [GHISTATK 2026-09-08] The attacker twin, gated by any_is_victim exactly like the
+    // BPD/BTB/ITLB/RAS/ICACHE domain-mismatch candidates above.  That gate is what keeps
+    // it useful: the attacker's OWN fetches are domain=1 and excluded, so this fires only
+    // on VICTIM fetches whose prediction consulted a GHR the attacker filled -- which is
+    // precisely spectre-v1's mistraining.  Placed last with the secret twin for the same
+    // slot-priority reason: the GHR window is high-frequency and must never evict a
+    // REG_DATAFLOW value edge.
   ))
 
   // Broadcast shared influencer list to all uops in the packet.
   for (i <- 0 until fetchWidth) {
     in_uops(i).cf_influencer_list := fb_post.cf_influencer_list
-    in_uops(i).cf_infl_overflow   := fb_post.cf_infl_overflow
+    in_uops(i).cf_infl_dropped    := fb_post.cf_infl_dropped
     when (fb_post.cf_attacker_influence) {
       in_uops(i).cf_attacker_influence := true.B
     }
     // Secret propagation: set when BPD, BTB, or RAS was trained/pushed by a secret instruction
-    when (io.enq.bits.bpd_secret_mismatch || io.enq.bits.btb_secret_mismatch || ras_pop_secret) {
+    when (io.enq.bits.bpd_secret_mismatch || io.enq.bits.btb_secret_mismatch || ras_pop_secret ||
+          io.enq.bits.ghist_secret) {
       in_uops(i).cf_secret_propagation := true.B
+    }
+    // [GHISTFIELD] Carry the window counters.  any_is_victim on the attacker side, matching
+    // the gate the other domain-mismatch channels use: the attacker's own fetches are
+    // domain=1 and must not be marked as influenced by themselves.  The summary bits are
+    // still raised, so BROADATK coverage is unchanged -- only the slot squatting is gone.
+    when (io.enq.bits.ghist_secret) {
+      in_uops(i).cf_sec_branch_ctr     := io.enq.bits.ghist_secret_ctr
+      in_uops(i).cf_secret_propagation := true.B
+    }
+    when (io.enq.bits.ghist_atk && any_is_victim) {
+      in_uops(i).cf_atk_branch_ctr     := io.enq.bits.ghist_atk_ctr
+      in_uops(i).cf_attacker_influence := true.B
     }
   }
 
