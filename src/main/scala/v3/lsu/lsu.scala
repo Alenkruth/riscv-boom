@@ -1615,6 +1615,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // Mask of stores which we can forward from
   val ldst_forward_matches = WireInit(widthMap(w => VecInit((0 until numStqEntries).map(x=>false.B))))
 
+  // [MEMORD] default: no edge this cycle.  Overridden at the two order_fail sites below.
+  for (w <- 0 until memWidth) {
+    io.core.cf_memord_upd(w).valid := false.B
+    io.core.cf_memord_upd(w).bits  := DontCare
+  }
   val failed_loads     = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B))) // Loads which we will report as failures (throws a mini-exception)
   val nacking_loads    = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B))) // Loads which are being nacked by dcache in the next stage
 
@@ -1680,6 +1685,15 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
             ldq(i).bits.uop := addInfluencer(l_bits.uop, stq_infl_uop.cf_op_count_id, INFL_MEM_ORDER.U,
               is_atk = stq_infl_uop.cf_domain_id === 1.U,
               is_secret = stq_infl_uop.cf_secret_access || stq_infl_uop.cf_secret_propagation)
+            // [MEMORD] The LDQ copy above is about to be destroyed by the order-fail flush
+            // (ldq_head/tail := 0), so send the same edge to the ROB entry, where it lands
+            // on the squashed load's [FLUSH] record.
+            io.core.cf_memord_upd(w).valid             := true.B
+            io.core.cf_memord_upd(w).bits.rob_idx      := l_bits.uop.rob_idx
+            io.core.cf_memord_upd(w).bits.op_count_id  := l_bits.uop.cf_op_count_id
+            io.core.cf_memord_upd(w).bits.prod_op_count := stq_infl_uop.cf_op_count_id
+            io.core.cf_memord_upd(w).bits.is_atk       := stq_infl_uop.cf_domain_id === 1.U
+            io.core.cf_memord_upd(w).bits.is_secret    := stq_infl_uop.cf_secret_access || stq_infl_uop.cf_secret_propagation
           }
         }
       } .elsewhen (do_ld_search(w)            &&
@@ -1702,6 +1716,15 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
               ldq(i).bits.uop := addInfluencer(l_bits.uop, lcam_uop(w).cf_op_count_id, INFL_MEM_ORDER.U,
                 is_atk = lcam_uop(w).cf_domain_id === 1.U,
                 is_secret = lcam_uop(w).cf_secret_access || lcam_uop(w).cf_secret_propagation)
+              // [MEMORD] same routing as site 1.  NOTE this site additionally requires
+              // l_bits.observed (a coherence probe from another agent), so it is
+              // structurally unreachable in a single-core sim -- wired for completeness.
+              io.core.cf_memord_upd(w).valid             := true.B
+              io.core.cf_memord_upd(w).bits.rob_idx      := l_bits.uop.rob_idx
+              io.core.cf_memord_upd(w).bits.op_count_id  := l_bits.uop.cf_op_count_id
+              io.core.cf_memord_upd(w).bits.prod_op_count := lcam_uop(w).cf_op_count_id
+              io.core.cf_memord_upd(w).bits.is_atk       := lcam_uop(w).cf_domain_id === 1.U
+              io.core.cf_memord_upd(w).bits.is_secret    := lcam_uop(w).cf_secret_access || lcam_uop(w).cf_secret_propagation
             }
           }
         } .elsewhen (lcam_ldq_idx(w) =/= i.U) {
@@ -1823,6 +1846,29 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   RCcover(ld_xcpt_valid, "BOOM_v3_MemOrderViolation",
     "Memory ordering violation: a load observed a stale value and must be replayed")
   val ld_xcpt_uop   = ldq(Mux(l_idx >= numLdqEntries.U, l_idx - numLdqEntries.U, l_idx)).bits.uop
+  // [MEMORD 2026-09-08] Until now there was NO simulation-visible signal that a memory
+  // ordering violation occurred: RCcover/AutoCounter is a Golden Gate transform that
+  // produces nothing under Verilator, and MINI_EXCEPTION_MEM_ORDERING is printed nowhere.
+  // So "ty=8 never appears" could not be told apart from "order_fail never fires".
+  // Gated by the usual printf plusarg, so it costs nothing in a normal run.
+  // [MEMORD2 2026-09-08] The probe now carries the FULL EDGE, not just the fact.
+  //
+  // WHY: the ty=8 edge IS correctly routed into rob_uop by cf_lsu_memord_upd, but that ROB
+  // entry is squashed through the EXCEPTION/rollback path, and rob.scala:993 emits its
+  // [FLUSH] record only for `IsKilledByBranch`.  Exception-squashed uops are logged
+  // NOWHERE.  So the edge existed in hardware and was never printed -- MEASURED: t35 fired
+  // order_fail exactly once (probe line present) with ty=8 absent from the whole log.
+  //
+  // This line makes MEM_ORDER fully observable without touching the ROB's flush machinery.
+  // The general hole -- no logging for ANY exception-squashed uop -- is a separate,
+  // larger fix (emit a record on the s_rollback walk) and is written up as such.
+  when (ld_xcpt_valid) {
+    val mo = io.core.cf_memord_upd(0)
+    printf("[MEMORD] order_fail rob_idx=%d ldq_head=%d oc=%d prod_oc=%d atk=%d sec=%d valid=%d\n",
+      ld_xcpt_uop.rob_idx, ldq_head, ld_xcpt_uop.cf_op_count_id,
+      mo.bits.prod_op_count, mo.bits.is_atk, mo.bits.is_secret, mo.valid)
+  }
+
 
   val use_mem_xcpt = (mem_xcpt_valid && IsOlder(mem_xcpt_uop.rob_idx, ld_xcpt_uop.rob_idx, io.core.rob_head_idx)) || !ld_xcpt_valid
 

@@ -61,6 +61,65 @@ class CF_SAccUpdate(implicit p: Parameters) extends BoomBundle with CoreFuzzingC
   val op_count_id = UInt(uopIDCounterWidthCF.W)
 }
 
+// [MEMORD 2026-09-08] Routes an INFL_MEM_ORDER edge from the LSU into the ROB entry.
+//
+// WHY THIS PORT EXISTS.  lsu.scala writes the ty=8 edge into `ldq(i).bits.uop` when a
+// store's late-resolving address finds a younger load that already read stale data.  That
+// edge is then DESTROYED, three ways over:
+//   1. order_fail raises MINI_EXCEPTION_MEM_ORDERING -> rob flush -> io.lsu.exception ->
+//      lsu.scala:2394 `ldq_head := 0; ldq_tail := 0` wipes the whole queue;
+//   2. an LDQ uop's only ride to the ROB is a load writeback, and the order_fail condition
+//      REQUIRES the load to have already executed -- that ride has departed;
+//   3. the replay does not re-violate: by then the store address is resolved and the load
+//      forwards correctly, so the edge is never regenerated.
+// Result: ty=8 has never once appeared in any log.
+//
+// The violating load is squashed BY DEFINITION, so the edge belongs on the [FLUSH] record.
+// Writing it into rob_uop here puts it exactly there (rob.scala already gates flush
+// logging on influencer presence), and order_fail is detected well before the exception is
+// taken at the head, so there is ample slack.
+class CF_MemOrdUpdate(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
+  val rob_idx       = UInt(robAddrSz.W)
+  val op_count_id   = UInt(uopIDCounterWidthCF.W)   // guard against ROB slot reuse
+  val prod_op_count = UInt(inflOpCountWidthCF.W)    // the conflicting store/load's op_count
+  val is_atk        = Bool()
+  val is_secret     = Bool()
+}
+
+/** ROB update for cf_secret_propagation, carrying WHY it fired.
+  *
+  * core.scala emits an s_prop update on two very different conditions:
+  *   (a) a real source taint  -- preg_secret[prs1|prs2], or a secret mem dataflow;
+  *   (b) the instruction is itself the secret access (wb_uop.cf_secret_access),
+  *       fired purely as bookkeeping so downstream consumers see the taint chain.
+  *
+  * rob.scala's Gap-2 setter must only turn (a) into cf_secret_transmission: for a
+  * load, prs1 IS the address register, so (a) literally means "this load's address
+  * is secret-derived" -- a genuine transmission.  Case (b) transmits nothing.
+  *
+  * The two arrive as identical valid pulses on the same port, so the ROB cannot
+  * tell them apart.  Its `!rob_uop(cidx).cf_secret_access` guard was intended to,
+  * but cannot: that bit is written by the SAME writeback (rob.scala:1012) in the
+  * SAME cycle, so the guard reads the stale register value and never fires.
+  * Measured on run_00016: zero records anywhere with s_acc=1, uses_ldq, s_tx=0 --
+  * the guard had no observable effect in 190,653 load-with-s_prop events, while
+  * all 10 secret-range loads were tagged s_tx despite transmitting nothing.
+  *
+  * Carrying the reason on the update makes the distinction explicit and immune to
+  * the cycle timing.  One bit per wakeup port.
+  */
+class CF_SPropUpdate(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
+  val rob_idx     = UInt(robAddrSz.W)
+  val op_count_id = UInt(uopIDCounterWidthCF.W)
+  val src_tainted = Bool()
+  // corefuzzing: this op's OWN effective address was in the secret range (its
+  // cf_secret_access, set by the LSU at TLB).  The ROB's retroactive s_tx rule needs
+  // it to reproduce the LSU's `!in_secret` guard: a load whose pointer lands IN
+  // secret memory stays inside the secure domain and is an ACCESS, not a
+  // TRANSMISSION.  Without this the secret load tags itself as its own transmitter.
+  val self_secret_acc = Bool()
+}
+
 /**
  * Payload for the TLB-stage preg_secret early-update bus.
  * is_fp=true  → pdst indexes the FP physical register file  (fp_preg_secret)

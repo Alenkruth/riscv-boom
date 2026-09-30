@@ -2025,31 +2025,24 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     (if (usingFPU) fp_pipeline.io.cf_contention_upd else Nil)
   )
   rob.io.cf_lsu_s_acc_upd        := io.lsu.cf_s_acc_rob_upd
+  // [MEMORD 2026-09-08] ty=8 MEM_ORDER edge from the LSU's order_fail sites.
+  rob.io.cf_lsu_memord_upd       := io.lsu.cf_memord_upd
 
   // Default driver for rob.io.cf_s_prop_rob_upd — always fires so the IO has a
   // valid default even when IFT is disabled. The IFT writeback-transitive block
   // below conditionally overrides via last-connect semantics when ENABLE_IFT=true.
-  rob.io.cf_s_prop_rob_upd.foreach { u => u.valid := false.B; u.bits := DontCare }
+  rob.io.cf_s_prop_rob_upd.foreach { u =>
+    u.valid := false.B; u.bits := DontCare
+    u.bits.src_tainted := false.B   // never DontCare: this bit gates a ROB write
+    u.bits.self_secret_acc := false.B
+  }
   // Gap 1 fix (DOC:23): defaults for new IOs — overridden inside if (ENABLE_IFT) below.
-  io.lsu.cf_preg_secret.foreach(_ := false.B)
   rob.io.cf_lsu_s_tx_upd.foreach { u => u.valid := false.B; u.bits := DontCare }
 
   if (ENABLE_IFT) {
-  // corefuzzing: preg_secret TLB-stage update from LSU — mark pdst as secret-tainted
-  // as soon as the load's address resolves to the secret range (before writeback).
-  for (w <- 0 until memWidth) {
-    when (io.lsu.cf_preg_secret_upd(w).valid) {
-      when (io.lsu.cf_preg_secret_upd(w).bits.is_fp) {
-        fp_preg_secret(io.lsu.cf_preg_secret_upd(w).bits.pdst) := true.B
-      } .otherwise {
-        preg_secret(io.lsu.cf_preg_secret_upd(w).bits.pdst) := true.B
-      }
-    }
-  }
 
   // Gap 1 fix (DOC:23): expose preg_secret to LSU so TLB stage can check live taint.
   // preg_secret is a Reg here; this is a register-read fan-out (192 wires), no logic depth.
-  io.lsu.cf_preg_secret  := preg_secret
   // Gap 1 fix: route LSU's cf_s_tx_rob_upd to ROB (mirrors cf_lsu_s_acc_upd at line 1913).
   rob.io.cf_lsu_s_tx_upd := io.lsu.cf_s_tx_rob_upd
 

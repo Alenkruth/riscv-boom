@@ -138,10 +138,24 @@ class RobIo(
   // Mirrors cf_lsu_s_acc_upd; op_count_id guard prevents stale ROB slot updates.
   val cf_lsu_s_tx_upd  = Input(Vec(memWidth, Valid(new CF_SAccUpdate)))
 
+  // [BRSELF 2026-09-07] The attacker-STEERING branch's own entry.  Step 1 marks a
+  // branch's SHADOW via br_mask, but a uop's br_mask holds only the OLDER branches it
+  // speculates under -- never its own tag -- so the steering branch excluded itself.
+  // It also cannot be marked at writeback: branches have rf_wen=false, so the ROB's
+  // writeback path skips them.  MEASURED: bounds branch 0x80001730 had cond_atk=1 on
+  // 650/650 resolves yet its own record read atk=0 on 477/477 commits.
+  // Direct indexed write (mirrors cf_lsu_s_acc_upd): one bank-match per port, NOT
+  // another 256-entry broadcast.
+  val cf_br_atk_self = Input(Vec(coreWidth, Valid(new CF_SAccUpdate)))
+
+  // [MEMORD 2026-09-08] ty=8 MEM_ORDER edge from the LSU's order_fail sites.  See
+  // CF_MemOrdUpdate in micro-op.scala for why the LDQ-resident edge cannot survive.
+  val cf_lsu_memord_upd = Input(Vec(memWidth, Valid(new CF_MemOrdUpdate)))
+
   // corefuzzing: direct ROB update to set cf_secret_propagation for in-flight instructions
   // whose physical source registers are secret-tainted, discovered at writeback time.
   // One port per integer writeback port (numWakeupPorts); unused ports stay valid=false.
-  val cf_s_prop_rob_upd = Input(Vec(numWakeupPorts, Valid(new CF_SAccUpdate)))
+  val cf_s_prop_rob_upd = Input(Vec(numWakeupPorts, Valid(new CF_SPropUpdate)))
 
   // corefuzzing changes
   val cf_debug_rob_enable = Input(Bool())
@@ -547,6 +561,42 @@ class Rob(
     // Gap 1 fix (DOC:23): direct s_tx update from LSU TLB stage.
     // Fires when live preg_secret[prs1/prs2] check detects a secret-tainted source address.
     // op_count_id guard prevents stale updates to reused ROB slots (same as cf_lsu_s_acc_upd).
+    // [BRSELF] mark the attacker-steered branch itself.  Same op_count_id guard as
+    // cf_lsu_s_acc_upd: a squashed branch's slot may be reallocated before this lands.
+    for (upd <- io.cf_br_atk_self) {
+      when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx))) {
+        val bidx = GetRowIdx(upd.bits.rob_idx)
+        when (rob_val(bidx) && rob_uop(bidx).cf_op_count_id === upd.bits.op_count_id) {
+          rob_uop(bidx).cf_attacker_influence := true.B
+        }
+      }
+    }
+
+    // [MEMORD] Append the MEM_ORDER edge to the squashed load's ROB entry so it lands on
+    // the [FLUSH] record.  Same bank-match + op_count guard as cf_br_atk_self above: the
+    // load is about to be squashed and its slot may be reallocated before this arrives.
+    for (upd <- io.cf_lsu_memord_upd) {
+      when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx))) {
+        val midx = GetRowIdx(upd.bits.rob_idx)
+        when (rob_val(midx) && rob_uop(midx).cf_op_count_id === upd.bits.op_count_id) {
+          val mo_base = PopCount(VecInit(rob_uop(midx).cf_influencer_list.map(_.valid)))
+          when (mo_base < numInfluencerSlotsCF.U) {
+            for (k <- 0 until numInfluencerSlotsCF) {
+              when (mo_base === k.U) {
+                rob_uop(midx).cf_influencer_list(k).valid     := true.B
+                rob_uop(midx).cf_influencer_list(k).op_count  := upd.bits.prod_op_count
+                rob_uop(midx).cf_influencer_list(k).infl_type := INFL_MEM_ORDER.U
+                rob_uop(midx).cf_influencer_list(k).is_atk    := upd.bits.is_atk
+                rob_uop(midx).cf_influencer_list(k).is_secret := upd.bits.is_secret
+              }
+            }
+          } .otherwise {
+            rob_uop(midx).cf_infl_dropped := SatDropped(rob_uop(midx).cf_infl_dropped, 1.U)
+          }
+        }
+      }
+    }
+
     for (upd <- io.cf_lsu_s_tx_upd) {
       when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx))) {
         val cidx = GetRowIdx(upd.bits.rob_idx)
