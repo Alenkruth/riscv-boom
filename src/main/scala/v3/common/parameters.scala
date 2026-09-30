@@ -230,19 +230,21 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     val init = BigInt(0x0) // index 0 = max (128 entries)
     Some(CustomCSR(fetchBufferCSRIdCF, mask, Some(init)))
   } else None
-  def cf_fetch_buffer_idx = getOrElse(fetchBufferCSRCF, _.value(2,0), 0.U)
+  def cf_fetch_buffer_idx = cfClampIdx(getOrElse(fetchBufferCSRCF, _.value(2,0), 0.U), fetchBufferEntryOptions.length)
 
   // load/store queue CSR
-  // bits [2:0] = LDQ index into ldQueueEntryOptions = Seq(64, 32, 24, 16, 8)
-  // bits [5:3] = STQ index into stQueueEntryOptions = Seq(64, 32, 24, 16, 8)
-  // init = 0x0 → both queues at index 0 = max (64 entries each)
+  // bits [2:0] = LDQ index into ldQueueEntryOptions = Seq(40, 32, 24, 16, 8)
+  // bits [5:3] = STQ index into stQueueEntryOptions = Seq(40, 32, 24, 16, 8)
+  // init = 0x0 → both queues at index 0 = max (40 entries each)
+  // [DOCFIX 2026-09-12] was documented as Seq(64,...) / 64 entries.  Authoritative lists are
+  // rocket-chip util/CoreFuzzing.scala:220-221; the built max is 40 (config-mixins.scala:534).
   override def ldqStqCSRCF = if (cfReconfEnabled) {
     val mask = BigInt(0x3F) // 6-bit: 3 bits for LDQ + 3 bits for STQ
-    val init = BigInt(0x0)  // index 0,0 = both at max (64 entries)
+    val init = BigInt(0x0)  // index 0,0 = both at max (40 entries)
     Some(CustomCSR(ldqStqCSRIdCF, mask, Some(init)))
   } else None
-  def cf_ldq_idx = getOrElse(ldqStqCSRCF, _.value(2,0), 0.U)
-  def cf_stq_idx = getOrElse(ldqStqCSRCF, _.value(5,3), 0.U)
+  def cf_ldq_idx = cfClampIdx(getOrElse(ldqStqCSRCF, _.value(2,0), 0.U), ldQueueEntryOptions.length)
+  def cf_stq_idx = cfClampIdx(getOrElse(ldqStqCSRCF, _.value(5,3), 0.U), stQueueEntryOptions.length)
   // def reconfigureBPD = getOrElse(configureCSR, _.value(2), true.B)
   
   def cf_bpd_tage_to_gshare = getOrElse(bpdCSRCF, _.value(2), false.B)
@@ -336,14 +338,18 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   } else None
  
   override def robSizeCSRCF = if (cfReconfEnabled) {
-    // 3-bit binary index into robEntryOptions = Seq(512, 256, 192, 128, 96, 64, 32)
-    // init = 0x0 → index 0 = 512 entries (max, hardware-built size)
-    val mask = BigInt(0x7)   // 3-bit index, 7 options (indices 0-6)
-    val init = BigInt(0x0)   // index 0 = max (512 entries)
+    // 3-bit binary index into robEntryOptions = Seq(256, 192, 128, 96, 64, 32)
+    // init = 0x0 → index 0 = 256 entries (max, hardware-built size)
+    // [DOCFIX 2026-09-12] was documented as Seq(512,...) with 7 options.  The authoritative
+    // list (rocket-chip util/CoreFuzzing.scala:138) has 6 entries starting at 256, and
+    // config-mixins.scala:521 builds numRobEntries = 256 = robEntryOptions(0).  The 3-bit mask
+    // still admits 6..7; cfClampIdx() clamps those -- see the note at :218.
+    val mask = BigInt(0x7)   // 3-bit index, 6 options (indices 0-5); out-of-range clamped
+    val init = BigInt(0x0)   // index 0 = max (256 entries)
     Some(CustomCSR(robSizeCSRIdCF, mask, Some(init)))
   } else None
 
-  def cf_rob_entries     = getOrElse(robSizeCSRCF, _.value, 0.U)
+  def cf_rob_entries     = cfClampIdx(getOrElse(robSizeCSRCF, _.value, 0.U), robEntryOptions.length)
   // Fires in the cycle the CSRRW to robSizeCSRCF commits; used by ROB to reset pointers.
   def cf_rob_entries_wen = getOrElse(robSizeCSRCF, _.wen, false.B)
   // move this to ROB
@@ -429,13 +435,19 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   } else None
   def cf_ras_idx = getOrElse(rasCountCSRCF, _.value(1,0), 0.U)
 
-  // PRF size CSR — 3-bit index into pregFileSizeOptions = Seq(256, 128, 96, 64, 48)
+  // PRF size CSR — 3-bit index. ONE index drives BOTH register files:
+  //   INT: pregFileSizeOptions   = Seq(192, 128, 96, 64, 48)   (hardware max 192)
+  //   FP:  fpPregFileSizeOptions = Seq( 96,  64, 48, 40, 40)   (hardware max  96)
+  //   [DOCFIX 2026-09-12] FP floor raised 36 -> 40.  Indices 3 and 4 share 40 ON PURPOSE --
+  //   rung 4 exists to sweep INT=48, not to shrink FP further.  36 deadlocked rename.
+  // They are NOT independently selectable. Authoritative lists live in
+  // rocket-chip util/CoreFuzzing.scala; do not restate sizes without checking there.
   override def pregSizeCSRCF = if (cfReconfEnabled) {
     val mask = BigInt(0x7)   // 3-bit index, 5 options
-    val init = BigInt(0x0)   // index 0 = 256 registers (max)
+    val init = BigInt(0x0)   // reset = index 0 = int 192 / fp 96 (max)
     Some(CustomCSR(pregSizeCSRIdCF, mask, Some(init)))
   } else None
-  def cf_preg_idx = getOrElse(pregSizeCSRCF, _.value(2,0), 0.U)
+  def cf_preg_idx = cfClampIdx(getOrElse(pregSizeCSRCF, _.value(2,0), 0.U), pregFileSizeOptions.length)
 
   // Issue queue size CSR — 2-bit index into issueQueueEntryOptions = Seq(64, 32, 16, 8)
   override def issueQueueCSRCF = if (cfReconfEnabled) {

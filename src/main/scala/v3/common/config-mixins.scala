@@ -529,10 +529,11 @@ class WithFuzzingBoom(n: Int = 1, overrideIdOffset: Option[Int] = None) extends 
               numIntPhysRegisters = 192,
               // FP reduced from 192 to 96 — FpPipeline/fregfile is the top Vivado
               // congestion hotspot (Level 5/6).  Runtime reconfig preserved via
-              // fpPregFileSizeOptions = Seq(96,64,48,32,32) sharing cf_preg_idx CSR.
+              // fpPregFileSizeOptions = Seq(96,64,48,40,40) sharing cf_preg_idx CSR.
+              // [DOCFIX 2026-09-12] floor raised 36 -> 40; 36 deadlocked rename.
               numFpPhysRegisters = 96,
-              numLdqEntries = 48,
-              numStqEntries = 48,
+              numLdqEntries = 40,   // = max(ldQueueEntryOptions); hardware is built at this size
+              numStqEntries = 40,   // = max(stQueueEntryOptions); hardware is built at this size
               maxBrCount = 20,
               numFetchBufferEntries = 64, // max(fetchBufferEntryOptions) = 64; must be multiple of fetchWidth (8)
               enablePrefetching = true,

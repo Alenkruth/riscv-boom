@@ -62,12 +62,45 @@ class RenameFreeList(
 
   // Runtime PRF size selection via `pregSizeOptions` constructor param.
   // INT rename passes pregFileSizeOptions = Seq(192, 128, 96, 64, 48).
-  // FP  rename passes fpPregFileSizeOptions = Seq(96, 64, 48, 32, 32).
-  // NOTE: index 3 and 4 both give 32 — minimum is capped at 32 (not 16) because
-  // 32 arch FP regs require at least 32 physical regs to avoid deadlock on the
-  // 32nd unique FP write (stale preg from first writes is p0, never freed).
+  // FP  rename passes fpPregFileSizeOptions = Seq(96, 64, 48, 40, 40).
+  // [DOCFIX 2026-09-12] The requirement below is the ORIGINAL, INCORRECT reasoning, kept to
+  // explain the fix: require(numFpPhysRegs >= 32+coreWidth) = 36 ADMITTED 36, which deadlocked.
+  // The require() does not account for the freelist's pre-selection depth (36 - 32 arch - 4
+  // pre-selected = 0 free).  The real floor is 32 + 2*coreWidth = 40, which is why
+  // fpPregFileSizeOptions now ends "40, 40".  Repro for the old bug: mm.riscv.
+  // ORIGINAL (WRONG): require(numFpPhysRegs >= 32+coreWidth) = 36 at width 4, 36 the minimum
+  // (4 free FP renames). 32 was degenerate — 32 arch FP regs fill all 32 pregs, 0 free ->
+  // deadlock on the first FP write — and is no longer offered.
+  // [DOCFIX 2026-09-12] RE-VERIFIED against the CURRENT gen-collateral/RenameFreeList_1.sv by
+  // decoding the popcount of each _GEN mask: idx0..7 = 96,64,48,40,40,96,96,96.
+  // So the built FP options are idx0..4 = 96,64,48,40,**40** — the floor is 40 and idx 4 is
+  // SAFE.  The previous text here recorded idx4 = 36 from an older build; that is no longer
+  // what is elaborated, and 0xbc7=4 must NOT be excluded from sweeps on account of it.
+  // (Indices 3 and 4 deliberately share 40: rung 4 exists to sweep INT=48.)  The
+  // three trailing 96s are padding for the unused 3-bit CSR encodings 5..7 — they select the
+  // FULL file so an out-of-range index can never under-provision (cfClampIdx also clamps).
   // Precompute one mask per option as a constant; runtime selection is a small Mux
   // instead of a barrel-shifter + numPregs-wide subtractor (LUT optimization).
+  // Every runtime option must leave at least one allocatable preg in the STEADY
+  // STATE, not merely at reset.  Two consumers are permanent:
+  //   numLregs  architectural mappings, once every architectural register is live
+  //   plWidth   pregs latched in the r_sel pre-selection registers below
+  // so the floor is numLregs + 2*plWidth, NOT numLregs + plWidth.
+  // fp=36 at coreWidth 4 satisfied the old bound and still deadlocked: 36-32-4 = 0
+  // available, the next FP write never renamed, and core.scala:2083 fired after 8192
+  // idle cycles (verified 2026-08-28; repro riscv-tests benchmarks/mm.riscv).
+  // That rung NO LONGER EXISTS: the floor was raised to 40 (= numLregs + 2*plWidth), so the
+  // smallest FP option now leaves 40-32-4 = 4 allocatable.  Kept here as the rationale for
+  // the bound, not as a description of a currently-reachable configuration.
+  pregSizeOptions.foreach { sz =>
+    val usable = (sz min numPregs)
+    require(usable >= numLregs + 2 * plWidth,
+      s"pregSizeOptions entry $sz leaves ${usable - numLregs - plWidth} allocatable " +
+      s"pregs in steady state (numLregs=$numLregs, plWidth=$plWidth); need >= " +
+      s"${numLregs + 2 * plWidth}. A value that only satisfies numLregs+plWidth " +
+      s"deadlocks once all architectural registers are live.")
+  }
+
   val preg_active_masks = VecInit(pregSizeOptions.map { sz =>
     val capped = sz min numPregs
     (((BigInt(1) << capped) - 1) & ((BigInt(1) << numPregs) - 1)).U(numPregs.W)
