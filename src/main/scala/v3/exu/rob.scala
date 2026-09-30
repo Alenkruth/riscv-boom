@@ -80,6 +80,7 @@ class RobIo(
   val lsu_clr_bsy_cf_bitmap = Input(Vec(memWidth + 1, UInt(numModules.W)))
   // corefuzzing: cf_secret_transmission for stores, from LSU
   val lsu_clr_bsy_cf_stx    = Input(Vec(memWidth + 1, Bool()))
+  val lsu_clr_bsy_cf_sprop  = Input(Vec(memWidth + 1, Bool()))
 
   // Port for unmarking loads/stores as speculation hazards..
   val lsu_clr_unsafe   = Input(Vec(memWidth, Valid(UInt(robAddrSz.W))))
@@ -432,19 +433,11 @@ class Rob(
       // IFT LUT optimization (Change 3): zero dead fields at ROB enqueue.
       //   cf_cntd_*: consumed at issue time via cf_contend_out → ic_pending_*
       //              tables; never read from rob_uop after enqueue.
-      //   cf_taint_producer_op / cf_taint_producer_is_atk: consumed at dispatch
-      //              in core.scala (INFL_REG_DATAFLOW addInfluencer); not read
-      //              from rob_uop afterward (printf reads dispatch-time copy via
-      //              rob_uop, but these specific fields aren't printed).
-      // KEEP cf_taint_producer_is_secret — rename-stage.scala:577 reads it at
-      // C7 commit (`io.com_uops(w).cf_taint_producer_is_secret`).
       rob_uop(rob_tail).cf_cntd_valid            := false.B
       rob_uop(rob_tail).cf_cntd_winner_op        := 0.U
       rob_uop(rob_tail).cf_cntd_winner_atk       := false.B
       rob_uop(rob_tail).cf_cntd_winner_sec       := false.B
       rob_uop(rob_tail).cf_cntd_deny_count       := 0.U
-      rob_uop(rob_tail).cf_taint_producer_op     := 0.U
-      rob_uop(rob_tail).cf_taint_producer_is_atk := false.B
       rob_exception(rob_tail) := io.enq_uops(w).exception
       rob_predicated(rob_tail)   := false.B
       rob_fflags(w)(rob_tail)    := 0.U
@@ -490,7 +483,7 @@ class Rob(
     }
 
     // Stores have a separate method to clear busy bits
-    for (((clr_rob_idx, cf_bmap), cf_stx) <- io.lsu_clr_bsy.zip(io.lsu_clr_bsy_cf_bitmap).zip(io.lsu_clr_bsy_cf_stx)) {
+    for ((((clr_rob_idx, cf_bmap), cf_stx), cf_sprop) <- io.lsu_clr_bsy.zip(io.lsu_clr_bsy_cf_bitmap).zip(io.lsu_clr_bsy_cf_stx).zip(io.lsu_clr_bsy_cf_sprop)) {
       when (clr_rob_idx.valid && MatchBank(GetBankIdx(clr_rob_idx.bits))) {
         val cidx = GetRowIdx(clr_rob_idx.bits)
         rob_bsy(cidx)    := false.B
@@ -499,6 +492,11 @@ class Rob(
         rob_uop(cidx).cf_fu_bitmap := rob_uop(cidx).cf_fu_bitmap | cf_bmap
         // corefuzzing: set cf_secret_transmission if store writes secret-derived data to non-secret addr
         when (cf_stx) { rob_uop(cidx).cf_secret_transmission := true.B }
+        // corefuzzing: a store's DATA taint reaches the ROB only here -- stores have
+        // rf_wen=false so they never appear as writeback resps, which is why the final
+        // store of each attack gadget chain logged s_prop=0 while every other member
+        // was tagged.
+        when (cf_sprop) { rob_uop(cidx).cf_secret_propagation := true.B }
         assert (rob_val(cidx) === true.B, "[rob] store writing back to invalid entry.")
         assert (rob_bsy(cidx) === true.B, "[rob] store writing back to a not-busy entry.")
       }
@@ -511,7 +509,7 @@ class Rob(
     }
 
     // corefuzzing: issue contention update — instead of writing directly to the ROB
-    // influencer list (6 ports × numRobRows × 140 bits = large MUX tree), record in a
+    // influencer list (6 ports × numRobRows × the whole list = large MUX tree), record in a
     // compact per-row pending table and drain 1 entry per cycle in the background.
     for (upd <- io.cf_issue_contention_upd) {
       when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx))) {
@@ -521,7 +519,12 @@ class Rob(
           ic_pending_winner_op(cidx)  := upd.bits.winner_op_count
           ic_pending_winner_atk(cidx) := upd.bits.winner_is_atk
           ic_pending_winner_sec(cidx) := upd.bits.winner_is_sec
-          ic_pending_deny_cnt(cidx)   := upd.bits.deny_count
+          ic_pending_infl_type(cidx)  := upd.bits.infl_type
+          // deny_count is a per-uop scalar, not a per-slot field: a uop can hold at most
+          // one INFL_ISSUE_CONTENTION entry, and the issue slot latches the FIRST denier
+          // while aggregating the count over ALL of them.  Compress to the shared 3-bit
+          // log bucket here, once, rather than in all 110 issue slots.
+          rob_uop(cidx).cf_cntd_deny_count := Log2Bucket(upd.bits.deny_count)
         }
       }
     }
@@ -556,7 +559,7 @@ class Rob(
     // corefuzzing: s_prop direct ROB update — set cf_secret_propagation on in-flight
     // instructions whose physical sources were secret-tainted (discovered at writeback time).
     // The 1-bit cf_secret_propagation write is kept as N-port (cheap); the influencer list
-    // write (was 8 ports × numRobRows × 140 bits) is replaced by a pending bit and drained
+    // write (8 ports × numRobRows × the whole list) is replaced by a pending bit and drained
     // 1 entry per cycle in the background.  op_count_id guard prevents stale updates.
     for (upd <- io.cf_s_prop_rob_upd) {
       when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx))) {
@@ -568,9 +571,33 @@ class Rob(
           // Covers the edge case where the probe load wrote back within the speculation window
           // after the taint chain propagated, and the Gap 1 TLB-stage ROB update was sufficient.
           // Belt-and-suspenders alongside Gap 1; runs whenever cf_s_prop_rob_upd fires.
-          when (rob_uop(cidx).uses_ldq && !rob_uop(cidx).cf_secret_access) {
-            rob_uop(cidx).cf_secret_transmission := true.B
-          }
+          // Gate on WHY this update fired, not on the ROB's cf_secret_access bit:
+          // that bit is written by the same writeback in the same cycle (see :1012),
+          // so reading it here always yields the stale value.  src_tainted is true
+          // only when a real source taint drove the update -- for a load, prs1 is
+          // the address register, so that is exactly "address is secret-derived".
+          // `!upd.bits.self_secret_acc` reproduces the LSU's `!in_secret` guard
+          // (lsu.scala is_secret_addr_load).  A load whose own address landed in the
+          // secret range is an ACCESS; counting it as a transmission makes the secret
+          // load its own s_tx and corrupts chain attribution.
+          // REMOVED 2026-09-03 (Gap 2 was wrong AND redundant).
+          // The premise in the comment above -- "for a load, prs1 is the address
+          // register" -- is false of the signal it actually read.  src_tainted is
+          // driven at core.scala:2077 from `sec1 || sec2 || has_mem_sec_infl`, and
+          // sec1 is `wb.bits.secret`: the WRITEBACK RESULT's taint.  For a load the
+          // LSU drives that from cf_secret_access || cf_mem_sec_dataflow -- both
+          // DATA-side.  So this clause scored "a secret arrived in this register"
+          // as a transmission.  Once store-data taint made memory taint real, every
+          // reload of a spilled secret tripped it: s_tx 1 -> 6559 on t18, dominated
+          // by `lbu a5,-17(s0)` whose address (s0) is clean.  That is propagation.
+          //
+          // Address-derived loads are already caught correctly, earlier, by Gap 1
+          // (lsu.scala:972 is_secret_addr_load): at TLB time a load's only register
+          // operand is rs1, so cf_secret_propagation there IS address taint, and its
+          // op_count_id-guarded ROB write covers squashed loads -- the case this
+          // clause was added for.  Gap 2's stated reason, "late-arriving address
+          // taint", cannot occur under taint-follows-data: the address operand's
+          // taint is known at register-read/bypass, before the AGU runs.
         }
       }
     }
@@ -607,7 +634,7 @@ class Rob(
             }
           }
         } .otherwise {
-          rob_uop(cidx).cf_infl_overflow := true.B
+          rob_uop(cidx).cf_infl_dropped := SatDropped(rob_uop(cidx).cf_infl_dropped, 1.U)
         }
       }
       sprob_infl_pending(cidx) := false.B
@@ -621,15 +648,14 @@ class Rob(
           for (k <- 0 until numInfluencerSlotsCF) {
             when (infl_base === k.U) {
               rob_uop(cidx).cf_influencer_list(k).valid      := true.B
-              rob_uop(cidx).cf_influencer_list(k).op_count   := ic_pending_winner_op(cidx)
-              rob_uop(cidx).cf_influencer_list(k).infl_type  := INFL_ISSUE_CONTENTION.U
+              rob_uop(cidx).cf_influencer_list(k).op_count   := ic_pending_winner_op(cidx).pad(inflOpCountWidthCF)(inflOpCountWidthCF-1, 0)
+              rob_uop(cidx).cf_influencer_list(k).infl_type  := ic_pending_infl_type(cidx)
               rob_uop(cidx).cf_influencer_list(k).is_atk     := ic_pending_winner_atk(cidx)
               rob_uop(cidx).cf_influencer_list(k).is_secret  := ic_pending_winner_sec(cidx)
-              rob_uop(cidx).cf_influencer_list(k).deny_count := ic_pending_deny_cnt(cidx)
             }
           }
         } .otherwise {
-          rob_uop(cidx).cf_infl_overflow := true.B
+          rob_uop(cidx).cf_infl_dropped := SatDropped(rob_uop(cidx).cf_infl_dropped, 1.U)
         }
         when (ic_pending_winner_atk(cidx)) { rob_uop(cidx).cf_attacker_influence := true.B }
         // D-CI fix: propagate shortcut atk/sec bits so software doesn't have to re-scan the log
@@ -661,10 +687,19 @@ class Rob(
         val wb_pfx   = (0 until numInfluencerSlotsCF).map { j =>
           if (j == 0) 0.U(4.W) else PopCount(VecInit(wb_valid.take(j)))
         }
-        when (!rob_uop(cidx).cf_infl_overflow && rob_base +& wb_total > numInfluencerSlotsCF.U) {
-          rob_uop(cidx).cf_infl_overflow := true.B
+        // Two independent drop contributions in THIS block: the merge overflowing the
+        // slots, and whatever the incoming wb list already carried.  Both can fire in the
+        // same cycle for the same cidx, so they are summed into one write below rather
+        // than left to last-connect, which would silently keep only the second.
+        // (The sprob/ic/wb drains cannot collide with each other -- ic_drain_fires and
+        // wb_drain_fires explicitly exclude a matching index -- so this is the only
+        // multi-contribution case in the ROB.)
+        val wb_drop_merge = WireDefault(0.U(3.W))
+        val wb_drop_inh   = WireDefault(0.U(3.W))
+        when (rob_uop(cidx).cf_infl_dropped === 0.U && rob_base +& wb_total > numInfluencerSlotsCF.U) {
+          wb_drop_merge := rob_base +& wb_total - numInfluencerSlotsCF.U
         }
-        when (!rob_uop(cidx).cf_infl_overflow) {
+        when (rob_uop(cidx).cf_infl_dropped === 0.U) {
           for (d <- 0 until numInfluencerSlotsCF) {
             val writers = (0 until numInfluencerSlotsCF).map { j =>
               wb_valid(j) && ((rob_base + wb_pfx(j)) === d.U)
@@ -675,11 +710,14 @@ class Rob(
               rob_uop(cidx).cf_influencer_list(d).infl_type  := Mux1H(writers, wb_list.map(_.infl_type))
               rob_uop(cidx).cf_influencer_list(d).is_atk     := Mux1H(writers, wb_list.map(_.is_atk))
               rob_uop(cidx).cf_influencer_list(d).is_secret  := Mux1H(writers, wb_list.map(_.is_secret))
-              rob_uop(cidx).cf_influencer_list(d).deny_count := Mux1H(writers, wb_list.map(_.deny_count))
             }
           }
         }
-        when (wb_infl_overflow(cidx)) { rob_uop(cidx).cf_infl_overflow := true.B }
+        when (wb_infl_overflow(cidx) =/= 0.U) { wb_drop_inh := wb_infl_overflow(cidx) }
+        when (wb_drop_merge +& wb_drop_inh =/= 0.U) {
+          rob_uop(cidx).cf_infl_dropped := SatDropped(rob_uop(cidx).cf_infl_dropped,
+                                                      wb_drop_merge +& wb_drop_inh)
+        }
       }
       wb_infl_pending(cidx) := false.B
     }
@@ -740,6 +778,14 @@ class Rob(
     io.commit.valids(w) := will_commit(w)
     io.commit.arch_valids(w) := will_commit(w) && !rob_predicated(com_idx)
     io.commit.uops(w)   := rob_uop(com_idx)
+    // corefuzzing: commit-time influencer drops.  The commit output is combinational,
+    // so it must NOT accumulate by reading itself -- doing so is a real comb cycle
+    // (CheckCombLoops rejects it).  Each drain site writes its own amount into a
+    // dedicated wire; they are summed once, on top of the REGISTER value, below.
+    val com_drop_sprob = WireDefault(0.U(3.W))
+    val com_drop_ic    = WireDefault(0.U(3.W))
+    val com_drop_wb    = WireDefault(0.U(3.W))
+    val com_drop_wbovf = WireDefault(0.U(3.W))
     io.commit.debug_insts(w) := rob_debug_inst_rdata(w)
 
     // We unbusy branches in b1, but its easier to mark the taken/provider src in b2,
@@ -775,7 +821,7 @@ class Rob(
             }
           }
         } .otherwise {
-          io.commit.uops(w).cf_infl_overflow := true.B
+          com_drop_sprob := 1.U
         }
         sprob_infl_pending(com_idx) := false.B
       }
@@ -785,15 +831,14 @@ class Rob(
           for (k <- 0 until numInfluencerSlotsCF) {
             when (ic_slot === k.U) {
               io.commit.uops(w).cf_influencer_list(k).valid      := true.B
-              io.commit.uops(w).cf_influencer_list(k).op_count   := ic_pending_winner_op(com_idx)
-              io.commit.uops(w).cf_influencer_list(k).infl_type  := INFL_ISSUE_CONTENTION.U
+              io.commit.uops(w).cf_influencer_list(k).op_count   := ic_pending_winner_op(com_idx).pad(inflOpCountWidthCF)(inflOpCountWidthCF-1, 0)
+              io.commit.uops(w).cf_influencer_list(k).infl_type  := ic_pending_infl_type(com_idx)
               io.commit.uops(w).cf_influencer_list(k).is_atk     := ic_pending_winner_atk(com_idx)
               io.commit.uops(w).cf_influencer_list(k).is_secret  := ic_pending_winner_sec(com_idx)
-              io.commit.uops(w).cf_influencer_list(k).deny_count := ic_pending_deny_cnt(com_idx)
             }
           }
         } .otherwise {
-          io.commit.uops(w).cf_infl_overflow := true.B
+          com_drop_ic := 1.U
         }
         when (ic_pending_winner_atk(com_idx)) { io.commit.uops(w).cf_attacker_influence := true.B }
         // D-CI fix: propagate shortcut atk/sec bits to commit uop
@@ -813,7 +858,7 @@ class Rob(
           if (j == 0) 0.U(4.W) else PopCount(VecInit(wb_valid.take(j)))
         }
         when (wb_base +& wb_total > numInfluencerSlotsCF.U) {
-          io.commit.uops(w).cf_infl_overflow := true.B
+          com_drop_wb := 1.U
         }
         for (d <- 0 until numInfluencerSlotsCF) {
           val writers = (0 until numInfluencerSlotsCF).map { j =>
@@ -825,13 +870,15 @@ class Rob(
             io.commit.uops(w).cf_influencer_list(d).infl_type  := Mux1H(writers, wb_list.map(_.infl_type))
             io.commit.uops(w).cf_influencer_list(d).is_atk     := Mux1H(writers, wb_list.map(_.is_atk))
             io.commit.uops(w).cf_influencer_list(d).is_secret  := Mux1H(writers, wb_list.map(_.is_secret))
-            io.commit.uops(w).cf_influencer_list(d).deny_count := Mux1H(writers, wb_list.map(_.deny_count))
           }
         }
-        when (wb_infl_overflow(com_idx)) { io.commit.uops(w).cf_infl_overflow := true.B }
+        when (wb_infl_overflow(com_idx) =/= 0.U) { com_drop_wbovf := wb_infl_overflow(com_idx) }
         wb_infl_pending(com_idx) := false.B
       }
     }
+    // Sum the commit-time drops on top of the registered count, once.
+    io.commit.uops(w).cf_infl_dropped := SatDropped(rob_uop(com_idx).cf_infl_dropped,
+      com_drop_sprob +& com_drop_ic +& com_drop_wb +& com_drop_wbovf)
 
 
     // Don't attempt to rollback the tail's row when the rob is full.
@@ -1016,16 +1063,16 @@ class Rob(
         // Opt#1: Defer influencer merge to pending table (breaks critical path).
         // Capture wb influencer list; drain 1 row/cycle via PriorityEncoder.
         val has_wb_infl = wb_uop_i.cf_influencer_list.map(_.valid).reduce(_ || _) ||
-                          wb_uop_i.cf_infl_overflow
+                          wb_uop_i.cf_infl_dropped =/= 0.U
         when (has_wb_infl) {
           when (!wb_infl_pending(rob_row)) {
             wb_infl_pending(rob_row)  := true.B
             wb_infl_list(rob_row)     := wb_uop_i.cf_influencer_list
-            wb_infl_overflow(rob_row) := wb_uop_i.cf_infl_overflow
+            wb_infl_overflow(rob_row) := wb_uop_i.cf_infl_dropped
           } .otherwise {
             // Second wb_resp hits same row while pending → merge into pending list
             // or set overflow if no room. Simple: just set overflow.
-            wb_infl_overflow(rob_row) := true.B
+            wb_infl_overflow(rob_row) := 3.U
           }
         }
       }
