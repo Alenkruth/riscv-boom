@@ -206,10 +206,22 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   when (meta_hazard =/= 0.U) { meta_hazard := meta_hazard + 1.U }
   when (io.meta_write.fire) { meta_hazard := 1.U }
   io.probe_rdy   := (meta_hazard === 0.U && (state.isOneOf(s_invalid, s_refill_req, s_refill_resp, s_drain_rpq_loads) || (state === s_meta_read && grantack.valid)))
+  // [reconf-fix] strict idle for the config-commit gate (see io declaration).
+  io.state_invalid := state === s_invalid
   // corefuzzing: expose stored request domain for fill-completion tracking in dcache
   io.cf_req_domain   := req.uop.cf_domain_id
   io.cf_req_op_count := req.uop.cf_op_count_id
-  io.cf_req_secret   := req.uop.cf_secret_propagation || req.uop.cf_secret_access
+  // [SECFIX 2026-09-07] The refill blankets this bit across ALL 8 DWs of the line
+  // (dcache.scala Fill(CF_SUBLINE, ...)), so it must describe the DATA, not the
+  // REQUESTER.  cf_secret_access = the TLB says this ADDRESS is in the secret range,
+  // which is a property of the line and legitimately covers it.  cf_secret_propagation
+  // = this uop merely CARRIES secret-derived data; tagging the line it reads from is
+  // a requester property and amplifies without bound: any s_prop-carrying load that
+  // misses marked a whole 64B line secret, and every later load from that line
+  // inherited it.  MEASURED: with the cf_mem_sec_dataflow merge enabled that drove
+  // s_prop 50 -> 144,332 on spectre-v1.  The per-DW masks were never the problem --
+  // the store path honours them; this refill path threw them away.
+  io.cf_req_secret   := req.uop.cf_secret_access
   io.idx.valid := state =/= s_invalid
   io.tag.valid := state =/= s_invalid
   io.way.valid := !state.isOneOf(s_invalid, s_prefetch)

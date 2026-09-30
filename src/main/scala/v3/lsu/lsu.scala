@@ -2009,49 +2009,53 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         merged_base_cf.cf_fu_bitmap          := ldq_base_cf.cf_fu_bitmap | resp_cf.cf_fu_bitmap
         merged_base_cf.cf_secret_access      := ldq_base_cf.cf_secret_access || resp_cf.cf_secret_access
         merged_base_cf.cf_secret_transmission := ldq_base_cf.cf_secret_transmission || resp_cf.cf_secret_transmission
-        // Merge resp_cf influencer list into merged_base_cf using parallel prefix.
-        val lsu_base_cnt = PopCount(VecInit(merged_base_cf.cf_influencer_list.map(_.valid)))
-        val resp_valid   = VecInit(resp_cf.cf_influencer_list.map(_.valid))
-        val resp_prefix  = (0 until numInfluencerSlotsCF).map { j =>
-          if (j == 0) 0.U(4.W) else PopCount(VecInit(resp_valid.take(j)))
-        }
-        val resp_total = PopCount(resp_valid)
-        val dmem_resp_uop_cf = WireInit(merged_base_cf)
-        when (!merged_base_cf.cf_infl_overflow && lsu_base_cnt +& resp_total > numInfluencerSlotsCF.U) {
-          dmem_resp_uop_cf.cf_infl_overflow := true.B
-        }
-        // Precompute destination slot for each resp entry once; writers are one-hot per slot
-        // by prefix-sum construction → Mux1H is valid. Overflow check hoisted outside d-loop.
-        val resp_dst_slot = (0 until numInfluencerSlotsCF).map { j => lsu_base_cnt + resp_prefix(j) }
-        when (!merged_base_cf.cf_infl_overflow) {
-          for (d <- 0 until numInfluencerSlotsCF) {
-            val writers: Seq[Bool] = (0 until numInfluencerSlotsCF).map { j =>
-              resp_valid(j) && (resp_dst_slot(j) === d.U)
-            }
-            val any_write = writers.reduce(_ || _)
-            when (any_write) {
-              dmem_resp_uop_cf.cf_influencer_list(d).valid      := true.B
-              dmem_resp_uop_cf.cf_influencer_list(d).op_count   := Mux1H(writers, resp_cf.cf_influencer_list.map(_.op_count))
-              dmem_resp_uop_cf.cf_influencer_list(d).infl_type  := Mux1H(writers, resp_cf.cf_influencer_list.map(_.infl_type))
-              dmem_resp_uop_cf.cf_influencer_list(d).is_atk     := Mux1H(writers, resp_cf.cf_influencer_list.map(_.is_atk))
-              dmem_resp_uop_cf.cf_influencer_list(d).is_secret  := Mux1H(writers, resp_cf.cf_influencer_list.map(_.is_secret))
-              dmem_resp_uop_cf.cf_influencer_list(d).deny_count := Mux1H(writers, resp_cf.cf_influencer_list.map(_.deny_count))
-            }
-          }
-        }
-        for (j <- 0 until numInfluencerSlotsCF) {
-          when (resp_cf.cf_influencer_list(j).valid && resp_cf.cf_influencer_list(j).is_atk) {
-            dmem_resp_uop_cf.cf_attacker_influence := true.B
-          }
-        }
-        when (resp_cf.cf_infl_overflow) { dmem_resp_uop_cf.cf_infl_overflow := true.B }
+        // [MERGEFIX 2026-09-07] VALIDATED. merged_base_cf = WireInit(ldq_base_cf), so any
+        // field not merged from the dcache response uop keeps the LDQ's stale copy.
+        // cf_mem_dataflow_atk is set by the dcache (dcache.scala:1398 from memdf_fire) but
+        // was never merged, so it read as 0 in 69,848/69,848 responses and R1d's
+        // `addr_is_atk || cf_mem_dataflow_atk` collapsed to addr_is_atk alone.
+        // After this: bounds branch cond_atk 2/650 -> 650/650, committed shadow 26% -> 92%,
+        // invariants exact (10/50/10, 4,495,125,000 cycles, exit 3).  See artifact 43.
+        // DO NOT also merge cf_mem_sec_dataflow -- tried, caused a secret-taint explosion
+        // (s_prop 50 -> 144,332).  That needs the D$ secret mask granularity fixed first.
+        merged_base_cf.cf_mem_dataflow_atk := ldq_base_cf.cf_mem_dataflow_atk || resp_cf.cf_mem_dataflow_atk
+        // [SECFIX 2026-09-07] The secret twin, re-enabled. The earlier explosion
+        // (s_prop 50 -> 144,332) was NOT line granularity -- the per-DW masks are honoured
+        // on the store path.  It was the REFILL blanketing the requester's carried secret
+        // across all 8 DWs (mshrs.scala cf_req_secret, now fixed to the address property).
+        // Without this merge core.scala:2191 / rob.scala:1140 read a permanently-0 field, so
+        // memory-borne secret never sets s_prop -- t19_dcache_secret_inherit measured 0
+        // records with s_prop=1 AND ty17 sec=1, i.e. it never tested what it documents.
+        merged_base_cf.cf_mem_sec_dataflow := ldq_base_cf.cf_mem_sec_dataflow || resp_cf.cf_mem_sec_dataflow
+        val dmem_resp_uop_cf = cfMergeRespInfluencers(merged_base_cf, resp_cf)
 
         io.core.exe(w).iresp.bits.uop  := dmem_resp_uop_cf
         io.core.exe(w).fresp.bits.uop  := dmem_resp_uop_cf
         io.core.exe(w).iresp.valid     := send_iresp
         io.core.exe(w).iresp.bits.data := io.dmem.resp(w).bits.data
+        io.core.exe(w).iresp.bits.secret := dmem_resp_uop_cf.cf_secret_access ||
+                                           dmem_resp_uop_cf.cf_mem_sec_dataflow
+        // ATTACKER: the loaded value's attacker taint.  Sourced from the LDQ entry, which
+        // recorded the address operand's attacker taint at the AGU.  A D$ LINE tag (a
+        // value written by the attacker and later loaded by the victim) is a separate
+        // surface and is NOT covered here -- see 16-attacker-taint-scope.md.
+        // [R1d 2026-09-05] The loaded VALUE's attacker taint, not just the address's.
+        // Mirrors the secret twin above (cf_secret_access || cf_mem_sec_dataflow).
+        // cf_mem_dataflow_atk is set at dcache.scala:1357 from memdf_fire: a load reading a
+        // line whose last writer was attacker-influenced.  The addr term is KEPT: a load
+        // whose address the attacker chose is influenced in its own right (array1[x]).
+        // ORDER MATTERS -- an identical change FAILED on 2026-09-05 when applied before
+        // R1a/R1c, because the line tag was then poisoned by the storing uop's aggregate
+        // and the control PC went 100% contaminated.  Re-applied only after R1a (line tag
+        // = data_is_atk) and R1c (value-class promotion) were validated clean.
+        io.core.exe(w).iresp.bits.taint_atk := ldq(io.dmem.resp(w).bits.uop.ldq_idx).bits.addr_is_atk ||
+                                              dmem_resp_uop_cf.cf_mem_dataflow_atk
         io.core.exe(w).fresp.valid     := send_fresp
         io.core.exe(w).fresp.bits.data := io.dmem.resp(w).bits.data
+        io.core.exe(w).fresp.bits.secret := dmem_resp_uop_cf.cf_secret_access ||
+                                           dmem_resp_uop_cf.cf_mem_sec_dataflow
+        io.core.exe(w).fresp.bits.taint_atk := ldq(io.dmem.resp(w).bits.uop.ldq_idx).bits.addr_is_atk ||
+                                              dmem_resp_uop_cf.cf_mem_dataflow_atk   // [R1d] see iresp
 
         assert(send_iresp ^ send_fresp)
         dmem_resp_fired(w) := true.B
