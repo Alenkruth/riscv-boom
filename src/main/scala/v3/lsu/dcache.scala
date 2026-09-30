@@ -1345,20 +1345,41 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     val uop_resp_final = WireInit(uop_resp_base)
     when (s2_valid(w) && s2_hit(w) && s2_type === t_lsu && !s2_nack(w)) {
       val uop_dom   = s2_req(w).uop.cf_domain_id
-      val is_load   = !isWrite(s2_req(w).uop.mem_cmd)
+      // [AMOLOAD 2026-09-08] An AMO READS memory and returns the old value to rd,
+      // but isWrite() is true for AMOs (Consts.scala:90), so `!isWrite` classified
+      // every AMO as a store and memdf_fire/memsec_fire could NEVER fire for one.
+      // An AMO on an attacker-written (or secret) line returned untainted data.
+      // Adding the isAMO term changes ONLY the AMO case -- every other mem_cmd
+      // keeps its previous classification exactly.
+      // (Known, deliberately NOT changed here: M_PFR prefetch is also counted as a
+      //  "load" by !isWrite.  It is inert -- a prefetch has no destination register,
+      //  so the taint it sets has no consumer.  One variable per validation run.)
+      //
+      // is_load and is_store are SEPARATE questions and an AMO answers YES to both.
+      // Deriving the store predicate as `!is_load` (as this code did) forces them to be
+      // complements, which is exactly why the AMO case could not be expressed: making
+      // AMO a load would have silently stopped it updating ift_store_meta.
+      //   is_load  -- does this op return memory data into a register?  (gates memdf/memsec)
+      //   is_store -- does this op write memory?                       (gates the meta write)
+      // `is_store` is bit-identical to the previous `!is_load`, so the store path is
+      // UNCHANGED for every mem_cmd including AMO.
+      val is_load   = !isWrite(s2_req(w).uop.mem_cmd) || isAMO(s2_req(w).uop.mem_cmd)
+      val is_store  = isWrite(s2_req(w).uop.mem_cmd)
       // INFL_CACHE_EVICTION: victim hits a line last FILLED by attacker (timing channel, loads and stores)
-      val evict_fire  = uop_dom === 0.U && iftDomain(s2_fill_entry) === 1.U
+      val evict_fire  = uop_dom === 0.U && iftFillDomain(s2_fill_entry) === 1.U
       // INFL_MEM_DATAFLOW: victim LOAD reads a line last STORED by attacker (data channel, loads only)
-      val memdf_fire  = uop_dom === 0.U && is_load && iftDomain(s2_store_entry) === 1.U
+      // [R1e] tests the DEDICATED atk bit, not the domain field: a victim store of
+      // attacker-derived data must fire this too, and it no longer forges `domain`.
+      val memdf_fire  = uop_dom === 0.U && is_load && iftAtkAt(s2_store_entry, s2_req(w).addr)
       // Fix 3a: memsec_fire — any LOAD reading a line whose last store had s_prop/s_acc set.
       // Same-domain secret propagation via memory: is_atk=false, is_secret=true.
       // Gated by !memdf_fire to avoid two INFL_MEM_DATAFLOW entries for the same store
       // when the store is simultaneously attacker-domain AND secret-marked.
-      val memsec_fire = is_load && iftSecret(s2_store_entry) && !memdf_fire
+      val memsec_fire = is_load && iftSecretAt(s2_store_entry, s2_req(w).addr) && !memdf_fire
 
       uop_resp_final := addInfluencerBatch(uop_resp_base, Seq(
-        InfluencerCandidate(evict_fire,  iftOpCount(s2_fill_entry),  INFL_CACHE_EVICTION, true.B,  iftSecret(s2_fill_entry)),
-        InfluencerCandidate(memdf_fire,  iftOpCount(s2_store_entry), INFL_MEM_DATAFLOW,   true.B,  iftSecret(s2_store_entry)),
+        InfluencerCandidate(evict_fire,  iftFillOpCount(s2_fill_entry),  INFL_CACHE_EVICTION, true.B,  iftFillSecMask(s2_fill_entry).orR),
+        InfluencerCandidate(memdf_fire,  iftOpCount(s2_store_entry), INFL_MEM_DATAFLOW,   true.B,  iftSecretAt(s2_store_entry, s2_req(w).addr)),
         InfluencerCandidate(memsec_fire, iftOpCount(s2_store_entry), INFL_MEM_DATAFLOW,   false.B, true.B),
       ))
       // Set summary flags so writeback paths can skip scanning cf_influencer_list.

@@ -1902,6 +1902,62 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   //-------------------------------------------------------------
 
   // Handle Memory Responses and nacks
+  // [AMOINFL 2026-09-08] Extracted VERBATIM from the load response path so the AMO path
+  // can use the identical merge.  Previously the AMO branch assigned
+  //   iresp.bits.uop := stq(...).bits.uop
+  // wholesale, DISCARDING the dcache response uop's influencer list -- so an AMO that
+  // read an attacker-written line got the summary tag (AMOFIX reads taint_atk straight
+  // off the response bundle) but never the ty=17 MEM_DATAFLOW EDGE that says which store
+  // produced it.  Measured in t32_amo_taint: atk=1 with all four slots v=0.
+  //
+  // ONE SOURCE DEFINITION ON PURPOSE.  Every defect this session came from a path being
+  // fixed while its twin was not; a second hand-copied merge is that bug waiting to happen.
+  // Chisel inlines a def, so this still elaborates one merge network per call site -- the
+  // area is unchanged versus duplicating the text, and the source cannot drift.
+  def cfMergeRespInfluencers(base: MicroOp, resp: MicroOp): MicroOp = {
+    val lsu_base_cnt = PopCount(VecInit(base.cf_influencer_list.map(_.valid)))
+    val resp_valid   = VecInit(resp.cf_influencer_list.map(_.valid))
+    val resp_prefix  = (0 until numInfluencerSlotsCF).map { j =>
+      if (j == 0) 0.U(4.W) else PopCount(VecInit(resp_valid.take(j)))
+    }
+    val resp_total = PopCount(resp_valid)
+    val out = WireInit(base)
+    // Drops contributed here: the merge overflowing this response's slots, plus any
+    // the responding uop already carried.  Summed once onto base below --
+    // accumulating into out by reading it would be a comb cycle, since it is a Wire.
+    val lsu_drop_merge = WireDefault(0.U(3.W))
+    val lsu_drop_resp  = WireDefault(0.U(3.W))
+    when (base.cf_infl_dropped === 0.U && lsu_base_cnt +& resp_total > numInfluencerSlotsCF.U) {
+      lsu_drop_merge := lsu_base_cnt +& resp_total - numInfluencerSlotsCF.U
+    }
+    // Precompute destination slot for each resp entry once; writers are one-hot per slot
+    // by prefix-sum construction -> Mux1H is valid. Overflow check hoisted outside d-loop.
+    val resp_dst_slot = (0 until numInfluencerSlotsCF).map { j => lsu_base_cnt + resp_prefix(j) }
+    when (base.cf_infl_dropped === 0.U) {
+      for (d <- 0 until numInfluencerSlotsCF) {
+        val writers: Seq[Bool] = (0 until numInfluencerSlotsCF).map { j =>
+          resp_valid(j) && (resp_dst_slot(j) === d.U)
+        }
+        val any_write = writers.reduce(_ || _)
+        when (any_write) {
+          out.cf_influencer_list(d).valid      := true.B
+          out.cf_influencer_list(d).op_count   := Mux1H(writers, resp.cf_influencer_list.map(_.op_count))
+          out.cf_influencer_list(d).infl_type  := Mux1H(writers, resp.cf_influencer_list.map(_.infl_type))
+          out.cf_influencer_list(d).is_atk     := Mux1H(writers, resp.cf_influencer_list.map(_.is_atk))
+          out.cf_influencer_list(d).is_secret  := Mux1H(writers, resp.cf_influencer_list.map(_.is_secret))
+        }
+      }
+    }
+    for (j <- 0 until numInfluencerSlotsCF) {
+      when (resp.cf_influencer_list(j).valid && resp.cf_influencer_list(j).is_atk) {
+        out.cf_attacker_influence := true.B
+      }
+    }
+    when (resp.cf_infl_dropped =/= 0.U) { lsu_drop_resp := resp.cf_infl_dropped }
+    out.cf_infl_dropped := SatDropped(base.cf_infl_dropped, lsu_drop_merge +& lsu_drop_resp)
+    out
+  }
+
   //----------------------------------
   for (w <- 0 until memWidth) {
     io.core.exe(w).iresp.valid := false.B
@@ -2010,8 +2066,37 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         when (io.dmem.resp(w).bits.uop.is_amo) {
           dmem_resp_fired(w) := true.B
           io.core.exe(w).iresp.valid     := true.B
-          io.core.exe(w).iresp.bits.uop  := stq(io.dmem.resp(w).bits.uop.stq_idx).bits.uop
+          // [AMOINFL 2026-09-08] Was a wholesale `:= stq(...).bits.uop`, which DISCARDED
+          // the dcache response uop's influencer list.  t32_amo_taint measured the result:
+          // the AMO carried atk=1 but all four influencer slots were v=0 -- the tag with no
+          // edge, so no parser could recover WHICH store produced the taint.  The load path
+          // has always merged this list; the AMO path never did.  Same merge, same helper.
+          val amo_base_cf = stq(io.dmem.resp(w).bits.uop.stq_idx).bits.uop
+          io.core.exe(w).iresp.bits.uop  := cfMergeRespInfluencers(amo_base_cf,
+                                                                   io.dmem.resp(w).bits.uop)
           io.core.exe(w).iresp.bits.data := io.dmem.resp(w).bits.data
+            // AMO path: the response uop is the STQ entry, so the taint is that
+            // AMO's own secret-range hit recorded at the TLB.
+            // [AMOFIX 2026-09-08] The AMO response path took the STQ entry's OWN taint only
+            // and dropped everything the memory access itself contributed.  Both flavours had
+            // the identical hole, so both are fixed together:
+            //   secret   : was cf_secret_access only -- an AMO reading a secret-marked line
+            //              returned data with secret=0.
+            //   taint_atk: was addr_is_atk only -- an AMO reading an attacker-written line
+            //              returned data with taint_atk=0.
+            // Source is the DCACHE RESPONSE uop, not `dmem_resp_uop_cf`: that val is local to
+            // the uses_ldq branch above and is not in scope here (that is what failed to
+            // elaborate at lsu.scala:2034).  The response uop is where dcache.scala sets these
+            // bits, so it is the direct and correct source.
+            // Requires the companion AMOLOAD fix in dcache.scala -- without it memdf_fire /
+            // memsec_fire never fire for an AMO and both new terms are constant 0.
+            io.core.exe(w).iresp.bits.secret := stq(io.dmem.resp(w).bits.uop.stq_idx).bits.uop.cf_secret_access ||
+                                                io.dmem.resp(w).bits.uop.cf_mem_sec_dataflow
+            // [AMOTAINT 2026-09-08] Was ADDRESS taint only: an AMO reading attacker-tainted
+            // memory returned CLEAN data.  Normal loads got the memory-dataflow term from the
+            // merge fix (:1985); the AMO path was never updated to match.
+            io.core.exe(w).iresp.bits.taint_atk := stq(io.dmem.resp(w).bits.uop.stq_idx).bits.addr_is_atk ||
+                                                   io.dmem.resp(w).bits.uop.cf_mem_dataflow_atk
 
           stq(io.dmem.resp(w).bits.uop.stq_idx).bits.debug_wb_data := io.dmem.resp(w).bits.data
         }
