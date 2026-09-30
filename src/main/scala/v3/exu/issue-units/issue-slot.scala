@@ -124,6 +124,13 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
   val nc_cntd_winner_atk = WireInit(cf_cntd_winner_atk)
   val nc_cntd_winner_sec = WireInit(cf_cntd_winner_sec)
   val nc_cntd_deny_count = WireInit(cf_cntd_deny_count)
+  // C2 (corefuzzing): this slot's operand taint, learned from the WAKEUP -- the moment
+  // the producer's destination register becomes ready, which is when DIFT defines the
+  // tag.  Must be a slot REGISTER: next_uop is Mux(in_uop.valid, in_uop.bits, slot_uop),
+  // a read-only OpResult.  Held so io.uop.cf_secret_propagation is correct AT ISSUE,
+  // which is when the issue unit samples winner_is_sec for INFL_ISSUE_CONTENTION.
+  val cf_src_secret = RegInit(false.B)
+  val nc_src_secret = WireInit(cf_src_secret)
 
   //-----------------------------------------------------------------------------
   // next slot state computation
@@ -190,13 +197,12 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
     slot_uop.cf_single_step              := false.B
     slot_uop.cf_fu_bitmap                := 0.U
     slot_uop.cf_src_tainted              := false.B
-    slot_uop.cf_taint_producer_op        := 0.U
-    slot_uop.cf_taint_producer_is_atk    := false.B
-    slot_uop.cf_taint_producer_is_secret := false.B
     slot_uop.cf_spec_branch_is_atk       := false.B
+    slot_uop.cf_atk_branch_ctr       := 0.U
+    slot_uop.cf_sec_branch_ctr       := 0.U
     slot_uop.cf_spec_branch_op_id        := 0.U
     slot_uop.cf_spec_branch_is_secret    := false.B
-    slot_uop.cf_infl_overflow            := false.B
+    slot_uop.cf_infl_dropped             := 0.U
     slot_uop.cf_mem_dataflow_atk         := false.B
     slot_uop.cf_mem_sec_dataflow         := false.B
     slot_uop.cf_influencer_list.foreach { e =>
@@ -205,7 +211,6 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
       e.infl_type  := 0.U
       e.is_atk     := false.B
       e.is_secret  := false.B
-      e.deny_count := 0.U
     }
     assert (is_invalid || io.clear || io.kill, "trying to overwrite a valid issue slot.")
   }
@@ -239,14 +244,31 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
     when (io.wakeup_ports(i).valid &&
          (io.wakeup_ports(i).bits.pdst === next_uop.prs1)) {
       p1 := true.B
+      if (ENABLE_IFT) {
+        when (io.wakeup_ports(i).bits.secret &&
+              (next_uop.lrs1_rtype === RT_FIX || next_uop.lrs1_rtype === RT_FLT)) {
+          nc_src_secret := true.B
+        }
+      }
     }
     when (io.wakeup_ports(i).valid &&
          (io.wakeup_ports(i).bits.pdst === next_uop.prs2)) {
       p2 := true.B
+      if (ENABLE_IFT) {
+        when (io.wakeup_ports(i).bits.secret &&
+              (next_uop.lrs2_rtype === RT_FIX || next_uop.lrs2_rtype === RT_FLT)) {
+          nc_src_secret := true.B
+        }
+      }
     }
     when (io.wakeup_ports(i).valid &&
          (io.wakeup_ports(i).bits.pdst === next_uop.prs3)) {
       p3 := true.B
+      if (ENABLE_IFT) {
+        when (io.wakeup_ports(i).bits.secret && next_uop.frs3_en) {
+          nc_src_secret := true.B
+        }
+      }
     }
   }
   when (io.pred_wakeup_port.valid && io.pred_wakeup_port.bits === next_uop.ppred) {
@@ -285,18 +307,22 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
   // Non-destructive speculative logging: print any slot that will be killed by a branch
   // corefuzzing
   when (IsKilledByBranch(io.brupdate, slot_uop)) {
-    // Print only if the slot currently holds a valid uop
-    when (is_valid) {
-      // Match commit log format from exu/core.scala but tag as speculative
-    // Modified: use new overload to include MicroOp so cf_* fields are printed
-    // Old call (kept for reference):
-    // SpeculativePrintf.dump("ISSUE", Sext.apply(slot_uop.debug_pc(vaddrBits-1,0), xLen), slot_uop.debug_inst, slot_uop.is_rvc, io.cf_debug_issue_enable)
-    SpeculativePrintf.dump("ISSUE", Sext.apply(slot_uop.debug_pc(vaddrBits-1,0), xLen), slot_uop.debug_inst, slot_uop.is_rvc, io.cf_debug_issue_enable, slot_uop)
-      when (slot_uop.dst_rtype === RT_FIX && slot_uop.ldst =/= 0.U) {
-        // No writeback data available at issue-slot; print a placeholder 0
-        printf(" x%d 0x%x\n", slot_uop.ldst, 0.U)
-      } .elsewhen (slot_uop.dst_rtype === RT_FLT) {
-        printf(" f%d 0x%x\n", slot_uop.ldst, 0.U)
+    // Compile-time gated (ENABLE_CF_DEBUG_PRINTF). The " x%d/f%d" printfs are part of
+    // this log and are gated with it. `next_state := s_invalid` is functional, not gated.
+    if (ENABLE_CF_DEBUG_PRINTF) {
+      // Print only if the slot currently holds a valid uop
+      when (is_valid) {
+        // Match commit log format from exu/core.scala but tag as speculative
+        // Modified: use new overload to include MicroOp so cf_* fields are printed
+        // Old call (kept for reference):
+        // SpeculativePrintf.dump("ISSUE", Sext.apply(slot_uop.debug_pc(vaddrBits-1,0), xLen), slot_uop.debug_inst, slot_uop.is_rvc, io.cf_debug_issue_enable)
+        SpeculativePrintf.dump("ISSUE", Sext.apply(slot_uop.debug_pc(vaddrBits-1,0), xLen), slot_uop.debug_inst, slot_uop.is_rvc, io.cf_debug_issue_enable, slot_uop)
+        when (slot_uop.dst_rtype === RT_FIX && slot_uop.ldst =/= 0.U) {
+          // No writeback data available at issue-slot; print a placeholder 0
+          printf(" x%d 0x%x\n", slot_uop.ldst, 0.U)
+        } .elsewhen (slot_uop.dst_rtype === RT_FLT) {
+          printf(" f%d 0x%x\n", slot_uop.ldst, 0.U)
+        }
       }
     }
     next_state := s_invalid
@@ -323,6 +349,9 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
   //assign outputs
   io.valid := is_valid
   io.uop := slot_uop
+  if (ENABLE_IFT) {
+    io.uop.cf_secret_propagation := slot_uop.cf_secret_propagation || cf_src_secret
+  }
   io.uop.iw_p1_poisoned := p1_poisoned
   io.uop.iw_p2_poisoned := p2_poisoned
 
@@ -350,6 +379,9 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
   io.out_uop.cf_cntd_winner_atk := nc_cntd_winner_atk
   io.out_uop.cf_cntd_winner_sec := nc_cntd_winner_sec
   io.out_uop.cf_cntd_deny_count := nc_cntd_deny_count
+  if (ENABLE_IFT) {
+    io.out_uop.cf_secret_propagation := next_uop.cf_secret_propagation || nc_src_secret
+  }
 
   when (state === s_valid_2) {
     when (p1 && p2 && ppred) {
@@ -379,8 +411,9 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
         nc_cntd_winner_op  := io.cf_contend_in.bits.winner_op_count
         nc_cntd_winner_atk := io.cf_contend_in.bits.winner_is_atk
         nc_cntd_winner_sec := io.cf_contend_in.bits.winner_is_sec
+        cf_cntd_infl_type  := io.cf_contend_in.bits.infl_type
       }
-      nc_cntd_deny_count := Mux(cf_cntd_deny_count === 15.U, 15.U, cf_cntd_deny_count + 1.U)
+      nc_cntd_deny_count := Mux(cf_cntd_deny_count === 63.U, 63.U, cf_cntd_deny_count + 1.U)
     }
   }
 
@@ -393,17 +426,20 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
     cf_cntd_winner_op  := io.in_uop.bits.cf_cntd_winner_op
     cf_cntd_winner_atk := io.in_uop.bits.cf_cntd_winner_atk
     cf_cntd_winner_sec := io.in_uop.bits.cf_cntd_winner_sec
+    cf_src_secret      := io.in_uop.bits.cf_secret_propagation
     cf_cntd_deny_count := io.in_uop.bits.cf_cntd_deny_count
   } .elsewhen (io.kill) {
     cf_cntd_valid      := false.B
     cf_cntd_deny_count := 0.U
     cf_cntd_winner_atk := false.B
     cf_cntd_winner_sec := false.B
+    cf_src_secret      := false.B
   } .otherwise {
     cf_cntd_valid      := nc_cntd_valid
     cf_cntd_winner_op  := nc_cntd_winner_op
     cf_cntd_winner_atk := nc_cntd_winner_atk
     cf_cntd_winner_sec := nc_cntd_winner_sec
+    cf_src_secret      := nc_src_secret
     cf_cntd_deny_count := nc_cntd_deny_count
   }
 
@@ -416,6 +452,9 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
   io.cf_contend_out.bits.winner_op_count   := cf_cntd_winner_op
   io.cf_contend_out.bits.winner_is_atk     := cf_cntd_winner_atk
   io.cf_contend_out.bits.winner_is_sec     := cf_cntd_winner_sec
+  // O1: default influence is issue-PORT contention.  A non-pipelined FU blocking
+  // issue is reported as INFL_FU_BUSY by the issue unit instead (see below).
+  io.cf_contend_out.bits.infl_type         := cf_cntd_infl_type
   io.cf_contend_out.bits.deny_count        := cf_cntd_deny_count
 
   // debug outputs

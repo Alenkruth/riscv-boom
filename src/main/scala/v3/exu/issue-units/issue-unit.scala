@@ -79,6 +79,14 @@ class IqWakeup(val pregSz: Int) extends Bundle
 {
   val pdst = UInt(width=pregSz.W)
   val poisoned = Bool()
+  // C2 (corefuzzing): the producer's taint, carried on the SAME broadcast that says
+  // its destination register is ready.  DIFT tags at producer-dest-ready, and an
+  // issue slot never sees the operand VALUE (unlike a load's AGU), so the wakeup is
+  // its ONLY channel -- and it is exactly the moment the slot learns.  This matters
+  // because INFL_ISSUE_CONTENTION samples winner_is_sec AT ISSUE, one stage later.
+  // The source is already an ExeUnitResp carrying .secret; only this narrowing
+  // dropped it, so the cost is 1 bit per wakeup port.
+  val secret = Bool()
 }
 
 /**
@@ -105,6 +113,12 @@ class IssueUnitIO(
 
   // tell the issue unit what each execution pipeline has in terms of functional units
   val fu_types         = Input(Vec(issueWidth, Bits(width=FUC_SZ.W)))
+  // O1: aggregated occupancy taint of the non-pipelined FUs behind these ports.
+  val cf_fu_busy       = Input(Valid(new Bundle {
+    val op_count = UInt(uopIDCounterWidthCF.W)
+    val is_atk   = Bool()
+    val is_sec   = Bool()
+  }))
 
   val brupdate         = Input(new BrUpdateInfo())
   val flush_pipeline   = Input(Bool())
@@ -145,7 +159,15 @@ abstract class IssueUnit(
 {
   val io = IO(new IssueUnitIO(issueWidth, numWakeupPorts, dispatchWidth))
 
-  // Runtime issue queue size selection: issueQueueEntryOptions = Seq(64, 32, 16, 8)
+  // Runtime issue queue size selection.  Authoritative list lives in rocket-chip
+  // util/CoreFuzzing.scala: issueQueueEntryOptions = Seq(32, 24, 16, 8).
+  // Every option MUST be <= the queue's built numIssueSlots (32 here).  active_offset in
+  // issue-unit-age-ordered.scala is `numIssueSlots.U - cf_iq_active`, an UNSIGNED subtract:
+  // an option larger than the built size underflows and gates OFF every slot, freezing the
+  // queue.  Verified in gen-collateral/IssueUnitCollapsing*.sv:
+  //   _GEN = '{6'h8, 6'h10, 6'h18, 6'h20}   (packed literal: index 3 FIRST)
+  //   => idx0..3 = 32, 24, 16, 8, and _active_offset_T = 6'h20 - _GEN[idx]  -- never underflows.
+  // Do not restate the option values here without checking CoreFuzzing.scala.
   val iqOptionsVec = VecInit(issueQueueEntryOptions.map(_.U))
   val cf_iq_active = iqOptionsVec(io.cf_iq_idx)
 

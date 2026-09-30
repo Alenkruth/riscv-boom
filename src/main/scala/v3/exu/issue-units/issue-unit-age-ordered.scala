@@ -209,8 +209,27 @@ class IssueUnitCollapsing(
         issue_slots(i).cf_contend_in.bits.winner_op_count     := winner_op
         issue_slots(i).cf_contend_in.bits.winner_is_atk       := winner_is_atk
         issue_slots(i).cf_contend_in.bits.winner_is_sec       := winner_is_sec
+        issue_slots(i).cf_contend_in.bits.infl_type           := INFL_ISSUE_CONTENTION.U
       }
       already_denied(i) = already_denied(i) | is_cross_loser
+    }
+  }
+
+  // O1: FU-occupancy denial.  A non-pipelined unit (div/fdivsqrt) holds its slot for
+  // ~20-30 cycles; a slot needing that unit finds no usable port at all, so there is
+  // no winner/loser pair and INFL_ISSUE_CONTENTION can never fire for it.
+  if (ENABLE_IFT) {
+    for (i <- 0 until numIssueSlots) {
+      val no_port_available = !(0 until issueWidth).map(w => slot_can_use_port(i)(w)).reduce(_||_)
+      val fu_busy_denial = issue_slots(i).request && !issue_slots(i).grant &&
+                           no_port_available && io.cf_fu_busy.valid
+      when (fu_busy_denial && !already_denied(i)) {
+        issue_slots(i).cf_contend_in.valid                := true.B
+        issue_slots(i).cf_contend_in.bits.winner_op_count := io.cf_fu_busy.bits.op_count(inflOpCountWidthCF-1, 0)
+        issue_slots(i).cf_contend_in.bits.winner_is_atk   := io.cf_fu_busy.bits.is_atk
+        issue_slots(i).cf_contend_in.bits.winner_is_sec   := io.cf_fu_busy.bits.is_sec
+        issue_slots(i).cf_contend_in.bits.infl_type       := INFL_FU_BUSY.U
+      }
     }
   }
 
