@@ -2053,17 +2053,21 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       when (IsKilledByBranch(io.core.brupdate, stq(i).bits.uop))
       {
         // BEGIN speculative flush logging
-        // Only log uncommitted, valid stores that will be invalidated
-        when (!stq(i).bits.committed) {
-          // Printf block matches commit log format in exu/core.scala, with [SPECULATIVE][LSU] prefix
-          // Modified: use new overload to include MicroOp (`stq(i).bits.uop`) so cf_* fields are printed
-          // Old call (kept for reference):
-          // SpeculativePrintf.dump("LSU", Sext.apply(stq(i).bits.uop.debug_pc(vaddrBits-1,0), xLen), stq(i).bits.uop.debug_inst, stq(i).bits.uop.is_rvc, io.core.cf_debug_lsu_enable)
-          SpeculativePrintf.dump("LSU", Sext.apply(stq(i).bits.uop.debug_pc(vaddrBits-1,0), xLen), stq(i).bits.uop.debug_inst, stq(i).bits.uop.is_rvc, io.core.cf_debug_lsu_enable, stq(i).bits.uop)
-          when (stq(i).bits.uop.dst_rtype === RT_FIX && stq(i).bits.uop.ldst =/= 0.U) {
-            printf(" x%d 0x%x\n", stq(i).bits.uop.ldst, stq(i).bits.debug_wb_data)
-          } .elsewhen (stq(i).bits.uop.dst_rtype === RT_FLT) {
-            printf(" f%d 0x%x\n", stq(i).bits.uop.ldst, stq(i).bits.debug_wb_data)
+        // Compile-time gated (ENABLE_CF_DEBUG_PRINTF). The " x%d/f%d" printfs are part of
+        // this log and are gated with it. The stq state clears below are NOT gated.
+        if (ENABLE_CF_DEBUG_PRINTF) {
+          // Only log uncommitted, valid stores that will be invalidated
+          when (!stq(i).bits.committed) {
+            // Printf block matches commit log format in exu/core.scala, with [SPECULATIVE][LSU] prefix
+            // Modified: use new overload to include MicroOp (`stq(i).bits.uop`) so cf_* fields are printed
+            // Old call (kept for reference):
+            // SpeculativePrintf.dump("LSU", Sext.apply(stq(i).bits.uop.debug_pc(vaddrBits-1,0), xLen), stq(i).bits.uop.debug_inst, stq(i).bits.uop.is_rvc, io.core.cf_debug_lsu_enable)
+            SpeculativePrintf.dump("LSU", Sext.apply(stq(i).bits.uop.debug_pc(vaddrBits-1,0), xLen), stq(i).bits.uop.debug_inst, stq(i).bits.uop.is_rvc, io.core.cf_debug_lsu_enable, stq(i).bits.uop)
+            when (stq(i).bits.uop.dst_rtype === RT_FIX && stq(i).bits.uop.ldst =/= 0.U) {
+              printf(" x%d 0x%x\n", stq(i).bits.uop.ldst, stq(i).bits.debug_wb_data)
+            } .elsewhen (stq(i).bits.uop.dst_rtype === RT_FLT) {
+              printf(" f%d 0x%x\n", stq(i).bits.uop.ldst, stq(i).bits.debug_wb_data)
+            }
           }
         }
         // END speculative flush logging
@@ -2089,16 +2093,20 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       when (IsKilledByBranch(io.core.brupdate, ldq(i).bits.uop))
       {
         // BEGIN speculative flush logging
-        // Only log valid loads that will be invalidated
-        // Printf block matches commit log format in exu/core.scala, with [SPECULATIVE][LSU] prefix
-  // Modified: use new overload that accepts MicroOp to print cf_* fields
-  // Old call (kept for traceability):
-  // SpeculativePrintf.dump("LSU", Sext.apply(ldq(i).bits.uop.debug_pc(vaddrBits-1,0), xLen), ldq(i).bits.uop.debug_inst, ldq(i).bits.uop.is_rvc, io.core.cf_debug_lsu_enable)
-  SpeculativePrintf.dump("LSU", Sext.apply(ldq(i).bits.uop.debug_pc(vaddrBits-1,0), xLen), ldq(i).bits.uop.debug_inst, ldq(i).bits.uop.is_rvc, io.core.cf_debug_lsu_enable, ldq(i).bits.uop)
-        when (ldq(i).bits.uop.dst_rtype === RT_FIX && ldq(i).bits.uop.ldst =/= 0.U) {
-          printf(" x%d 0x%x\n", ldq(i).bits.uop.ldst, ldq(i).bits.debug_wb_data)
-        } .elsewhen (ldq(i).bits.uop.dst_rtype === RT_FLT) {
-          printf(" f%d 0x%x\n", ldq(i).bits.uop.ldst, ldq(i).bits.debug_wb_data)
+        // Compile-time gated (ENABLE_CF_DEBUG_PRINTF). The " x%d/f%d" printfs are part of
+        // this log and are gated with it. The ldq state clears below are NOT gated.
+        if (ENABLE_CF_DEBUG_PRINTF) {
+          // Only log valid loads that will be invalidated
+          // Printf block matches commit log format in exu/core.scala, with [SPECULATIVE][LSU] prefix
+          // Modified: use new overload that accepts MicroOp to print cf_* fields
+          // Old call (kept for traceability):
+          // SpeculativePrintf.dump("LSU", Sext.apply(ldq(i).bits.uop.debug_pc(vaddrBits-1,0), xLen), ldq(i).bits.uop.debug_inst, ldq(i).bits.uop.is_rvc, io.core.cf_debug_lsu_enable)
+          SpeculativePrintf.dump("LSU", Sext.apply(ldq(i).bits.uop.debug_pc(vaddrBits-1,0), xLen), ldq(i).bits.uop.debug_inst, ldq(i).bits.uop.is_rvc, io.core.cf_debug_lsu_enable, ldq(i).bits.uop)
+          when (ldq(i).bits.uop.dst_rtype === RT_FIX && ldq(i).bits.uop.ldst =/= 0.U) {
+            printf(" x%d 0x%x\n", ldq(i).bits.uop.ldst, ldq(i).bits.debug_wb_data)
+          } .elsewhen (ldq(i).bits.uop.dst_rtype === RT_FLT) {
+            printf(" f%d 0x%x\n", ldq(i).bits.uop.ldst, ldq(i).bits.debug_wb_data)
+          }
         }
         // END speculative flush logging
         ldq(i).valid           := false.B

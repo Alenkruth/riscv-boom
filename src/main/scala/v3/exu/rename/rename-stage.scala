@@ -147,54 +147,58 @@ abstract class AbstractRenameStage(
     next_uop := r_uop
 
     // corefuzzing: [FLUSH] for ren2 uops killed by branch mispredict. SRC=2 (rename).
-    when (r_valid && IsKilledByBranch(io.brupdate, r_uop.br_mask) && io.cf_debug_rename_enable) {
-      // corefuzzing: read pipeline register directly — fl/floc are separate fields.
-      val ren_fu = r_uop
-      val fl_cross_domain = io.cf_mispredict_uop.valid &&
-        (io.cf_mispredict_uop.bits.cf_domain_id =/= ren_fu.cf_domain_id)
-      val fl_op_count = Mux(io.cf_mispredict_uop.valid,
-        io.cf_mispredict_uop.bits.cf_op_count_id, 0.U)
-      val renBrInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d,dc=%d}"}.mkString(" ")
-      val renBrFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d floc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d $renBrInflFmt\n"
-      val renBrArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
-        ren_fu.cf_influencer_list(k).valid,
-        ren_fu.cf_influencer_list(k).op_count,
-        ren_fu.cf_influencer_list(k).infl_type,
-        ren_fu.cf_influencer_list(k).is_atk,
-        ren_fu.cf_influencer_list(k).is_secret,
-        ren_fu.cf_influencer_list(k).deny_count
-      ))
-      printf(renBrFmt, (Seq[Bits](
-        Sext.apply(ren_fu.debug_pc(vaddrBits-1,0), xLen), ren_fu.debug_inst,
-        ren_fu.cf_domain_id, ren_fu.cf_speculated, ren_fu.cf_attacker_influence,
-        ren_fu.cf_secret_access, ren_fu.cf_secret_propagation, ren_fu.cf_secret_transmission,
-        ren_fu.cf_op_count_id, ren_fu.cf_spec_branch_is_atk, ren_fu.cf_spec_branch_op_id,
-        fl_cross_domain, fl_op_count,
-        ren_fu.cf_fu_bitmap, 2.U, inflBitmapFromList(ren_fu.cf_influencer_list), ren_fu.cf_infl_overflow
-      ) ++ renBrArgs): _*)
+    // corefuzzing [FLUSH] rename-branch log — compile-time gated (see ENABLE_CF_DEBUG_PRINTF).
+    if (ENABLE_CF_DEBUG_PRINTF) {
+      when (r_valid && IsKilledByBranch(io.brupdate, r_uop.br_mask) && io.cf_debug_rename_enable) {
+        // corefuzzing: read pipeline register directly — fl/floc are separate fields.
+        val ren_fu = r_uop
+        val fl_cross_domain = io.cf_mispredict_uop.valid &&
+          (io.cf_mispredict_uop.bits.cf_domain_id =/= ren_fu.cf_domain_id)
+        val fl_op_count = Mux(io.cf_mispredict_uop.valid,
+          io.cf_mispredict_uop.bits.cf_op_count_id, 0.U)
+        val renBrInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d}"}.mkString(" ")
+        val renBrFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d floc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d $renBrInflFmt\n"
+        val renBrArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
+          ren_fu.cf_influencer_list(k).valid,
+          ren_fu.cf_influencer_list(k).op_count,
+          ren_fu.cf_influencer_list(k).infl_type,
+          ren_fu.cf_influencer_list(k).is_atk,
+          ren_fu.cf_influencer_list(k).is_secret
+        ))
+        printf(renBrFmt, (Seq[Bits](
+          Sext.apply(ren_fu.debug_pc(vaddrBits-1,0), xLen), ren_fu.debug_inst,
+          ren_fu.cf_domain_id, ren_fu.cf_speculated, ren_fu.cf_attacker_influence,
+          ren_fu.cf_secret_access, ren_fu.cf_secret_propagation, ren_fu.cf_secret_transmission,
+          ren_fu.cf_op_count_id, ren_fu.cf_spec_branch_is_atk, ren_fu.cf_spec_branch_op_id,
+          fl_cross_domain, fl_op_count,
+          ren_fu.cf_fu_bitmap, 2.U, inflBitmapFromList(ren_fu.cf_influencer_list), ren_fu.cf_infl_dropped, ren_fu.cf_cntd_deny_count, ren_fu.cf_stall_cycles_rob, ren_fu.cf_stall_cycles_stq, ren_fu.cf_infl_oc_aliased
+        ) ++ renBrArgs): _*)
+      }
     }
 
     when (io.kill) {
       // corefuzzing: [FLUSH] for ren2 uops killed by pipeline flush (exception/ROB flush). SRC=2.
-      when (r_valid && io.cf_debug_rename_enable) {
-        val renKillInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d,dc=%d}"}.mkString(" ")
-        val renKillFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d floc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d $renKillInflFmt\n"
-        val renKillArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
-          r_uop.cf_influencer_list(k).valid,
-          r_uop.cf_influencer_list(k).op_count,
-          r_uop.cf_influencer_list(k).infl_type,
-          r_uop.cf_influencer_list(k).is_atk,
-          r_uop.cf_influencer_list(k).is_secret,
-          r_uop.cf_influencer_list(k).deny_count
-        ))
-        printf(renKillFmt, (Seq[Bits](
-          Sext.apply(r_uop.debug_pc(vaddrBits-1,0), xLen), r_uop.debug_inst,
-          r_uop.cf_domain_id, r_uop.cf_speculated, r_uop.cf_attacker_influence,
-          r_uop.cf_secret_access, r_uop.cf_secret_propagation, r_uop.cf_secret_transmission,
-          r_uop.cf_op_count_id, r_uop.cf_spec_branch_is_atk, r_uop.cf_spec_branch_op_id,
-          0.U, 0.U,  // fl=0 floc=0: ROB flush has no flushing branch
-          r_uop.cf_fu_bitmap, 2.U, inflBitmapFromList(r_uop.cf_influencer_list), r_uop.cf_infl_overflow
-        ) ++ renKillArgs): _*)
+      // corefuzzing [FLUSH] rename-kill log — compile-time gated (see ENABLE_CF_DEBUG_PRINTF).
+      if (ENABLE_CF_DEBUG_PRINTF) {
+        when (r_valid && io.cf_debug_rename_enable) {
+          val renKillInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d}"}.mkString(" ")
+          val renKillFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d floc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d $renKillInflFmt\n"
+          val renKillArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
+            r_uop.cf_influencer_list(k).valid,
+            r_uop.cf_influencer_list(k).op_count,
+            r_uop.cf_influencer_list(k).infl_type,
+            r_uop.cf_influencer_list(k).is_atk,
+            r_uop.cf_influencer_list(k).is_secret
+          ))
+          printf(renKillFmt, (Seq[Bits](
+            Sext.apply(r_uop.debug_pc(vaddrBits-1,0), xLen), r_uop.debug_inst,
+            r_uop.cf_domain_id, r_uop.cf_speculated, r_uop.cf_attacker_influence,
+            r_uop.cf_secret_access, r_uop.cf_secret_propagation, r_uop.cf_secret_transmission,
+            r_uop.cf_op_count_id, r_uop.cf_spec_branch_is_atk, r_uop.cf_spec_branch_op_id,
+            0.U, 0.U,  // fl=0 floc=0: ROB flush has no flushing branch
+            r_uop.cf_fu_bitmap, 2.U, inflBitmapFromList(r_uop.cf_influencer_list), r_uop.cf_infl_dropped, r_uop.cf_cntd_deny_count, r_uop.cf_stall_cycles_rob, r_uop.cf_stall_cycles_stq, r_uop.cf_infl_oc_aliased
+          ) ++ renKillArgs): _*)
+        }
       }
       r_valid := false.B
     } .elsewhen (ren2_ready) {

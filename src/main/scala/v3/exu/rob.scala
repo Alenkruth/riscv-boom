@@ -912,44 +912,77 @@ class Rob(
     for (i <- 0 until numRobRows) {
       when(i.U < cf_rob_rows) {
         val br_mask = rob_uop(i).br_mask
+        // [FLUSHFIX 2026-09-07] The attacker-shadow term, computed ONCE per entry and
+        // reused at all three consumers below.  PROVEN NECESSARY: rob_val(i) := false.B
+        // (the IsKilledByBranch kill) and the shadow register write land on the SAME clock
+        // edge, so a squashed uop's register never becomes observable -- the [FLUSH] printf
+        // and cf_has_ift_activity both read the PRE-write register and saw atk=0.
+        // Measured before this fix: FLUSH 16/8469 = 0% tainted vs COMMIT 1802/6188 = 29%.
+        // Sharing the val keeps this to ONE 20-bit AND-reduce per entry, not three.
+        val cf_in_atk_shadow = (br_mask & io.cf_br_atk_mask).orR
         // corefuzzing
         // [SPECULATIVE][ROB] speculative flush logging (non-destructive)
         // We print any valid ROB entries that will be killed by the branch update
-        when (rob_val(i) && IsKilledByBranch(io.brupdate, br_mask) && io.cf_debug_rob_enable) {
-          // [FLUSH] log: full commit-log format for squashed entries
-          // corefuzzing: add INFL_PIPELINE_FLUSH when flushing branch is from different domain
-          // corefuzzing: single printf per entry — atomic in Verilator multi-threaded mode,
-          // preventing interleaving of header/influencer-loop/footer across threads.
-          // corefuzzing: no WireInit copy needed — read ROB state directly.
-          // Pipeline-flush info is printed as separate fl/floc fields (like spec_atk/spec_oc),
-          // completely outside the influencer list.  This eliminates the addInfluencer call
-          // and WireInit(full MicroOp) that previously generated ~100 mux expressions per entry
-          // across 128 entries, causing Rob.sv to balloon to 168 MB.
-          val fu = rob_uop(i)
-          val fl_cross_domain = io.cf_mispredict_uop.valid &&
-            (io.cf_mispredict_uop.bits.cf_domain_id =/= fu.cf_domain_id)
-          val fl_is_secret = io.cf_mispredict_uop.valid &&
-            (io.cf_mispredict_uop.bits.cf_secret_propagation || io.cf_mispredict_uop.bits.cf_secret_access)
-          val fl_op_count = Mux(io.cf_mispredict_uop.valid,
-            io.cf_mispredict_uop.bits.cf_op_count_id, 0.U)
-          val robFlushInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d,dc=%d}"}.mkString(" ")
-          val robFlushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d fl_sec=%d floc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d $robFlushInflFmt\n"
-          val robInflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
-            fu.cf_influencer_list(k).valid,
-            fu.cf_influencer_list(k).op_count,
-            fu.cf_influencer_list(k).infl_type,
-            fu.cf_influencer_list(k).is_atk,
-            fu.cf_influencer_list(k).is_secret,
-            fu.cf_influencer_list(k).deny_count
-          ))
-          printf(robFlushFmt, (Seq[Bits](
-            Sext(fu.debug_pc(vaddrBits-1,0), xLen), fu.inst,
-            fu.cf_domain_id, fu.cf_speculated, fu.cf_attacker_influence,
-            fu.cf_secret_access, fu.cf_secret_propagation, fu.cf_secret_transmission,
-            fu.cf_op_count_id, fu.cf_spec_branch_is_atk, fu.cf_spec_branch_op_id,
-            fl_cross_domain, fl_is_secret, fl_op_count,
-            fu.cf_fu_bitmap, 3.U, inflBitmapFromList(fu.cf_influencer_list), fu.cf_infl_overflow
-          ) ++ robInflArgs): _*)
+        // Gated by ENABLE_CF_DEBUG_PRINTF (compile-time): eliding this removes the
+        // large influencer-dump mux cone that inflated Rob.sv.
+        // [RBKLOG 2026-09-08] Exception-squashed entries were logged NOWHERE.
+        //
+        // This printf fired only on IsKilledByBranch.  A uop squashed by an EXCEPTION --
+        // including MINI_EXCEPTION_MEM_ORDERING, which flushes via exception_thrown ->
+        // io.flush.valid -> s_rollback -- produced no record at all: its influencer list,
+        // its taint bits, everything, discarded silently.  PROVEN (t35, 2026-09-08): the
+        // [MEMORD] probe fired once, so a real ordering violation occurred and
+        // cf_lsu_memord_upd routed the ty=8 edge into rob_uop -- yet ty=8 appeared ZERO
+        // times in the whole log and the victim load had no [FLUSH] record.  The edge
+        // existed in hardware and was never printed.
+        //
+        // Not MEM_ORDER-specific: ANY transient flow ending in an exception was invisible.
+        //
+        // The rollback walk clears one row per bank per cycle at `com_idx`, which during
+        // s_rollback is rob_tail (see `val rbk_row` above).  Reusing THIS printf rather
+        // than adding a second one is deliberate -- the comment above notes the
+        // influencer-dump mux cone is what inflated Rob.sv, so a duplicate would pay that
+        // area twice.  SRC distinguishes the two: 3 = branch kill, 4 = exception rollback.
+        val rbk_kill_i = (rob_state === s_rollback) && !full && (i.U === rob_tail)
+        if (ENABLE_CF_DEBUG_PRINTF) {
+          when (rob_val(i) && (IsKilledByBranch(io.brupdate, br_mask) || rbk_kill_i) && io.cf_debug_rob_enable) {
+            // [FLUSH] log: full commit-log format for squashed entries
+            // corefuzzing: add INFL_PIPELINE_FLUSH when flushing branch is from different domain
+            // corefuzzing: single printf per entry — atomic in Verilator multi-threaded mode,
+            // preventing interleaving of header/influencer-loop/footer across threads.
+            // corefuzzing: no WireInit copy needed — read ROB state directly.
+            // Pipeline-flush info is printed as separate fl/floc fields (like spec_atk/spec_oc),
+            // completely outside the influencer list.  This eliminates the addInfluencer call
+            // and WireInit(full MicroOp) that previously generated ~100 mux expressions per entry
+            // across 128 entries, causing Rob.sv to balloon to 168 MB.
+            val fu = rob_uop(i)
+            val fl_cross_domain = io.cf_mispredict_uop.valid &&
+              (io.cf_mispredict_uop.bits.cf_domain_id =/= fu.cf_domain_id)
+            val fl_is_secret = io.cf_mispredict_uop.valid &&
+              (io.cf_mispredict_uop.bits.cf_secret_propagation || io.cf_mispredict_uop.bits.cf_secret_access)
+            val fl_op_count = Mux(io.cf_mispredict_uop.valid,
+              io.cf_mispredict_uop.bits.cf_op_count_id, 0.U)
+            val robFlushInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d}"}.mkString(" ")
+            val robFlushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d fl_sec=%d floc=%d FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d pdst=%d prs1=%d prs2=%d rt1=%d rt2=%d brmask=0x%x brtag=%d abr=%d sbr=%d) $robFlushInflFmt\n"
+            val robInflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
+              fu.cf_influencer_list(k).valid,
+              fu.cf_influencer_list(k).op_count,
+              fu.cf_influencer_list(k).infl_type,
+              fu.cf_influencer_list(k).is_atk,
+              fu.cf_influencer_list(k).is_secret
+            ))
+            printf(robFlushFmt, (Seq[Bits](
+              Sext(fu.debug_pc(vaddrBits-1,0), xLen), fu.inst,
+              fu.cf_domain_id, fu.cf_speculated, (fu.cf_attacker_influence || cf_in_atk_shadow),
+              fu.cf_secret_access, fu.cf_secret_propagation, fu.cf_secret_transmission,
+              fu.cf_op_count_id, fu.cf_spec_branch_is_atk, fu.cf_spec_branch_op_id,
+              fl_cross_domain, fl_is_secret, fl_op_count,
+              fu.cf_fu_bitmap, Mux(rbk_kill_i, 4.U, 3.U), inflBitmapFromList(fu.cf_influencer_list), fu.cf_infl_dropped, fu.cf_cntd_deny_count, fu.cf_stall_cycles_rob, fu.cf_stall_cycles_stq, fu.cf_infl_oc_aliased, fu.pdst, fu.prs1, fu.prs2, fu.lrs1_rtype, fu.lrs2_rtype,
+              // [BRMASK 2026-09-08] full speculation shadow + own tag; see core.scala
+              br_mask, rob_uop(i).br_tag,
+              fu.cf_atk_branch_ctr, fu.cf_sec_branch_ctr   // [GHISTFIELD]
+            ) ++ robInflArgs): _*)
+          }
         }
 
         //kill instruction if mispredict & br mask match

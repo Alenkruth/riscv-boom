@@ -524,45 +524,49 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     // A single printf call is atomic in Verilator's multi-threaded mode.
     // Dump ALL valid entries (no filter): FB entries haven't yet accumulated influencers
     // since influencer injection happens at dispatch, well after the fetch buffer stage.
-    when (io.cf_debug_rob_enable) {
-      // Expand influencer slots as fixed-format fields {v=,oc=,ty=} so the entire entry is
-      // one printf call — no per-slot conditional printf loop needed.
-      val flushInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d,dc=%d}"}.mkString(" ")
-      val flushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d floc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d $flushInflFmt\n"
-      for (i <- 0 until numEntries) {
-        // corefuzzing: read RAM entry directly — no WireInit copy needed since we don't
-        // modify the influencer list here.  fl/floc are separate fields (like spec_atk/spec_oc).
-        val base_uop = ram(i)
-        val fl_cross_domain = io.brupdate.b2.mispredict &&
-          (io.brupdate.b2.uop.cf_domain_id =/= base_uop.cf_domain_id)
-        val fl_op_count = Mux(io.brupdate.b2.mispredict,
-          io.brupdate.b2.uop.cf_op_count_id, 0.U)
-        when (ram_valid(i)) {
-          val inflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
-            base_uop.cf_influencer_list(k).valid,
-            base_uop.cf_influencer_list(k).op_count,
-            base_uop.cf_influencer_list(k).infl_type,
-            base_uop.cf_influencer_list(k).is_atk,
-            base_uop.cf_influencer_list(k).is_secret,
-            base_uop.cf_influencer_list(k).deny_count
-          ))
-          printf(flushFmt, (Seq[Bits](
-            Sext.apply(base_uop.debug_pc(vaddrBits-1,0), xLen),
-            base_uop.debug_inst,
-            base_uop.cf_domain_id,
-            base_uop.cf_speculated,
-            base_uop.cf_attacker_influence,
-            base_uop.cf_secret_access,
-            base_uop.cf_secret_propagation,
-            base_uop.cf_secret_transmission,
-            base_uop.cf_op_count_id,
-            base_uop.cf_spec_branch_is_atk,
-            base_uop.cf_spec_branch_op_id,
-            fl_cross_domain, fl_op_count,
-            base_uop.cf_fu_bitmap,
-            0.U, inflBitmapFromList(base_uop.cf_influencer_list),
-            base_uop.cf_infl_overflow
-          ) ++ inflArgs): _*)
+    // corefuzzing [FLUSH] fetch-buffer log
+    // Compile-time gated: when ENABLE_CF_DEBUG_PRINTF is false this block is never
+    // emitted, so neither the printf nor its argument cone reaches synthesis.
+    if (ENABLE_CF_DEBUG_PRINTF) {
+      when (io.cf_debug_rob_enable) {
+        // Expand influencer slots as fixed-format fields {v=,oc=,ty=} so the entire entry is
+        // one printf call — no per-slot conditional printf loop needed.
+        val flushInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d}"}.mkString(" ")
+        val flushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d floc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d $flushInflFmt\n"
+        for (i <- 0 until numEntries) {
+          // corefuzzing: read RAM entry directly — no WireInit copy needed since we don't
+          // modify the influencer list here.  fl/floc are separate fields (like spec_atk/spec_oc).
+          val base_uop = ram(i)
+          val fl_cross_domain = io.brupdate.b2.mispredict &&
+            (io.brupdate.b2.uop.cf_domain_id =/= base_uop.cf_domain_id)
+          val fl_op_count = Mux(io.brupdate.b2.mispredict,
+            io.brupdate.b2.uop.cf_op_count_id, 0.U)
+          when (ram_valid(i)) {
+            val inflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
+              base_uop.cf_influencer_list(k).valid,
+              base_uop.cf_influencer_list(k).op_count,
+              base_uop.cf_influencer_list(k).infl_type,
+              base_uop.cf_influencer_list(k).is_atk,
+              base_uop.cf_influencer_list(k).is_secret
+            ))
+            printf(flushFmt, (Seq[Bits](
+              Sext.apply(base_uop.debug_pc(vaddrBits-1,0), xLen),
+              base_uop.debug_inst,
+              base_uop.cf_domain_id,
+              base_uop.cf_speculated,
+              base_uop.cf_attacker_influence,
+              base_uop.cf_secret_access,
+              base_uop.cf_secret_propagation,
+              base_uop.cf_secret_transmission,
+              base_uop.cf_op_count_id,
+              base_uop.cf_spec_branch_is_atk,
+              base_uop.cf_spec_branch_op_id,
+              fl_cross_domain, fl_op_count,
+              base_uop.cf_fu_bitmap,
+              0.U, inflBitmapFromList(base_uop.cf_influencer_list),
+              base_uop.cf_infl_dropped, base_uop.cf_cntd_deny_count, base_uop.cf_stall_cycles_rob, base_uop.cf_stall_cycles_stq, base_uop.cf_infl_oc_aliased
+            ) ++ inflArgs): _*)
+          }
         }
       }
     }

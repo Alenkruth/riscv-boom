@@ -122,7 +122,18 @@ case class BoomCoreParams(
    * dynamic limits). When false, all reconfiguration CSRs are absent and
    * structures use their hardware-built maximum sizes.
    * Set via WithReconf config fragment. */
-  enableReconf: Boolean = false
+  enableReconf: Boolean = false,
+
+  /* CF debug printf: compile-time gate for the corefuzzing debug logs
+   * ([FLUSH] squashed-entry dumps in the ROB, [SPECULATIVE][MISPREDICT] in the
+   * core). When false the printf logic is elided at FIRRTL emission time -- this
+   * both silences the logs and removes the large mux cones they generate (the
+   * [FLUSH] influencer dump is what inflated Rob.sv). The runtime cf_debug_*
+   * CSRs still gate these when the flag IS enabled.
+   * DEFAULT TRUE: preserves existing corefuzzing behavior. Set FALSE (via
+   * WithoutCfDebugPrintf) only in the dedicated spike-diff config, where the
+   * commit log must match spike's format byte-for-byte. */
+  enableCfDebugPrintf: Boolean = true
 
 // DOC include end: BOOM Parameters
 ) extends freechips.rocketchip.tile.CoreParams
@@ -626,6 +637,7 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val ENABLE_IFT_BRIDGE   = boomParams.enableIFTBridge // export IFT records as tile IO for FireSim IFTBridge
   val ENABLE_IFT          = boomParams.enableIFT       // compile-time gate for DIFT tracking logic
   val ENABLE_RECONF       = boomParams.enableReconf    // compile-time gate for runtime reconfigurability
+  val ENABLE_CF_DEBUG_PRINTF = boomParams.enableCfDebugPrintf // compile-time gate for [FLUSH]/[SPECULATIVE] debug printfs
 
   //************************************
   // Other Non/Should-not-be sythesizable modules

@@ -72,6 +72,41 @@ class WithIFT extends Config((site, here, up) => {
 // structure sizing CSRs, quiesce-for-resize FSM, index masking, dynamic pointer
 // wrapping). Layer on top of WithFuzzingBoom to synthesize BOOM with
 // reconfigurable structures.
+/**
+ * Compile-time-remove ALL corefuzzing debug printfs ([FLUSH], [SPECULATIVE],
+ * [QS], [LSU], and the CF(...) extras appended to the commit log).
+ *
+ * With this applied the commit log emits ONLY the spike-standard fields
+ * (priv, pc, inst, rd, wdata), so it can be diffed byte-for-byte against a
+ * spike commit log. Because the gate is a Scala `if`, the printf logic and its
+ * argument mux cones are never emitted -- no synthesis/area impact.
+ *
+ * NOT applied by default: enableCfDebugPrintf defaults to true so existing
+ * corefuzzing configs keep their current behavior. Use this only in the
+ * dedicated spike-diff config.
+ */
+class WithoutCfDebugPrintf extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      enableCfDebugPrintf = false
+    )))
+    case other => other
+  }
+})
+
+/* Disables the LSU memory-access trace printf ("MT ..." lines, MEMTRACE_PRINTF /
+ * enableMemtracePrintf, lsu.scala:1991). That dump is a SEPARATE gate from the CF-debug
+ * printfs and is on by default, so a commit-log config must also apply this to emit only
+ * spike-standard commit lines. Scala `if`, so no synthesis/area impact. */
+class WithoutMemtracePrintf extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      enableMemtracePrintf = false
+    )))
+    case other => other
+  }
+})
+
 class WithReconf extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
     case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(

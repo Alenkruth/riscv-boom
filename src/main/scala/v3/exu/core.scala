@@ -237,16 +237,20 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // When we detect a mispredict, print a short summary line identifying the branch
   // that caused the flush. This prints before we propagate `brupdate` into the
   // frontend and other modules so it's shown ahead of the per-module speculative dumps.
-  when (b2.mispredict) {
-    // Print: PC, inst, cfi_type, br_tag, rob_idx, taken, jalr_target (if any)
-    printf("[SPECULATIVE][MISPREDICT] pc=0x%x inst=0x%x cfi=%d br_tag=%d rob_idx=%d taken=%d target=0x%x\n",
-      Sext.apply(oldest_mispredict.uop.debug_pc(vaddrBits-1,0), xLen),
-      oldest_mispredict.uop.debug_inst,
-      oldest_mispredict.cfi_type,
-      oldest_mispredict.uop.br_tag,
-      oldest_mispredict.uop.rob_idx,
-      oldest_mispredict.taken,
-      b2.jalr_target)
+  // Gated by ENABLE_CF_DEBUG_PRINTF (compile-time): when false the printf and its
+  // argument cone are never emitted, so this costs nothing in non-debug builds.
+  if (ENABLE_CF_DEBUG_PRINTF) {
+    when (b2.mispredict) {
+      // Print: PC, inst, cfi_type, br_tag, rob_idx, taken, jalr_target (if any)
+      printf("[SPECULATIVE][MISPREDICT] pc=0x%x inst=0x%x cfi=%d br_tag=%d rob_idx=%d taken=%d target=0x%x\n",
+        Sext.apply(oldest_mispredict.uop.debug_pc(vaddrBits-1,0), xLen),
+        oldest_mispredict.uop.debug_inst,
+        oldest_mispredict.cfi_type,
+        oldest_mispredict.uop.br_tag,
+        oldest_mispredict.uop.rob_idx,
+        oldest_mispredict.taken,
+        b2.jalr_target)
+    }
   }
 
   io.ifu.brupdate := brupdate
@@ -526,12 +530,17 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   io.ifu.cf_btb_quiesce := cf_quiesce_core
 
   // Debug: trace quiesce FSM state every cycle when quiesce is active.
-  when (cf_quiesce_core || qs_state =/= QS_IDLE) {
-    printf("[QS] st=%d af=%d sf=%d fc=%d rc=%d pds=%d (rob=%d lsq=%d nmem=%d fri=%d fb=%d dec=%d dis=%d) flush=%d fp=%d\n",
-      qs_state, allow_fetch, qs_saw_flush, qs_fetch_cnt, qs_retry_cnt, pipeline_drained_strict,
-      rob.io.empty, io.lsu.queues_empty, io.lsu.no_pending_mem, io.lsu.fencei_rdy,
-      fetch_buffer_empty, decode_stage_empty, dispatch_stage_empty,
-      rob.io.flush.valid, io.ifu.fetchpacket.valid)
+  // corefuzzing [QS] quiesce debug log
+  // Compile-time gated: when ENABLE_CF_DEBUG_PRINTF is false this block is never
+  // emitted, so neither the printf nor its argument cone reaches synthesis.
+  if (ENABLE_CF_DEBUG_PRINTF) {
+    when (cf_quiesce_core || qs_state =/= QS_IDLE) {
+      printf("[QS] st=%d af=%d sf=%d fc=%d rc=%d pds=%d (rob=%d lsq=%d nmem=%d fri=%d fb=%d dec=%d dis=%d) flush=%d fp=%d\n",
+        qs_state, allow_fetch, qs_saw_flush, qs_fetch_cnt, qs_retry_cnt, pipeline_drained_strict,
+        rob.io.empty, io.lsu.queues_empty, io.lsu.no_pending_mem, io.lsu.fencei_rdy,
+        fetch_buffer_empty, decode_stage_empty, dispatch_stage_empty,
+        rob.io.flush.valid, io.ifu.fetchpacket.valid)
+    }
   }
 
   // IFT quiesce-flush: pulse for one cycle on QS_DRAINING → QS_FETCH transition
@@ -899,16 +908,15 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // corefuzzing: [FLUSH] logging for decode-stage uops killed by branch mispredict or ROB flush.
   // SRC=1 (decode). Gated by cf_debug_rob_enable + cf_debug_enable.
   {
-    val decFlushInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d,dc=%d}"}.mkString(" ")
-    val decFlushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d floc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d $decFlushInflFmt\n"
+    val decFlushInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d}"}.mkString(" ")
+    val decFlushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d floc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d $decFlushInflFmt\n"
     def printDecFlush(uop: MicroOp, fl: UInt, floc: UInt): Unit = {
       val inflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
         uop.cf_influencer_list(k).valid,
         uop.cf_influencer_list(k).op_count,
         uop.cf_influencer_list(k).infl_type,
         uop.cf_influencer_list(k).is_atk,
-        uop.cf_influencer_list(k).is_secret,
-        uop.cf_influencer_list(k).deny_count
+        uop.cf_influencer_list(k).is_secret
       ))
       printf(decFlushFmt, (Seq[Bits](
         Sext(uop.debug_pc(vaddrBits-1,0), xLen), uop.debug_inst,
@@ -916,22 +924,25 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
         uop.cf_secret_access, uop.cf_secret_propagation, uop.cf_secret_transmission,
         uop.cf_op_count_id, uop.cf_spec_branch_is_atk, uop.cf_spec_branch_op_id,
         fl, floc,
-        uop.cf_fu_bitmap, 1.U, inflBitmapFromList(uop.cf_influencer_list), uop.cf_infl_overflow
+        uop.cf_fu_bitmap, 1.U, inflBitmapFromList(uop.cf_influencer_list), uop.cf_infl_dropped, uop.cf_cntd_deny_count, uop.cf_stall_cycles_rob, uop.cf_stall_cycles_stq, uop.cf_infl_oc_aliased
       ) ++ inflArgs): _*)
     }
     for (w <- 0 until coreWidth) {
-      when (custom_csrs.cf_debug_rob_enable && custom_csrs.cf_debug_enable) {
-        // Path A: branch mispredict kills this instruction
-        when (dec_valids(w) && IsKilledByBranch(brupdate, dec_uops(w))) {
-          val dec_uop = dec_uops(w)
-          val fl_cross_domain = brupdate.b2.mispredict &&
-            (brupdate.b2.uop.cf_domain_id =/= dec_uop.cf_domain_id)
-          val fl_op_count = Mux(brupdate.b2.mispredict, brupdate.b2.uop.cf_op_count_id, 0.U)
-          printDecFlush(dec_uop, fl_cross_domain, fl_op_count)
-        }
-        // Path B: ROB flush (exception, FENCE.I, etc.) — kills all in-flight decode instructions
-        .elsewhen (dec_valids(w) && rob.io.flush.valid) {
-          printDecFlush(dec_uops(w), 0.U, 0.U)
+      // corefuzzing [FLUSH] decode-stage log — compile-time gated (see ENABLE_CF_DEBUG_PRINTF).
+      if (ENABLE_CF_DEBUG_PRINTF) {
+        when (custom_csrs.cf_debug_rob_enable && custom_csrs.cf_debug_enable) {
+          // Path A: branch mispredict kills this instruction
+          when (dec_valids(w) && IsKilledByBranch(brupdate, dec_uops(w))) {
+            val dec_uop = dec_uops(w)
+            val fl_cross_domain = brupdate.b2.mispredict &&
+              (brupdate.b2.uop.cf_domain_id =/= dec_uop.cf_domain_id)
+            val fl_op_count = Mux(brupdate.b2.mispredict, brupdate.b2.uop.cf_op_count_id, 0.U)
+            printDecFlush(dec_uop, fl_cross_domain, fl_op_count)
+          }
+          // Path B: ROB flush (exception, FENCE.I, etc.) — kills all in-flight decode instructions
+          .elsewhen (dec_valids(w) && rob.io.flush.valid) {
+            printDecFlush(dec_uops(w), 0.U, 0.U)
+          }
         }
       }
     }
