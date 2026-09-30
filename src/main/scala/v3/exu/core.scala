@@ -836,9 +836,106 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   //
   // Ports coreWidth..coreWidth+memWidth-1: wired from LSU TLB stage (lsu.cf_secret_ftq_updates).
   //   Fires when in_secret is determined at address resolution — captures s_acc speculatively.
+  // C1 (2026-09-02): these ports used to fire at DISPATCH on
+  // dis_uops.cf_secret_propagation, which the rename-stage taint tables set.  Under
+  // taint-follows-data nothing is known at dispatch -- the taint resolves when the
+  // producer delivers -- so the whole FTQ secret path went dark, and with it the
+  // BPD, BTB, **RAS**, icache and iTLB secret shadows AND the fetch-buffer uop taint
+  // (fetch-buffer.scala:326), since fetch-target-queue.scala:245 feeds all of them
+  // from this one bus.  spectre-v3 is an RSB attack, so the RAS is its actual channel.
+  //
+  // Re-driven from WRITEBACK, using the SAME condition the ROB s_prop update already
+  // computes (rob.io.cf_s_prop_rob_upd(i).valid).  Writeback, not commit: a squashed
+  // transient op never commits, and the transient path is the whole point -- measured
+  // 8/10 spectre-v3 chain ops reach writeback with the taint intact.  It is early
+  // enough: bpd_ptr TRAILS the commit pointer (fetch-target-queue.scala do_commit_update
+  // requires bpd_ptr =/= deq_ptr), so the tag lands well before the BPD walk reads it.
+  //
+  // The writeback loop is wider than this bus (numWakeupPorts > coreWidth), so the
+  // requests are compacted.  Compaction can drop a tag if more than coreWidth taints
+  // resolve in one cycle; FTQ writes are monotone and idempotent so a drop only costs
+  // a missed marking, never a wrong one.
+  // C1-BRANCH FIX (proven 2026-09-03).  The writeback feed below can NEVER tag a
+  // branch: core.scala:2002 gates cf_s_prop_rob_upd on
+  //   rf_wen && dst_rtype === RT_FIX && ldst_val
+  // and a conditional branch has rf_wen=false / dst_rtype=RT_X / ldst_val=false.
+  // Meanwhile fetch-target-queue.scala:352 only raises bpdupdate.valid for a packet
+  // that CONTAINS a control-flow inst:
+  //   (bpd_entry.cfi_idx.valid || bpd_entry.br_mask =/= 0.U)
+  // So the two gates are complementary in the worst way: the packets C1 could tag
+  // (secret load + ALU consumers) have no branch and are discarded, and the packet
+  // that does have a branch is never tagged.  MEASURED: 512 tags written, 257 reaching
+  // the bits assignment, ZERO reaching the predictor input.
+  //
+  // A branch's taint IS known -- register-read sets cf_secret_propagation from its
+  // operands -- and brupdate.b2 carries that executed uop plus its ftq_idx at
+  // resolution (already used for redirect_ftq_idx at :779).  So the branch is fed in
+  // as one extra compactor input: no new bus, no width change to the FTQ port vector.
+  val ftq_taint_compactor = Module(new Compactor(rob.numWakeupPorts + coreWidth, coreWidth,
+                                                 UInt(log2Ceil(ftqSz).W)))
+  for (i <- 0 until rob.numWakeupPorts) {
+    ftq_taint_compactor.io.in(i).valid := rob.io.cf_s_prop_rob_upd(i).valid
+    ftq_taint_compactor.io.in(i).bits  := rob.io.wb_resps(i).bits.uop.ftq_idx
+  }
+  // the branch path: tag at resolution, when secret-dependence is known.
+  // MUST use brinfos (per-ALU resolution), NOT brupdate.b2 -- core.scala:226 sets
+  //   b2.uop := UpdateBrMask(brupdate, oldest_mispredict.uop)
+  // so b2 carries ONLY the oldest MISPREDICTED branch (and b2.valid is never even
+  // assigned).  A correctly-predicted secret-dependent branch never appears there,
+  // which is why the first version of this fix changed nothing at all.
+  // brinfos(i) := alu_units(i).io.brinfo carries EVERY resolved branch.
+  // [STEP1] accumulates one-hot br_tags of branches resolving this cycle with an
+  // attacker-influenced condition; broadcast to the ROB to mark their shadows.
+  // NOTE one-hot(br_tag), NOT br_mask: a branch's br_mask holds the OLDER branches it
+  // is speculating under, not its own tag.
+  // [STEP1 2026-09-06] R2+R3+R4: consume cond_atk (computed at functional-unit.scala:570
+  // and read NOWHERE before this) and broadcast the resolving branch's tag so every
+  // in-flight uop in its speculative shadow is marked attacker-influenced.
+  // STEERING, not ownership: spectre-v1's bounds check is VICTIM code, so the old
+  // ownership test (spec_branch_atk_table from cf_domain_id) is 0 exactly when it matters.
+  // A REDUCTION, not an accumulator: `w := w | x` on a Wire is a combinational cycle.
+  // one-hot(br_tag), NOT br_mask -- a branch's br_mask holds the OLDER branches it
+  // speculates under, not its own tag.
+  // AREA: gated so the 20-bit x 256-entry ROB compare vanishes when IFT is off.
+  // rob.scala:171 states the convention -- the ROB port is driven unconditionally,
+  // core.scala gates the driver; a constant 0 lets FIRRTL DCE strip the per-entry
+  // `(br_mask & cf_br_atk_mask).orR` in every ROB row (~2.3k LUT6 + a 20-bit
+  // broadcast net).  ENABLE_IFT is true here, so the emitted Verilog is unchanged.
+  val cf_br_atk_mask_acc = if (ENABLE_IFT) {
+    (0 until brinfos.length).map(i =>
+      Mux(brinfos(i).valid && brinfos(i).cond_atk,
+          UIntToOH(brinfos(i).uop.br_tag)(maxBrCount-1,0), 0.U(maxBrCount.W))
+    ).reduce(_ | _)
+  } else { 0.U(maxBrCount.W) }
+
+  for (i <- 0 until brinfos.length) {
+    ftq_taint_compactor.io.in(rob.numWakeupPorts + i).valid :=
+      brinfos(i).valid && brinfos(i).uop.cf_secret_propagation
+    ftq_taint_compactor.io.in(rob.numWakeupPorts + i).bits  := brinfos(i).uop.ftq_idx
+    // REACTIVE control context, set HERE and not at the writeback site.  The writeback
+    // loop is gated `wb.valid && rf_wen && dst_rtype===RT_FIX && ldst_val`; a branch has
+    // rf_wen=false, so it never reaches that code and the first version of this fix
+    // produced ty20=0 everywhere.  brinfos carries every resolved branch and now carries
+    // its CONDITION taint (cond_secret) -- not the aggregate, which cannot tell the
+    // secret beqz (s_prop 522/523) from the clean loop bge (263/267).
+    when (brinfos(i).valid && brinfos(i).cond_secret) {
+      cf_ctrl_secret_ctx := true.B
+    }
+    // STEERING, not ownership: a mispredict is attacker-CAUSED when the branch's own
+    // CONDITION is attacker-derived.  The previous test (branch in attacker domain) is
+    // false for every steered gadget -- spectre-v1's bounds check is victim code.
+    // NOTE: there is deliberately NO sticky attacker context here.  A bit meaning
+    // "an attacker branch resolved at some point" never decays, and since the attacker
+    // executes constantly it would tag essentially the whole program -- the same
+    // pre-emptive shape that made the secret side tag 97% of a function and leak across
+    // the clear_ift_csrs() phase boundary.  Attacker influence propagates through DATA
+    // (regfile taint_atk -> operands -> results) and through STATE (predictor/cache
+    // domain shadows raising an edge AT the cross-domain hit), both of which decay.
+  }
   for (w <- 0 until coreWidth) {
-    io.ifu.cf_secret_ftq_updates(w).valid := dis_fire(w) && dis_uops(w).cf_secret_propagation
-    io.ifu.cf_secret_ftq_updates(w).bits  := dis_uops(w).ftq_idx
+    ftq_taint_compactor.io.out(w).ready := true.B
+    io.ifu.cf_secret_ftq_updates(w).valid := ftq_taint_compactor.io.out(w).valid
+    io.ifu.cf_secret_ftq_updates(w).bits  := ftq_taint_compactor.io.out(w).bits
   }
   for (w <- 0 until memWidth) {
     io.ifu.cf_secret_ftq_updates(coreWidth + w) := io.lsu.cf_secret_ftq_updates(w)
@@ -1998,6 +2095,14 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   // branch resolution
   rob.io.brupdate <> brupdate
+  rob.io.cf_br_atk_mask := cf_br_atk_mask_acc   // [STEP1] attacker shadow broadcast
+  // [BRSELF] the steering branch's OWN entry -- see rob.scala.  Gated with the mask
+  // reduction so it vanishes with it when ENABLE_IFT=false.
+  for (i <- 0 until coreWidth) {
+    rob.io.cf_br_atk_self(i).valid            := (if (ENABLE_IFT) brinfos(i).valid && brinfos(i).cond_atk else false.B)
+    rob.io.cf_br_atk_self(i).bits.rob_idx     := brinfos(i).uop.rob_idx
+    rob.io.cf_br_atk_self(i).bits.op_count_id := brinfos(i).uop.cf_op_count_id
+  }
 
   exe_units.map(u => u.io.status := csr.io.status)
   if (usingFPU)

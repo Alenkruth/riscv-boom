@@ -68,6 +68,20 @@ class RobIo(
   // Handle Branch Misspeculations
   val brupdate = Input(new BrUpdateInfo())
 
+  // [STEP1 2026-09-06] Retroactive attacker-shadow broadcast.
+  // One-hot union of the br_tags of branches that resolved this cycle with an
+  // ATTACKER-INFLUENCED CONDITION (BrResolutionInfo.cond_atk).  Every in-flight uop
+  // still holding one of those tags in its br_mask was fetched in that branch's
+  // speculative shadow, so it is attacker-influenced.
+  // WHY A BROADCAST, NOT A CONTEXT REGISTER: cond_atk is known only at RESOLVE, after
+  // the shadow has already dispatched.  The secret side bridges that with the sticky
+  // cf_ctrl_secret_ctx, which doc 16 sec.B forbids here -- a sticky "the attacker
+  // branched at some point" bit never decays and tagged ~97% of a function on the
+  // secret side.  This broadcast is exact and self-limiting: the tag is freed at
+  // resolution, so the marked set is precisely the speculative window.
+  // COST: reuses the per-entry br_mask compare that already runs for brupdate.
+  val cf_br_atk_mask = Input(UInt(maxBrCount.W))
+
   // Write-back Stage
   // (Update of ROB)
   // Instruction is no longer busy and can be committed
@@ -1050,7 +1064,7 @@ class Rob(
           // guarantee drain reads correct pre-kill uop data even if dispatch co-fires).
           when (rob_val(i)) {
             val cf_has_ift_activity =
-              rob_uop(i).cf_attacker_influence  ||
+              rob_uop(i).cf_attacker_influence  || cf_in_atk_shadow ||
               rob_uop(i).cf_secret_access       ||
               rob_uop(i).cf_secret_propagation  ||
               rob_uop(i).cf_secret_transmission ||
@@ -1062,6 +1076,12 @@ class Rob(
         } .elsewhen (rob_val(i)) {
           // clear speculation bit even on correct speculation
           rob_uop(i).br_mask := GetNewBrMask(io.brupdate, br_mask)
+        }
+        // [STEP1] attacker shadow: this uop is in the window of a branch whose CONDITION
+        // was attacker-influenced.  Tested against the CURRENT br_mask, so the resolving
+        // branch's own tag still matches before GetNewBrMask retires it.
+        when (rob_val(i) && cf_in_atk_shadow) {
+          rob_uop(i).cf_attacker_influence := true.B
         }
       }
     }
