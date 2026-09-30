@@ -469,6 +469,20 @@ class Rob(
       rob_exception(rob_tail) := io.enq_uops(w).exception
       rob_predicated(rob_tail)   := false.B
       rob_fflags(w)(rob_tail)    := 0.U
+      // [A6PROBE2 2026-09-15] measurement only: a row being re-allocated while its
+      // squash record is still waiting for the 1/cycle squash drain.  The clear below
+      // then drops that squash record entirely -- the second loss on the squash path
+      // (the first, kill-clears-pending, is [A6PROBE] at the kill site).
+      if (ENABLE_CF_DEBUG_PRINTF) {
+        when (ift_squash_pending(rob_tail) && io.cf_debug_rob_enable) {
+          printf("[A6PROBE2] reuse-before-squash-drain row=%d old_pc=0x%x old_oc=%d s_acc=%d s_prop=%d s_tx=%d infl_valid=%d new_pc=0x%x\n",
+            rob_tail, rob_uop(rob_tail).debug_pc, rob_uop(rob_tail).cf_op_count_id,
+            rob_uop(rob_tail).cf_secret_access, rob_uop(rob_tail).cf_secret_propagation,
+            rob_uop(rob_tail).cf_secret_transmission,
+            PopCount(VecInit(rob_uop(rob_tail).cf_influencer_list.map(_.valid))),
+            io.enq_uops(w).debug_pc)
+        }
+      }
       // IFT bridge: clear stale squash-pending bit so an old killed entry doesn't
       // pollute a freshly dispatched instruction at the same ROB row.
       ift_squash_pending(rob_tail) := false.B
@@ -1054,6 +1068,21 @@ class Rob(
         {
           rob_val(i) := false.B
           rob_uop(i.U).debug_inst := BUBBLE
+          // [A6PROBE 2026-09-15] measurement only, no functional change: how often does
+          // a kill discard an influencer edge that was still pending (never drained into
+          // the row), i.e. an edge the squash record / [FLUSH] printf will never show?
+          // Decides whether the squash path needs the commit path's pending overrides.
+          if (ENABLE_CF_DEBUG_PRINTF) {
+            when (rob_val(i) && io.cf_debug_rob_enable &&
+                  (sprob_infl_pending(i) || ic_pending_valid(i) || wb_infl_pending(i))) {
+              printf("[A6PROBE] kill-with-pending pc=0x%x oc=%d sprob=%d ic=%d wb=%d wb_valid=%d s_acc=%d s_prop=%d s_tx=%d\n",
+                rob_uop(i).debug_pc, rob_uop(i).cf_op_count_id,
+                sprob_infl_pending(i), ic_pending_valid(i), wb_infl_pending(i),
+                PopCount(VecInit(wb_infl_list(i).map(_.valid))),
+                rob_uop(i).cf_secret_access, rob_uop(i).cf_secret_propagation,
+                rob_uop(i).cf_secret_transmission)
+            }
+          }
           // corefuzzing: clear pending influencer bits so the drain doesn't
           // write to a slot that has been freed and potentially reallocated.
           sprob_infl_pending(i) := false.B
