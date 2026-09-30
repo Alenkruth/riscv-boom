@@ -124,12 +124,19 @@ class FDivSqrtUnit(implicit p: Parameters)
     r_buffer_req.uop.br_mask := GetNewBrMask(io.brupdate, io.req.bits.uop)
     // IFT LUT optimization: zero cf_* fields not read by FDivSqrtUnit or by ROB
     // wb_resps merge handler. Same field set as PipelinedFunctionalUnit (Change 2).
-    r_buffer_req.uop.cf_domain_id               := 0.U
+    // [A3 2026-09-10] identity preserved on IFT builds -- same reason as
+    // functional-unit.scala; an FP-divide result reaching the ROB anonymous
+    // makes any edge keyed on domain/op_count name the wrong op.
+    if (!ENABLE_IFT) {
+      r_buffer_req.uop.cf_domain_id               := 0.U
+      r_buffer_req.uop.cf_op_count_id              := 0.U
+    }
     r_buffer_req.uop.cf_speculated               := false.B
-    r_buffer_req.uop.cf_op_count_id              := 0.U
     r_buffer_req.uop.cf_single_step              := false.B
     r_buffer_req.uop.cf_src_tainted              := false.B
     r_buffer_req.uop.cf_spec_branch_is_atk       := false.B
+    r_buffer_req.uop.cf_atk_branch_ctr       := 0.U
+    r_buffer_req.uop.cf_sec_branch_ctr       := 0.U
     r_buffer_req.uop.cf_spec_branch_op_id        := 0.U
     r_buffer_req.uop.cf_spec_branch_is_secret    := false.B
     r_buffer_req.uop.cf_cntd_valid               := false.B
@@ -193,12 +200,19 @@ class FDivSqrtUnit(implicit p: Parameters)
     r_divsqrt_uop.br_mask := GetNewBrMask(io.brupdate, r_buffer_req.uop)
     // IFT LUT optimization: explicit zero (Vivado would also propagate from
     // r_buffer_req.uop's already-zero cf_* fields, but be explicit).
-    r_divsqrt_uop.cf_domain_id               := 0.U
+    // [A3 2026-09-10] identity preserved on IFT builds -- same reason as
+    // functional-unit.scala; an FP-divide result reaching the ROB anonymous
+    // makes any edge keyed on domain/op_count name the wrong op.
+    if (!ENABLE_IFT) {
+      r_divsqrt_uop.cf_domain_id               := 0.U
+      r_divsqrt_uop.cf_op_count_id              := 0.U
+    }
     r_divsqrt_uop.cf_speculated               := false.B
-    r_divsqrt_uop.cf_op_count_id              := 0.U
     r_divsqrt_uop.cf_single_step              := false.B
     r_divsqrt_uop.cf_src_tainted              := false.B
     r_divsqrt_uop.cf_spec_branch_is_atk       := false.B
+    r_divsqrt_uop.cf_atk_branch_ctr       := 0.U
+    r_divsqrt_uop.cf_sec_branch_ctr       := 0.U
     r_divsqrt_uop.cf_spec_branch_op_id        := 0.U
     r_divsqrt_uop.cf_spec_branch_is_secret    := false.B
     r_divsqrt_uop.cf_cntd_valid               := false.B
@@ -230,12 +244,19 @@ class FDivSqrtUnit(implicit p: Parameters)
     r_out_uop := r_divsqrt_uop
     r_out_uop.br_mask := GetNewBrMask(io.brupdate, r_divsqrt_uop)
     // IFT LUT optimization: explicit zero (chained from r_divsqrt_uop above).
-    r_out_uop.cf_domain_id               := 0.U
+    // [A3 2026-09-10] identity preserved on IFT builds -- same reason as
+    // functional-unit.scala; an FP-divide result reaching the ROB anonymous
+    // makes any edge keyed on domain/op_count name the wrong op.
+    if (!ENABLE_IFT) {
+      r_out_uop.cf_domain_id               := 0.U
+      r_out_uop.cf_op_count_id              := 0.U
+    }
     r_out_uop.cf_speculated               := false.B
-    r_out_uop.cf_op_count_id              := 0.U
     r_out_uop.cf_single_step              := false.B
     r_out_uop.cf_src_tainted              := false.B
     r_out_uop.cf_spec_branch_is_atk       := false.B
+    r_out_uop.cf_atk_branch_ctr       := 0.U
+    r_out_uop.cf_sec_branch_ctr       := 0.U
     r_out_uop.cf_spec_branch_op_id        := 0.U
     r_out_uop.cf_spec_branch_is_secret    := false.B
     r_out_uop.cf_cntd_valid               := false.B
