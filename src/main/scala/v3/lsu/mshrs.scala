@@ -73,6 +73,10 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     val prober_state = Input(Valid(UInt(coreMaxAddrBits.W)))
     // [reconf-fix 2026-08-12] active set mask, for PHYSICAL-row comparisons
     val dcache_set_mask = Input(UInt(idxBits.W))
+    // [D1FIXA] dcache.scala cf_pend_hold (a flop): a deferred IFT metadata write is pending.
+    // Holds this MSHR's refill beats (s_commit_line) and meta writes (s_meta_clear,
+    // s_meta_write_req).  Constant false with IFT off.
+    val cf_ift_hold = Input(Bool())
 
     val refill      = Decoupled(new L1DataWriteReq)
 
@@ -111,6 +115,11 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     val cf_req_op_count = Output(UInt(uopIDCounterWidthCF.W))
     val cf_req_pc12     = Output(UInt(inflPcBitsCF.W))   // [PCPROV] filler PC[13:2] (wire off req.uop)
     val cf_req_secret   = Output(Bool())
+    // [RESID] step 15: the line this MSHR fills was requested at a secret-derived ADDRESS by the
+    // primary or by any merged secondary; PC[13:2] of the first such request.
+    val cf_req_addr_sec = Output(Bool())
+    val cf_req_addr_atk = Output(Bool())   // [ATKRES] attacker-address line mark
+    val cf_req_res_pc   = Output(UInt(inflPcBitsCF.W))
   })
 
   // TODO: Optimize this. We don't want to mess with cache during speculation
@@ -143,10 +152,27 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     new_coh.onSecondaryAccess(req.uop.mem_cmd, io.req.uop.mem_cmd)
 
   val (_, _, refill_done, refill_address_inc) = edge.addr_inc(io.mem_grant)
+  // [G9LIVE] patch 50: forward progress for the [G9STMETA] store-replay bubble (s_drain_rpq).
+  // With the bubble, s_drain_rpq replays at most one store per 2 cycles, and the LSU gets the
+  // D$ port in every bubble cycle, so a tight store loop to the missed line put one new
+  // secondary store into the rpq per bubble: the rpq never emptied, the MSHR never left
+  // s_drain_rpq, GrantAck was never sent and probe_rdy stayed 0 (an L2 probe of the line, e.g.
+  // a TSI Get of tohost, starved forever; FPGA IFT bitstream, rv64ui-p-simple).  IFT builds
+  // therefore refuse NEW secondaries while draining, exactly as upstream already does from
+  // s_meta_write_req on: the request is nacked (s2_nack_miss), the LSU retries it, and block_hit
+  // keeps it from hitting until the MSHR is s_invalid.  The drain is then bounded by the rpq
+  // contents at entry (<= nRPQ entries, <= 2*nRPQ cycles).  The bubble itself, probe_rdy and the
+  // prober/writeback interlocks are unchanged.  Timing: `state` is a 5-bit flop and the state
+  // term stays one 5-input function of it, so 0 added levels on sec_rdy -> io.req.ready ->
+  // s2_nack.  IFT off (no bubble) elaborates the original expression.
   val sec_rdy = (!cmd_requires_second_acquire && !io.req_is_probe &&
-                 !state.isOneOf(s_invalid, s_meta_write_req, s_mem_finish_1, s_mem_finish_2))// Always accept secondary misses
+                 !state.isOneOf(s_invalid, s_meta_write_req, s_mem_finish_1, s_mem_finish_2) &&
+                 (if (ENABLE_IFT) state =/= s_drain_rpq else true.B))// Always accept secondary misses
 
-  val rpq = Module(new BranchKillableQueue(new BoomDCacheReqInternal, cfg.nRPQ, u => u.uses_ldq, false))
+  // [AREA35] patch 35 (D): the 16-entry replay queue keeps its IFT uop fields in LUTRAM
+  // (8 MSHRs x 16 entries; see BranchKillableQueue iftInRam).  Not on W: rpq.io.deq feeds
+  // io.replay (D$ s0 -> registered s1), and sec_rdy reads only rpq.io.enq.ready (pointers).
+  val rpq = Module(new BranchKillableQueue(new BoomDCacheReqInternal, cfg.nRPQ, u => u.uses_ldq, false, iftInRam = true))
   rpq.io.brupdate := io.brupdate
   rpq.io.flush  := io.exception
   assert(!(state === s_invalid && !rpq.io.empty))
@@ -178,21 +204,30 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   // The uncached path (:576, `io.resp.bits.uop := req.uop`) never passes through the rpq and
   // is unaffected.  If lsu.scala:2092 ever stops basing the merge on the LDQ entry, this
   // zeroing becomes a live attacker-taint bug -- that line is the load-bearing one.
-  rpq.io.enq.bits.uop.cf_speculated               := false.B
-  rpq.io.enq.bits.uop.cf_op_count_id              := 0.U
-  rpq.io.enq.bits.uop.cf_single_step              := false.B
-  rpq.io.enq.bits.uop.cf_src_tainted              := false.B
-  rpq.io.enq.bits.uop.cf_spec_branch_is_atk       := false.B
-  rpq.io.enq.bits.uop.cf_atk_branch_ctr       := 0.U
-  rpq.io.enq.bits.uop.cf_sec_branch_ctr       := 0.U
-  rpq.io.enq.bits.uop.cf_spec_branch_op_id        := 0.U
-  rpq.io.enq.bits.uop.cf_spec_branch_is_secret    := false.B
-  rpq.io.enq.bits.uop.cf_cntd_valid               := false.B
-  rpq.io.enq.bits.uop.cf_cntd_winner_op           := 0.U
-  rpq.io.enq.bits.uop.cf_cntd_winner_atk          := false.B
-  rpq.io.enq.bits.uop.cf_cntd_winner_sec          := false.B
-  rpq.io.enq.bits.uop.cf_cntd_deny_count          := 0.U
-  rpq.io.enq.bits.uop.cf_domain_id                := 0.U
+  rpq.io.enq.bits.uop.cf_op_count_id.foreach(_ := 0.U)
+  rpq.io.enq.bits.uop.cf_spec_branch_is_secret.foreach(_ := false.B)
+  // [RDDOM] step 19: the rpq keeps ONE bit of the reader's domain (iftTagWidth = 1; any wider
+  // bits stay constant 0 and fold).  It is read only by the attacker-address edge gate below and
+  // is zeroed again on the resp/replay uop, so everything downstream still sees domain 0.
+  // [R124GATE] patch 26 (r151): IFT off keeps the pre-step-19 constant 0 (no rpq domain bit).
+  rpq.io.enq.bits.uop.cf_domain_id.foreach(_ := (if (ENABLE_IFT) (io.req.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U).asUInt
+                                                      else 0.U))
+  // [RESID] step 15: the residency bits are per-MSHR (req + the regs below), never per rpq entry.
+  // Constant inputs: firtool folds the rpq storage for them away (same idiom as above).
+  rpq.io.enq.bits.cf_addr_sec.foreach(_ := false.B)
+  rpq.io.enq.bits.cf_addr_atk.foreach(_ := false.B)   // [ATKRES] per-MSHR, like cf_addr_sec
+  rpq.io.enq.bits.cf_res_v.foreach(_ := false.B)
+  rpq.io.enq.bits.cf_res_pc.foreach(_ := 0.U)
+  rpq.io.enq.bits.cf_res_atk.foreach(_ := false.B)   // [ATKEVICT] per-MSHR too
+  rpq.io.enq.bits.cf_res_esec.foreach(_ := false.B)
+  // [G9STMETA] (ruling 101, G-9) the store replay writes D$ store metadata, whose attacker
+  // bit is `domain || cf_attacker_influence` on the hit path.  The domain is zeroed above, so
+  // fold it into the (kept) attacker bit for STORES only: one LUT, no extra rpq bit.  The
+  // replayed store's response uop is never read for taint (the LSU uses the STQ uop).
+  if (ENABLE_IFT) {
+    rpq.io.enq.bits.uop.cf_attacker_influence.foreach(_ := io.req.uop.cf_attacker_influence.getOrElse(false.B) ||
+      (isWrite(io.req.uop.mem_cmd) && io.req.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U))
+  }
   rpq.io.deq.ready := false.B
 
 
@@ -210,9 +245,10 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   // [reconf-fix] strict idle for the config-commit gate (see io declaration).
   io.state_invalid := state === s_invalid
   // corefuzzing: expose stored request domain for fill-completion tracking in dcache
-  io.cf_req_domain   := req.uop.cf_domain_id
-  io.cf_req_op_count := req.uop.cf_op_count_id
-  io.cf_req_pc12     := req.uop.debug_pc(inflPcBitsCF + 1, 2)   // [PCPROV]
+  io.cf_req_domain   := req.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W))
+  io.cf_req_op_count := req.uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
+  // [R124GATE] patch 26: IFT off drives 0, so nothing reads req.uop.debug_pc (40 FF per MSHR).
+  io.cf_req_pc12     := (if (ENABLE_IFT) req.uop.debug_pc(inflPcBitsCF + 1, 2) else 0.U)   // [PCPROV]
   // [SECFIX 2026-09-07] The refill blankets this bit across ALL 8 DWs of the line
   // (dcache.scala Fill(CF_SUBLINE, ...)), so it must describe the DATA, not the
   // REQUESTER.  cf_secret_access = the TLB says this ADDRESS is in the secret range,
@@ -223,7 +259,75 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   // inherited it.  MEASURED: with the cf_mem_sec_dataflow merge enabled that drove
   // s_prop 50 -> 144,332 on spectre-v1.  The per-DW masks were never the problem --
   // the store path honours them; this refill path threw them away.
-  io.cf_req_secret   := req.uop.cf_secret_access
+  io.cf_req_secret   := req.uop.cf_secret_access.getOrElse(false.B)
+  // [RESID] step 15 (residue audit rows 2/3/5/13).  The primary's own bits live in `req`
+  // (req := io.req at allocation): req.cf_addr_sec = the primary's address is secret-derived,
+  // req.cf_res_v/pc = the D$ found the primary's tag in the per-set eviction filter (this line
+  // was evicted by a secret-chosen eviction).  A merged secondary with a secret address is
+  // recorded in cf_sec_asec/pc (first one wins).  cf_first_rp = the next rpq dequeue is the
+  // primary itself (the rpq is FIFO and the primary is enqueued first unless it is a prefetch,
+  // whose cf_addr_sec is 0).
+  // [R124GATE] patch 26 (ruling 124): these five are flops only with ENABLE_IFT; IFT off they
+  // are constant-0 wires (writes gated below) and the four cf_req_* outputs are 0.
+  val cf_sec_asec    = if (ENABLE_IFT) RegInit(false.B) else WireInit(false.B)
+  val cf_sec_asec_pc = if (ENABLE_IFT) Reg(UInt(inflPcBitsCF.W)) else WireInit(0.U(inflPcBitsCF.W))
+  val cf_first_rp    = if (ENABLE_IFT) RegInit(false.B) else WireInit(false.B)
+  val cf_pri_pc12    = req.uop.debug_pc(inflPcBitsCF + 1, 2)
+  // [ATKRES] step 17 (owner ruling 119 (3)): the attacker-address twin of cf_sec_asec.
+  val cf_sec_aatk    = if (ENABLE_IFT) RegInit(false.B) else WireInit(false.B)
+  val cf_sec_aatk_pc = if (ENABLE_IFT) Reg(UInt(inflPcBitsCF.W)) else WireInit(0.U(inflPcBitsCF.W))
+  if (ENABLE_IFT) {
+    io.cf_req_addr_sec := req.cf_addr_sec.get || cf_sec_asec
+    io.cf_req_addr_atk := req.cf_addr_atk.get || cf_sec_aatk
+    // the mark's PC: the secret cause first, else the attacker-address access
+    io.cf_req_res_pc   := Mux(req.cf_addr_sec.get, cf_pri_pc12, Mux(cf_sec_asec, cf_sec_asec_pc,
+                          Mux(req.cf_addr_atk.get, cf_pri_pc12, cf_sec_aatk_pc)))
+  } else {
+    io.cf_req_addr_sec := false.B
+    io.cf_req_addr_atk := false.B
+    io.cf_req_res_pc   := 0.U
+  }
+  // Edge on a dequeued request's response: the line was secret-evicted (every request, the
+  // primary included), or the primary's secret-address miss brought the line in (every request
+  // but the primary itself -- its own latency is not influenced by its own address).
+  // [ATKRES] ...or the primary's ATTACKER-address miss brought it in: {atk=1, sec=0} edge.
+  val cf_rp_asec_e = req.cf_addr_sec.getOrElse(false.B) && !cf_first_rp
+  // [RDDOM] step 19 (side finding, p3-postapply-markers): like the hit path (dcache ratk_fire,
+  // uop_dom === 0), the attacker-address edge goes to VICTIM (domain 0) readers only.  The
+  // reader is the dequeued rpq entry; one AND on the rpq output bit (nRPQ x 1 flop of storage).
+  val cf_rp_rd_atk = rpq.io.deq.bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W))(0)
+  val cf_rp_aatk_e = req.cf_addr_atk.getOrElse(false.B) && !cf_first_rp && !cf_rp_rd_atk
+  // [NACKATK] patch 44 (r111 extended, r173 (3)): an attacker-only nack edge {atk=1, sec=0} of the
+  // primary (a victim load nacked behind an attacker-influenced MSHR, then missed) arrives as
+  // req {cf_res_v=0, cf_res_atk=1} (dcache.scala [NACKATK]; cf_res_atk was unused with cf_res_v=0).
+  // It goes on every response to a VICTIM reader of this MSHR (the primary included; attacker
+  // readers excluded as for cf_rp_aatk_e) as {atk=1}; when a residency edge of this MSHR also fires
+  // (asec_e / aatk_e) that edge keeps its PC (the primary's) and gains atk=1, and sec stays asec_e
+  // (secret-first, one edge).  With cf_rp_nk = 0 every output below is unchanged.
+  val cf_rp_nk     = !req.cf_res_v.getOrElse(false.B) && req.cf_res_atk.getOrElse(false.B) && !cf_rp_rd_atk
+  val cf_rp_res_v  = req.cf_res_v.getOrElse(false.B) || cf_rp_asec_e || cf_rp_aatk_e || cf_rp_nk
+  val cf_rp_res_pc = Mux(req.cf_res_v.getOrElse(false.B) || (cf_rp_nk && !cf_rp_asec_e && !cf_rp_aatk_e),
+                         req.cf_res_pc.getOrElse(0.U), cf_pri_pc12)
+  val cf_rp_res_atk  = Mux(req.cf_res_v.getOrElse(false.B), req.cf_res_atk.getOrElse(false.B),  !cf_rp_asec_e || cf_rp_nk)
+  // !cf_res_v: sec = !atk || esec = asec_e both with and without cf_rp_nk (was esec = 0, same sec)
+  val cf_rp_res_esec = Mux(req.cf_res_v.getOrElse(false.B), req.cf_res_esec.getOrElse(false.B), cf_rp_asec_e)
+  if (ENABLE_IFT) { when (rpq.io.deq.fire) { cf_first_rp := false.B } }   // [R124GATE]
+  // [SECDEST] step 17 (owner ruling 116 A(2)), miss path: the line this MSHR fills is marked by
+  // a secret-ADDRESS access (the same bit the meta write puts in ift_res_meta), so every value
+  // read out of it is secret.  Set on the dequeued request's uop flag cf_mem_sec_dataflow
+  // (line-buffer response and replay below); the D$/LSU/core then treat it like any other
+  // D$-metadata secret value (preg secret + s_prop).  The primary's own value is A(1) anyway.
+  // [VSECEV] step 17 (owner ruling 119 (2)): also a miss on a tag a SECRET-chosen eviction
+  // removed (the D$ set req.uop.cf_mem_sec_dataflow from the eviction filter's s bit).
+  val cf_rp_vsec   = io.cf_req_addr_sec || req.uop.cf_mem_sec_dataflow.getOrElse(false.B)
+  // [ATKEVICT] step 17 (owner extension of ruling 116 C), miss path: the primary missed on a tag
+  // that an attacker-domain allocation evicted (the D$ set req.uop.cf_mem_dataflow_atk from the
+  // eviction filter, victim readers only).  Every value drained from this MSHR carries the
+  // attacker taint, as every response already carries the edge (cf_rp_res_*).
+  // [ATKRES] ...and a line marked by an attacker-ADDRESS access (ruling 119 (3)).  The rpq
+  // zeroes the reader's domain, so attacker-domain readers get it too (their values are
+  // attacker-tainted by the domain seed anyway).
+  val cf_rp_vatk   = req.uop.cf_mem_dataflow_atk.getOrElse(false.B) || io.cf_req_addr_atk
   io.idx.valid := state =/= s_invalid
   io.tag.valid := state =/= s_invalid
   io.way.valid := !state.isOneOf(s_invalid, s_prefetch)
@@ -233,6 +337,16 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
 
   io.meta_write.valid    := false.B
   io.meta_write.bits     := DontCare
+  // [D1FIXA] (dcache.scala, D1 fix A) while the D$ holds a deferred ift_store_meta /
+  // ift_res_meta write, no refill beat and no meta write may fire: a new first-beat clear or fill
+  // mark would need a second pending entry, and the MSHR whose clear is pending must not reach
+  // s_drain_rpq (replays) or s_meta_write_req before that clear lands.  Holding EVERY beat, not
+  // only the first, also holds the s_commit_line -> s_drain_rpq step (it fires on the last beat)
+  // and keeps the gate a single flop input: lb_read.valid / meta_write.valid become one LUT of
+  // (state, cf_ift_hold) = 6 inputs, as deep as the 5-bit state decode they replace.  Typical
+  // hold: 1 cycle (the next cycle without a lane write on that way); bound 16 + 2 cycles plus the
+  // bounded replay drain (dcache.scala cf_pend_starve).
+  val cf_hold = if (ENABLE_IFT) io.cf_ift_hold else false.B
   io.req_pri_rdy         := false.B
   io.req_sec_rdy         := sec_rdy && rpq.io.enq.ready
   io.mem_acquire.valid   := false.B
@@ -241,10 +355,17 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   io.refill.bits         := DontCare
   io.replay.valid        := false.B
   io.replay.bits         := DontCare
+  // [G9STMETA] a store replay fired last cycle (see s_drain_rpq)
+  val cf_st_replay_last = RegNext(io.replay.fire && isWrite(io.replay.bits.uop.mem_cmd), false.B)
   io.wb_req.valid        := false.B
   io.wb_req.bits         := DontCare
   io.resp.valid          := false.B
   io.resp.bits           := DontCare
+  io.resp.bits.edges     := 0.U.asTypeOf(new IftEdgeList)   // Task 3.2 (D16): a refill response has no D$ edge
+  io.resp.bits.cf_res_v.foreach(_ := false.B)
+  io.resp.bits.cf_res_pc.foreach(_ := 0.U)
+  io.resp.bits.cf_res_atk.foreach(_ := false.B)   // [ATKEVICT]
+  io.resp.bits.cf_res_esec.foreach(_ := false.B)
   io.commit_val          := false.B
   io.commit_addr         := req.addr
   io.commit_coh          := coh_on_grant
@@ -287,12 +408,23 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     // Convention follows dcache.scala:1511, whose comment notes the gate is what lets
     // FIRRTL DCE remove the machinery rather than relying on it to prove them dead.
     if (ENABLE_IFT) {
-      val cf_sec_req_tainted = io.req.uop.cf_domain_id.orR || io.req.uop.cf_secret_access
-      val cf_pri_untainted   = !req.uop.cf_domain_id.orR && !req.uop.cf_secret_access
-      req.uop.cf_domain_id     := req.uop.cf_domain_id | io.req.uop.cf_domain_id
-      req.uop.cf_secret_access := req.uop.cf_secret_access || io.req.uop.cf_secret_access
+      val cf_sec_req_tainted = io.req.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)).orR || io.req.uop.cf_secret_access.getOrElse(false.B)
+      val cf_pri_untainted   = !req.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)).orR && !req.uop.cf_secret_access.getOrElse(false.B)
+      req.uop.cf_domain_id.foreach(_ := req.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) | io.req.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)))
+      req.uop.cf_secret_access.foreach(_ := req.uop.cf_secret_access.getOrElse(false.B) || io.req.uop.cf_secret_access.getOrElse(false.B))
       when (cf_sec_req_tainted && cf_pri_untainted) {
-        req.uop.cf_op_count_id := io.req.uop.cf_op_count_id
+        req.uop.cf_op_count_id.foreach(_ := io.req.uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)))
+      }
+      // [RESID] a secondary at a secret-derived address also makes this line's residency secret.
+      // [R124GATE] these cf_sec_asec/aatk(_pc) writes are inside the G2 `if (ENABLE_IFT)` above, so
+      // IFT off nothing drives the constant wires (no self-referencing when, no comb loop).
+      when (io.req.cf_addr_sec.getOrElse(false.B) && !cf_sec_asec) {
+        cf_sec_asec    := true.B
+        cf_sec_asec_pc := io.req.uop.debug_pc(inflPcBitsCF + 1, 2)
+      }
+      when (io.req.cf_addr_atk.getOrElse(false.B) && !cf_sec_aatk) {   // [ATKRES]
+        cf_sec_aatk    := true.B
+        cf_sec_aatk_pc := io.req.uop.debug_pc(inflPcBitsCF + 1, 2)
       }
     }
   }
@@ -326,6 +458,11 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
         // [CFNOISE-COMMENTED] isRead(io.req.uop.mem_cmd), isWrite(io.req.uop.mem_cmd))
     }
     req := io.req
+    if (ENABLE_IFT) {   // [R124GATE]
+      cf_sec_asec := false.B   // [RESID]
+      cf_sec_aatk := false.B   // [ATKRES]
+      cf_first_rp := !isPrefetch(io.req.uop.mem_cmd)
+    }
     val old_coh   = io.req.old_meta.coh
     req_needs_wb := old_coh.onCacheControl(M_FLUSH)._1 // does the line we are evicting need to be written back
     when (io.req.tag_match) {
@@ -410,6 +547,15 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     io.resp.bits.uop  := rpq.io.deq.bits.uop
     io.resp.bits.data := loadgen.data
     io.resp.bits.is_hella := rpq.io.deq.bits.is_hella
+    if (ENABLE_IFT) {   // [R124GATE] IFT off: the rpq uop's own bits, as before step 17
+      io.resp.bits.uop.cf_mem_sec_dataflow.foreach(_ := rpq.io.deq.bits.uop.cf_mem_sec_dataflow.getOrElse(false.B) || cf_rp_vsec)   // [SECDEST]
+      io.resp.bits.uop.cf_mem_dataflow_atk.foreach(_ := rpq.io.deq.bits.uop.cf_mem_dataflow_atk.getOrElse(false.B) || cf_rp_vatk)   // [ATKEVICT]
+    }
+    io.resp.bits.uop.cf_domain_id.foreach(_ := 0.U)   // [RDDOM] unchanged downstream (LSU uses the LDQ uop)
+    io.resp.bits.cf_res_atk.foreach(_ := cf_rp_res_atk)   // [ATKEVICT]/[ATKRES] edge flags (per-MSHR)
+    io.resp.bits.cf_res_esec.foreach(_ := cf_rp_res_esec)
+    io.resp.bits.cf_res_v.foreach(_ := cf_rp_res_v)   // [RESID] line-buffer (miss) response edge
+    io.resp.bits.cf_res_pc.foreach(_ := cf_rp_res_pc)
     when (rpq.io.deq.fire) {
       commit_line   := true.B
     }
@@ -440,7 +586,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     state := Mux(!io.meta_resp.valid, s_meta_read, // Prober could have nack'd this read
              Mux(needs_wb, s_meta_clear, s_commit_line))
   } .elsewhen (state === s_meta_clear) {
-    io.meta_write.valid         := true.B
+    io.meta_write.valid         := !cf_hold   // [D1FIXA]
     io.meta_write.bits.idx      := req_idx
     io.meta_write.bits.data.coh := coh_on_clear
     io.meta_write.bits.data.tag := req_tag
@@ -469,7 +615,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
       state := s_commit_line
     }
   } .elsewhen (state === s_commit_line) {
-    io.lb_read.valid       := true.B
+    io.lb_read.valid       := !cf_hold   // [D1FIXA] refill.valid = lb_read.fire
     io.lb_read.bits.id     := io.id
     io.lb_read.bits.offset := refill_ctr
 
@@ -486,7 +632,26 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     }
   } .elsewhen (state === s_drain_rpq) {
     io.replay <> rpq.io.deq
+    // [G9STMETA] (ruling 101) one bubble between two store replays of this MSHR.  A store
+    // replay's metadata read-modify-write reads in s1 and writes in s2; a second store replay
+    // to the same line one cycle later would read the SyncReadMem in the write cycle (old
+    // data) and overwrite the first store's doubleword bit.  Store replays only follow a miss,
+    // so the cost is one cycle per extra store to the missed line.
+    if (ENABLE_IFT) {
+      val st_rp_stall = cf_st_replay_last && isWrite(rpq.io.deq.bits.uop.mem_cmd)
+      io.replay.valid  := rpq.io.deq.valid && !st_rp_stall
+      rpq.io.deq.ready := io.replay.ready && !st_rp_stall
+    }
     io.replay.bits.way_en    := req.way_en
+    if (ENABLE_IFT) {   // [R124GATE] IFT off: the rpq uop's own bits, as before step 17
+      io.replay.bits.uop.cf_mem_sec_dataflow.foreach(_ := rpq.io.deq.bits.uop.cf_mem_sec_dataflow.getOrElse(false.B) || cf_rp_vsec)   // [SECDEST]
+      io.replay.bits.uop.cf_mem_dataflow_atk.foreach(_ := rpq.io.deq.bits.uop.cf_mem_dataflow_atk.getOrElse(false.B) || cf_rp_vatk)   // [ATKEVICT]
+    }
+    io.replay.bits.uop.cf_domain_id.foreach(_ := 0.U)   // [RDDOM] replays keep domain 0 in the D$ s2 checks
+    io.replay.bits.cf_res_atk.foreach(_ := cf_rp_res_atk)   // [ATKEVICT]/[ATKRES]
+    io.replay.bits.cf_res_esec.foreach(_ := cf_rp_res_esec)
+    io.replay.bits.cf_res_v.foreach(_ := cf_rp_res_v)   // [RESID] replay (t_replay) response edge
+    io.replay.bits.cf_res_pc.foreach(_ := cf_rp_res_pc)
     io.replay.bits.addr := Cat(req_tag, req_idx(cfIdxLowBits-1, 0), rpq.io.deq.bits.addr(blockOffBits-1,0))
     when (io.replay.fire && isWrite(rpq.io.deq.bits.uop.mem_cmd)) {
       // Set dirty bit
@@ -498,7 +663,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
       state := s_meta_write_req
     }
   } .elsewhen (state === s_meta_write_req) {
-    io.meta_write.valid         := true.B
+    io.meta_write.valid         := !cf_hold   // [D1FIXA]
     io.meta_write.bits.idx      := req_idx
     io.meta_write.bits.data.coh := new_coh
     io.meta_write.bits.data.tag := req_tag
@@ -599,6 +764,11 @@ class BoomIOMSHR(id: Int)(implicit edge: TLEdgeOut, p: Parameters) extends BoomM
   io.resp.bits.is_hella := req.is_hella
   io.resp.bits.uop  := req.uop
   io.resp.bits.data := loadgen.data
+  io.resp.bits.edges := 0.U.asTypeOf(new IftEdgeList)   // Task 3.2 (D16): an uncached response has no D$ edge
+  io.resp.bits.cf_res_v.foreach(_ := false.B)   // [RESID]
+  io.resp.bits.cf_res_pc.foreach(_ := 0.U)
+  io.resp.bits.cf_res_atk.foreach(_ := false.B)   // [ATKEVICT]
+  io.resp.bits.cf_res_esec.foreach(_ := false.B)
 
   when (io.req.fire) {
     req   := io.req.bits
@@ -657,6 +827,10 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     val req_is_probe = Input(Vec(memWidth, Bool()))
     val resp = Decoupled(new BoomDCacheResp)
     val secondary_miss = Output(Vec(memWidth, Bool()))
+    // [RESID] step 15 / [PRIALLOC] patch 32: req(w) fired AND allocated a PRIMARY cacheable MSHR
+    // (fire && cacheable && !idx_match).  A secondary merges and evicts nothing; an uncacheable
+    // request goes to an IOMSHR and touches no line.  Was cf_req_idx_match (fire && !it).
+    val cf_req_alloc = Output(Vec(memWidth, Bool()))
     val block_hit = Output(Vec(memWidth, Bool()))
 
     val brupdate       = Input(new BrUpdateInfo)
@@ -693,11 +867,6 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     // staged D$ geometry change (IOMSHRs excluded: they never touch the cache arrays).
     val cache_idle = Output(Bool())
     val probe_rdy = Output(Bool())
-    // corefuzzing: union of way_en bits of all active MSHRs (one-hot per way).
-    // Used by the dcache to avoid assigning two concurrent misses to the same way,
-    // which would cause the second MSHR's refill to overwrite the first, making the
-    // first MSHR's subsequent replay miss and trigger assert(!(s2_type===t_replay && !s2_hit)).
-    val pending_way_mask = Output(UInt(nWays.W))
     // [reconf-fix 2026-08-12] Active set mask (cf_dcache_active_sets-1), driven by the
     // dcache.  The per-set exclusion below MUST compare the PHYSICAL row a line occupies,
     // not the full untagged index: refills write `idx & dcache_set_mask` (dcache.scala
@@ -706,6 +875,19 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     // different sets.  Both then allocate, both refill the same row, and one line's tag
     // ends up over the other's data -- a silent wrong-data hit.
     val dcache_set_mask = Input(UInt(idxBits.W))
+    // [D1FIXA] dcache.scala cf_pend_hold, to every cacheable MSHR (see BoomMSHR.io.cf_ift_hold)
+    val cf_ift_hold = Input(Bool())
+    // [NACKRES 2026-10-13, series-r step 16, owner ruling 111] registered: some valid MSHR
+    // holds a secret-ADDRESS miss (primary req.cf_addr_sec or a merged secondary's), with the
+    // PC[13:2] of that access (lowest MSHR wins).  The LSU tags a load the D$ nacks while
+    // this is set (ldq cf_nack_res).  The WB unit drains the line such an MSHR evicts while
+    // the MSHR is still valid, so WB occupancy is covered by the same OR.
+    val cf_asec_busy = Output(Valid(UInt(inflPcBitsCF.W)))
+    // [NACKATK] patch 44 (r111 extended, owner r173 (3)): registered: some valid MSHR holds an
+    // ATTACKER-INFLUENCED request (primary attacker domain, or an attacker-tainted address of the
+    // primary or a merged secondary: cf_req_addr_atk).  Its PC rides on cf_asec_busy.bits, which
+    // is now the PC of the nack's blocking access, secret-first.  IFT only.
+    val cf_aatk_busy = if (ENABLE_IFT) Some(Output(Bool())) else None
     // corefuzzing: fill-completion event — fires when an MSHR meta_write completes
     val cf_meta_write_fill = Output(Valid(new Bundle {
       val idx      = UInt(idxBits.W)
@@ -714,6 +896,9 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
       val op_count = UInt(uopIDCounterWidthCF.W)   // kept for the [FILL] printf only
       val pc12     = UInt(inflPcBitsCF.W)          // [PCPROV] what the line metadata stores
       val secret   = Bool()
+      val addr_sec = Bool()                        // [RESID] secret-address fill (ift_res_meta)
+      val addr_atk = Bool()                        // [ATKRES] attacker-address fill (ift_res_meta)
+      val res_pc   = UInt(inflPcBitsCF.W)          // [RESID] PC[13:2] of that access
       // [TAGPROBE 2026-09-09] the line's TAG.  Needed because every taint-field-based
       // test for "did this access miss?" is circular when the field under investigation
       // is the one being stripped: a fill whose op_count was lost cannot be matched to
@@ -812,6 +997,7 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     val mshr = Module(new BoomMSHR)
     mshr.io.id := i.U(log2Ceil(cfg.nMSHRs).W)
     mshr.io.dcache_set_mask := io.dcache_set_mask
+    mshr.io.cf_ift_hold     := io.cf_ift_hold   // [D1FIXA]
 
     for (w <- 0 until memWidth) {
       // [reconf-fix 2026-08-12] Mask BOTH sides to the active geometry so "same set"
@@ -895,9 +1081,16 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     mshr
   }
 
-  // corefuzzing: OR together way_en of all active MSHRs so the dcache can avoid
-  // picking the same replacement way for two concurrent misses to the same set.
-  io.pending_way_mask := mshrs.map(m => Mux(m.io.way.valid, m.io.way.bits, 0.U)).reduce(_ | _)
+  // [NOPENDOVR] patch 32: pending_way_mask (the global union of pending ways, which the D$ used
+  // to move a victim off any pending way) is gone.  Two MSHRs can only collide on a way if they
+  // own the same physical row, which pri_val's !idx_match (masked-row compare, reconf-fix
+  // 2026-08-12) forbids.  This simulation check states that invariant: no two live MSHRs share
+  // a masked row.  (s_prefetch holds the row too: idx.valid covers it.)
+  for (i <- 0 until cfg.nMSHRs; j <- i + 1 until cfg.nMSHRs) {
+    assert(!(mshrs(i).io.idx.valid && mshrs(j).io.idx.valid &&
+             (mshrs(i).io.idx.bits & io.dcache_set_mask) === (mshrs(j).io.idx.bits & io.dcache_set_mask)),
+           "D$ MSHR file: two live MSHRs own the same row")
+  }
 
   // [reconf-fix 2026-08-06] Strict all-idle for the D$ config-commit gate.
   // Compile-time gated: constant true when reconfiguration is not built, so the
@@ -927,6 +1120,35 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
                                            VecInit(mshrs.map(_.io.cf_req_pc12)))   // [PCPROV]
   io.cf_meta_write_fill.bits.secret   := Mux1H(UIntToOH(meta_write_arb.io.chosen),
                                            VecInit(mshrs.map(_.io.cf_req_secret)))
+  io.cf_meta_write_fill.bits.addr_sec := Mux1H(UIntToOH(meta_write_arb.io.chosen),
+                                           VecInit(mshrs.map(_.io.cf_req_addr_sec)))   // [RESID]
+  io.cf_meta_write_fill.bits.addr_atk := Mux1H(UIntToOH(meta_write_arb.io.chosen),
+                                           VecInit(mshrs.map(_.io.cf_req_addr_atk)))   // [ATKRES]
+  io.cf_meta_write_fill.bits.res_pc   := Mux1H(UIntToOH(meta_write_arb.io.chosen),
+                                           VecInit(mshrs.map(_.io.cf_req_res_pc)))
+  // [NACKRES] step 16: nMSHRs-input OR + priority PC select, registered (one cycle old).
+  // [NACKPF] DF-m55 (r140): a parked s_prefetch MSHR is not a miss in progress (it is allocatable,
+  // req_pri_rdy=1), so it must not hold cf_asec_busy; io.way.valid already excludes s_prefetch.
+  // Limitation: the one same-set different-tag nack a parked secret prefetch causes (in the cycle
+  // clear_prefetch releases it) gets no nack edge.
+  val cf_asec_live = mshrs.map(m => m.io.way.valid && m.io.cf_req_addr_sec)
+  io.cf_asec_busy.valid := RegNext(cf_asec_live.reduce(_ || _), false.B)
+  // [NACKATK] patch 44 (r111 extended, r173 (3)): the attacker twin of cf_asec_live (same
+  // way.valid gate, so a parked s_prefetch MSHR is excluded as in [NACKPF]).  The registered PC is
+  // shared: every secret MSHR ranks above every attacker MSHR (secret-first, lowest index within
+  // each), so .bits is unchanged whenever .valid is set; it carries the attacker MSHR's PC only
+  // when no secret MSHR is live.  The attacker MSHR's PC is its PRIMARY's PC[13:2] (cf_req_pc12,
+  // the access that holds the MSHR).  Registered, one cycle old, like cf_asec_busy.
+  if (ENABLE_IFT) {
+    val cf_aatk_live = mshrs.map(m => m.io.way.valid && (m.io.cf_req_domain(0) || m.io.cf_req_addr_atk))
+    io.cf_aatk_busy.get := RegNext(cf_aatk_live.reduce(_ || _), false.B)
+    io.cf_asec_busy.bits  := RegNext(PriorityMux(cf_asec_live ++ cf_aatk_live :+ true.B,
+                                                 mshrs.map(_.io.cf_req_res_pc) ++ mshrs.map(_.io.cf_req_pc12) :+
+                                                 0.U(inflPcBitsCF.W)))
+  } else {
+    io.cf_asec_busy.bits  := RegNext(PriorityMux(cf_asec_live :+ true.B,
+                                                 mshrs.map(_.io.cf_req_res_pc) :+ 0.U(inflPcBitsCF.W)))
+  }
 
   val mmio_alloc_arb = Module(new Arbiter(Bool(), nIOMSHRs))
 
@@ -972,6 +1194,9 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     io.req(w).ready      := (w.U === req_idx) &&
       Mux(!cacheable, mmio_rdy, sdq_rdy && Mux(idx_match(w), tag_match(w) && sec_rdy, pri_rdy))
     io.secondary_miss(w) := idx_match(w) && way_match(w) && !tag_match(w)
+    // [PRIALLOC] fire(w) implies w === req_idx, so `cacheable` (decoded from req = io.req(req_idx))
+    // is lane w's.  Ends only at the D$ replacement / ift_evf write ports, not on the W family.
+    io.cf_req_alloc(w)   := io.req(w).fire && cacheable && !idx_match(w)
     io.block_hit(w)      := idx_match(w) && tag_match(w)
   }
   io.refill         <> refill_arb.io.out
@@ -989,5 +1214,20 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
   prefetcher.io.mshr_avail    := RegNext(pri_rdy)
   prefetcher.io.req_val       := RegNext(commit_vals.reduce(_||_))
   prefetcher.io.req_addr      := RegNext(Mux1H(commit_vals, commit_addrs))
+  // [PFTAINT] step 17 (owner answer Q7): the triggering MSHR's domain, line mark and PC, muxed
+  // and registered exactly like req_addr (one-hot mux of nMSHRs, no new level on req_addr).
+  // [R124GATE] patch 26 (ruling 124): the four [PFTAINT] flops exist only with ENABLE_IFT.
+  if (ENABLE_IFT) {
+    prefetcher.io.req_dom     := RegNext(Mux1H(commit_vals, mshrs.map(_.io.cf_req_domain)))
+    prefetcher.io.req_asec    := RegNext(Mux1H(commit_vals, mshrs.map(_.io.cf_req_addr_sec)))
+    prefetcher.io.req_aatk    := RegNext(Mux1H(commit_vals, mshrs.map(_.io.cf_req_addr_atk)))   // [ATKRES]
+    prefetcher.io.req_pc12    := RegNext(Mux1H(commit_vals, mshrs.map(m =>
+                                   Mux(m.io.cf_req_addr_sec || m.io.cf_req_addr_atk, m.io.cf_req_res_pc, m.io.cf_req_pc12))))
+  } else {
+    prefetcher.io.req_dom     := 0.U
+    prefetcher.io.req_asec    := false.B
+    prefetcher.io.req_aatk    := false.B
+    prefetcher.io.req_pc12    := 0.U
+  }
   prefetcher.io.req_coh       := RegNext(Mux1H(commit_vals, commit_cohs))
 }

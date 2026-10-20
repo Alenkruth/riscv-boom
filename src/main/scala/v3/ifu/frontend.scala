@@ -40,13 +40,9 @@ class FrontendResp(implicit p: Parameters) extends BoomBundle()(p) {
   val fsrc = UInt(BSRC_SZ.W)
   val tsrc = UInt(BSRC_SZ.W)
   // corefuzzing: ICache line was last refilled by a different domain
-  val icache_domain_mismatch = Bool()
+  val icache_domain_mismatch = if (ENABLE_IFT) Some(Bool()) else None
   // corefuzzing: ICache line was last refilled during a secret-range fetch (same-domain case)
-  val icache_secret_mismatch = Bool()
-  // corefuzzing: ITLB entry was last filled by a different domain
-  val itlb_domain_mismatch = Bool()
-  // corefuzzing: ITLB entry was last filled during a secret instruction fetch
-  val itlb_secret_mismatch = Bool()
+  val icache_secret_mismatch = if (ENABLE_IFT) Some(Bool()) else None
 }
 
 class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
@@ -78,8 +74,8 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
   // is also the longest TAGE table history (tables: 2,4,8,16,16,32,64) -- past that the
   // bit cannot influence any prediction.  A new secret-dependent branch resets the
   // counter, re-extending the window.
-  val secret_tag = Bool()
-  val secret_ctr = UInt(log2Ceil(globalHistoryLength + 1).W)
+  val secret_tag = if (ENABLE_IFT) Some(Bool()) else None
+  val secret_ctr = if (ENABLE_IFT) Some(UInt(log2Ceil(globalHistoryLength + 1).W)) else None
 
   def histories(bank: Int) = {
     if (nBanks == 1) {
@@ -154,11 +150,13 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
     // branch sets the tag and restarts the window; the tag clears once the contributed
     // bit has aged past globalHistoryLength.
     val shifted = cfi_valid && cfi_is_br
-    val aged    = secret_ctr >= globalHistoryLength.U
-    new_history.secret_ctr := Mux(cfi_is_secret, 0.U,
-                              Mux(shifted && !aged, secret_ctr + 1.U, secret_ctr))
-    new_history.secret_tag := Mux(cfi_is_secret, true.B,
-                              Mux(aged, false.B, secret_tag))
+    // [R124GATE3] patch 28: secret_tag/secret_ctr exist only with ENABLE_IFT (IFT off the nodes
+    // below have no reader and are dropped; IFT on the same expressions in the same order).
+    val aged    = secret_ctr.getOrElse(0.U(7.W)) >= globalHistoryLength.U
+    new_history.secret_ctr.foreach(_ := Mux(cfi_is_secret, 0.U,
+                              Mux(shifted && !aged, secret_ctr.get + 1.U, secret_ctr.get)))
+    new_history.secret_tag.foreach(_ := Mux(cfi_is_secret, true.B,
+                              Mux(aged, false.B, secret_tag.get)))
 
     new_history.ras_idx := Mux(cfi_valid && cfi_is_call, WrapInc(ras_idx, rasActive),
                            Mux(cfi_valid && cfi_is_ret , WrapDec(ras_idx, rasActive), ras_idx))
@@ -288,27 +286,33 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
   val tsrc    = UInt(BSRC_SZ.W)
 
   // corefuzzing: domain mismatch flags for IFT influencer injection
-  val icache_domain_mismatch = Bool()  // ICache line last filled by different domain
-  val icache_secret_mismatch = Bool()  // ICache line last filled during secret-range fetch
-  val itlb_domain_mismatch   = Bool()  // ITLB entry last filled by different domain
-  val itlb_secret_mismatch   = Bool()  // ITLB entry last filled during secret instruction fetch
-  val ras_domain_mismatch    = Bool()  // RAS return addr pushed by different domain
-  val bpd_domain_mismatch    = Bool()  // TAGE entry last updated by different domain
-  val btb_domain_mismatch    = Bool()  // BTB entry last written by different domain
-  val btb_target_xdom        = Bool()  // BTB-predicted JALR target is cross-domain (branch-target-injection)
-  val cf_fetch_domain        = UInt(1.W) // domain of this fetch packet (for FTQ/bpdupdate)
+  val icache_domain_mismatch = if (ENABLE_IFT) Some(Bool()) else None  // ICache line last filled by different domain
+  val icache_secret_mismatch = if (ENABLE_IFT) Some(Bool()) else None  // ICache line last filled during secret-range fetch
+  val ras_domain_mismatch    = if (ENABLE_IFT) Some(Bool()) else None  // RAS return addr pushed by different domain
+  val bpd_domain_mismatch    = if (ENABLE_IFT) Some(Bool()) else None  // TAGE entry last updated by different domain
+  val btb_domain_mismatch    = if (ENABLE_IFT) Some(Bool()) else None  // BTB entry last written by different domain
+  val btb_target_xdom        = if (ENABLE_IFT) Some(Bool()) else None  // BTB-predicted JALR target is cross-domain (branch-target-injection)
+  val cf_fetch_domain        = if (ENABLE_IFT) Some(UInt(1.W)) else None // domain of this fetch packet (for FTQ/bpdupdate)
   // corefuzzing: secret shadow mismatch — predictor entry was trained by secret instruction
-  val bpd_secret_mismatch    = Bool()
-  val btb_secret_mismatch    = Bool()
+  val bpd_secret_mismatch    = if (ENABLE_IFT) Some(Bool()) else None
+  val btb_secret_mismatch    = if (ENABLE_IFT) Some(Bool()) else None
+  // [BTBDISP] step 16: fetch of a tag a secret BTB/uBTB allocation displaced, and PC[13:2] of
+  // the secret allocator behind btb_secret_mismatch || btb_sec_disp
+  // [R124GATE] patch 26: None without ENABLE_IFT (as BranchPredictionBundle, predictor.scala)
+  val btb_sec_disp           = if (ENABLE_IFT) Some(Bool()) else None
+  val btb_sec_pc             = if (ENABLE_IFT) Some(UInt(12.W)) else None
+  // [BTBATK] DF-btbatk: fetch of a tag an ATTACKER-domain BTB/uBTB allocation displaced (its PC
+  // rides btb_sec_pc when no secret BTB edge fires)
+  val btb_atk_disp           = if (ENABLE_IFT) Some(Bool()) else None
   // C3: this packet was predicted using a GHR that still holds a secret branch outcome
-  val ghist_secret           = Bool()
+  val ghist_secret           = if (ENABLE_IFT) Some(Bool()) else None
   // [GHISTATK 2026-09-08] attacker twin: the GHR holds an attacker-determined outcome
-  val ghist_atk              = Bool()
+  val ghist_atk              = if (ENABLE_IFT) Some(Bool()) else None
   // [GHISTOC] distance-to-arming-branch, carried as the influencer's op_count
-  val ghist_secret_ctr       = UInt(7.W)
-  val ghist_atk_ctr          = UInt(7.W)
+  val ghist_secret_ctr       = if (ENABLE_IFT) Some(UInt(7.W)) else None
+  val ghist_atk_ctr          = if (ENABLE_IFT) Some(UInt(7.W)) else None
   // corefuzzing: RAS pop was from a slot pushed by a secret call (retroactively tagged)
-  val ras_pop_secret         = Bool()
+  val ras_pop_secret         = if (ENABLE_IFT) Some(Bool()) else None
 }
 
 
@@ -405,6 +409,18 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   // corefuzzing: multi-port dispatch/execute-time FTQ secret marking (replaces commit-time single port)
   // Driven from core.scala dispatch and lsu.scala TLB stage; forwarded to FTQ.cf_secret_ftq_updates
   val cf_secret_ftq_updates = Output(Vec(coreWidth + memWidth, Valid(UInt(log2Ceil(ftqSz).W))))
+
+  // [ARMRES] step 20 (rulings 134/137): the secret / attacker window counters now live in the
+  // core (armed at branch resolution, aged by retiring branches younger than the arming one).
+  // The FTQ's retire-time counters are no longer read.
+  val cf_win_sec_ctr = Output(UInt(7.W))
+  val cf_win_atk_ctr = Output(UInt(7.W))
+  // [WINFTQ] patch 29b (owner r160): the FTQ index of the oldest secret-window arming branch
+  // that resolved (registered); the FTQ tags every entry younger than it (fetch-target-queue.scala).
+  val cf_win_ftq_rs = if (ENABLE_IFT) Some(Output(Valid(UInt(log2Ceil(ftqSz).W)))) else None
+  // [FTQATK] patch 47 (r173 (5)): per brinfos lane, a br/jalr resolved with an attacker-tainted
+  // condition / target (cond_atk) at this ftq_idx; the FTQ ORs it into the predictor update domain.
+  val cf_atk_ftq_updates = if (ENABLE_IFT) Some(Output(Vec(coreWidth, Valid(UInt(log2Ceil(ftqSz).W))))) else None
 }
 
 /**
@@ -552,97 +568,18 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // corefuzzing: compute fetch domain (attacker=1, victim=0) based on s0_vpc vs CSR range
   val s0_fetch_is_attacker = (io.cpu.cf_attacker_start_addr =/= 0.U) &&
     (s0_vpc >= io.cpu.cf_attacker_start_addr) && (s0_vpc < io.cpu.cf_attacker_end_addr)
-  val s1_fetch_domain = RegNext(s0_fetch_is_attacker)
+  // [R124GATE3] patch 28 (B51): IFT-only flop (feeds only the ICache domain-mismatch compare).
+  val s1_fetch_domain = if (ENABLE_IFT) RegNext(s0_fetch_is_attacker) else false.B
   // corefuzzing: compute fetch secret flag based on s0_vpc vs secret CSR range
   val s0_fetch_is_secret = (io.cpu.cf_secret_start_addr =/= io.cpu.cf_secret_end_addr) &&
     (s0_vpc >= io.cpu.cf_secret_start_addr) && (s0_vpc < io.cpu.cf_secret_end_addr)
   val s1_fetch_is_secret = RegNext(s0_fetch_is_secret)
   icache.io.s1_domain_id := s1_fetch_domain
-  icache.io.s1_is_secret := s1_fetch_is_secret
+  // [ICSEC] step 15: icache.io.s1_is_secret is driven below, after `ftq` is in Scala scope.
 
-  // corefuzzing: ITLB domain shadow — parallel array indexed by VPN low bits.
-  // Updated when TLB fills (miss→hit transition); compared on every TLB hit.
-  val itlb_shadow_nEntries = nTLBSets * nTLBWays
-  val itlb_vpn_bits        = log2Ceil(itlb_shadow_nEntries)
-  val itlb_shadow_domain   = RegInit(VecInit(Seq.fill(itlb_shadow_nEntries)(false.B)))
-  val itlb_shadow_valid    = RegInit(VecInit(Seq.fill(itlb_shadow_nEntries)(false.B)))
-  // corefuzzing: ITLB secret shadow — tracks whether the filling fetch was from secret inst memory
-  val itlb_shadow_secret   = RegInit(VecInit(Seq.fill(itlb_shadow_nEntries)(false.B)))
-
-  // VPN index: strip page-offset bits, take low itlb_vpn_bits
-  val s1_vpn_idx       = s1_vpc(itlb_vpn_bits + pgIdxBits - 1, pgIdxBits)
-  val s1_tlb_miss_prev = RegNext(s1_tlb_miss, false.B)
-  // Fill detected: was a miss last cycle, now a hit
-  val s1_tlb_just_filled = s1_valid && !s1_tlb_miss && s1_tlb_miss_prev
-  // IFT compile-time gate: ITLB shadow writes are elided when ENABLE_IFT=false;
-  // the shadow registers stay at init (all false), reads return false, and
-  // s1_itlb_mismatch / s1_itlb_secret_mismatch collapse to false via
-  // constant propagation — FIRRTL DCE removes the shadow arrays entirely.
-  if (ENABLE_IFT) {
-    when (s1_tlb_just_filled) {
-      // Use RegNext of vpn_idx/domain since the miss was serviced the previous cycle
-      // [ITLBFIX 2026-09-11] Use the CURRENT vpn/domain, not RegNext.
-      //
-      // PROVEN by the [ITLBFILL] probe -- the fill for the attacker's page prints
-      //     now= 6 prev= 0 dom=1 prevdom=0 vpc=0x80006000 prevpc=0x0
-      // i.e. the page that just filled is slot 6 in domain 1, but RegNext wrote slot 0 with
-      // domain 0.  `prevpc` is literally zero, so RegNext is capturing stale state rather than
-      // the missing page: on `s1_tlb_just_filled` the PREVIOUS cycle was the MISS, during which
-      // s1_vpc/s1_vpn_idx are not the resolved page.  now != prev on ALL SIX fills observed.
-      //
-      // Consequence of the old form: the shadow slot for the page you later HIT is never the
-      // slot the fill wrote, so `itlb_shadow_valid(s1_vpn_idx)` was false at every hit
-      // (measured: 28/28) and INFL_ITLB_STATE could never assert -- which is why that channel
-      // has never fired in any workload.
-      itlb_shadow_domain(s1_vpn_idx) := s1_fetch_domain.asBool
-      itlb_shadow_valid(s1_vpn_idx)  := true.B
-      itlb_shadow_secret(s1_vpn_idx) := s1_fetch_is_secret
-    }
-    // Flush shadow on sfence (shadow_valid gates secret reads so no separate secret flush needed)
-    when (tlb.io.sfence.valid) {
-      itlb_shadow_valid := VecInit(Seq.fill(itlb_shadow_nEntries)(false.B))
-    }
-  }
-  // Domain mismatch: hit in ITLB but shadow was written by a different domain
-  val s1_itlb_mismatch = s1_valid && !s1_tlb_miss &&
-    itlb_shadow_valid(s1_vpn_idx) &&
-    (itlb_shadow_domain(s1_vpn_idx) =/= s1_fetch_domain)
-// [PROBE STRIPPED 2026-09-11] ITLBPROBE -- diagnostic only, purpose discharged.
-  // // [ITLBPROBE 2026-09-11] TEMPORARY.  ITLB_STATE has never fired.  The superpage explanation
-  // // was implemented (4 KiB-mapping the code) and REFUTED: the fix took effect (cycles
-  // // 9,784,396 -> 10,013,506) and the channel stayed at 0, with the cross-domain condition
-  // // demonstrably created (attacker domain=1 at 0x80006004..18, victim domain=0 at 0x80006038,
-  // // same page).  So measure instead of theorising again.
-  // //   FILL -- was the shadow ever WRITTEN, and with which domain?
-  // //   HIT  -- on a hitting fetch, what does the shadow hold vs the fetch domain?
-  // // Together: "never written" / "wrong domain" / "written but never hit cross-domain" /
-  // // "mismatch asserts but is lost downstream".
-  // if (ENABLE_CF_DEBUG_PRINTF) {
-    // when (s1_tlb_just_filled) {
-      // // [ITLBFILL2] print BOTH indices.  The fill writes RegNext(s1_vpn_idx) on the premise
-      // // that "the miss was serviced the previous cycle" (:582).  If s1_vpc ADVANCES during the
-      // // page walk instead of holding the missing PC, RegNext captures the wrong page and the
-      // // domain of page A is written into the slot for page B -- which is what the first probe
-      // // implied (fills at idx 0/4 only, while every attacker hit reads idx 6).
-      // // now  = index of the page being fetched THIS cycle (the one that just hit)
-      // // prev = index actually written by the fill
-      // printf("\n[ITLBFILL] now=%d prev=%d dom=%d prevdom=%d vpc=0x%x prevpc=0x%x\n",
-        // s1_vpn_idx, RegNext(s1_vpn_idx), s1_fetch_domain, RegNext(s1_fetch_domain),
-        // s1_vpc, RegNext(s1_vpc))
-    // }
-    // when (s1_valid && !s1_tlb_miss &&
-          // (s1_fetch_domain === 1.U || itlb_shadow_domain(s1_vpn_idx))) {
-      // printf("\n[ITLBHIT] idx=%d shval=%d shdom=%d fdom=%d mism=%d vpc=0x%x\n",
-        // s1_vpn_idx, itlb_shadow_valid(s1_vpn_idx), itlb_shadow_domain(s1_vpn_idx),
-        // s1_fetch_domain, s1_itlb_mismatch, s1_vpc)
-    // }
-  // }
-  val s2_itlb_mismatch = RegNext(s1_itlb_mismatch, false.B)
-  // Secret mismatch: hit in ITLB but shadow was written during a secret instruction fetch
-  val s1_itlb_secret_mismatch = s1_valid && !s1_tlb_miss &&
-    itlb_shadow_valid(s1_vpn_idx) &&
-    itlb_shadow_secret(s1_vpn_idx) && !s1_fetch_is_secret
-  val s2_itlb_secret_mismatch = RegNext(s1_itlb_secret_mismatch, false.B)
+  // [FIFO10] step 10 (owner ruling 94: machine mode, paging off): the ITLB domain/secret shadow
+  // (INFL_ITLB_STATE) is removed.  It was filled only on an ITLB miss -> hit transition, which
+  // needs translation, so it could never fire.  Type code 15 stays reserved.
 
   val f1_mask = fetchMask(s1_vpc)
   val f1_redirects = (0 until fetchWidth) map { i =>
@@ -723,8 +660,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   val f2_correct_f1_ghist = s1_ghist =/= f2_predicted_ghist && enableGHistStallRepair.B
 
-  when ((s2_valid && !icache.io.resp.valid) ||
-        (s2_valid && icache.io.resp.valid && !f3_ready)) {
+  // [D4FIX] fix A: the f2 replay condition, named so the f3 hand-off below can test the SAME
+  // node.  Same expression as before (pure rename, identical netlist).
+  val f2_replay = (s2_valid && !icache.io.resp.valid) ||
+                  (s2_valid && icache.io.resp.valid && !f3_ready)
+  when (f2_replay) {
     s0_valid := (!s2_tlb_resp.ae.inst && !s2_tlb_resp.pf.inst) || s2_is_replay || s2_tlb_miss
     s0_vpc   := s2_vpc
     s0_is_replay := s2_valid && icache.io.resp.valid
@@ -782,13 +722,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3.io.enq.bits.tsrc := s2_tsrc
   // corefuzzing: carry icache domain mismatch through the f3 queue;
   // gate on resp.valid to avoid propagating stale bits when we enqueue due to a TLB fault
-  f3.io.enq.bits.icache_domain_mismatch := icache.io.resp.bits.icache_domain_mismatch &&
-                                            icache.io.resp.valid
-  f3.io.enq.bits.icache_secret_mismatch := icache.io.resp.bits.icache_secret_mismatch &&
-                                            icache.io.resp.valid
-  // corefuzzing: carry ITLB domain/secret mismatch (computed at s1, registered to s2) into f3 queue
-  f3.io.enq.bits.itlb_domain_mismatch  := s2_itlb_mismatch
-  f3.io.enq.bits.itlb_secret_mismatch  := s2_itlb_secret_mismatch
+  f3.io.enq.bits.icache_domain_mismatch.foreach(_ := icache.io.resp.bits.icache_domain_mismatch &&
+                                            icache.io.resp.valid)
+  f3.io.enq.bits.icache_secret_mismatch.foreach(_ := icache.io.resp.bits.icache_secret_mismatch &&
+                                            icache.io.resp.valid)
 
   // RAS takes a cycle to read
   val ras_read_idx = RegInit(0.U(log2Ceil(nRasEntries).W))
@@ -1039,24 +976,25 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val f3_fetch_is_attacker = (io.cpu.cf_attacker_start_addr =/= 0.U) &&
     (f3_imemresp.pc >= io.cpu.cf_attacker_start_addr) &&
     (f3_imemresp.pc < io.cpu.cf_attacker_end_addr)
-  f3_fetch_bundle.icache_domain_mismatch := f3_imemresp.icache_domain_mismatch
-  f3_fetch_bundle.icache_secret_mismatch := f3_imemresp.icache_secret_mismatch
-  f3_fetch_bundle.itlb_domain_mismatch   := f3_imemresp.itlb_domain_mismatch
-  f3_fetch_bundle.itlb_secret_mismatch   := f3_imemresp.itlb_secret_mismatch
+  f3_fetch_bundle.icache_domain_mismatch.foreach(_ := f3_imemresp.icache_domain_mismatch.getOrElse(false.B))
+  f3_fetch_bundle.icache_secret_mismatch.foreach(_ := f3_imemresp.icache_secret_mismatch.getOrElse(false.B))
   // RAS domain mismatch: ret pops an addr pushed by a different domain
-  f3_fetch_bundle.ras_domain_mismatch := (
+  // [RASPTR] patch 29 (F-RAS-1): or a VICTIM ret pops an entry written before the latest
+  // attacker pointer move (ras.scala read_stale).  Same field, so the same mispredict-gated ROB
+  // edge (INFL_RAS_STATE, is_atk = the ret is domain 0).  One more input on the same LUT.
+  f3_fetch_bundle.ras_domain_mismatch.foreach(_ := (
     f3_fetch_bundle.cfi_is_ret && f3_fetch_bundle.cfi_idx.valid &&
-    (ras.io.read_domain =/= f3_fetch_is_attacker)
-  )
+    ((ras.io.read_domain =/= f3_fetch_is_attacker) || (!f3_fetch_is_attacker && ras.io.read_stale))
+  ))
   // corefuzzing: RAS pop secret — the popped slot was retroactively marked secret
   // (pushed by a call from a secret fetch packet). Gated to actual returns only.
-  f3_fetch_bundle.ras_pop_secret := (
+  f3_fetch_bundle.ras_pop_secret.foreach(_ := (
     f3_fetch_bundle.cfi_is_ret && f3_fetch_bundle.cfi_idx.valid &&
     ras.io.read_secret
-  )
+  ))
   // corefuzzing: BPD/BTB domain and secret mismatches from the prediction response
-  f3_fetch_bundle.bpd_domain_mismatch := f3_bpd_resp.io.deq.bits.bpd_domain_mismatch
-  f3_fetch_bundle.btb_domain_mismatch := f3_bpd_resp.io.deq.bits.btb_domain_mismatch
+  f3_fetch_bundle.bpd_domain_mismatch.foreach(_ := f3_bpd_resp.io.deq.bits.bpd_domain_mismatch.getOrElse(false.B))
+  f3_fetch_bundle.btb_domain_mismatch.foreach(_ := f3_bpd_resp.io.deq.bits.btb_domain_mismatch.getOrElse(false.B))
   // corefuzzing: BTB TARGET-domain edge (branch-target-injection, doc 67 Part A).
   // btb_domain_mismatch tracks the INSTALLER's domain; the BTI attack rides the
   // branch->TARGET jump instead. Here: a BTB-predicted JALR whose predicted target is in
@@ -1067,16 +1005,21 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val f3_btb_target_is_attacker = (io.cpu.cf_attacker_start_addr =/= 0.U) &&
     (f3_btb_pred_target >= io.cpu.cf_attacker_start_addr) &&
     (f3_btb_pred_target <  io.cpu.cf_attacker_end_addr)
-  f3_fetch_bundle.btb_target_xdom := (
+  f3_fetch_bundle.btb_target_xdom.foreach(_ := (
     f3_fetch_bundle.cfi_idx.valid &&
     (f3_fetch_bundle.cfi_type === CFI_JALR) &&
     !f3_fetch_bundle.cfi_is_ret &&   // exclude returns (jalr x0) -- those are RAS co-location, not BTI
     (f3_btb_target_is_attacker =/= f3_fetch_is_attacker)
-  )
-  f3_fetch_bundle.bpd_secret_mismatch := f3_bpd_resp.io.deq.bits.bpd_secret_mismatch
-  f3_fetch_bundle.btb_secret_mismatch := f3_bpd_resp.io.deq.bits.btb_secret_mismatch
+  ))
+  f3_fetch_bundle.bpd_secret_mismatch.foreach(_ := f3_bpd_resp.io.deq.bits.bpd_secret_mismatch.getOrElse(false.B))
+  f3_fetch_bundle.btb_secret_mismatch.foreach(_ := f3_bpd_resp.io.deq.bits.btb_secret_mismatch.getOrElse(false.B))
+  if (ENABLE_IFT) {   // [R124GATE] the fields exist only with ENABLE_IFT
+    f3_fetch_bundle.btb_sec_disp.get    := f3_bpd_resp.io.deq.bits.btb_sec_disp.get
+    f3_fetch_bundle.btb_sec_pc.get      := f3_bpd_resp.io.deq.bits.btb_sec_pc.get
+    f3_fetch_bundle.btb_atk_disp.get    := f3_bpd_resp.io.deq.bits.btb_atk_disp.get
+  }
   // corefuzzing: record the fetch domain for the FTQ bpdupdate path
-  f3_fetch_bundle.cf_fetch_domain     := f3_fetch_is_attacker.asUInt
+  f3_fetch_bundle.cf_fetch_domain.foreach(_ := f3_fetch_is_attacker.asUInt)
   // Redirect earlier stages only if the later stage
   // can consume this packet
 
@@ -1110,6 +1053,22 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   ras.io.write_domain := f3_fetch_is_attacker
   // corefuzzing: secret not yet known at push time; retroactively updated via late_write_secret
   ras.io.write_secret := false.B
+  // [WINFTQPOST] patch 38: a call pushed while the secret window is open is a window member, so the
+  // slot it pushes is window-secret at once (same f3 bit as ghist_secret; the late ports above only
+  // cover tagged FTQ entries, which a jalr call with a clean target and no window operand never
+  // was, and a JAL only through [RASJAL] a few cycles after dispatch).  The top repair below keeps
+  // false (it restores content).  Levels: core winCtr register -> 7-bit zero detect (shared) ->
+  // ras_secret D data and the read-forward flop; the RAS write select is unchanged.  Cost: about
+  // 1 LUT per RAS slot plus the forward flop (previously a constant).
+  if (ENABLE_IFT) { ras.io.write_secret := io.cpu.cf_win_sec_ctr =/= 0.U }
+  // [RASPTR] patch 29 (F-RAS-1): the f3 push (default) vs the top repair (below), and the
+  // attacker pointer move: an attacker-domain packet whose first CFI is a call (push) or a ret
+  // (pop), on the same f3 fire that writes the push / takes the ghist pop.
+  ras.io.write_push := true.B
+  ras.io.atk_move   := (if (ENABLE_IFT) f3.io.deq.valid && f4_ready && f3_fetch_bundle.cfi_idx.valid &&
+                                        (f3_fetch_bundle.cfi_is_call || f3_fetch_bundle.cfi_is_ret) &&
+                                        f3_fetch_is_attacker
+                        else false.B)
 
 
   val f3_correct_f1_ghist = s1_ghist =/= f3_predicted_ghist && enableGHistStallRepair.B
@@ -1124,6 +1083,23 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     }
     when (s2_valid && s2_vpc === f3_predicted_target && !f3_correct_f2_ghist) {
       f3.io.enq.bits.ghist := f3_predicted_ghist
+      // [D4FIX] fix A (D4, stock-BOOM correctness, applies with ENABLE_IFT off too): the f3
+      // ras_idx hand-off above reaches the successor only if f3.io.enq fires.  When f2 replays s2
+      // instead (no I$ response this cycle -- the corefuzzing fetch throttle makes this common at
+      // CoreWidth <= 2 -- since f3 is dequeuing here f3_ready is true, so f2_replay reduces to
+      // s2_valid && !icache.io.resp.valid), the replay at the f2 block above sends s0_ghist :=
+      // s2_ghist, whose ras_idx predates this call/ret (f1/f2 pass call/ret = false), and ===
+      // ignores ras_idx, so nothing repairs it.  Carry the f3 pointer into the replay.
+      // Only ras_idx: under !f3_correct_f2_ghist (enableGHistStallRepair) the === fields of
+      // s2_ghist and f3_predicted_ghist are equal, and secret_tag/secret_ctr have no reader, so
+      // the BPD-visible history bits keep their select unchanged.  A later redirect_flush/sfence
+      // assignment still wins (last connect).  Levels: f3_predicted_ghist.ras_idx is already a
+      // data input of this mux (f3 redirect leg); the leg's select gains one early term
+      // (!icache.io.resp.valid).  Endpoint: the 5 s1_ghist.ras_idx flops only (the predictor
+      // reads f0_req.bits.ghist only through histories(), never ras_idx).
+      when (f2_replay) {
+        s0_ghist.ras_idx := f3_predicted_ghist.ras_idx
+      }
     } .elsewhen (!s2_valid && s1_valid && s1_vpc === f3_predicted_target && !f3_correct_f1_ghist) {
       s2_ghist := f3_predicted_ghist
     } .elsewhen (( s2_valid &&  (s2_vpc =/= f3_predicted_target || f3_correct_f2_ghist)) ||
@@ -1154,7 +1130,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f4_btb_corrections.io.enq.bits.lhist                := f3_fetch_bundle.lhist
   f4_btb_corrections.io.enq.bits.meta                 := f3_fetch_bundle.bpd_meta
   // corefuzzing: carry fetch domain into BTB correction update
-  f4_btb_corrections.io.enq.bits.cf_domain_id         := f3_fetch_bundle.cf_fetch_domain
+  f4_btb_corrections.io.enq.bits.cf_domain_id.foreach(_ := f3_fetch_bundle.cf_fetch_domain.getOrElse(0.U(1.W)))
 
 
   // -------------------------------------------------------
@@ -1180,14 +1156,36 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // the channel could never fire, in any workload, which is why it showed 0 occurrences
   // across every log.  Enabling it restores secret-tainted global history as an
   // influencer source.
-  f3_fetch_bundle.ghist_secret := ftq.io.cf_ghist_secret_active
-  f3_fetch_bundle.ghist_atk    := ftq.io.cf_ghist_atk_active
-  f3_fetch_bundle.ghist_secret_ctr := ftq.io.cf_ghist_secret_ctr_val
-  f3_fetch_bundle.ghist_atk_ctr    := ftq.io.cf_ghist_atk_ctr_val
+  f3_fetch_bundle.ghist_secret.foreach(_ := io.cpu.cf_win_sec_ctr =/= 0.U)   // [ARMRES] core window
+  // [ICSEC] step 15 (residue audit row 18): the I$ line secret bit was "fetch PC inside the
+  // secret DATA range", which code practically never is, so a line fetched only because of
+  // secret-dependent control flow was recorded clean.  The fetch is now also secret while the
+  // committed secret-branch window (the GHR counter, armed by a secret branch packet) is open.
+  // Registered (1 FF) to keep the FTQ counter compare off the I$ s1 path.  The same bit gates
+  // the reader-side mismatch: a fetch inside the window does not flag itself.  Wrong-path
+  // fetches before the branch commits stay unmarked (secretness is not known at fetch).
+  // [R124GATE] patch 26: the window-term flop exists only with ENABLE_IFT.
+  icache.io.s1_is_secret := (if (ENABLE_IFT) s1_fetch_is_secret || RegNext(io.cpu.cf_win_sec_ctr =/= 0.U, false.B)
+                             else s1_fetch_is_secret)
+  f3_fetch_bundle.ghist_atk.foreach(_ := io.cpu.cf_win_atk_ctr =/= 0.U)
+  f3_fetch_bundle.ghist_secret_ctr.foreach(_ := io.cpu.cf_win_sec_ctr)
+  f3_fetch_bundle.ghist_atk_ctr.foreach(_ := io.cpu.cf_win_atk_ctr)
   // corefuzzing: late secret update from FTQ — fires when a secret instruction commits from a
   // call-containing fetch packet, retroactively marking the pushed RAS slot as secret
   ras.io.late_write_secret_valid := ftq.io.cf_ras_secret_upd_valid
-  ras.io.late_write_secret_idx   := ftq.io.cf_ras_secret_upd_idx
+  // [RASIDX] step 19: the FTQ stores the PRE-push RAS pointer (ghist.ras_idx,
+  // fetch-target-queue.scala new_entry.ras_idx); a call pushed its return address at WrapInc
+  // of it (ras.io.write_idx above), so mark that slot, not the caller's slot below it.
+  // Off the fetch path (FTQ register read -> RAS register write); 5-bit wrap-inc per lane.
+  ras.io.late_write_secret_idx   := VecInit(ftq.io.cf_ras_secret_upd_idx.map(i => WrapInc(i, cf_ras_active)))
+  // [WINFTQ] patch 29b: the window range's calls (FTQ queue, one per cycle), same slot rule
+  ftq.io.cf_win_ftq_rs.foreach(_ := io.cpu.cf_win_ftq_rs.get)
+  ftq.io.cf_win_sec_open.foreach(_ := io.cpu.cf_win_sec_ctr =/= 0.U)   // [WINFTQPOST] patch 38
+  ftq.io.cf_atk_ftq_updates.foreach(_ := io.cpu.cf_atk_ftq_updates.get)   // [FTQATK] patch 47
+  ras.io.late_write_win.foreach { l =>
+    l.valid := ftq.io.cf_ras_win_upd.get.valid
+    l.bits  := WrapInc(ftq.io.cf_ras_win_upd.get.bits, cf_ras_active)
+  }
   ras.io.quiesce_flush           := io.cpu.cf_ras_quiesce_flush
   // corefuzzing
   // Wire frontend cf_debug gate into fetch buffer and FTQ
@@ -1198,6 +1196,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   fb.io.cf_attacker_end_addr     := io.cpu.cf_attacker_end_addr
   ftq.io.cf_debug_ftq_enable   := io.cpu.cf_debug_frontend_enable
   ftq.io.cf_ftq_idx            := io.cpu.cf_ftq_idx
+  // [F-RAS-3b] same wire as the F1/F2/F3 ghist updates and the RAS write index: no skew.
+  ftq.io.cf_ras_active.foreach(_ := cf_ras_active)
   ftq.io.cf_ftq_quiesce_reset  := io.cpu.cf_ftq_quiesce_reset
   icache.io.cf_icache_set_conf := io.cpu.cf_icache_set_conf
   icache.io.cf_icache_way_conf := io.cpu.cf_icache_way_conf
@@ -1279,8 +1279,64 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   when (ftq.io.ras_update && enableRasTopRepair.B) {
     ras.io.write_valid := true.B
+    ras.io.write_push  := false.B   // [RASPTR] a repair restores content, it does not refresh
+    ras.io.write_secret := false.B  // [WINFTQPOST] patch 38: unchanged for the repair
     ras.io.write_idx   := ftq.io.ras_update_idx
     ras.io.write_addr  := ftq.io.ras_update_pc
+  }
+
+  // [D4RAS] D4 probe (2026-10-18, measurement only, no logic change): every f3 RAS push/pop with
+  // its pre-push pointer, the top repair, every front-end redirect's ras_idx, and the hand-off
+  // hole under test: a call/ret packet leaves f3 while its successor sits in s2 with the same
+  // PC but no I$ response (f3.io.enq does not fire), so the f3_predicted_ghist ras_idx written
+  // into f3.io.enq.bits.ghist (line 1082) is dropped and s2 replays with s2_ghist (line 670).
+  // GlobalHistory === ignores ras_idx (line 98), so f3_correct_f2_ghist cannot catch it.
+  // Compile-time ENABLE_CF_DEBUG_PRINTF; runtime 0xbc0 bit 4 (cf_debug_rob_enable, set by
+  // ENABLE_DEBUG()=29; the frontend bit 6 is not).  Printf cones only; elided in non-debug builds.
+  if (ENABLE_CF_DEBUG_PRINTF) {
+    val d4_cyc = RegInit(0.U(40.W))
+    d4_cyc := d4_cyc + 1.U
+    val d4_on    = io.cpu.cf_debug_rob_enable
+    val d4_fire  = f3.io.deq.valid && f4_ready && f3_fetch_bundle.cfi_idx.valid
+    val d4_cfipc = f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1)   // -2 when the cfi is an edge inst
+    val d4_push_req = d4_fire && f3_fetch_bundle.cfi_is_call
+    when (d4_on && d4_push_req) {
+      printf("[D4RAS] c=%d PUSH pkt=0x%x cfi=0x%x pre=%d widx=%d waddr=0x%x rep=%d f3clr=%d act=%d thr=%d\n",
+        d4_cyc, f3_imemresp.pc, d4_cfipc, f3_fetch_bundle.ghist.ras_idx,
+        WrapInc(f3_fetch_bundle.ghist.ras_idx, cf_ras_active),
+        f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U),
+        ftq.io.ras_update && enableRasTopRepair.B, f3_clear, cf_ras_active, cf_fetch_throttle_gate)
+    }
+    when (d4_on && d4_fire && f3_fetch_bundle.cfi_is_ret) {
+      printf("[D4RAS] c=%d POP pkt=0x%x cfi=0x%x pre=%d raddr=0x%x tgt=0x%x f3clr=%d act=%d thr=%d\n",
+        d4_cyc, f3_imemresp.pc, d4_cfipc, f3_fetch_bundle.ghist.ras_idx, ras.io.read_addr,
+        f3_predicted_target, f3_clear, cf_ras_active, cf_fetch_throttle_gate)
+    }
+    // [D4FIX] HANDOFF = the hole's trigger occurred (any build); LEAK = the replay actually carried a
+    // pointer different from the f3 one (the drop itself; expected 0 with fix A).  rpidx is the
+    // ras_idx the replay sends to s0.  Same-cycle redirect_flush/sfence squash the replay: not a drop.
+    val d4_handoff = d4_fire && (f3_fetch_bundle.cfi_is_call || f3_fetch_bundle.cfi_is_ret) &&
+          s2_valid && s2_vpc === f3_predicted_target && !f3_correct_f2_ghist && !f3.io.enq.fire
+    when (d4_on && d4_handoff) {
+      printf("[D4RAS] c=%d HANDOFF pkt=0x%x s2=0x%x s2idx=%d f3nidx=%d rpidx=%d icv=%d thr=%d\n",
+        d4_cyc, f3_imemresp.pc, s2_vpc, s2_ghist.ras_idx, f3_predicted_ghist.ras_idx,
+        s0_ghist.ras_idx, icache.io.resp.valid, cf_fetch_throttle_gate)
+    }
+    when (d4_on && d4_handoff && s0_ghist.ras_idx =/= f3_predicted_ghist.ras_idx &&
+          !io.cpu.redirect_flush && !io.cpu.sfence.valid) {
+      printf("[D4RAS] c=%d LEAK pkt=0x%x s2=0x%x s2idx=%d f3nidx=%d icv=%d thr=%d f3rdy=%d\n",
+        d4_cyc, f3_imemresp.pc, s2_vpc, s2_ghist.ras_idx, f3_predicted_ghist.ras_idx,
+        icache.io.resp.valid, cf_fetch_throttle_gate, f3_ready)
+    }
+    when (d4_on && ftq.io.ras_update) {
+      printf("[D4RAS] c=%d REPAIR idx=%d addr=0x%x pushlost=%d\n",
+        d4_cyc, ftq.io.ras_update_idx, ftq.io.ras_update_pc, d4_push_req && enableRasTopRepair.B)
+    }
+    when (d4_on && io.cpu.redirect_flush && io.cpu.redirect_val) {
+      printf("[D4RAS] c=%d REDIR pc=0x%x idx=%d ftq=%d misp=%d\n",
+        d4_cyc, io.cpu.redirect_pc, io.cpu.redirect_ghist.ras_idx, io.cpu.redirect_ftq_idx,
+        io.cpu.redirect_flush_is_mispredict)
+    }
   }
 
 

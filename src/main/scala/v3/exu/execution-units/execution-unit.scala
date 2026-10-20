@@ -47,6 +47,10 @@ class ExeUnitResp(val dataWidth: Int)(implicit p: Parameters) extends BoomBundle
   val taint_atk   = Bool()
   val predicated = Bool() // Was this predicated off?
   val fflags = new ValidIO(new FFlagsResp) // write fflags to ROB // TODO: Do this better
+  // IFT overhaul Task 3.2 (D16): influencer edges travelling with a MEMORY response (D$ and
+  // STL forward), written into the ROB's C_wb column.  Every non-LSU producer ties it to
+  // zero, so firtool removes it everywhere but the LSU-fed writeback ports.
+  val edges = new IftEdgeList
 }
 
 /**
@@ -165,6 +169,7 @@ abstract class ExecutionUnit(
   if (writesIrf)   {
     io.iresp.valid := false.B
     io.iresp.bits := DontCare
+    io.iresp.bits.edges := 0.U.asTypeOf(new IftEdgeList)   // Task 3.2: zero, never DontCare (Phase 0 Bug 3)
     io.iresp.bits.fflags.valid := false.B
     io.iresp.bits.predicated := false.B
     assert(io.iresp.ready)
@@ -172,12 +177,14 @@ abstract class ExecutionUnit(
   if (writesLlIrf) {
     io.ll_iresp.valid := false.B
     io.ll_iresp.bits := DontCare
+    io.ll_iresp.bits.edges := 0.U.asTypeOf(new IftEdgeList)   // Task 3.2: zero, never DontCare (Phase 0 Bug 3)
     io.ll_iresp.bits.fflags.valid := false.B
     io.ll_iresp.bits.predicated := false.B
   }
   if (writesFrf)   {
     io.fresp.valid := false.B
     io.fresp.bits := DontCare
+    io.fresp.bits.edges := 0.U.asTypeOf(new IftEdgeList)   // Task 3.2: zero, never DontCare (Phase 0 Bug 3)
     io.fresp.bits.fflags.valid := false.B
     io.fresp.bits.predicated := false.B
     assert(io.fresp.ready)
@@ -185,6 +192,7 @@ abstract class ExecutionUnit(
   if (writesLlFrf) {
     io.ll_fresp.valid := false.B
     io.ll_fresp.bits := DontCare
+    io.ll_fresp.bits.edges := 0.U.asTypeOf(new IftEdgeList)   // Task 3.2: zero, never DontCare (Phase 0 Bug 3)
     io.ll_fresp.bits.fflags.valid := false.B
     io.ll_fresp.bits.predicated := false.B
   }
@@ -310,6 +318,7 @@ class ALUExeUnit(
     alu.io.req.bits.rs1_taint_atk := io.req.bits.rs1_taint_atk
     alu.io.req.bits.rs2_taint_atk := io.req.bits.rs2_taint_atk
     alu.io.req.bits.rs3_secret := io.req.bits.rs3_secret
+    alu.io.req.bits.rs3_taint_atk := io.req.bits.rs3_taint_atk   // [G3RS3ATK]
     alu.io.req.bits.rs3_data := DontCare
     alu.io.req.bits.pred_data := io.req.bits.pred_data
     alu.io.resp.ready := DontCare
@@ -343,6 +352,7 @@ class ALUExeUnit(
     rocc.io.req.bits.rs1_taint_atk := io.req.bits.rs1_taint_atk
     rocc.io.req.bits.rs2_taint_atk := io.req.bits.rs2_taint_atk
     rocc.io.req.bits.rs3_secret := io.req.bits.rs3_secret
+    rocc.io.req.bits.rs3_taint_atk := io.req.bits.rs3_taint_atk   // [G3RS3ATK]
     rocc.io.brupdate          := io.brupdate // We should assert on this somewhere
     rocc.io.status            := io.status
     rocc.io.exception         := io.com_exception
@@ -371,6 +381,7 @@ class ALUExeUnit(
     imul.io.req.bits.rs1_taint_atk := io.req.bits.rs1_taint_atk
     imul.io.req.bits.rs2_taint_atk := io.req.bits.rs2_taint_atk
     imul.io.req.bits.rs3_secret := io.req.bits.rs3_secret
+    imul.io.req.bits.rs3_taint_atk := io.req.bits.rs3_taint_atk   // [G3RS3ATK]
     imul.io.req.bits.kill     := io.req.bits.kill
     imul.io.brupdate := io.brupdate
     //corefuzzing
@@ -399,10 +410,13 @@ class ALUExeUnit(
     queue.io.enq.bits.secret := ifpu.io.resp.bits.secret
     queue.io.enq.bits.taint_atk := ifpu.io.resp.bits.taint_atk
     queue.io.enq.bits.fflags := ifpu.io.resp.bits.fflags
+    queue.io.enq.bits.edges  := 0.U.asTypeOf(new IftEdgeList)
     queue.io.brupdate := io.brupdate
     queue.io.flush := io.req.bits.kill
 
     io.ll_fresp <> queue.io.deq
+    // Task 3.2: constant zero after the queue, so its memory carries no edge bits
+    io.ll_fresp.bits.edges := 0.U.asTypeOf(new IftEdgeList)
     ifpu_busy := !(queue.io.empty)
     assert (queue.io.enq.ready)
   }
@@ -419,6 +433,14 @@ class ALUExeUnit(
     div.io.req.bits.uop        := io.req.bits.uop
     div.io.req.bits.rs1_data   := io.req.bits.rs1_data
     div.io.req.bits.rs2_data   := io.req.bits.rs2_data
+    // [DIVTAINT] taint-follows-data: the divider's result taint (r_secret/r_atk) comes
+    // only from these ports; `div.io <> DontCare` above had folded them to 0.
+    div.io.req.bits.rs1_secret    := io.req.bits.rs1_secret
+    div.io.req.bits.rs2_secret    := io.req.bits.rs2_secret
+    div.io.req.bits.rs1_taint_atk := io.req.bits.rs1_taint_atk
+    div.io.req.bits.rs2_taint_atk := io.req.bits.rs2_taint_atk
+    div.io.req.bits.rs3_secret    := io.req.bits.rs3_secret
+    div.io.req.bits.rs3_taint_atk := io.req.bits.rs3_taint_atk   // [G3RS3ATK]
     div.io.brupdate            := io.brupdate
     // corefuzzing
     div.io.cf_debug_exu_enable := io.cf_debug_exu_enable
@@ -545,6 +567,7 @@ class FPUExeUnit(
     fpu.io.req.bits.rs1_taint_atk := io.req.bits.rs1_taint_atk
     fpu.io.req.bits.rs2_taint_atk := io.req.bits.rs2_taint_atk
     fpu.io.req.bits.rs3_secret := io.req.bits.rs3_secret
+    fpu.io.req.bits.rs3_taint_atk := io.req.bits.rs3_taint_atk   // [G3RS3ATK]
     fpu.io.req.bits.rs3_data := io.req.bits.rs3_data
     fpu.io.req.bits.pred_data := false.B
     fpu.io.req.bits.kill     := io.req.bits.kill
@@ -577,6 +600,7 @@ class FPUExeUnit(
     fdivsqrt.io.req.bits.rs1_taint_atk := io.req.bits.rs1_taint_atk
     fdivsqrt.io.req.bits.rs2_taint_atk := io.req.bits.rs2_taint_atk
     fdivsqrt.io.req.bits.rs3_secret := io.req.bits.rs3_secret
+    fdivsqrt.io.req.bits.rs3_taint_atk := io.req.bits.rs3_taint_atk   // [G3RS3ATK]
     fdivsqrt.io.req.bits.rs3_data := DontCare
     fdivsqrt.io.req.bits.pred_data := false.B
     fdivsqrt.io.req.bits.kill     := io.req.bits.kill
@@ -622,6 +646,7 @@ class FPUExeUnit(
     queue.io.enq.bits.secret := fpu.io.resp.bits.secret
     queue.io.enq.bits.taint_atk := fpu.io.resp.bits.taint_atk
     queue.io.enq.bits.fflags := fpu.io.resp.bits.fflags
+    queue.io.enq.bits.edges  := 0.U.asTypeOf(new IftEdgeList)
     queue.io.brupdate          := io.brupdate
     queue.io.flush           := io.req.bits.kill
 
@@ -636,6 +661,7 @@ class FPUExeUnit(
     fp_sdq.io.enq.bits.taint_atk := io.req.bits.rs2_taint_atk
     fp_sdq.io.enq.bits.predicated := false.B
     fp_sdq.io.enq.bits.fflags := DontCare
+    fp_sdq.io.enq.bits.edges  := 0.U.asTypeOf(new IftEdgeList)
     fp_sdq.io.brupdate         := io.brupdate
     fp_sdq.io.flush          := io.req.bits.kill
 
@@ -645,6 +671,8 @@ class FPUExeUnit(
     resp_arb.io.in(0) <> queue.io.deq
     resp_arb.io.in(1) <> fp_sdq.io.deq
     io.ll_iresp       <> resp_arb.io.out
+    // Task 3.2: constant zero after the queues (the FP->int path never carries edges)
+    io.ll_iresp.bits.edges := 0.U.asTypeOf(new IftEdgeList)
 
     fpiu_busy := !(queue.io.empty && fp_sdq.io.empty)
   }

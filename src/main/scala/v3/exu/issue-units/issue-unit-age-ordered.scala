@@ -96,9 +96,13 @@ class IssueUnitCollapsing(
                                                         !dis_uops(i).is_fencei)
 
   val uops = issue_slots.map(s=>s.out_uop) ++ dis_uops.map(s=>s)
+  // Task 3.4: the slot-local contention carry shifts beside the uop; dispatch positions
+  // carry a zeroed one (the base-class default is the same zero).
+  val cntds = issue_slots.map(s=>s.out_cntd) ++ Seq.fill(dispatchWidth)(0.U.asTypeOf(new IssueCntdCarry))
   for (i <- 0 until numIssueSlots) {
   issue_slots(i).in_uop.valid := false.B
   issue_slots(i).in_uop.bits  := uops(i+1)
+  issue_slots(i).in_cntd      := cntds(i+1)
     // Gate: only active slots (i >= active_offset) receive new uops.
     // Active slots are at TOP indices so they are adjacent to dispatch positions.
     when (i.U >= active_offset) {
@@ -106,8 +110,9 @@ class IssueUnitCollapsing(
         when (shamts_oh(i+j) === (1 << (j-1)).U) {
           issue_slots(i).in_uop.valid := will_be_valid(i+j)
           issue_slots(i).in_uop.bits  := uops(i+j)
+          issue_slots(i).in_cntd      := cntds(i+j)
           // corefuzzing: stamp issue-queue bitmap bit when uop enters slot
-          issue_slots(i).in_uop.bits.cf_fu_bitmap := uops(i+j).cf_fu_bitmap | (1.U << moduleTagCF.U)
+          issue_slots(i).in_uop.bits.cf_fu_bitmap.foreach(_ := uops(i+j).cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << moduleTagCF.U))
         }
       }
     }
@@ -192,21 +197,26 @@ class IssueUnitCollapsing(
   // escaping occurs when the Scala vars are updated.
   // Scala-var priority ensures each slot fires cf_contend_in at most once per cycle (lowest port).
   val already_denied = Array.fill(numIssueSlots)(WireInit(false.B))
+  // [FIFO10] step 10: every port's denial of each slot this cycle, and that port's winner is_atk,
+  // so the slot counts the extra same-cycle denials as dropped and ORs all their is_atk.
+  val cross_loser = Array.fill(numIssueSlots, issueWidth)(false.B)
+  val port_atk    = Array.fill(issueWidth)(false.B)
+  val port_sec    = Array.fill(issueWidth)(false.B)   // [R117SWEEP] patch 33
   for (w <- 0 until issueWidth) {
     // Compute winner info unconditionally; gate with io.iss_valids(w) via AND.
-    val winner_domain = io.iss_uops(w).cf_domain_id
+    val winner_domain = io.iss_uops(w).cf_domain_id.getOrElse(0.U(iftTagWidth.W))
     // [NARROW 2026-09-10] truncate explicitly to the contention field's width; the
       // ty=2 edge discarded these bits anyway (rob.scala:715), so cutting here keeps
       // it visible instead of relying on an implicit Chisel width truncation.
-      val winner_op     = io.iss_uops(w).cf_op_count_id(inflOpCountWidthCF-1, 0)
-    val winner_is_atk = io.iss_uops(w).cf_domain_id === 1.U
-    val winner_is_sec = io.iss_uops(w).cf_secret_access || io.iss_uops(w).cf_secret_propagation
+      val winner_op     = io.iss_uops(w).cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))(inflOpCountWidthCF-1, 0)
+    val winner_is_atk = io.iss_uops(w).cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U
+    val winner_is_sec = io.iss_uops(w).cf_secret_access.getOrElse(false.B) || io.iss_uops(w).cf_secret_propagation.getOrElse(false.B)
     for (i <- 0 until numIssueSlots) {
       val can_use_port   = slot_can_use_port(i)(w)
       // Gate with io.iss_valids(w) here — all signals are in the outer scope.
       // Also fires when winner is same-domain but secret (same-domain secret contention).
       val is_cross_loser = io.iss_valids(w) && requests(i) && !issue_slots(i).grant &&
-                           can_use_port && (issue_slots(i).uop.cf_domain_id =/= winner_domain || winner_is_sec)
+                           can_use_port && (issue_slots(i).uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= winner_domain || winner_is_sec)
       when (is_cross_loser && !already_denied(i)) {
         issue_slots(i).cf_contend_in.valid                    := true.B
         issue_slots(i).cf_contend_in.bits.winner_op_count     := winner_op
@@ -215,6 +225,18 @@ class IssueUnitCollapsing(
         issue_slots(i).cf_contend_in.bits.infl_type           := INFL_ISSUE_CONTENTION.U
       }
       already_denied(i) = already_denied(i) | is_cross_loser
+      cross_loser(i)(w) = is_cross_loser
+    }
+    port_atk(w) = winner_is_atk
+    port_sec(w) = winner_is_sec
+  }
+  if (ENABLE_IFT) {
+    for (i <- 0 until numIssueSlots) {
+      issue_slots(i).cf_contend_in.bits.multi   := PopCount(cross_loser(i).toSeq) > 1.U
+      issue_slots(i).cf_contend_in.bits.any_atk := (0 until issueWidth).map(w => cross_loser(i)(w) && port_atk(w)).reduce(_ || _)
+      // [R117SWEEP] patch 33 (r117): the secret twin, same AND-OR shape beside any_atk (registered
+      // in the slot; 0 levels on the select/grant path, which it does not feed)
+      issue_slots(i).cf_contend_in.bits.any_sec.foreach(_ := (0 until issueWidth).map(w => cross_loser(i)(w) && port_sec(w)).reduce(_ || _))
     }
   }
 
@@ -224,16 +246,56 @@ class IssueUnitCollapsing(
   if (ENABLE_IFT) {
     for (i <- 0 until numIssueSlots) {
       val no_port_available = !(0 until issueWidth).map(w => slot_can_use_port(i)(w)).reduce(_||_)
+      // [I2BUSYFU] (ruling 100, I-2) only a slot that needs the busy unit is charged to it.  A
+      // slot starved for another reason (I2F queue full, F2I busy, ...) also sees no port and
+      // was named after the divider.  fu_code is a slot register, the mask a busy-unit OR:
+      // one more input on the existing AND, no new level.
+      val needs_busy_fu  = (issue_slots(i).uop.fu_code & io.cf_fu_busy.bits.fu_code) =/= 0.U
       val fu_busy_denial = issue_slots(i).request && !issue_slots(i).grant &&
-                           no_port_available && io.cf_fu_busy.valid
+                           no_port_available && io.cf_fu_busy.valid && needs_busy_fu
       when (fu_busy_denial && !already_denied(i)) {
         issue_slots(i).cf_contend_in.valid                := true.B
         issue_slots(i).cf_contend_in.bits.winner_op_count := io.cf_fu_busy.bits.op_count(inflOpCountWidthCF-1, 0)
         issue_slots(i).cf_contend_in.bits.winner_is_atk   := io.cf_fu_busy.bits.is_atk
         issue_slots(i).cf_contend_in.bits.winner_is_sec   := io.cf_fu_busy.bits.is_sec
         issue_slots(i).cf_contend_in.bits.infl_type       := INFL_FU_BUSY.U
+        issue_slots(i).cf_contend_in.bits.multi           := false.B                  // [FIFO10] one occupant
+        issue_slots(i).cf_contend_in.bits.any_atk         := io.cf_fu_busy.bits.is_atk // [FIFO10]
+        issue_slots(i).cf_contend_in.bits.any_sec.foreach(_ := io.cf_fu_busy.bits.is_sec) // [R117SWEEP]
       }
     }
+  }
+
+  // [IQHEAD] patch 49 (owner r175: "IQ full should follow the same"): the IQ_FULL edge names the
+  // queue's STALLING occupant, as ROB_FULL / LDQ_FULL / STQ_FULL name their head.  This queue
+  // collapses toward slot 0 and fills from the top, so its oldest occupant sits at the lowest ACTIVE
+  // slot, active_offset = numIssueSlots - issueQueueEntryOptions(cf_iq_idx): a FIXED slot per
+  // option (4 options -> slots 0/8/16/24 at 32 entries), no search, no scan.  The one-cycle hole
+  // after the head issues (the slot above shifts down next cycle) is covered by the slot above.
+  // Registered here: io.cf_iq_head at cycle t = the head of t-1, the occupancy the dispatch ready
+  // (RegNext(num_available > w)) of t was computed from.  Fields: oc = cf_op_count_id; atk =
+  // attacker domain || cf_src_atk (dispatch seed + wakeup taint_atk); sec = s_acc || s_prop (io.uop,
+  // incl. cf_src_secret) || cf_pend_sec (41).  No valid head: 0 (oc 0, clean).
+  // Levels: slot registers -> per-slot field LUT (sec 3-in OR, atk 2-3-in) -> 2:1 hole mux -> 4:1
+  // option mux (2-bit CSR index) -> FF: ~3 LUT, register to register, off every existing path.
+  // Cost: (uopIDCounterWidthCF + 2) FF; ~8 x 18 LUT inputs of muxing (~40-55 LUT) per IQ.
+  if (ENABLE_IFT) {
+    def headOf(i: Int): IftIqHead = {
+      val s = issue_slots(i)
+      val h = Wire(new IftIqHead)
+      h.oc  := s.uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
+      h.atk := s.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U || s.cf_src_atk.get
+      h.sec := s.uop.cf_secret_access.getOrElse(false.B) || s.uop.cf_secret_propagation.getOrElse(false.B) ||
+               s.cf_pend_sec.get
+      h
+    }
+    val noHead = 0.U.asTypeOf(new IftIqHead)
+    val optHeads = issueQueueEntryOptions.map { opt =>
+      val o = (numIssueSlots - opt) max 0          // the active_offset of this option (never underflows)
+      val n = (o + 1) min (numIssueSlots - 1)
+      Mux(issue_slots(o).valid, headOf(o), Mux(issue_slots(n).valid, headOf(n), noHead))
+    }
+    io.cf_iq_head.get := RegNext(VecInit(optHeads)(io.cf_iq_idx), noHead)
   }
 
   // Route cf_contend_out from each port's winning slot.

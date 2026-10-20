@@ -40,6 +40,38 @@ import boom.v3.util._
  * @param numWakeupPorts number of wakeup ports to the rob
  * @param numFpuPorts number of fpu ports that will write back fflags
  */
+/**
+ * [WINSHADOW] step 20: one implicit-flow window shadow range (core.scala winShadow).  Entries
+ * younger than the arming branch B (all of them once B has retired: bdone) and older than the
+ * ROB tail T at resolution (all of them when the ROB was full at capture: tall).  `head` is the
+ * ROB head the ages are taken against.
+ */
+class WinShadowInfo(implicit p: Parameters) extends BoomBundle
+{
+  val v     = Bool()
+  val b     = UInt(robAddrSz.W)
+  val bdone = Bool()
+  val t     = UInt(robAddrSz.W)
+  val tall  = Bool()
+  val head  = UInt(robAddrSz.W)
+  // [WINEXP] step 21 (owner r139, F3): the kind's current window epoch (core.scala winCtr).
+  val ep    = UInt(2.W)
+  def in(idx: UInt): Bool = v && (bdone || IsOlder(b, idx, head)) && (tall || IsOlder(idx, t, head))
+  // [WINAGE] Phase 4 Task 4.3c (gate review C3): the same test on head-relative ages,
+  // ai = (idx - head) mod 2^robAddrSz.  Exact for every robAddrSz-bit value: with N = 2^k and
+  // a, c, h in [0, N), IsOlder(a, c, h) = (a<c) ^ (a<h) ^ (c<h) equals (a-h mod N) < (c-h mod N)
+  // (both >= h: no wrap, a<c; both < h: both +N, a<c; a < h <= c: a-h+N > c-h, false, and the
+  // XOR is 1^1^0 = 0; c < h <= a: true, 0^0^1 = 1; a = c: both false).  Used where the age is
+  // cheaper than the index (the ROB commit slots, whose age is a function of rob_head_lsb only).
+  def age(x: UInt): UInt = (x - head)(robAddrSz - 1, 0)
+  def inAge(ai: UInt): Bool = v && (bdone || age(b) < ai) && (tall || ai < age(t))
+  // [WINEXP] the LIVE window taint of a result: the uop's own window taint (membership or a
+  // window operand) counts only if it was stamped in the current epoch (uep = uop.cf_wep_*);
+  // a shadow member (in) is marked in the current epoch.  The 2-bit compare (one LUT) runs in
+  // parallel with in(); the final OR is the one the step-20 `win || in` already had.
+  def res(win: Bool, uep: UInt, idx: UInt): Bool = (win && uep === ep) || in(idx)
+}
+
 class RobIo(
   val numWakeupPorts: Int,
   val numFpuPorts: Int
@@ -50,6 +82,9 @@ class RobIo(
   // (Allocate, write instruction to ROB).
   val enq_valids       = Input(Vec(coreWidth, Bool()))
   val enq_uops         = Input(Vec(coreWidth, new MicroOp()))
+  // IFT overhaul Phase 3, Task 3.3: the dispatch column's payload (base list, stall buckets,
+  // branch context), built at dispatch beside the uop.
+  val enq_ift          = Input(Vec(coreWidth, new IftDispatchInfo))
   val enq_partial_stall= Input(Bool()) // we're dispatching only a partial packet,
                                        // and stalling on the rest of it (don't
                                        // advance the tail ptr)
@@ -62,6 +97,10 @@ class RobIo(
   val rob_head_op_count  = Output(UInt(uopIDCounterWidthCF.W))
   val rob_head_domain    = Output(UInt(1.W))   // cf_domain_id of ROB head entry
   val rob_head_is_secret = Output(Bool())      // ROB head had s_acc=1 or s_prop=1
+  // [ROBHEADATK] patch 48 (r173 (6)): the head row's own result carries attacker VALUE taint
+  // (its C_sprob is_atk column, written at writeback by the existing port; registered like the
+  // other head fields, [HEADREG]).  IFT only.
+  val rob_head_valatk    = if (ENABLE_IFT) Some(Output(Bool())) else None
   // corefuzzing: cycle-N mispredicting branch UOP (same cycle as b1.mispredict_mask)
   val cf_mispredict_uop  = Input(Valid(new MicroOp))
 
@@ -145,7 +184,7 @@ class RobIo(
   // Fires when LSU TLB detects the effective address falls in the secret range, before
   // the dcache response — ensures s_acc is visible in [FLUSH] logs for speculative loads
   // killed before the dcache responds.
-  val cf_lsu_s_acc_upd = Input(Vec(memWidth, Valid(new CF_SAccUpdate)))
+  val cf_lsu_s_acc_upd = Input(Vec(memWidth, Valid(new CF_TlbFlagsUpdate)))   // [FIFO10] + atk / s_prop
 
   // corefuzzing: direct ROB s_tx update at TLB stage — fires when live preg_secret check
   // detects a secret-tainted source address register at issue time (Gap 1 fix, DOC:23).
@@ -165,11 +204,20 @@ class RobIo(
   // [MEMORD 2026-09-08] ty=8 MEM_ORDER edge from the LSU's order_fail sites.  See
   // CF_MemOrdUpdate in micro-op.scala for why the LDQ-resident edge cannot survive.
   val cf_lsu_memord_upd = Input(Vec(memWidth, Valid(new CF_MemOrdUpdate)))
+  // ([FIFO10] step 10, owner ruling 94: the Task 3.2 cf_lsu_dtlb_upd INFL_DTLB_STATE port is
+  //  removed with the DTLB domain/secret shadows; paging is off, it could never fire.)
 
   // corefuzzing: direct ROB update to set cf_secret_propagation for in-flight instructions
   // whose physical source registers are secret-tainted, discovered at writeback time.
   // One port per integer writeback port (numWakeupPorts); unused ports stay valid=false.
   val cf_s_prop_rob_upd = Input(Vec(numWakeupPorts, Valid(new CF_SPropUpdate)))
+
+  // [WINSHADOW] step 20: the window shadow ranges (core.scala winShadow): entries younger than
+  // B (all of them once B has committed, bdone) are in the window when they commit.
+  val cf_wsh_sec       = Input(new WinShadowInfo)
+  val cf_wsh_atk       = Input(new WinShadowInfo)
+  val cf_com_win_sec   = Output(Vec(coreWidth, Bool()))
+  val cf_com_win_atk   = Output(Vec(coreWidth, Bool()))
 
   // corefuzzing changes
   val cf_debug_rob_enable = Input(Bool())
@@ -187,9 +235,25 @@ class RobIo(
   val ift_priv            = Input(UInt(3.W))               // current privilege mode (from csr.io.status.prv)
   val ift_commit_valids   = Output(Vec(retireWidth, Bool())) // arch_valids
   val ift_commit_records  = Output(Vec(retireWidth, UInt(256.W)))
-  val ift_squash_valid    = Output(Bool())                  // one squash record drains per cycle
-  val ift_squash_record   = Output(UInt(256.W))
-  val ift_squash_ovf      = Output(Bool())                  // pending bitvector was clobbered before drain
+  // [THINUOP] Task 3.5: the IFT record fields that left the MicroOp, per retire slot, for the
+  // commit printf in core.scala: the sidecar readout (all zero with IFT off, except the two
+  // retained uop fields, which are taken from the uop as before).  The row's sticky flags
+  // stay on io.commit.uops (IftApply); Task 3.9 removed the unread commit_sticky copy.
+  val commit_ift          = Output(Vec(retireWidth, new IftCommitInfo))
+  val ift_squash          = Decoupled(UInt(256.W))          // one squash record per cycle; Task 3.4: ready from
+                                                            // the core's lane arbiter, absorbed by IftSquashMerge's
+                                                            // output queue (never reaches the banks, D6)
+  val ift_squash_ovf      = Output(Bool())                  // sticky: a squash record has been lost since reset (Task 2.7, D6)
+  val ift_squash_ovf_cnt  = Output(UInt(16.W))   // D6: squash records lost (bank FIFO full + row reuse), saturating
+  val ift_squash_reuse_cnt = Output(UInt(16.W))  // D6: the row-reuse share of ift_squash_ovf_cnt (Task 2.7)
+  val ift_third_drop_cnt  = Output(UInt(16.W))   // D19: readouts that saw a third same-type update
+  // [FFTAINT] step 18 (ruling 118, G-2): this cycle a retiring FP op RAISED a flag (its
+  // committed fflags are non-zero) and that op was secret (sticky s_acc || s_prop) / attacker
+  // tainted (sticky atk || domain != 0).  Combinational on the commit readout, beside
+  // io.commit.fflags; core.scala ORs them into its two sticky fflags taint bits.  Outputs
+  // only: no new message path into the ROB.  Constant 0 without ENABLE_IFT.
+  val cf_ff_set_sec       = Output(Bool())
+  val cf_ff_set_atk       = Output(Bool())
 }
 
 /**
@@ -342,19 +406,85 @@ class Rob(
   val rob_head_uses_stq   = Wire(Vec(coreWidth, Bool()))
   val rob_head_uses_ldq   = Wire(Vec(coreWidth, Bool()))
   val rob_head_fflags     = Wire(Vec(coreWidth, UInt(freechips.rocketchip.tile.FPConstants.FLAGS_SZ.W)))
+  // [FFTAINT] step 18: the head row's secret (s_acc || s_prop) and attacker (atk || domain)
+  // status per bank, read beside rob_head_fflags; used only by the FP-exceptions block.
+  val rob_head_ffsec      = Wire(Vec(coreWidth, Bool()))
+  val rob_head_ffatk      = Wire(Vec(coreWidth, Bool()))
 
-  // for core fuzzing
-  val cf_rob_head_uop     = Wire(Vec(coreWidth, new MicroOp()))
+  // for core fuzzing: the head row's op_count and domain (bank 0 = retire slot 0), driven inside
+  // the bank loop for w == 0.  Task 2.10: two fields instead of a Vec of whole MicroOps of which
+  // only bank 0's two fields were read.
+  val rob_head_oc_bank0  = Wire(UInt(uopIDCounterWidthCF.W))
+  val rob_head_dom_bank0 = Wire(UInt(1.W))
+  // [SIDECAR] Task 2.4: the head row's secret status (s_acc || s_prop) comes from bank 0's
+  // sticky flags (spec 5.1.1), not from rob_uop; driven inside the bank loop for w == 0.
+  val rob_head_is_secret_bank0 = Wire(Bool())
+  rob_head_is_secret_bank0 := false.B
+  val rob_head_valatk_bank0 = WireInit(false.B)   // [ROBHEADATK] patch 48
+  // [SIDECAR] Task 2.7 (spec 5.1.7, deferred D-9): the ROB pointer-reset pulse (quiesce drain,
+  // or the ROB-size CSR change at its flush_commit).  Driven once after the bank loop (its
+  // terms are computed there) and read inside the loop: it clears the squash-pending bits and
+  // the sticky flags and re-syncs the squash drain pointer to the new tail (row 0).
+  val ift_rob_ptr_reset = Wire(Bool())
 
-  // IFT bridge: per-bank drain wires; arbitrated outside the bank loop to one output.
-  val ift_sq_bank_valid   = Wire(Vec(coreWidth, Bool()))
-  val ift_sq_bank_record  = Wire(Vec(coreWidth, UInt(256.W)))
-  // Only the winning bank may clear its pending bit; others retry next cycle.
-  val ift_sq_bank_drain_ok = Wire(Vec(coreWidth, Bool()))
-  // Initialised to safe defaults; each bank drives its own slot inside the loop.
-  ift_sq_bank_valid    := VecInit(Seq.fill(coreWidth)(false.B))
-  ift_sq_bank_record   := VecInit(Seq.fill(coreWidth)(0.U(256.W)))
-  ift_sq_bank_drain_ok := VecInit(Seq.fill(coreWidth)(false.B))
+  // LSU-fed writeback ports (the ones that carry influencer lists): 0 = ll_wbarb
+  // (mem_resps(0) + fp->int), 1 = mem_resps(1); with the FPU the fp_pipeline wakeups
+  // are the LAST three ports and their first two are the memory ones (fp ll_wbarb =
+  // ll_wports(0) + int->fp, then ll_wports(1)); the FPU itself is last
+  // (core.scala:2071-2128, fp-pipeline.scala:299-330).  Task 2.10d: hoisted out of the bank
+  // loop because the raw squash entry's shape (IftSqEntry) is needed before it.
+  val lsuWbPorts  = Seq(0, 1) ++ (if (usingFPU) Seq(numWakeupPorts - 3, numWakeupPorts - 2) else Nil)
+  val iftNSprob   = numWakeupPorts                               // the sidecar's sprobPorts
+  val iftNIc      = io.cf_issue_contention_upd.length
+  val iftNMo      = memWidth
+  // Task 2.10d (review F7, ruling 63 Q2): the squash path's printf copies (IftSqDbg memories,
+  // [FLUSH], [SQREC], [SQDROP], [SQRAW]) and the Verilator-only bit-exact shadow check of the
+  // 4b record exist only in printf builds without the IFT bridge.  No FireSim bridge build
+  // elaborates them; in the oracle build they feed only printf/assert and Vivado removes them.
+  val iftSqDbgOn  = ENABLE_IFT && ENABLE_CF_DEBUG_PRINTF && !ENABLE_IFT_BRIDGE
+  val iftSqShadow = iftSqDbgOn
+
+  // IFT bridge: per-bank squash captures (tail-order drain + rollback walk, Task 2.6).  Task
+  // 2.10d (design 4b): each bank writes the RAW row of the captured entry into its own FIFO
+  // in IftSquashMerge (after the loop), whose one shared merge drains the four FIFOs round-
+  // robin onto the single squash lane.  No back-pressure into the bank (D6).
+  val ift_sq_cap = Wire(Vec(coreWidth, Valid(new IftSqEntry(iftNSprob, iftNIc, lsuWbPorts.length, iftNMo))))
+  val ift_sq_dbg = Wire(Vec(coreWidth, new IftSqDbg(iftSqShadow)))
+  // D19 / D6 event pulses, counted after the loop: a readout that dropped a third same-type
+  // update (commit readout and squash capture separately: both can fire in one cycle), a row
+  // re-allocated while its squash record was still pending, and (Task 2.10d, D-22) the
+  // pending rows a ROB pointer reset clears without a record.
+  val ift_third_drop_bank    = Wire(Vec(coreWidth, Bool()))
+  val ift_third_drop_sq_bank = Wire(Vec(coreWidth, Bool()))
+  val ift_sq_reuse_bank      = Wire(Vec(coreWidth, Bool()))
+  val ift_sq_ptrrst_bank     = Wire(Vec(coreWidth, UInt((log2Ceil(numRobRows) + 1).W)))
+  // Initialised to safe defaults (no DontCare: Phase 0 Bug 3); each bank drives its own slot.
+  ift_sq_cap             := 0.U.asTypeOf(ift_sq_cap)
+  ift_sq_dbg             := 0.U.asTypeOf(ift_sq_dbg)
+  ift_third_drop_bank    := VecInit(Seq.fill(coreWidth)(false.B))
+  ift_third_drop_sq_bank := VecInit(Seq.fill(coreWidth)(false.B))
+  ift_sq_reuse_bank      := VecInit(Seq.fill(coreWidth)(false.B))
+  ift_sq_ptrrst_bank     := VecInit(Seq.fill(coreWidth)(0.U((log2Ceil(numRobRows) + 1).W)))
+  // [FLUSH] printf (Task 2.6): the flushing branch's fields (the brief's
+  // `RegEnable(io.cf_mispredict_uop.bits, io.cf_mispredict_uop.valid)`, reduced to the three
+  // fields the printf reads and hoisted out of the bank loop), captured in the b1 cycle and
+  // held for the drain.  Task 2.10d: the drain copies them into the entry's IftSqDbg at capture
+  // (review F4 of the 4c design), so a later mispredict cannot change a printed field.
+  // Debug-printf only; constants unless iftSqDbgOn (ruling 5, review F7).
+  val flush_mp_gate = iftSqDbgOn
+  val flush_mp_dom  = if (flush_mp_gate) RegEnable(io.cf_mispredict_uop.bits.cf_domain_id.getOrElse(0.U(iftTagWidth.W)), io.cf_mispredict_uop.valid)
+                      else 0.U.asTypeOf(io.cf_mispredict_uop.bits.cf_domain_id.getOrElse(0.U(iftTagWidth.W)))
+  val flush_mp_sec  = if (flush_mp_gate) RegEnable(io.cf_mispredict_uop.bits.cf_secret_propagation.getOrElse(false.B) ||
+                                                   io.cf_mispredict_uop.bits.cf_secret_access.getOrElse(false.B), io.cf_mispredict_uop.valid)
+                      else false.B
+  val flush_mp_oc   = if (flush_mp_gate) RegEnable(io.cf_mispredict_uop.bits.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)), io.cf_mispredict_uop.valid)
+                      else 0.U(uopIDCounterWidthCF.W)
+
+  // [SIDECAR] arrival-stamp counter shared by the four sidecar banks (spec 5.1.2, D15).  Ruling 38:
+  // a register only under ENABLE_IFT (rule 6.1/5), constant otherwise.  Task 2.10: one counter
+  // instead of one identical copy per bank (48 declared register bits fewer; Vivado already
+  // merged the copies, so the FPGA count does not move).
+  val ift_stamp = if (ENABLE_IFT) { val r = RegInit(0.U(IftStamp.W.W)); r := r + 1.U; r } else 0.U(IftStamp.W.W)
 
   val exception_thrown = Wire(Bool())
 
@@ -420,29 +550,92 @@ class Rob(
 
     val rob_debug_wdata = Mem(numRobRows, UInt(xLen.W))
 
-    // corefuzzing: pending tables for serialized influencer list writes.
-    // Replaces direct N-port writes to rob_uop influencer lists with a
-    // 1-drain-per-cycle pattern, reducing ROB register file MUX tree complexity.
-    //   sprob: one pending bit per row (fixed content: INFL_REG_DATAFLOW, is_secret=true)
-    //   ic:    pending bit + variable winner data per row (INFL_ISSUE_CONTENTION)
-    //   wb:    pending bit + full influencer list per row (writeback merge — Fix opt#1)
-    val sprob_infl_pending    = RegInit(VecInit(Seq.fill(numRobRows)(false.B)))
-    val ic_pending_valid      = RegInit(VecInit(Seq.fill(numRobRows)(false.B)))
-    val ic_pending_winner_op  = Reg(Vec(numRobRows, UInt(inflOpCountWidthCF.W)))  // [NARROW]
-    val ic_pending_winner_atk = Reg(Vec(numRobRows, Bool()))
-    val ic_pending_winner_sec = Reg(Vec(numRobRows, Bool()))
-    val ic_pending_infl_type  = Reg(Vec(numRobRows, UInt(inflTypeWidthCF.W)))
-    // wb_infl pending: captures influencer list from writeback responses.
-    // Drains 1/cycle via PriorityEncoder (same pattern as sprob/ic).
-    // If a second wb_resp hits the same row while pending, overflow is set.
-    val wb_infl_pending       = RegInit(VecInit(Seq.fill(numRobRows)(false.B)))
-    val wb_infl_list          = Reg(Vec(numRobRows, Vec(numInfluencerSlotsCF, new InfluencerEntry)))
-    val wb_infl_overflow      = Reg(Vec(numRobRows, UInt(2.W)))
-
-    // IFT bridge: per-row pending bits for squashed IFT-active entries.
-    // Set in branch-kill loop when rob_val && IFT-active; cleared in per-bank drain.
-    // Also cleared on dispatch (new enqueue to same row) to prevent stale drain.
+    // IFT bridge: per-row squash-pending bits.  [SQUASHALL] Task 2.5 (D5, spec 5.1.6): set
+    // in the kill loop for EVERY branch-killed valid row (the old IFT-activity gate and the
+    // old sprob/ic/wb pending tables are gone, ruling 38 item 2); cleared by the tail-order
+    // drain (Task 2.6, after the commit section) and on dispatch (new enqueue to the row).
     val ift_squash_pending = RegInit(VecInit(Seq.fill(numRobRows)(false.B)))
+    // corefuzzing [SIDECAR] (IFT overhaul Phase 2, Task 2.2): IFT state for this bank moves
+    // into a per-bank LUTRAM sidecar (RobIftBank, spec 5.1; D3, D15, D17, D19).  Once
+    // Tasks 2.3/2.4 route the update ports and the readout, rob_uop keeps only op_count,
+    // domain and ras_pred_xdom; everything else lives in the sidecar columns or in the four
+    // sticky bits below (same-cycle readers: shadow broadcast, head status, squash gate).
+    // Task 2.3 routed every update port into the columns / sticky bits and deleted the
+    // drains; Task 2.4 made the commit path read the sidecar (io.commit.uops(w).cf_* is
+    // reconstructed from the readout + sticky flags, the commit-time override is gone).
+    // Task 2.5 rewrote the kill loop (D5: every branch-killed valid row is marked for a
+    // squash record, no activity gate; the STEP1 shadow promotion writes only sticky_atk)
+    // and deleted the old pending tables (sprob/ic/wb) with their last readers.  Task 2.6
+    // moved the squash record and the [FLUSH] printf to the sidecar squash readout (tail-order
+    // drain + rollback walk) and zeroes the rob_uop.cf_* copy at enqueue: rob_uop.cf_* is read
+    // only for op_count, domain and ras_pred_xdom (spec 5.1.1) when ENABLE_IFT.
+    // LSU-fed writeback ports: `lsuWbPorts` above the bank loop (Task 2.10d).
+    // One op_count guard read port per guarded update port, in guardOk call order
+    // (s_acc, br_atk_self, memord, s_tx, sprob); the require after the last call checks it.
+    // ([FIFO10] step 10: the 2 DTLB guard ports are gone, 21 -> 19.)
+    val sidecarGuardPorts = io.cf_lsu_s_acc_upd.length + io.cf_br_atk_self.length +
+                            io.cf_lsu_memord_upd.length +
+                            io.cf_lsu_s_tx_upd.length + io.cf_s_prop_rob_upd.length
+    // Rule 6.1/5: every new element is under ENABLE_IFT.  With IFT off the sidecar is not
+    // elaborated and the readout fields below read as zero, so BaselineBoomConfig's Verilog
+    // is unchanged (checked in Task 2.11).  Written as a Module inside `if (ENABLE_IFT)`
+    // with its IO exposed through a wire so the rest of this file reads one name:
+    val sidecar_io = Wire(new RobIftBankIO(numRobRows, numWakeupPorts, memWidth + 1, numWakeupPorts,
+                                           io.cf_issue_contention_upd.length, memWidth,
+                                           guardPorts = sidecarGuardPorts, lsuWbCount = lsuWbPorts.length))
+    // Ruling 29 (Task 2.1 review; Phase 0 Bug 3): no DontCare on this wire.  Every field
+    // gets an explicit zero/false default here; the real drivers follow (last connect wins).
+    sidecar_io.stamp        := 0.U
+    sidecar_io.clear_all    := false.B
+    sidecar_io.enq.valid    := false.B
+    sidecar_io.enq.bits     := 0.U.asTypeOf(sidecar_io.enq.bits)
+    sidecar_io.wb.foreach     { x => x.valid := false.B; x.bits := 0.U.asTypeOf(x.bits) }
+    sidecar_io.clr.foreach    { x => x.valid := false.B; x.bits := 0.U.asTypeOf(x.bits) }
+    sidecar_io.sprob.foreach  { x => x.valid := false.B; x.bits := 0.U.asTypeOf(x.bits) }
+    sidecar_io.ic.foreach     { x => x.valid := false.B; x.bits := 0.U.asTypeOf(x.bits) }
+    sidecar_io.memord.foreach { x => x.valid := false.B; x.bits := 0.U.asTypeOf(x.bits) }
+    sidecar_io.ras.valid    := false.B
+    sidecar_io.ras.bits     := 0.U
+    sidecar_io.guard_row.foreach(_ := 0.U)
+    sidecar_io.guard_oc.foreach(_ := 0.U)
+    sidecar_io.commit       := 0.U.asTypeOf(sidecar_io.commit)
+    sidecar_io.commit_out   := 0.U.asTypeOf(sidecar_io.commit_out)
+    sidecar_io.commit_third := false.B
+    sidecar_io.commit_valatk := false.B   // [ROBHEADATK] patch 48
+    sidecar_io.commit_age   := 0.U
+    sidecar_io.squash       := 0.U.asTypeOf(sidecar_io.squash)
+    sidecar_io.sq_raw       := 0.U.asTypeOf(sidecar_io.sq_raw)
+    sidecar_io.sq_third     := false.B
+    if (ENABLE_IFT) {
+      val m = Module(new RobIftBank(numRobRows, numWakeupPorts, lsuWbPorts, memWidth + 1,
+                                    numWakeupPorts, io.cf_issue_contention_upd.length, memWidth,
+                                    guardPorts = sidecarGuardPorts))
+      m.io <> sidecar_io
+    }
+    // Keeps the `sidecar.io.*` spelling used by Tasks 2.3/2.4.  A local object rather than
+    // the plan's `new { val io = ... }` so member access is not reflective (Task 2.1 review).
+    object sidecar { val io = sidecar_io }
+    sidecar.io.stamp     := ift_stamp
+    sidecar.io.clear_all := io.cf_rob_quiesce_reset
+    // Ruling 38: the four sticky vectors are registers only under ENABLE_IFT (rule 6.1/5);
+    // constant-false wires otherwise, and every write to them sits under if (ENABLE_IFT).
+    def stickyVec(): Vec[Bool] =
+      if (ENABLE_IFT) RegInit(VecInit(Seq.fill(numRobRows)(false.B)))
+      else            WireDefault(VecInit(Seq.fill(numRobRows)(false.B)))
+    val sticky_s_acc  = stickyVec()
+    val sticky_s_prop = stickyVec()
+    val sticky_s_tx   = stickyVec()
+    val sticky_atk    = stickyVec()
+    // [SIDECAR] Task 2.3: op_count reuse guard through the sidecar's replicated op_count
+    // column (spec 5.1.4).  One asynchronous read port per guarded update port, compared
+    // once here: rob_val(row) && C_oc(row) === op_count.  Callers connect the row address
+    // unconditionally (outside their `when`) so no mux sits in front of the LUTRAM read.
+    var guard_k = 0
+    def guardOk(row: UInt, oc: UInt): Bool = {
+      val k = guard_k; guard_k += 1
+      sidecar.io.guard_row(k) := row
+      rob_val(row) && sidecar.io.guard_oc(k) === oc
+    }
 
     //-----------------------------------------------
     // Dispatch: Add Entry to ROB
@@ -455,39 +648,65 @@ class Rob(
       rob_bsy(rob_tail)       := !(io.enq_uops(w).is_fence ||
                                    io.enq_uops(w).is_fencei)
       rob_unsafe(rob_tail)    := io.enq_uops(w).unsafe
-      // corefuzzing: stamp robTagCF bit into cf_fu_bitmap at enqueue
       rob_uop(rob_tail)       := io.enq_uops(w)
-      rob_uop(rob_tail).cf_fu_bitmap := io.enq_uops(w).cf_fu_bitmap | (1.U << robTagCF.U)
+      // corefuzzing: stamp robTagCF bit into cf_fu_bitmap at enqueue.  IFT off only: with IFT
+      // the sidecar's dispatch column stamps it (rob-ift-sidecar.scala, enqueue) and the copy
+      // here is zeroed below (Task 2.10).
+      if (!ENABLE_IFT) {
+        rob_uop(rob_tail).cf_fu_bitmap.foreach(_ := io.enq_uops(w).cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << robTagCF.U))
+      }
       // IFT LUT optimization (Change 3): zero dead fields at ROB enqueue.
-      //   cf_cntd_*: consumed at issue time via cf_contend_out → ic_pending_*
-      //              tables; never read from rob_uop after enqueue.
-      rob_uop(rob_tail).cf_cntd_valid            := false.B
-      rob_uop(rob_tail).cf_cntd_winner_op        := 0.U
-      rob_uop(rob_tail).cf_cntd_winner_atk       := false.B
-      rob_uop(rob_tail).cf_cntd_winner_sec       := false.B
-      rob_uop(rob_tail).cf_cntd_deny_count       := 0.U
+      //   cf_cntd_*: consumed at issue time via cf_contend_out → the C_ic sidecar
+      //              columns (io.cf_issue_contention_upd); never read from rob_uop after enqueue.
+      // [SIDECAR] Task 2.2: dispatch writes the sidecar's dispatch column and the four
+      // sticky bits.  Task 2.6 (ruling 38 amendment 1, deferred from Task 2.2): with the
+      // [FLUSH] printf and the squash record now read from the sidecar squash readout, no
+      // rob_uop.cf_* reader is left except cf_op_count_id, cf_domain_id and cf_ras_pred_xdom
+      // (spec 5.1.1), so the row's copy of every other cf_* field is zeroed here and the
+      // flops fold away.  Under ENABLE_IFT only (ruling 5): with IFT off the sidecar does not
+      // exist and the commit uop still carries the rob_uop copy, as before Phase 2.
+      if (ENABLE_IFT) {
+        rob_uop(rob_tail).cf_attacker_influence.foreach(_ := false.B)
+        rob_uop(rob_tail).cf_secret_access.foreach(_ := false.B)
+        rob_uop(rob_tail).cf_secret_propagation.foreach(_ := false.B)
+        rob_uop(rob_tail).cf_secret_transmission.foreach(_ := false.B)
+        rob_uop(rob_tail).cf_fu_bitmap.foreach(_ := 0.U)
+        rob_uop(rob_tail).cf_mem_dataflow_atk.foreach(_ := false.B)
+        rob_uop(rob_tail).cf_mem_sec_dataflow.foreach(_ := false.B)
+        rob_uop(rob_tail).cf_spec_branch_is_secret.foreach(_ := false.B)
+      }
+      sidecar.io.enq.valid    := true.B
+      sidecar.io.enq.bits.row  := rob_tail
+      sidecar.io.enq.bits.oc   := io.enq_uops(w).cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
+      sidecar.io.enq.bits.fu_bitmap := io.enq_uops(w).cf_fu_bitmap.getOrElse(0.U(numModules.W))
+      sidecar.io.enq.bits.spec_branch_is_secret := io.enq_uops(w).cf_spec_branch_is_secret.getOrElse(false.B)
+      sidecar.io.enq.bits.info := io.enq_ift(w)
+      if (ENABLE_IFT) {
+        sticky_s_acc(rob_tail)  := io.enq_uops(w).cf_secret_access.getOrElse(false.B)
+        // [RSTICKY] step 17 (audit P18, R-STICKY): a dispatch-time edge with is_secret=1 sets the
+        // row's s_prop summary, as dis_promoted_atk already does for is_atk (core.scala).  Read
+        // from the base list the row is enqueued with, so the uop's own s_prop (which feeds the
+        // issue-time wakeup secret) is untouched: summary only, no value taint.  Covers the
+        // step-16 IQ_FULL and BTB_STATE (bit 7: secret hit / displacement) edges, and the other
+        // dispatch edges with sec=1 that had no s_prop (REG_PRESSURE head, MEM_HOL).  An edge
+        // dropped by the 4-slot list is not seen (the atk twin sees all candidates).
+        // [R117SWEEP] patch 33 (r117 + r93): the enqueue uop's cf_secret_propagation now carries
+        // the dispatch summary itself: core.scala ORs in is_secret over EVERY firing dispatch
+        // candidate (stored or dropped by the 4-slot list) on rob.io.enq_uops only.  That is a
+        // superset of the surviving base entries (zero base: every stored entry is a firing
+        // candidate), so the old base-list OR is redundant and is removed (r91): 0 LUT here.
+        sticky_s_prop(rob_tail) := io.enq_uops(w).cf_secret_propagation.getOrElse(false.B)
+        sticky_s_tx(rob_tail)   := io.enq_uops(w).cf_secret_transmission.getOrElse(false.B)
+        sticky_atk(rob_tail)    := io.enq_uops(w).cf_attacker_influence.getOrElse(false.B)
+      }
       rob_exception(rob_tail) := io.enq_uops(w).exception
       rob_predicated(rob_tail)   := false.B
       rob_fflags(w)(rob_tail)    := 0.U
-      // [A6PROBE2 2026-09-15] measurement only: a row being re-allocated while its
-      // squash record is still waiting for the 1/cycle squash drain.  The clear below
-      // then drops that squash record entirely -- the second loss on the squash path
-      // (the first, kill-clears-pending, is [A6PROBE] at the kill site).
-      if (ENABLE_CF_DEBUG_PRINTF) {
-        when (ift_squash_pending(rob_tail) && io.cf_debug_rob_enable) {
-          // [CFNOISE-COMMENTED] printf("[A6PROBE2] reuse-before-squash-drain row=%d old_pc=0x%x old_oc=%d s_acc=%d s_prop=%d s_tx=%d infl_valid=%d new_pc=0x%x\n",
-            // [CFNOISE-COMMENTED] rob_tail, rob_uop(rob_tail).debug_pc, rob_uop(rob_tail).cf_op_count_id,
-            // [CFNOISE-COMMENTED] rob_uop(rob_tail).cf_secret_access, rob_uop(rob_tail).cf_secret_propagation,
-            // [CFNOISE-COMMENTED] rob_uop(rob_tail).cf_secret_transmission,
-            // [CFNOISE-COMMENTED] PopCount(VecInit(rob_uop(rob_tail).cf_influencer_list.map(_.valid))),
-            // [CFNOISE-COMMENTED] io.enq_uops(w).debug_pc)
-        }
-      }
       // IFT bridge: clear stale squash-pending bit so an old killed entry doesn't
-      // pollute a freshly dispatched instruction at the same ROB row.
+      // pollute a freshly dispatched instruction at the same ROB row.  With the tail-order
+      // drain (Task 2.6) the bit is normally clear here; a set bit means the record was lost
+      // to reuse, which the drain section asserts and counts (sq_reuse, D6).
       ift_squash_pending(rob_tail) := false.B
-      // Opt#1: clear stale wb influencer pending on dispatch.
-      wb_infl_pending(rob_tail) := false.B
 
       assert (rob_val(rob_tail) === false.B, "[rob] overwriting a valid entry.")
       assert ((io.enq_uops(w).rob_idx >> log2Ceil(coreWidth)) === rob_tail)
@@ -525,20 +744,23 @@ class Rob(
     }
 
     // Stores have a separate method to clear busy bits
-    for ((((clr_rob_idx, cf_bmap), cf_stx), cf_sprop) <- io.lsu_clr_bsy.zip(io.lsu_clr_bsy_cf_bitmap).zip(io.lsu_clr_bsy_cf_stx).zip(io.lsu_clr_bsy_cf_sprop)) {
+    for (((((clr_rob_idx, cf_bmap), cf_stx), cf_sprop), ci) <- io.lsu_clr_bsy.zip(io.lsu_clr_bsy_cf_bitmap).zip(io.lsu_clr_bsy_cf_stx).zip(io.lsu_clr_bsy_cf_sprop).zipWithIndex) {
       when (clr_rob_idx.valid && MatchBank(GetBankIdx(clr_rob_idx.bits))) {
         val cidx = GetRowIdx(clr_rob_idx.bits)
         rob_bsy(cidx)    := false.B
         rob_unsafe(cidx) := false.B
-        // corefuzzing: merge accumulated store cf_fu_bitmap (stq+dtlb+dcache bits) into rob_uop
-        rob_uop(cidx).cf_fu_bitmap := rob_uop(cidx).cf_fu_bitmap | cf_bmap
-        // corefuzzing: set cf_secret_transmission if store writes secret-derived data to non-secret addr
-        when (cf_stx) { rob_uop(cidx).cf_secret_transmission := true.B }
-        // corefuzzing: a store's DATA taint reaches the ROB only here -- stores have
-        // rf_wen=false so they never appear as writeback resps, which is why the final
-        // store of each attack gadget chain logged s_prop=0 while every other member
-        // was tagged.
-        when (cf_sprop) { rob_uop(cidx).cf_secret_propagation := true.B }
+        // corefuzzing [SIDECAR] Task 2.3: the store's accumulated cf_fu_bitmap
+        // (stq+dtlb+dcache bits) goes to this port's C_clr column; its data-taint flags go
+        // to the sticky bits: s_tx = the store writes secret-derived data to a non-secret
+        // address; s_prop = a store's DATA taint reaches the ROB only here (stores have
+        // rf_wen=false, so they never appear as writeback resps).
+        if (ENABLE_IFT) {
+          sidecar.io.clr(ci).valid          := true.B
+          sidecar.io.clr(ci).bits.row       := cidx
+          sidecar.io.clr(ci).bits.fu_bitmap := cf_bmap
+          when (cf_stx)   { sticky_s_tx(cidx)   := true.B }
+          when (cf_sprop) { sticky_s_prop(cidx) := true.B }
+        }
         assert (rob_val(cidx) === true.B, "[rob] store writing back to invalid entry.")
         assert (rob_bsy(cidx) === true.B, "[rob] store writing back to a not-busy entry.")
       }
@@ -550,299 +772,151 @@ class Rob(
       }
     }
 
-    // corefuzzing: issue contention update — instead of writing directly to the ROB
-    // influencer list (6 ports × numRobRows × the whole list = large MUX tree), record in a
-    // compact per-row pending table and drain 1 entry per cycle in the background.
-    for (upd <- io.cf_issue_contention_upd) {
-      when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx))) {
-        val cidx = GetRowIdx(upd.bits.rob_idx)
-        when (rob_val(cidx)) {
-          ic_pending_valid(cidx)      := true.B
-          ic_pending_winner_op(cidx)  := upd.bits.winner_op_count
-          ic_pending_winner_atk(cidx) := upd.bits.winner_is_atk
-          ic_pending_winner_sec(cidx) := upd.bits.winner_is_sec
-          ic_pending_infl_type(cidx)  := upd.bits.infl_type
-          // deny_count is a per-uop scalar, not a per-slot field: a uop can hold at most
-          // one INFL_ISSUE_CONTENTION entry, and the issue slot latches the FIRST denier
-          // while aggregating the count over ALL of them.  Compress to the shared 3-bit
-          // log bucket here, once, rather than in all 110 issue slots.
-          rob_uop(cidx).cf_cntd_deny_count := Log2Bucket(upd.bits.deny_count)
+    // corefuzzing [SIDECAR] Task 2.3: issue contention update -> this port's C_ic column
+    // (the entry, Log2Bucket(deny_count) and the stamp are formed in the column write; the
+    // deny bucket is read back at readout) and the sticky attacker bit.  rob_val is the
+    // only guard, as before (the port carries no op_count).  The old per-row contention
+    // pending tables are gone (Task 2.5).
+    if (ENABLE_IFT) {
+      for ((upd, ui) <- io.cf_issue_contention_upd.zipWithIndex) {
+        when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx))) {
+          val cidx = GetRowIdx(upd.bits.rob_idx)
+          when (rob_val(cidx)) {
+            sidecar.io.ic(ui).valid    := true.B
+            sidecar.io.ic(ui).bits.row := cidx
+            sidecar.io.ic(ui).bits.upd := upd.bits
+            // [FIFO10] any_atk: every winner that denied the uop (the slot keeps only the newest)
+            when (upd.bits.winner_is_atk || upd.bits.any_atk) { sticky_atk(cidx) := true.B }
+            // [R117SWEEP] patch 33 (DF-29b-ic, r117): the secret twin.  A sec=1 ISSUE_CONTENTION /
+            // FU_BUSY winner (the newest, or any the slot's one-entry list replaced: any_sec) sets
+            // the row's s_prop summary.  Same enable as the sticky_atk write, +0 levels on it.
+            when (upd.bits.winner_is_sec || upd.bits.any_sec.getOrElse(false.B)) { sticky_s_prop(cidx) := true.B }
+          }
         }
       }
     }
 
-    // corefuzzing: direct s_acc update from LSU TLB stage — fires at address-compute time,
-    // before dcache response, so speculative secret loads show s_acc=1 in [FLUSH] logs.
-    for (upd <- io.cf_lsu_s_acc_upd) {
-      when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx))) {
+    // [SIDECAR] Task 2.3: the op_count-guarded update ports (spec 5.1.4).  Each guard's
+    // row address is connected outside the `when` (guardOk) so the LUTRAM read sees the
+    // port's row bits directly, and the valid/bank/guard conjunction gates only the one-bit
+    // sticky writes and the column write enables.  None of these sites touches rob_uop
+    // any more; the entries they used to append are reconstructed at readout (Task 2.4).
+    if (ENABLE_IFT) {
+      // corefuzzing: direct s_acc update from LSU TLB stage -- fires at address-compute
+      // time, before the dcache response, so speculative secret loads show s_acc=1 in
+      // [FLUSH] logs.  Guard against ROB slot reuse: only apply if the slot still holds
+      // the same instruction (same op_count_id) that generated this TLB-stage update.
+      for (upd <- io.cf_lsu_s_acc_upd) {
         val cidx = GetRowIdx(upd.bits.rob_idx)
-        // Guard against ROB slot reuse: only apply if the slot still holds the
-        // same instruction (same op_count_id) that generated this TLB-stage update.
-        // A squashed instruction can have its slot reallocated before the update
-        // arrives; without this guard the new instruction inherits a stale s_acc=1.
-        when (rob_val(cidx) && rob_uop(cidx).cf_op_count_id === upd.bits.op_count_id) {
-          rob_uop(cidx).cf_secret_access := true.B
+        val ok   = guardOk(cidx, upd.bits.op_count_id)
+        when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx)) && ok) {
+          when (upd.bits.s_acc)  { sticky_s_acc(cidx)  := true.B }
+          // [FIFO10] step 10: a load's issue-path flags at the TLB stage (squash-record parity)
+          when (upd.bits.atk)    { sticky_atk(cidx)    := true.B }
+          when (upd.bits.s_prop) { sticky_s_prop(cidx) := true.B }
         }
       }
-    }
-
-    // Gap 1 fix (DOC:23): direct s_tx update from LSU TLB stage.
-    // Fires when live preg_secret[prs1/prs2] check detects a secret-tainted source address.
-    // op_count_id guard prevents stale updates to reused ROB slots (same as cf_lsu_s_acc_upd).
-    // [BRSELF] mark the attacker-steered branch itself.  Same op_count_id guard as
-    // cf_lsu_s_acc_upd: a squashed branch's slot may be reallocated before this lands.
-    for (upd <- io.cf_br_atk_self) {
-      when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx))) {
+      // [BRSELF] mark the attacker-steered branch itself.  Same op_count_id guard: a
+      // squashed branch's slot may be reallocated before this lands.
+      for (upd <- io.cf_br_atk_self) {
         val bidx = GetRowIdx(upd.bits.rob_idx)
-        when (rob_val(bidx) && rob_uop(bidx).cf_op_count_id === upd.bits.op_count_id) {
-          rob_uop(bidx).cf_attacker_influence := true.B
-        }
+        val ok   = guardOk(bidx, upd.bits.op_count_id)
+        when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx)) && ok) { sticky_atk(bidx) := true.B }
       }
-    }
-
-    // [MEMORD] Append the MEM_ORDER edge to the squashed load's ROB entry so it lands on
-    // the [FLUSH] record.  Same bank-match + op_count guard as cf_br_atk_self above: the
-    // load is about to be squashed and its slot may be reallocated before this arrives.
-    for (upd <- io.cf_lsu_memord_upd) {
-      when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx))) {
+      // [MEMORD] the INFL_MEM_ORDER edge of the squashed load goes to this port's C_memord
+      // column so it lands on the squash record.  Same bank-match + op_count guard.
+      for ((upd, mi) <- io.cf_lsu_memord_upd.zipWithIndex) {
         val midx = GetRowIdx(upd.bits.rob_idx)
-        when (rob_val(midx) && rob_uop(midx).cf_op_count_id === upd.bits.op_count_id) {
-          val mo_base = PopCount(VecInit(rob_uop(midx).cf_influencer_list.map(_.valid)))
-          when (mo_base < numInfluencerSlotsCF.U) {
-            for (k <- 0 until numInfluencerSlotsCF) {
-              when (mo_base === k.U) {
-                rob_uop(midx).cf_influencer_list(k).valid     := true.B
-                rob_uop(midx).cf_influencer_list(k).op_count  := upd.bits.prod_op_count
-                rob_uop(midx).cf_influencer_list(k).infl_type := INFL_MEM_ORDER.U
-                rob_uop(midx).cf_influencer_list(k).is_atk    := upd.bits.is_atk
-                rob_uop(midx).cf_influencer_list(k).is_secret := upd.bits.is_secret
-              }
-            }
-          } .otherwise {
-            rob_uop(midx).cf_infl_dropped := SatDropped(rob_uop(midx).cf_infl_dropped, 1.U)
-          }
+        val ok   = guardOk(midx, upd.bits.op_count_id)
+        when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx)) && ok) {
+          sidecar.io.memord(mi).valid    := true.B
+          sidecar.io.memord(mi).bits.row := midx
+          sidecar.io.memord(mi).bits.upd := upd.bits
+          // [FIFO10] step 10 (R-STICKY): the attacker MEM_ORDER edge sets the row's attacker
+          // flag whether or not its entry survives the merge or a later write to the column.
+          when (upd.bits.is_atk) { sticky_atk(midx) := true.B }
+          // [MEMORDSP] patch 29b (r117; t83 finding F-t83-1): a secret MEM_ORDER edge (the
+          // conflicting store / searcher had s_acc or s_prop, lsu.scala order_fail sites) sets the
+          // squashed load's sticky s_prop.  Step 10 added only the attacker half (R-STICKY, r93);
+          // the r117 sweep (step 17) covered residency / IQ_FULL / BTB / nack / REG_PRESSURE /
+          // MEM_HOL and missed this port, and the record's s_prop is the sticky bit alone (the
+          // merge ORs is_atk over every edge, edge_atk, but has no is_secret twin).  Same enable
+          // as the sticky_atk write beside it: +0 levels; +memWidth s_prop write ports per bank.
+          when (upd.bits.is_secret) { sticky_s_prop(midx) := true.B }
         }
       }
-    }
-
-    // [RASGATE doc 67 Part B] RAS cross-domain edge, MISPREDICT-GATED. The fetch-time
-    // ras_domain_mismatch influencer was removed (it fired on every benign cross-domain
-    // call = co-location pollution). Raise INFL_RAS_STATE only when a ret whose RAS-predicted
-    // top was cross-domain (cf_ras_pred_xdom, set in fetch-buffer) actually MISPREDICTS --
-    // a real ret2spec. is_atk = the ret was fetched in the victim domain (cf_domain_id==0):
-    // a victim ret steered to an attacker-controlled target. op_count 0, like the old edge.
-    when (io.brupdate.b2.mispredict &&
-          MatchBank(GetBankIdx(io.brupdate.b2.uop.rob_idx))) {
-      val ras_ridx = GetRowIdx(io.brupdate.b2.uop.rob_idx)
-      when (rob_val(ras_ridx) && rob_uop(ras_ridx).cf_ras_pred_xdom) {
-        val ras_base = PopCount(VecInit(rob_uop(ras_ridx).cf_influencer_list.map(_.valid)))
-        when (ras_base < numInfluencerSlotsCF.U) {
-          for (k <- 0 until numInfluencerSlotsCF) {
-            when (ras_base === k.U) {
-              rob_uop(ras_ridx).cf_influencer_list(k).valid     := true.B
-              rob_uop(ras_ridx).cf_influencer_list(k).op_count  := 0.U
-              rob_uop(ras_ridx).cf_influencer_list(k).infl_type := INFL_RAS_STATE.U
-              rob_uop(ras_ridx).cf_influencer_list(k).is_atk    := (rob_uop(ras_ridx).cf_domain_id === 0.U)
-              rob_uop(ras_ridx).cf_influencer_list(k).is_secret := false.B
-            }
-          }
-        } .otherwise {
-          rob_uop(ras_ridx).cf_infl_dropped := SatDropped(rob_uop(ras_ridx).cf_infl_dropped, 1.U)
+      // [RASGATE doc 67 Part B] RAS cross-domain edge, MISPREDICT-GATED: raise
+      // INFL_RAS_STATE only when a ret whose RAS-predicted top was cross-domain
+      // (cf_ras_pred_xdom, set in fetch-buffer) actually mispredicts -- a real ret2spec.
+      // The entry (op_count 0, is_atk = the ret was fetched in the victim domain) is
+      // built at readout from the row's domain; only the arrival stamp is stored (C_ras).
+      when (io.brupdate.b2.mispredict && MatchBank(GetBankIdx(io.brupdate.b2.uop.rob_idx))) {
+        val ras_ridx = GetRowIdx(io.brupdate.b2.uop.rob_idx)
+        when (rob_val(ras_ridx) && rob_uop(ras_ridx).cf_ras_pred_xdom.getOrElse(false.B)) {
+          sidecar.io.ras.valid := true.B
+          sidecar.io.ras.bits  := ras_ridx
         }
       }
-    }
-
-    for (upd <- io.cf_lsu_s_tx_upd) {
-      when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx))) {
+      // Gap 1 fix (DOC:23): direct s_tx update from LSU TLB stage -- a live preg_secret
+      // check found a secret-tainted source address.  Same op_count_id guard.
+      for (upd <- io.cf_lsu_s_tx_upd) {
         val cidx = GetRowIdx(upd.bits.rob_idx)
-        when (rob_val(cidx) && rob_uop(cidx).cf_op_count_id === upd.bits.op_count_id) {
-          rob_uop(cidx).cf_secret_transmission := true.B
+        val ok   = guardOk(cidx, upd.bits.op_count_id)
+        when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx)) && ok) { sticky_s_tx(cidx) := true.B }
+      }
+      // corefuzzing: s_prop direct ROB update -- an in-flight instruction whose physical
+      // sources were secret-tainted, discovered at writeback (core.scala, the
+      // `for (i <- 0 until rob.numWakeupPorts)` block under ENABLE_IFT).  The 1-bit
+      // s_prop goes to the sticky flag; the INFL_REG_DATAFLOW mark goes to this port's
+      // C_sprob column.  (The Gap 2 retroactive s_tx clause was removed 2026-09-03.)
+      //
+      // Spec 5.1.2 amendment (2026-10-08, owner-approved; Task 0.9): the column carries
+      // is_atk / is_secret from the WRITEBACK SOURCE so the readout can emit the attacker
+      // register-dataflow edge lost at the 2026-09-02 taint-follows-data cutover instead
+      // of a hard-coded is_atk = false.  cf_s_prop_rob_upd(si) is driven from
+      // wb_resps(si) in the same cycle, index-aligned, so the result taint on wb_resps(si)
+      // is this update's source.  The guard reads row/op_count from that uop (equal to
+      // upd.bits whenever upd.valid; asserted) so the attacker twin shares the guard port:
+      //   is_secret = the core's s_prop condition (upd.valid);
+      //   is_atk    = the old dispatch-time rule, victim consumer of an attacker-tainted
+      //               operand: taint_atk && domain == 0, on a real int/FP register write
+      //               (the ownership seed is applied at the regfile write, so for a
+      //               domain-0 uop taint_atk is exactly the operand taint).
+      // The twin fires the column on is_atk alone (is_secret = 0) and writes no sticky
+      // bit: sticky_atk is already set by the R0 site in the writeback merge below.
+      for ((upd, si) <- io.cf_s_prop_rob_upd.zipWithIndex) {
+        val sp_wb    = io.wb_resps(si)
+        val sp_uop   = sp_wb.bits.uop
+        val sp_row   = GetRowIdx(sp_uop.rob_idx)
+        val sp_bank  = MatchBank(GetBankIdx(sp_uop.rob_idx))
+        val sp_ok    = guardOk(sp_row, sp_uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)))
+        val sp_regwr = sp_wb.valid && sp_uop.rf_wen && sp_uop.ldst_val &&
+                       (sp_uop.dst_rtype === RT_FIX || sp_uop.dst_rtype === RT_FLT)
+        // [MEMATKGATE] Task 0.14 item 6 (owner, 2026-10-09): a load whose attacker taint came
+        // through the D$ line (cf_mem_dataflow_atk, set at the dcache response) already has its
+        // type-17 INFL_MEM_DATAFLOW edge; no duplicate type-0 edge.  The store-forward half
+        // has no per-uop flag at the ROB and still raises the type-0 twin (spec 6.2).
+        val sp_atk   = sp_regwr && (sp_wb.bits.taint_atk || sp_uop.cf_opnd_watk.getOrElse(false.B)) &&   // [IMPLWIN]
+                       (sp_uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U) &&
+                       !sp_uop.cf_mem_dataflow_atk.getOrElse(false.B)
+        val sp_sec   = upd.valid
+        assert (!upd.valid || (upd.bits.rob_idx === sp_uop.rob_idx &&
+                               upd.bits.op_count_id === sp_uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))),
+                "[rob] cf_s_prop_rob_upd(" + si + ") does not name the wb_resps(" + si + ") uop")
+        when ((sp_sec || sp_atk) && sp_bank && sp_ok) {
+          when (sp_sec) { sticky_s_prop(sp_row) := true.B }
+          sidecar.io.sprob(si).valid          := true.B
+          sidecar.io.sprob(si).bits.row       := sp_row
+          sidecar.io.sprob(si).bits.is_atk    := sp_atk
+          sidecar.io.sprob(si).bits.is_secret := sp_sec
         }
       }
+      require(guard_k == sidecar.io.guard_row.length,
+        s"[rob] sidecar guard ports: ${sidecar.io.guard_row.length} declared, ${guard_k} used")
     }
 
-    // corefuzzing: s_prop direct ROB update — set cf_secret_propagation on in-flight
-    // instructions whose physical sources were secret-tainted (discovered at writeback time).
-    // The 1-bit cf_secret_propagation write is kept as N-port (cheap); the influencer list
-    // write (8 ports × numRobRows × the whole list) is replaced by a pending bit and drained
-    // 1 entry per cycle in the background.  op_count_id guard prevents stale updates.
-    for (upd <- io.cf_s_prop_rob_upd) {
-      when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx))) {
-        val cidx = GetRowIdx(upd.bits.rob_idx)
-        when (rob_val(cidx) && rob_uop(cidx).cf_op_count_id === upd.bits.op_count_id) {
-          rob_uop(cidx).cf_secret_propagation := true.B  // 1-bit: cheap N-port write
-          sprob_infl_pending(cidx) := true.B              // defer influencer write to drain
-          // Gap 2 fix (DOC:23): retroactively set s_tx for loads with late-arriving address taint.
-          // Covers the edge case where the probe load wrote back within the speculation window
-          // after the taint chain propagated, and the Gap 1 TLB-stage ROB update was sufficient.
-          // Belt-and-suspenders alongside Gap 1; runs whenever cf_s_prop_rob_upd fires.
-          // Gate on WHY this update fired, not on the ROB's cf_secret_access bit:
-          // that bit is written by the same writeback in the same cycle (see :1012),
-          // so reading it here always yields the stale value.  src_tainted is true
-          // only when a real source taint drove the update -- for a load, prs1 is
-          // the address register, so that is exactly "address is secret-derived".
-          // `!upd.bits.self_secret_acc` reproduces the LSU's `!in_secret` guard
-          // (lsu.scala is_secret_addr_load).  A load whose own address landed in the
-          // secret range is an ACCESS; counting it as a transmission makes the secret
-          // load its own s_tx and corrupts chain attribution.
-          // REMOVED 2026-09-03 (Gap 2 was wrong AND redundant).
-          // The premise in the comment above -- "for a load, prs1 is the address
-          // register" -- is false of the signal it actually read.  src_tainted is
-          // driven at core.scala:2077 from `sec1 || sec2 || has_mem_sec_infl`, and
-          // sec1 is `wb.bits.secret`: the WRITEBACK RESULT's taint.  For a load the
-          // LSU drives that from cf_secret_access || cf_mem_sec_dataflow -- both
-          // DATA-side.  So this clause scored "a secret arrived in this register"
-          // as a transmission.  Once store-data taint made memory taint real, every
-          // reload of a spilled secret tripped it: s_tx 1 -> 6559 on t18, dominated
-          // by `lbu a5,-17(s0)` whose address (s0) is clean.  That is propagation.
-          //
-          // Address-derived loads are already caught correctly, earlier, by Gap 1
-          // (lsu.scala:972 is_secret_addr_load): at TLB time a load's only register
-          // operand is rs1, so cf_secret_propagation there IS address taint, and its
-          // op_count_id-guarded ROB write covers squashed loads -- the case this
-          // clause was added for.  Gap 2's stated reason, "late-arriving address
-          // taint", cannot occur under taint-follows-data: the address operand's
-          // taint is known at register-read/bypass, before the AGU runs.
-        }
-      }
-    }
-
-    // -----------------------------------------------
-    // Background drain: one influencer list write per pending table per cycle.
-    // Uses PriorityEncoderOH to pick one entry; clears pending bit after write.
-    // Timing correctness: since collect writes set pending bits as registers, the
-    // drain reads old (pre-collect) values and cannot fire for an entry in the same
-    // cycle its pending bit is set — guaranteed 1-cycle gap before first drain.
-    val sprob_drain_oh  = PriorityEncoderOH(sprob_infl_pending.asUInt)
-    val sprob_drain_idx = OHToUInt(sprob_drain_oh)
-    val sprob_drain_any = sprob_infl_pending.asUInt.orR
-
-    val ic_drain_oh   = PriorityEncoderOH(ic_pending_valid.asUInt)
-    val ic_drain_idx  = OHToUInt(ic_drain_oh)
-    val ic_drain_any  = ic_pending_valid.asUInt.orR
-    // Suppress ic drain when it would target the same ROB row as the sprob drain.
-    // Both use PopCount(valid) as the base slot; same row → same base → same slot → conflict.
-    val ic_drain_fires = ic_drain_any && !(sprob_drain_any && ic_drain_idx === sprob_drain_idx)
-
-    when (sprob_drain_any) {
-      val cidx = sprob_drain_idx
-      when (rob_val(cidx)) {
-        val infl_base = PopCount(VecInit(rob_uop(cidx).cf_influencer_list.map(_.valid)))
-        when (infl_base < numInfluencerSlotsCF.U) {
-          for (k <- 0 until numInfluencerSlotsCF) {
-            when (infl_base === k.U) {
-              rob_uop(cidx).cf_influencer_list(k).valid     := true.B
-              rob_uop(cidx).cf_influencer_list(k).op_count  := 0.U
-              rob_uop(cidx).cf_influencer_list(k).infl_type := INFL_REG_DATAFLOW.U
-              rob_uop(cidx).cf_influencer_list(k).is_atk    := false.B
-              rob_uop(cidx).cf_influencer_list(k).is_secret := true.B
-            }
-          }
-        } .otherwise {
-          rob_uop(cidx).cf_infl_dropped := SatDropped(rob_uop(cidx).cf_infl_dropped, 1.U)
-        }
-      }
-      sprob_infl_pending(cidx) := false.B
-    }
-
-    when (ic_drain_fires) {
-      val cidx = ic_drain_idx
-      when (rob_val(cidx)) {
-        val infl_base = PopCount(VecInit(rob_uop(cidx).cf_influencer_list.map(_.valid)))
-        when (infl_base < numInfluencerSlotsCF.U) {
-          for (k <- 0 until numInfluencerSlotsCF) {
-            when (infl_base === k.U) {
-              rob_uop(cidx).cf_influencer_list(k).valid      := true.B
-              rob_uop(cidx).cf_influencer_list(k).op_count   := ic_pending_winner_op(cidx).pad(inflOpCountWidthCF)(inflOpCountWidthCF-1, 0)
-              rob_uop(cidx).cf_influencer_list(k).infl_type  := ic_pending_infl_type(cidx)
-              rob_uop(cidx).cf_influencer_list(k).is_atk     := ic_pending_winner_atk(cidx)
-              rob_uop(cidx).cf_influencer_list(k).is_secret  := ic_pending_winner_sec(cidx)
-            }
-          }
-        } .otherwise {
-          rob_uop(cidx).cf_infl_dropped := SatDropped(rob_uop(cidx).cf_infl_dropped, 1.U)
-        }
-        when (ic_pending_winner_atk(cidx)) { rob_uop(cidx).cf_attacker_influence := true.B }
-        // D-CI fix: propagate shortcut atk/sec bits so software doesn't have to re-scan the log
-        rob_uop(cidx).cf_cntd_winner_atk := ic_pending_winner_atk(cidx)
-        rob_uop(cidx).cf_cntd_winner_sec := ic_pending_winner_sec(cidx)
-      }
-      ic_pending_valid(cidx) := false.B
-    }
-
-    // -----------------------------------------------
-    // Opt#1: wb influencer drain — merge pending wb influencer list into rob_uop.
-    // One row per cycle per bank. The compact-and-append runs from REGISTERED
-    // pending data (not combinationally from wb_resp), breaking the critical path.
-    val wb_drain_oh  = PriorityEncoderOH(wb_infl_pending.asUInt)
-    val wb_drain_idx = OHToUInt(wb_drain_oh)
-    val wb_drain_any = wb_infl_pending.asUInt.orR
-    // Suppress wb drain when it targets the same row as sprob or ic drain.
-    val wb_drain_fires = wb_drain_any &&
-      !(sprob_drain_any && wb_drain_idx === sprob_drain_idx) &&
-      !(ic_drain_fires  && wb_drain_idx === ic_drain_idx)
-
-    when (wb_drain_fires) {
-      val cidx = wb_drain_idx
-      when (rob_val(cidx)) {
-        val rob_base = PopCount(VecInit(rob_uop(cidx).cf_influencer_list.map(_.valid)))
-        val wb_list  = wb_infl_list(cidx)
-        val wb_valid = VecInit(wb_list.map(_.valid))
-        val wb_total = PopCount(wb_valid)
-        val wb_pfx   = (0 until numInfluencerSlotsCF).map { j =>
-          if (j == 0) 0.U(4.W) else PopCount(VecInit(wb_valid.take(j)))
-        }
-        // Two independent drop contributions in THIS block: the merge overflowing the
-        // slots, and whatever the incoming wb list already carried.  Both can fire in the
-        // same cycle for the same cidx, so they are summed into one write below rather
-        // than left to last-connect, which would silently keep only the second.
-        // (The sprob/ic/wb drains cannot collide with each other -- ic_drain_fires and
-        // wb_drain_fires explicitly exclude a matching index -- so this is the only
-        // multi-contribution case in the ROB.)
-        val wb_drop_merge = WireDefault(0.U(3.W))
-        val wb_drop_inh   = WireDefault(0.U(3.W))
-        when (rob_uop(cidx).cf_infl_dropped === 0.U && rob_base +& wb_total > numInfluencerSlotsCF.U) {
-          wb_drop_merge := rob_base +& wb_total - numInfluencerSlotsCF.U
-        }
-        when (rob_uop(cidx).cf_infl_dropped === 0.U) {
-          for (d <- 0 until numInfluencerSlotsCF) {
-            val writers = (0 until numInfluencerSlotsCF).map { j =>
-              wb_valid(j) && ((rob_base + wb_pfx(j)) === d.U)
-            }
-            when (writers.reduce(_ || _)) {
-              rob_uop(cidx).cf_influencer_list(d).valid      := true.B
-              rob_uop(cidx).cf_influencer_list(d).op_count   := Mux1H(writers, wb_list.map(_.op_count))
-              rob_uop(cidx).cf_influencer_list(d).infl_type  := Mux1H(writers, wb_list.map(_.infl_type))
-              rob_uop(cidx).cf_influencer_list(d).is_atk     := Mux1H(writers, wb_list.map(_.is_atk))
-              rob_uop(cidx).cf_influencer_list(d).is_secret  := Mux1H(writers, wb_list.map(_.is_secret))
-            }
-          }
-        }
-        when (wb_infl_overflow(cidx) =/= 0.U) { wb_drop_inh := wb_infl_overflow(cidx) }
-        when (wb_drop_merge +& wb_drop_inh =/= 0.U) {
-          rob_uop(cidx).cf_infl_dropped := SatDropped(rob_uop(cidx).cf_infl_dropped,
-                                                      wb_drop_merge +& wb_drop_inh)
-        }
-      }
-      wb_infl_pending(cidx) := false.B
-    }
-
-    // -----------------------------------------------
-    // IFT bridge: drain one squash-pending entry per bank per cycle.
-    // Drives ift_sq_bank_valid(w) / ift_sq_bank_record(w); arbitrated outside the loop.
-    val ift_sq_oh  = PriorityEncoderOH(ift_squash_pending.asUInt)
-    val ift_sq_idx = OHToUInt(ift_sq_oh)
-    val ift_sq_any = ift_squash_pending.asUInt.orR
-
-    when (ift_sq_any) {
-      ift_sq_bank_valid(w)  := true.B
-      ift_sq_bank_record(w) := uopToIFTBits(rob_uop(ift_sq_idx), 2.U /*squash*/, io.ift_priv)
-    }
-    // Only clear pending if this bank wins cross-bank arbitration (driven after the loop).
-    // Non-winning banks retain their pending entry and retry next cycle.
-    when (ift_sq_any && ift_sq_bank_drain_ok(w)) {
-      ift_squash_pending(ift_sq_idx) := false.B
-    }
+    // (The squash drain moved below the commit section in Task 2.6: it shares applyIft and
+    // reads rbk_row; see [SQUASHALL] tail-order drain.)
 
     //-----------------------------------------------
     // Accruing fflags
@@ -883,14 +957,6 @@ class Rob(
     io.commit.valids(w) := will_commit(w)
     io.commit.arch_valids(w) := will_commit(w) && !rob_predicated(com_idx)
     io.commit.uops(w)   := rob_uop(com_idx)
-    // corefuzzing: commit-time influencer drops.  The commit output is combinational,
-    // so it must NOT accumulate by reading itself -- doing so is a real comb cycle
-    // (CheckCombLoops rejects it).  Each drain site writes its own amount into a
-    // dedicated wire; they are summed once, on top of the REGISTER value, below.
-    val com_drop_sprob = WireDefault(0.U(3.W))
-    val com_drop_ic    = WireDefault(0.U(3.W))
-    val com_drop_wb    = WireDefault(0.U(3.W))
-    val com_drop_wbovf = WireDefault(0.U(3.W))
     io.commit.debug_insts(w) := rob_debug_inst_rdata(w)
 
     // We unbusy branches in b1, but its easier to mark the taken/provider src in b2,
@@ -902,88 +968,91 @@ class Rob(
       io.commit.uops(w).taken      := io.brupdate.b2.taken
     }
 
-    // corefuzzing: commit-time combinational override for pending influencer entries.
-    // If the drain hasn't serviced com_idx yet by the time it commits, apply the
-    // influencer(s) directly to io.commit.uops(w) (a Wire) so the commit log is correct.
-    // Purely combinational: reads registers, writes only to the commit output Wire.
-    // Also clears the pending bits so the drain skips this row after commit.
-    when (will_commit(w)) {
-      val pend_base0 = PopCount(VecInit(rob_uop(com_idx).cf_influencer_list.map(_.valid)))
-      val has_sprob  = sprob_infl_pending(com_idx)
-      val has_ic     = ic_pending_valid(com_idx)
-      // sprob slot = pend_base0; ic slot = pend_base0 + (1 if sprob also pending)
-      val ic_slot    = pend_base0 + has_sprob.asUInt
-
-      when (has_sprob) {
-        when (pend_base0 < numInfluencerSlotsCF.U) {
-          for (k <- 0 until numInfluencerSlotsCF) {
-            when (pend_base0 === k.U) {
-              io.commit.uops(w).cf_influencer_list(k).valid     := true.B
-              io.commit.uops(w).cf_influencer_list(k).op_count  := 0.U
-              io.commit.uops(w).cf_influencer_list(k).infl_type := INFL_REG_DATAFLOW.U
-              io.commit.uops(w).cf_influencer_list(k).is_atk    := false.B
-              io.commit.uops(w).cf_influencer_list(k).is_secret := true.B
-            }
-          }
-        } .otherwise {
-          com_drop_sprob := 1.U
-        }
-        sprob_infl_pending(com_idx) := false.B
-      }
-
-      when (has_ic) {
-        when (ic_slot < numInfluencerSlotsCF.U) {
-          for (k <- 0 until numInfluencerSlotsCF) {
-            when (ic_slot === k.U) {
-              io.commit.uops(w).cf_influencer_list(k).valid      := true.B
-              io.commit.uops(w).cf_influencer_list(k).op_count   := ic_pending_winner_op(com_idx).pad(inflOpCountWidthCF)(inflOpCountWidthCF-1, 0)
-              io.commit.uops(w).cf_influencer_list(k).infl_type  := ic_pending_infl_type(com_idx)
-              io.commit.uops(w).cf_influencer_list(k).is_atk     := ic_pending_winner_atk(com_idx)
-              io.commit.uops(w).cf_influencer_list(k).is_secret  := ic_pending_winner_sec(com_idx)
-            }
-          }
-        } .otherwise {
-          com_drop_ic := 1.U
-        }
-        when (ic_pending_winner_atk(com_idx)) { io.commit.uops(w).cf_attacker_influence := true.B }
-        // D-CI fix: propagate shortcut atk/sec bits to commit uop
-        io.commit.uops(w).cf_cntd_winner_atk := ic_pending_winner_atk(com_idx)
-        io.commit.uops(w).cf_cntd_winner_sec := ic_pending_winner_sec(com_idx)
-        ic_pending_valid(com_idx) := false.B
-      }
-
-      // Opt#1: commit-time override for pending wb influencer entries.
-      val has_wb = wb_infl_pending(com_idx)
-      when (has_wb) {
-        val wb_base = pend_base0 + has_sprob.asUInt + has_ic.asUInt
-        val wb_list = wb_infl_list(com_idx)
-        val wb_valid = VecInit(wb_list.map(_.valid))
-        val wb_total = PopCount(wb_valid)
-        val wb_pfx   = (0 until numInfluencerSlotsCF).map { j =>
-          if (j == 0) 0.U(4.W) else PopCount(VecInit(wb_valid.take(j)))
-        }
-        when (wb_base +& wb_total > numInfluencerSlotsCF.U) {
-          com_drop_wb := 1.U
-        }
-        for (d <- 0 until numInfluencerSlotsCF) {
-          val writers = (0 until numInfluencerSlotsCF).map { j =>
-            wb_valid(j) && ((wb_base + wb_pfx(j)) === d.U)
-          }
-          when (writers.reduce(_ || _)) {
-            io.commit.uops(w).cf_influencer_list(d).valid      := true.B
-            io.commit.uops(w).cf_influencer_list(d).op_count   := Mux1H(writers, wb_list.map(_.op_count))
-            io.commit.uops(w).cf_influencer_list(d).infl_type  := Mux1H(writers, wb_list.map(_.infl_type))
-            io.commit.uops(w).cf_influencer_list(d).is_atk     := Mux1H(writers, wb_list.map(_.is_atk))
-            io.commit.uops(w).cf_influencer_list(d).is_secret  := Mux1H(writers, wb_list.map(_.is_secret))
-          }
-        }
-        when (wb_infl_overflow(com_idx) =/= 0.U) { com_drop_wbovf := wb_infl_overflow(com_idx) }
-        wb_infl_pending(com_idx) := false.B
-      }
+    // corefuzzing [SIDECAR] Task 2.4: the commit record's IFT fields are reconstructed from
+    // the sidecar readout (dispatch column + late columns merged in arrival order, the four
+    // newest surviving: spec 5.1.5, D3, D19) and the four sticky flags.  rob_uop supplies
+    // op_count, domain and the fields the sidecar does not hold.  This replaces the
+    // commit-time combinational override of the old pending tables (sprob/ic/wb), which is
+    // deleted; nothing at commit reads those tables any more.  The readout is combinational
+    // here (core.scala's commit printf reads io.commit.* in the commit cycle); the register
+    // stage on io.ift_commit_records is Phase 4's [RECREG] (below, at the record pack).
+    // applyIft is used by the commit readout and, in printf builds, by the capture-time shadow
+    // record of the squash drain below (Task 2.10d); it is only called under ENABLE_IFT.
+    // Task 2.10d: the body moved to IftApply (rob-ift-sidecar.scala), which IftSquashMerge
+    // shares; the commit readout passes this row's sticky flags.
+    def applyIft(u: MicroOp, row: UInt, i: IftCommitInfo): Unit =
+      IftApply(u, sticky_s_acc(row), sticky_s_prop(row), sticky_s_tx(row), sticky_atk(row), i)
+    // [THINUOP] Task 3.5: the commit readout and sticky flags of this retire slot, for the
+    // bridge record (uopToIFTBits) and the commit printf (RobIo.commit_ift).
+    val com_ift    = WireInit(0.U.asTypeOf(new IftCommitInfo))
+    val com_sticky = WireInit(0.U(4.W))
+    if (!ENABLE_IFT) {
+      // IFT off: no sidecar; the record's retained fields come from the uop, as before.
+      com_ift.fu_bitmap             := io.commit.uops(w).cf_fu_bitmap.getOrElse(0.U(numModules.W))
+      com_ift.spec_branch_is_secret := io.commit.uops(w).cf_spec_branch_is_secret.getOrElse(false.B)
+      com_sticky := Cat(io.commit.uops(w).cf_attacker_influence.getOrElse(false.B), io.commit.uops(w).cf_secret_transmission.getOrElse(false.B),
+                        io.commit.uops(w).cf_secret_propagation.getOrElse(false.B), io.commit.uops(w).cf_secret_access.getOrElse(false.B))
     }
-    // Sum the commit-time drops on top of the registered count, once.
-    io.commit.uops(w).cf_infl_dropped := SatDropped(rob_uop(com_idx).cf_infl_dropped,
-      com_drop_sprob +& com_drop_ic +& com_drop_wb +& com_drop_wbovf)
+    io.commit_ift(w)    := com_ift
+    io.cf_com_win_sec(w) := false.B   // [WINSHADOW] driven below under ENABLE_IFT
+    io.cf_com_win_atk(w) := false.B
+    if (ENABLE_IFT) {
+      // [SIDECAR] reconstruct the record fields from the sidecar + sticky flags
+      sidecar.io.commit.row    := com_idx
+      sidecar.io.commit.domain := rob_uop(com_idx).cf_domain_id.getOrElse(0.U(iftTagWidth.W))
+      com_ift    := sidecar.io.commit_out
+      // [WINSHADOW] step 20: a committing entry in the window shadow range is in the window
+      // [WINAGE] Phase 4 Task 4.3c (gate review C3, the ROB commit instance): the test no longer
+      // reads the committing uop's rob_idx out of the rob_uop readout (com_idx mux -> 64:1 row
+      // read -> 2 x IsOlder -> com_sticky / cf_com_win_* -> regfile set ports, cross-module).
+      // Proof the index is the same where it is observed: every consumer of win_sec / win_atk
+      // is gated by this lane's commit valid (cf_com_win_* by cwr = commit.valids in
+      // core.scala; the record by arch_valids; the commit uop's cf_secret_propagation /
+      // cf_attacker_influence / cf_win_* by commit.valids in the LSU, the commit printf and
+      // the record; rollback readers of io.commit.uops use only ldst/pdst/stale_pdst).
+      // commit.valids(w) = will_commit(w) implies !block_commit, so rob_state is s_normal or
+      // s_wait_till_empty and com_idx = rob_head; and it implies rob_val(rob_head) in bank w,
+      // whose rob_uop was written at enqueue with io.enq_uops(w) = dis_uops(w), rob_idx =
+      // Cat(rob_tail_idx >> log2(coreWidth), w) with rob_tail = the written row (core.scala
+      // dispatch; nothing rewrites rob_uop(*).rob_idx).  So cidx = Cat(rob_head, w) on every
+      // observed cycle, and its age against io.cf_wsh_*.head (= rob.io.rob_head_idx =
+      // Cat(rob_head, rob_head_lsb)) is (w - rob_head_lsb) mod 2^robAddrSz: a function of one
+      // 2-bit register.  inAge on that age is exact (identity at WinShadowInfo.inAge).
+      // Levels: the window bit is now register-sourced (b, t, head, rob_head_lsb, v/bdone/tall:
+      // one subtract, one compare, one LUT, about 5) and runs in parallel with the readout;
+      // the readout -> com_sticky / cf_com_win_* leg keeps only its final OR (was readout +
+      // about 4).  LUT: the per-slot compare is against a 2-bit-dependent constant (ab and at
+      // are shared by the coreWidth slots), about half of the two IsOlder it replaces.
+      val cage    = if (coreWidth == 1) 0.U(robAddrSz.W)
+                    else (w.U(robAddrSz.W) - rob_head_lsb.pad(robAddrSz))(robAddrSz - 1, 0)
+      val win_sec = io.cf_wsh_sec.inAge(cage)
+      val win_atk = io.cf_wsh_atk.inAge(cage) && rob_uop(com_idx).cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U
+      io.cf_com_win_sec(w) := win_sec
+      io.cf_com_win_atk(w) := win_atk
+      com_sticky := Cat(sticky_atk(com_idx) || win_atk, sticky_s_tx(com_idx),
+                        sticky_s_prop(com_idx) || win_sec, sticky_s_acc(com_idx))
+      applyIft(io.commit.uops(w), com_idx, sidecar.io.commit_out)
+      when (win_sec) { io.commit.uops(w).cf_secret_propagation.foreach(_ := true.B) }
+      when (win_atk) { io.commit.uops(w).cf_attacker_influence.foreach(_ := true.B) }
+      // [WINMEM] step 21 (owner r139, F2): a committing STORE in the shadow range is a window
+      // member; the LSU ORs this into its STQ entry so the D$ write marks the doubleword with
+      // window taint (the `if (secret) x = 1` store dispatched before the branch resolved).
+      // Nothing else reads the commit uop's cf_win_* (the regfile set ports use cf_com_win_*).
+      // [AREA35] patch 35 (B): drive cf_win_* from the commit-time test alone.  Its only reader,
+      // the LSU store commit (lsu.scala stq(idx).cf_win_* := stq.cf_win_* || commit.cf_win_*),
+      // already holds the dispatch-time value: rob.io.enq_uops := dis_uops and the STQ entry
+      // takes io.lsu.dis_uops(w).bits = dis_uops(w) in the same cycle, and nothing writes the
+      // STQ uop's cf_win_* between enqueue and that commit OR.  So stq || (rob || win) =
+      // stq || win: record-identical, and the 256 x 2 rob_uop cf_win_* flops plus their commit
+      // readout die (-512 FF).  Levels: unchanged (win_sec / win_atk already feed this output).
+      io.commit.uops(w).cf_win_sec.foreach(_ := win_sec)
+      io.commit.uops(w).cf_win_atk.foreach(_ := win_atk)
+      // D15: residency bound that makes the 16-bit stamps monotone
+      assert(!(will_commit(w) && ENABLE_IFT.B) || sidecar.io.commit_age < 65535.U,
+        "[rob] ROB row resident for >= 65535 cycles; IFT stamps would wrap (D15)")
+      // D19 (Task 2.6): the commit readout dropped a third same-type update on a real commit
+      ift_third_drop_bank(w) := sidecar.io.commit_third && will_commit(w)
+    }
 
 
     // Don't attempt to rollback the tail's row when the rob is full.
@@ -998,6 +1067,118 @@ class Rob(
     when (rbk_row) {
       rob_val(com_idx)       := false.B
       rob_exception(com_idx) := false.B
+    }
+
+    // -----------------------------------------------
+    // [SQUASHALL] tail-order drain (section 5.1.6; D5, D6, D2b; Task 2.6).  One squash capture
+    // per bank per cycle.  Task 2.10d (design 4b): the capture reads the row RAW (every merge
+    // input, sidecar.io.sq_raw) plus its side fields and writes them into this bank's raw FIFO
+    // in IftSquashMerge (after the loop); the shared merge runs when the entry leaves the FIFO.
+    // Two sources share the capture:
+    //  - rollback walk (cause = 1): during s_rollback the walk reads the walked row
+    //    (com_idx = rob_tail) in the cycle before its rob_val clear lands;
+    //  - branch-kill drain (cause = 0): the pointer restarts at the new tail on every
+    //    mispredict (b2), i.e. at the first killed row, and walks forward one row per cycle
+    //    (emit or skip) while any row of the bank is pending -- the order re-allocation
+    //    reuses rows, so the drain stays ahead of the tail.
+    // Every update that lands in the kill cycle is in the record (the row is read one or more
+    // cycles later and nothing writes a killed row afterwards).  Under ENABLE_IFT only
+    // (ruling 5); with IFT off ift_squash_pending is never set and the outputs are constant.
+    if (ENABLE_IFT) {
+      val sq_ptr     = RegInit(0.U(log2Ceil(numRobRows).W))
+      val sq_any     = ift_squash_pending.asUInt.orR
+      val rbk_emit   = rbk_row && rob_val(com_idx)
+      // The readout address selects on rbk_row (registers only), not on rbk_emit, so no
+      // rob_val read sits in front of the LUTRAM address: the squash readout keeps the commit
+      // readout's depth.  The drain therefore pauses for the whole rollback walk (no enqueue
+      // happens during s_rollback, so it cannot be overtaken meanwhile).
+      val drain_emit = !rbk_row && ift_squash_pending(sq_ptr)
+      val sq_row     = Mux(rbk_row, com_idx, sq_ptr)
+      sidecar.io.squash.row    := sq_row
+      sidecar.io.squash.domain := rob_uop(sq_row).cf_domain_id.getOrElse(0.U(iftTagWidth.W))   // raw.domain (4c review F2)
+      val sq_cause = rbk_row                                    // 0 branch kill, 1 exception rollback (D2b)
+      val su       = rob_uop(sq_row)
+      val cap      = ift_sq_cap(w)
+      cap.valid                := rbk_emit || drain_emit
+      cap.bits.raw             := sidecar.io.sq_raw
+      cap.bits.side.pc         := su.debug_pc(31, 0)
+      cap.bits.side.inst       := su.debug_inst                 // the record packs debug_inst (4c review F3)
+      cap.bits.side.op_count   := su.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
+      cap.bits.side.pdst       := su.pdst
+      cap.bits.side.prs1       := su.prs1
+      cap.bits.side.prs2       := su.prs2
+      cap.bits.side.lrs1_rtype := su.lrs1_rtype
+      cap.bits.side.lrs2_rtype := su.lrs2_rtype
+      cap.bits.side.s_acc      := sticky_s_acc(sq_row)
+      cap.bits.side.s_prop     := sticky_s_prop(sq_row)
+      cap.bits.side.s_tx       := sticky_s_tx(sq_row)
+      cap.bits.side.atk        := sticky_atk(sq_row)
+      cap.bits.side.priv       := io.ift_priv
+      cap.bits.side.cause      := sq_cause
+      when (rbk_emit)   { ift_squash_pending(com_idx) := false.B }
+      when (drain_emit) { ift_squash_pending(sq_ptr)  := false.B }
+      when (!rbk_row && sq_any) { sq_ptr := WrapInc(sq_ptr, cf_rob_rows) }   // emit or skip
+      // The rollback walk rewinds rob_tail to rob_head, and re-allocation restarts there; the
+      // pointer follows the tail through the walk so it resumes at the new tail too.  Without
+      // this a still-pending row BEHIND the pointer (the younger, killed entries in the
+      // mispredicting branch's own row, which the b2 restart below skips over: they are reached
+      // only after a wrap) could be re-allocated first once an older instruction's exception
+      // rewinds the tail below it.
+      when (rob_state === s_rollback) { sq_ptr := rob_tail }
+      // Restart LAST so it wins over the walk's increment in the b2 cycle (the pending bits
+      // of this kill are already set then, so the walk is active in that cycle).
+      when (io.brupdate.b2.mispredict) { sq_ptr := WrapInc(GetRowIdx(io.brupdate.b2.uop.rob_idx), cf_rob_rows) }
+      // Task 2.7 (D-9): the pointer reset rewinds rob_tail to row 0, so the drain pointer
+      // follows it there (the pending bits are cleared on the same pulse, end of this loop).
+      when (ift_rob_ptr_reset) { sq_ptr := 0.U }
+      // a row re-used while still pending would lose its record: count it (D6) and assert in
+      // sim.  A row drained in the reuse cycle itself is read before the write lands: no loss.
+      val sq_reuse = io.enq_valids(w) && ift_squash_pending(rob_tail) && !(drain_emit && sq_ptr === rob_tail)
+      assert(!sq_reuse, "[rob] squash record lost to row reuse (tail-order drain overtaken)")
+      ift_sq_reuse_bank(w)      := sq_reuse
+      // D19: the same function of the same valid bits, in the same cycle, as the old squash
+      // readout's third-drop pulse (a capture dropped on a full FIFO still counts, as before)
+      ift_third_drop_sq_bank(w) := sidecar.io.sq_third && (rbk_emit || drain_emit)
+      // D-22 (Task 2.10d, ruling 64): the pointer reset below clears every pending bit of the
+      // bank.  Count the rows it clears without a record.  The row the drain captures in the
+      // same cycle is not lost (drain_emit implies its pending bit is set, so no underflow).  A
+      // rollback capture never names a pending row: enqueue clears the bit and a kill sets it
+      // only while clearing rob_val, so rbk_emit (rob_val set) excludes it.  The pulse fires on
+      // an empty ROB (quiesce drain, or the ROB-size CSRRW's own flush_commit), so no kill can
+      // set a pending bit in the same cycle.
+      ift_sq_ptrrst_bank(w) := Mux(ift_rob_ptr_reset, PopCount(ift_squash_pending) - drain_emit.asUInt, 0.U)
+      // Review Focus 3: a MEM_ORDER edge must land before the rollback walk reads its row
+      val memord_hits_rbk_row = io.cf_lsu_memord_upd.map(u => u.valid && MatchBank(GetBankIdx(u.bits.rob_idx)) &&
+                                                               GetRowIdx(u.bits.rob_idx) === com_idx).reduce(_ || _)
+      assert(!(rbk_emit && memord_hits_rbk_row), "[rob] MEM_ORDER edge arrived in the rollback cycle of its row")
+      // [FLUSH] printf (Task 2.10d, ruling 63 Q3): printed by IftSquashMerge from the shipped
+      // record, at the merge, in lane order.  The printf-only fields are copied here at capture
+      // (4c review F3, F4): the expanded inst, the full pc, br_mask, br_tag, the enable and the
+      // flushing branch's fl/fl_sec/floc (flush_mp_*, which a later mispredict reloads).
+      // fl/fl_sec/floc name the flushing branch, captured at its b1; a rollback record (SRC=4)
+      // has no flushing branch and prints 0 for all three, as before.
+      if (iftSqDbgOn) {
+        val d = ift_sq_dbg(w)
+        d.en      := io.cf_debug_rob_enable
+        d.pc      := su.debug_pc(vaddrBits - 1, 0)
+        d.inst    := su.inst
+        d.br_mask := su.br_mask
+        d.br_tag  := su.br_tag
+        d.fl_dom  := flush_mp_dom
+        d.fl_sec  := flush_mp_sec
+        d.fl_oc   := flush_mp_oc
+        if (iftSqShadow) {
+          // the pre-4b record, packed at capture exactly as the old drain did (Verilator only;
+          // IftSquashMerge asserts the shipped record equals it, design 7.9 B5)
+          val old_ift = IftMerge(sidecar.io.sq_raw)._1
+          d.old_rec.get := uopToIFTBits(rob_uop(sq_row), old_ift,
+            (sticky_s_acc(sq_row), sticky_s_prop(sq_row), sticky_s_tx(sq_row), sticky_atk(sq_row)),
+            2.U, io.ift_priv) | (sq_cause.asUInt << 253)
+        }
+        when (ift_sq_ptrrst_bank(w) =/= 0.U) {
+          printf("[SQPTRRST] bank=%d lost=%d\n", w.U, ift_sq_ptrrst_bank(w))
+        }
+      }
     }
 
     if (enableCommitMapTable) {
@@ -1048,86 +1229,78 @@ class Rob(
         // than adding a second one is deliberate -- the comment above notes the
         // influencer-dump mux cone is what inflated Rob.sv, so a duplicate would pay that
         // area twice.  SRC distinguishes the two: 3 = branch kill, 4 = exception rollback.
-        val rbk_kill_i = (rob_state === s_rollback) && !full && (i.U === rob_tail)
-        if (ENABLE_CF_DEBUG_PRINTF) {
+        //
+        // [SQUASHALL] Task 2.6: with ENABLE_IFT the [FLUSH] printf lives in the squash path
+        // (Task 2.10d: IftSquashMerge prints it from the shipped record, after the kill, so the
+        // record carries the late edges) and this per-row printf is not elaborated.  It stays
+        // for ENABLE_IFT = false, where there is no sidecar and rob_uop.cf_* is not zeroed,
+        // so an IFT-off build (BaselineBoomConfig) keeps its pre-Phase-2 [FLUSH] output.
+        // [R124GATE3] patch 28 (B51): this IFT-off [FLUSH] record is IFT output (CF(...) fields,
+        // all 0 IFT off) and was the only reader that kept rob_uop.inst/prs1/prs2/lrs*_rtype/br_tag
+        // in every ROB row of an IFT-off build.  It is no longer elaborated (robIftOffFlushLog);
+        // set it true to restore the pre-patch-28 IFT-off [FLUSH] lines.  IFT on: never elaborated
+        // (unchanged).
+        val robIftOffFlushLog = false
+        if (ENABLE_CF_DEBUG_PRINTF && !ENABLE_IFT && robIftOffFlushLog) {
+          val rbk_kill_i = (rob_state === s_rollback) && !full && (i.U === rob_tail)
           when (rob_val(i) && (IsKilledByBranch(io.brupdate, br_mask) || rbk_kill_i) && io.cf_debug_rob_enable) {
             // [FLUSH] log: full commit-log format for squashed entries
             // corefuzzing: add INFL_PIPELINE_FLUSH when flushing branch is from different domain
             // corefuzzing: single printf per entry — atomic in Verilator multi-threaded mode,
             // preventing interleaving of header/influencer-loop/footer across threads.
             // corefuzzing: no WireInit copy needed — read ROB state directly.
+            // [SQUASHALL] Task 2.5: atk reads the sticky flag (spec 5.1.1), the only place the
+            // STEP1 shadow promotion lands now; the same-cycle shadow is ORed in as before.
             // Pipeline-flush info is printed as separate fl/floc fields (like spec_atk/spec_oc),
             // completely outside the influencer list.  This eliminates the addInfluencer call
             // and WireInit(full MicroOp) that previously generated ~100 mux expressions per entry
             // across 128 entries, causing Rob.sv to balloon to 168 MB.
             val fu = rob_uop(i)
             val fl_cross_domain = io.cf_mispredict_uop.valid &&
-              (io.cf_mispredict_uop.bits.cf_domain_id =/= fu.cf_domain_id)
+              (io.cf_mispredict_uop.bits.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= fu.cf_domain_id.getOrElse(0.U(iftTagWidth.W)))
             val fl_is_secret = io.cf_mispredict_uop.valid &&
-              (io.cf_mispredict_uop.bits.cf_secret_propagation || io.cf_mispredict_uop.bits.cf_secret_access)
+              (io.cf_mispredict_uop.bits.cf_secret_propagation.getOrElse(false.B) || io.cf_mispredict_uop.bits.cf_secret_access.getOrElse(false.B))
             val fl_op_count = Mux(io.cf_mispredict_uop.valid,
-              io.cf_mispredict_uop.bits.cf_op_count_id, 0.U)
+              io.cf_mispredict_uop.bits.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)), 0.U)
             val robFlushInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d}"}.mkString(" ")
             val robFlushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d fl_sec=%d floc=%d FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d pdst=%d prs1=%d prs2=%d rt1=%d rt2=%d brmask=0x%x brtag=%d abr=%d sbr=%d) $robFlushInflFmt\n"
+            // [THINUOP] Task 3.5: this IFT-off printf used to read the removed MicroOp IFT fields,
+            // which are constant zero in an IFT-off build (only the fetch buffer ever wrote them,
+            // with zeros), so it prints the same zeros from a zero IftCommitInfo.
+            val fu_ift = 0.U.asTypeOf(new IftCommitInfo)
             val robInflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
-              fu.cf_influencer_list(k).valid,
-              fu.cf_influencer_list(k).op_count,
-              fu.cf_influencer_list(k).infl_type,
-              fu.cf_influencer_list(k).is_atk,
-              fu.cf_influencer_list(k).is_secret
+              fu_ift.influencer_list(k).valid,
+              fu_ift.influencer_list(k).op_count,
+              fu_ift.influencer_list(k).infl_type,
+              fu_ift.influencer_list(k).is_atk,
+              fu_ift.influencer_list(k).is_secret
             ))
             printf(robFlushFmt, (Seq[Bits](
               Sext(fu.debug_pc(vaddrBits-1,0), xLen), fu.inst,
-              fu.cf_domain_id, fu.cf_speculated, (fu.cf_attacker_influence || cf_in_atk_shadow),
-              fu.cf_secret_access, fu.cf_secret_propagation, fu.cf_secret_transmission,
-              fu.cf_op_count_id, fu.cf_spec_branch_is_atk, fu.cf_spec_branch_op_id,
+              fu.cf_domain_id.getOrElse(0.U(iftTagWidth.W)), fu_ift.speculated, (sticky_atk(i) || cf_in_atk_shadow),
+              fu.cf_secret_access.getOrElse(false.B), fu.cf_secret_propagation.getOrElse(false.B), fu.cf_secret_transmission.getOrElse(false.B),
+              fu.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)), fu_ift.spec_branch_is_atk, fu_ift.spec_branch_op_id,
               fl_cross_domain, fl_is_secret, fl_op_count,
-              fu.cf_fu_bitmap, Mux(rbk_kill_i, 4.U, 3.U), inflBitmapFromList(fu.cf_influencer_list), fu.cf_infl_dropped, fu.cf_cntd_deny_count, fu.cf_stall_cycles_rob, fu.cf_stall_cycles_stq, fu.cf_infl_oc_aliased, fu.pdst, fu.prs1, fu.prs2, fu.lrs1_rtype, fu.lrs2_rtype,
+              fu.cf_fu_bitmap.getOrElse(0.U(numModules.W)), Mux(rbk_kill_i, 4.U, 3.U), inflBitmapFromList(fu_ift.influencer_list), fu_ift.infl_dropped, fu_ift.cntd_deny_count, fu_ift.stall_cycles_rob, fu_ift.stall_cycles_stq, fu_ift.infl_oc_aliased, fu.pdst, fu.prs1, fu.prs2, fu.lrs1_rtype, fu.lrs2_rtype,
               // [BRMASK 2026-09-08] full speculation shadow + own tag; see core.scala
               br_mask, rob_uop(i).br_tag,
-              fu.cf_atk_branch_ctr, fu.cf_sec_branch_ctr   // [GHISTFIELD]
+              fu_ift.atk_branch_ctr, fu_ift.sec_branch_ctr   // [GHISTFIELD]
             ) ++ robInflArgs): _*)
           }
         }
 
         //kill instruction if mispredict & br mask match
-        when (IsKilledByBranch(io.brupdate, br_mask))
-        {
+        // [SQUASHALL] Task 2.5 (D5, spec 5.1.6): every branch-killed valid row is marked for
+        // a squash record.  The old IFT-activity gate (cf_has_ift_activity), the clears of
+        // the old sprob/ic/wb pending tables and the [A6PROBE] measurement are gone with the
+        // tables (ruling 38 item 2); the drain (Task 2.6: tail order, sidecar squash readout)
+        // reads the row one or more cycles later, so nothing here touches rob_uop(i).
+        when (IsKilledByBranch(io.brupdate, br_mask)) {
           rob_val(i) := false.B
-          rob_uop(i.U).debug_inst := BUBBLE
-          // [A6PROBE 2026-09-15] measurement only, no functional change: how often does
-          // a kill discard an influencer edge that was still pending (never drained into
-          // the row), i.e. an edge the squash record / [FLUSH] printf will never show?
-          // Decides whether the squash path needs the commit path's pending overrides.
-          if (ENABLE_CF_DEBUG_PRINTF) {
-            when (rob_val(i) && io.cf_debug_rob_enable &&
-                  (sprob_infl_pending(i) || ic_pending_valid(i) || wb_infl_pending(i))) {
-              // [CFNOISE-COMMENTED] printf("[A6PROBE] kill-with-pending pc=0x%x oc=%d sprob=%d ic=%d wb=%d wb_valid=%d s_acc=%d s_prop=%d s_tx=%d\n",
-                // [CFNOISE-COMMENTED] rob_uop(i).debug_pc, rob_uop(i).cf_op_count_id,
-                // [CFNOISE-COMMENTED] sprob_infl_pending(i), ic_pending_valid(i), wb_infl_pending(i),
-                // [CFNOISE-COMMENTED] PopCount(VecInit(wb_infl_list(i).map(_.valid))),
-                // [CFNOISE-COMMENTED] rob_uop(i).cf_secret_access, rob_uop(i).cf_secret_propagation,
-                // [CFNOISE-COMMENTED] rob_uop(i).cf_secret_transmission)
-            }
-          }
-          // corefuzzing: clear pending influencer bits so the drain doesn't
-          // write to a slot that has been freed and potentially reallocated.
-          sprob_infl_pending(i) := false.B
-          ic_pending_valid(i)   := false.B
-          wb_infl_pending(i)    := false.B
-          // IFT bridge: if this entry has IFT activity, record it for bridge output.
-          // Pending bit is set here; drain fires 1/cycle per bank (register semantics
-          // guarantee drain reads correct pre-kill uop data even if dispatch co-fires).
-          when (rob_val(i)) {
-            val cf_has_ift_activity =
-              rob_uop(i).cf_attacker_influence  || cf_in_atk_shadow ||
-              rob_uop(i).cf_secret_access       ||
-              rob_uop(i).cf_secret_propagation  ||
-              rob_uop(i).cf_secret_transmission ||
-              rob_uop(i).cf_src_tainted         ||
-              VecInit(rob_uop(i).cf_influencer_list.map(_.valid)).asUInt.orR ||
-              wb_infl_pending(i)  // pending wb influencer data not yet drained
-            ift_squash_pending(i) := cf_has_ift_activity
+          // NOTE: no `debug_inst := BUBBLE` here any more (Phase 0 bug 7): the squash
+          // record is read from this row one or more cycles later.
+          if (ENABLE_IFT) {
+            when (rob_val(i)) { ift_squash_pending(i) := true.B }      // D5: every killed row
           }
         } .elsewhen (rob_val(i)) {
           // clear speculation bit even on correct speculation
@@ -1135,9 +1308,12 @@ class Rob(
         }
         // [STEP1] attacker shadow: this uop is in the window of a branch whose CONDITION
         // was attacker-influenced.  Tested against the CURRENT br_mask, so the resolving
-        // branch's own tag still matches before GetNewBrMask retires it.
-        when (rob_val(i) && cf_in_atk_shadow) {
-          rob_uop(i).cf_attacker_influence := true.B
+        // branch's own tag still matches before GetNewBrMask retires it.  The promotion
+        // lands in the sticky flag only (spec 5.1.1): the commit readout (Task 2.4) and the
+        // squash readout with its [FLUSH] printf (Task 2.6 drain) read sticky_atk, so the
+        // rob_uop.cf_attacker_influence write is gone.
+        if (ENABLE_IFT) {
+          when (rob_val(i) && cf_in_atk_shadow) { sticky_atk(i) := true.B }
         }
       }
     }
@@ -1162,17 +1338,52 @@ class Rob(
     rob_head_vals(w)     := rob_val(rob_head)
     rob_tail_vals(w)     := rob_val(rob_tail)
     rob_head_fflags(w)   := rob_fflags(w)(rob_head)
+    // [FFTAINT] step 18: same head-row read as the flags; sticky_* are constant-false
+    // wires without ENABLE_IFT, and the domain term is gated here.
+    rob_head_ffsec(w)    := sticky_s_acc(rob_head) || sticky_s_prop(rob_head)
+    rob_head_ffatk(w)    := sticky_atk(rob_head) ||
+                            (ENABLE_IFT.B && rob_uop(rob_head).cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U)
     rob_head_uses_stq(w) := rob_uop(rob_head).uses_stq
     rob_head_uses_ldq(w) := rob_uop(rob_head).uses_ldq
 
     // -------------------------------------------------
     // CoreFuzzing outputs
-    cf_rob_head_uop(w)   := rob_uop(rob_head)
+    if (w == 0) {
+      rob_head_oc_bank0  := rob_uop(rob_head).cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
+      rob_head_dom_bank0 := rob_uop(rob_head).cf_domain_id.getOrElse(0.U(iftTagWidth.W))
+    }
+    // [SIDECAR] Task 2.4: head secret status from the sticky flags (bank 0 = retire slot 0)
+    if (w == 0) rob_head_is_secret_bank0 := sticky_s_acc(rob_head) || sticky_s_prop(rob_head)
+    // [ROBHEADATK] patch 48 (r173 (6), task-reports/p4-owner-gap-check.md C-rob): the same head row,
+    // bank 0, through the sidecar's EXISTING commit readout (its row is com_idx = rob_head outside
+    // rollback; rollback reads the tail, so it is masked).  An output only: no new ROB state, no new
+    // write port or path into the ROB (r98).  sp_atk is value taint (taint_atk / window operand
+    // taint of a domain-0 register write, not a line-borne load value), never a sticky summary, so
+    // the stalled consumers' sticky atk can never feed it back (no chain, the r168a principle).
+    if (ENABLE_IFT && w == 0) rob_head_valatk_bank0 := sidecar.io.commit_valatk && rob_state =/= s_rollback
 
-    // IFT bridge commit records: one per retire slot, valid on arch_valids.
-    // Use io.commit.uops (Wire with pending overrides applied) not rob_uop (register).
-    io.ift_commit_valids(w)  := io.commit.arch_valids(w)
-    io.ift_commit_records(w) := uopToIFTBits(io.commit.uops(w), 1.U /*commit*/, io.ift_priv)
+    // IFT bridge commit records: one per retire slot, valid on arch_valids.  Packed from
+    // io.commit.uops (the Wire carrying the sidecar readout, Task 2.4), not from rob_uop.
+    // D2a (Task 2.4): an invalid retire lane packs event_type 0 instead of a constant 1, so
+    // the bridge can compact the valid records (D12).  2-bit literals: uopToIFTBits slices
+    // event_type(1, 0), which Chisel rejects on a 1-bit Mux result.  Under ENABLE_IFT only.
+    val com_evt = if (ENABLE_IFT) Mux(io.commit.arch_valids(w), 1.U(2.W), 0.U(2.W)) else 1.U(2.W)
+    // [RECREG] (Phase 4 Task 4.3, spec 5.3, ruling 44) the bridge record and its valid are
+    // registered together under ENABLE_IFT, so the ROB readout -> uopToIFTBits -> core -> tile
+    // -> ChipTop -> bridge leg starts at a flop beside the ROB.  The commit printf and every
+    // commit-time consumer in core.scala still read io.commit.* in the commit cycle (unchanged
+    // logs).  Record-identical: each record is the same bits one cycle later, with its valid.
+    // The squash lane gets the matching extra cycle in core.scala ([RECREG] there), so the
+    // commit/squash order on the bridge token stream is unchanged.  Cost: retireWidth x 257 FF.
+    val com_rec = uopToIFTBits(io.commit.uops(w), com_ift,
+      (com_sticky(0), com_sticky(1), com_sticky(2), com_sticky(3)), com_evt, io.ift_priv)
+    if (ENABLE_IFT) {
+      io.ift_commit_valids(w)  := RegNext(io.commit.arch_valids(w), false.B)
+      io.ift_commit_records(w) := RegNext(com_rec, 0.U)
+    } else {
+      io.ift_commit_valids(w)  := io.commit.arch_valids(w)
+      io.ift_commit_records(w) := com_rec
+    }
     
     //------------------------------------------------
     // Invalid entries are safe; thrown exceptions are unsafe.
@@ -1187,9 +1398,11 @@ class Rob(
 
     // -----------------------------------------------
     // debugging write ports that should not be synthesized
+    // [SQUASHALL] Task 2.6: the rollback-walk BUBBLE write is gone with ENABLE_IFT (the
+    // rollback record must carry the instruction); kept for ENABLE_IFT = false (ruling 5).
     when (will_commit(w)) {
       rob_uop(rob_head).debug_inst := BUBBLE
-    } .elsewhen (rbk_row)
+    } .elsewhen (rbk_row && (!ENABLE_IFT).B)
     {
       rob_uop(rob_tail).debug_inst := BUBBLE
     }
@@ -1202,83 +1415,40 @@ class Rob(
       when (io.debug_wb_valids(i) && MatchBank(GetBankIdx(rob_idx))) {
         rob_debug_wdata(GetRowIdx(rob_idx)) := io.debug_wb_wdata(i)
       }
-      // corefuzzing: merge cf_fu_bitmap bits and IFT flags from the functional unit (Phase 2)
-      // Also guarded by rob_val && rob_bsy to suppress stale wakeups (same reason as above).
-      when (io.wb_resps(i).valid && MatchBank(GetBankIdx(rob_idx)) && rob_val(GetRowIdx(rob_idx)) && rob_bsy(GetRowIdx(rob_idx))) {
-        val rob_row  = GetRowIdx(rob_idx)
-        val wb_uop_i = io.wb_resps(i).bits.uop
-        rob_uop(rob_row).cf_fu_bitmap :=
-          rob_uop(rob_row).cf_fu_bitmap | wb_uop_i.cf_fu_bitmap
-        when (wb_uop_i.cf_attacker_influence)  { rob_uop(rob_row).cf_attacker_influence   := true.B }
-        // [GHISTFIELD] carry the GHR window counters; take the LARGER value, which is the
-        // more recent arming (the counter is set to globalHistoryLength and decays).
-        when (wb_uop_i.cf_atk_branch_ctr > rob_uop(rob_row).cf_atk_branch_ctr) {
-          rob_uop(rob_row).cf_atk_branch_ctr := wb_uop_i.cf_atk_branch_ctr }
-        when (wb_uop_i.cf_sec_branch_ctr > rob_uop(rob_row).cf_sec_branch_ctr) {
-          rob_uop(rob_row).cf_sec_branch_ctr := wb_uop_i.cf_sec_branch_ctr }
-        // [R0 2026-09-04] ATTACKER: record the RESULT's attacker taint on the instruction.
-        // Mirrors the secret side, which at writeback takes sec1 = wb.bits.secret and emits
-        // cf_s_prop_rob_upd (core.scala:2136-2152).  Before this, wbresp.bits.taint_atk had
-        // exactly ONE consumer -- the regfile write at core.scala:1949 -- so attacker taint
-        // flowed through FUs and registers but was NEVER recorded on any instruction: it was
-        // invisible in the commit log and could not seed spec_branch_atk_table.  That, not the
-        // memory round-trip, is why the whole spectre-v1 gadget logged atk=0.
-        // This is the VALUE's own taint (a specific channel), NOT an aggregate -- do not
-        // widen it to cf_attacker_influence || domain, which is how the secret side became
-        // an aggregate.  Gated on a real integer register write (mirrors core.scala's int_wb)
-        // so a store/branch cannot inherit a result taint that is not its own.
-        // The RESULT's attacker taint as WRITTEN TO THE REGISTER FILE.  Must mirror
-        // core.scala:1949 exactly:
-        //     taint_atk := wbresp.bits.taint_atk || (uop.cf_domain_id =/= 0.U)
-        // The ownership seed (|| domain) is applied AT THE REGFILE WRITE, not inside
-        // wbresp.bits.taint_atk.  A first version of this fix read the un-seeded
-        // wb_resps(i).bits.taint_atk and therefore recorded nothing for domain-1
-        // producers -- MEASURED: the dom-1 load feeding a0 (0x80003308) stayed atk=0.
-        // This is the SAME write event, not a downstream re-application of the OR
-        // (doc 16 sec.A forbids the latter, and that is what made the secret side an
-        // aggregate).  Recording it here means exactly: "this instruction produced a
-        // value the register file considers attacker-influenced".
-        val wb_res_atk = io.wb_resps(i).bits.taint_atk ||
-                         (wb_uop_i.cf_domain_id =/= 0.U)
-        // [FPRTYPE 2026-09-08] Was `dst_rtype === RT_FIX`, i.e. INTEGER DESTINATIONS ONLY.
-        // An FP instruction has dst_rtype === RT_FLT, so a `fadd.d` reading an
-        // attacker-tainted FP register could NEVER get cf_attacker_influence here, no
-        // matter how correct the FP datapath was.  MEASURED by t33_fp_atk_taint: the
-        // `fld` showed atk=1 (its flag is set in the LSU by the memdf influencer,
-        // lsu.scala:1919, and carried through by the ungated :1105 below), but both
-        // dependent `fadd.d` showed atk=0 while the control stayed clean.
-        // Every other link was already intact and verified: fregfile read port ->
-        // fregister_read rs1_taint_atk -> execution-unit:545 -> FPUUnit:879/899 ->
-        // execution-unit:606 fresp -> fp-pipeline:325 wakeup -> core:2088 wb_resps.
-        // This guard was the only break.  RT_FLT is the symmetric completion; rf_wen and
-        // ldst_val still gate, so stores/branches are excluded exactly as before.
-        when (wb_res_atk && wb_uop_i.rf_wen && wb_uop_i.ldst_val &&
-              (wb_uop_i.dst_rtype === RT_FIX || wb_uop_i.dst_rtype === RT_FLT)) {
-          rob_uop(rob_row).cf_attacker_influence := true.B
-        }
-        when (wb_uop_i.cf_secret_access)       { rob_uop(rob_row).cf_secret_access        := true.B }
-        when (wb_uop_i.cf_secret_transmission) { rob_uop(rob_row).cf_secret_transmission  := true.B }
-        when (wb_uop_i.cf_secret_propagation)  { rob_uop(rob_row).cf_secret_propagation   := true.B }
-        // Fix 3c: dcache memsec_fire injects INFL_MEM_DATAFLOW(is_atk=false, is_secret=true)
-        // into the wb uop's influencer list. The flag itself is not on cf_secret_propagation
-        // (dcache doesn't write that field), so detect it here and set s_prop on the ROB entry.
-        val has_mem_sec_infl_rob = wb_uop_i.cf_mem_sec_dataflow
-        when (has_mem_sec_infl_rob) { rob_uop(rob_row).cf_secret_propagation := true.B }
-
-        // Opt#1: Defer influencer merge to pending table (breaks critical path).
-        // Capture wb influencer list; drain 1 row/cycle via PriorityEncoder.
-        val has_wb_infl = wb_uop_i.cf_influencer_list.map(_.valid).reduce(_ || _) ||
-                          wb_uop_i.cf_infl_dropped =/= 0.U
-        when (has_wb_infl) {
-          when (!wb_infl_pending(rob_row)) {
-            wb_infl_pending(rob_row)  := true.B
-            wb_infl_list(rob_row)     := wb_uop_i.cf_influencer_list
-            wb_infl_overflow(rob_row) := wb_uop_i.cf_infl_dropped
-          } .otherwise {
-            // Second wb_resp hits same row while pending → merge into pending list
-            // or set overflow if no room. Simple: just set overflow.
-            wb_infl_overflow(rob_row) := 3.U
-          }
+      // corefuzzing [SIDECAR] Task 2.3: the writeback's IFT contribution goes to this
+      // port's sidecar column (edges + fu_bitmap on the LSU-fed ports, fu_bitmap only on
+      // the others; the sidecar picks the shape by port index) and to the sticky bits.
+      // Guarded by rob_val && rob_bsy like the busy-clear above, to drop stale wakeups of
+      // branch-killed instructions.  The old read-modify-write of rob_uop(row).cf_* and the
+      // writeback pending-list capture are gone; the commit readout (Task 2.4) merges the column.
+      // The branch-counter max merge is dropped: every post-dispatch copy of the uop zeroes
+      // cf_atk/sec_branch_ctr (issue slots, FUs, LSU), so it never changed the row
+      // (spec 5.1.5 step 6 amendment, ruling 29).
+      if (ENABLE_IFT) {
+        when (io.wb_resps(i).valid && MatchBank(GetBankIdx(rob_idx)) && rob_val(GetRowIdx(rob_idx)) && rob_bsy(GetRowIdx(rob_idx))) {
+          val rob_row  = GetRowIdx(rob_idx)
+          val wb_uop_i = io.wb_resps(i).bits.uop
+          // sticky flags (same semantics as the old per-row ORs)
+          when (wb_uop_i.cf_attacker_influence.getOrElse(false.B)) { sticky_atk(rob_row) := true.B }
+          // [R0 2026-09-04] the RESULT's attacker taint AS WRITTEN TO THE REGISTER FILE
+          // (core.scala: taint_atk || domain seed), on a real int/FP register write
+          // ([FPRTYPE 2026-09-08]: RT_FLT included; rf_wen && ldst_val exclude stores and
+          // branches).  Not widened to cf_attacker_influence: it is the value's own taint.
+          val wb_res_atk = io.wb_resps(i).bits.taint_atk || (wb_uop_i.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U)
+          when (wb_res_atk && wb_uop_i.rf_wen && wb_uop_i.ldst_val &&
+                (wb_uop_i.dst_rtype === RT_FIX || wb_uop_i.dst_rtype === RT_FLT)) { sticky_atk(rob_row) := true.B }
+          when (wb_uop_i.cf_secret_access.getOrElse(false.B))       { sticky_s_acc(rob_row)  := true.B }
+          when (wb_uop_i.cf_secret_transmission.getOrElse(false.B)) { sticky_s_tx(rob_row)   := true.B }
+          when (wb_uop_i.cf_secret_propagation.getOrElse(false.B))  { sticky_s_prop(rob_row) := true.B }
+          // Fix 3c: dcache memsec_fire marks INFL_MEM_DATAFLOW on cf_mem_sec_dataflow (the
+          // dcache does not write cf_secret_propagation); it is s_prop on the ROB entry.
+          when (wb_uop_i.cf_mem_sec_dataflow.getOrElse(false.B))    { sticky_s_prop(rob_row) := true.B }
+          // column write: edges (LSU-fed ports), fu_bitmap (all ports), stamp.  Task 3.2 (D16):
+          // the edges are the response's own list; non-LSU ports tie it to zero (unread).
+          sidecar.io.wb(i).valid          := true.B
+          sidecar.io.wb(i).bits.row       := rob_row
+          sidecar.io.wb(i).bits.edges     := io.wb_resps(i).bits.edges
+          sidecar.io.wb(i).bits.fu_bitmap := wb_uop_i.cf_fu_bitmap.getOrElse(0.U(numModules.W))
         }
       }
       val temp_uop = rob_uop(GetRowIdx(rob_idx))
@@ -1294,6 +1464,48 @@ class Rob(
                "[rob] writeback (" + i + ") occurred to the wrong pdst.")
     }
     io.commit.debug_wdata(w) := rob_debug_wdata(rob_head)
+
+    // [SCFWD] patch 40b (D17 sweep, phase4/patches/p4-40b-review.md): the commit readout is an
+    // asynchronous read of columns written at the clock edge, so a column or sticky write in its
+    // row's commit cycle would be lost.  Only C_ras can do that (b2 vs a head-ready ret) and it
+    // is forwarded into the commit merge ([RASBYP], rob-ift-sidecar.scala).  For every other
+    // port the write precedes the commit by at least one edge (proof per port in the report);
+    // these checks make a later change that breaks it a hard stop.  Verilator printf builds
+    // only (iftSqShadow: ENABLE_CF_DEBUG_PRINTF and no bridge), like the squash shadow check:
+    // no FireSim or NoLog Verilog changes.  The guarded ports use rob_uop's op_count (the value
+    // C_oc holds) so no sidecar guard port is added.
+    if (ENABLE_IFT && iftSqShadow) {
+      def scChk(v: Bool, row: UInt, what: String): Unit =
+        assert(!(will_commit(w) && v && row === com_idx),
+          "[rob] [SCFWD] " + what + " lands in its row's commit cycle (lost by the commit readout)")
+      def scOk(row: UInt, oc: UInt): Bool =
+        rob_val(row) && rob_uop(row).cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)) === oc
+      sidecar.io.wb.zipWithIndex.foreach     { case (p, k) => scChk(p.valid, p.bits.row, s"sidecar wb($k)") }
+      sidecar.io.clr.zipWithIndex.foreach    { case (p, k) => scChk(p.valid, p.bits.row, s"sidecar clr($k)") }
+      sidecar.io.sprob.zipWithIndex.foreach  { case (p, k) => scChk(p.valid, p.bits.row, s"sidecar sprob($k)") }
+      sidecar.io.ic.zipWithIndex.foreach     { case (p, k) => scChk(p.valid, p.bits.row, s"sidecar ic($k)") }
+      sidecar.io.memord.zipWithIndex.foreach { case (p, k) => scChk(p.valid, p.bits.row, s"sidecar memord($k)") }
+      // sticky-only ports (same enables as their writes above)
+      def scUpd(v: Bool, idx: UInt, oc: UInt, what: String): Unit = {
+        val r = GetRowIdx(idx)
+        scChk(v && MatchBank(GetBankIdx(idx)) && scOk(r, oc), r, what)
+      }
+      io.cf_lsu_s_acc_upd.zipWithIndex.foreach { case (u, k) => scUpd(u.valid, u.bits.rob_idx, u.bits.op_count_id, s"cf_lsu_s_acc_upd($k)") }
+      io.cf_lsu_s_tx_upd.zipWithIndex.foreach  { case (u, k) => scUpd(u.valid, u.bits.rob_idx, u.bits.op_count_id, s"cf_lsu_s_tx_upd($k)") }
+      io.cf_br_atk_self.zipWithIndex.foreach   { case (u, k) => scUpd(u.valid, u.bits.rob_idx, u.bits.op_count_id, s"cf_br_atk_self($k)") }
+    }
+
+    // [SIDECAR] Task 2.7 (spec 5.1.7): on the ROB pointer reset (quiesce drain / ROB-size
+    // change; the ROB is empty) the squash-pending bits and the four sticky flags are cleared.
+    // Last connect in the bank, so it wins over a same-cycle kill, writeback or enqueue write.
+    // The sidecar columns are cleared by sidecar.io.clear_all (cf_rob_quiesce_reset, Task 2.2);
+    // records already in the squash FIFO drain normally.
+    if (ENABLE_IFT) {
+      when (ift_rob_ptr_reset) {
+        ift_squash_pending.foreach(_ := false.B)
+        Seq(sticky_s_acc, sticky_s_prop, sticky_s_tx, sticky_atk).foreach(_.foreach(_ := false.B))
+      }
+    }
 
   } //for (w <- 0 until coreWidth)
 
@@ -1390,6 +1602,20 @@ class Rob(
   }
   io.commit.fflags.valid := fflags_val.reduce(_|_)
   io.commit.fflags.bits  := fflags.reduce(_|_)
+
+  // [FFTAINT] step 18 (ruling 118, G-2): a retire slot SETS the flags taint only when its
+  // committed flags are non-zero (fflags(w) is already gated by fflags_val(w): commit.valids,
+  // fp_val, !uses_stq; FP loads carry 0 flags, asserted above).  A tainted op whose flags stay
+  // 0 is knowingly untagged (owner).  Per slot: a 5-bit OR and an AND, then a coreWidth-wide
+  // OR, after the existing head-row readout.  The bits go to core.scala's sticky registers.
+  val ff_raised = fflags.map(_.orR)
+  if (ENABLE_IFT) {
+    io.cf_ff_set_sec := (ff_raised zip rob_head_ffsec).map { case (r, t) => r && t }.reduce(_||_)
+    io.cf_ff_set_atk := (ff_raised zip rob_head_ffatk).map { case (r, t) => r && t }.reduce(_||_)
+  } else {
+    io.cf_ff_set_sec := false.B
+    io.cf_ff_set_atk := false.B
+  }
 
   // -----------------------------------------------
   // Exception Tracking Logic
@@ -1588,7 +1814,8 @@ class Rob(
   val cf_rob_entries_wen_pending = RegInit(false.B)
   when (io.cf_rob_entries_wen)                              { cf_rob_entries_wen_pending := true.B  }
   .elsewhen (flush_commit && !exception_thrown)             { cf_rob_entries_wen_pending := false.B }
-  when (io.cf_rob_quiesce_reset || (cf_rob_entries_wen_pending && flush_commit && !exception_thrown)) {
+  ift_rob_ptr_reset := io.cf_rob_quiesce_reset || (cf_rob_entries_wen_pending && flush_commit && !exception_thrown)
+  when (ift_rob_ptr_reset) {
     rob_head     := 0.U
     rob_head_lsb := 0.U
     rob_tail     := 0.U
@@ -1603,22 +1830,69 @@ class Rob(
   io.rob_head_idx      := rob_head_idx
   io.rob_tail_idx      := rob_tail_idx
   io.rob_pnr_idx       := rob_pnr_idx
-  io.rob_head_op_count  := cf_rob_head_uop(0).cf_op_count_id
-  io.rob_head_domain    := cf_rob_head_uop(0).cf_domain_id
-  io.rob_head_is_secret := cf_rob_head_uop(0).cf_secret_access || cf_rob_head_uop(0).cf_secret_propagation
+  // [HEADREG] (Phase 4 Task 4.2) the head status is registered under ENABLE_IFT (IFT off:
+  // plain wires).  Before: rob_head -> 64:1 row mux (rob_uop / sticky columns) -> ROB->core
+  // route -> the dispatch stall captures.  After: the route starts at a flop.  core.scala's
+  // consumers read it only one cycle after a stall cycle (see [HEADREG] there), so every
+  // record is unchanged.  Cost: 16 + 1 + 1 = 18 FF.
+  def headReg[T <: Data](x: T): T = if (ENABLE_IFT) RegNext(x, 0.U.asTypeOf(x)) else x
+  io.rob_head_op_count  := headReg(rob_head_oc_bank0)
+  io.rob_head_domain    := headReg(rob_head_dom_bank0)
+  io.rob_head_is_secret := headReg(rob_head_is_secret_bank0)
+  io.rob_head_valatk.foreach(_ := headReg(rob_head_valatk_bank0))   // [ROBHEADATK] patch 48: 1 FF
   io.empty        := empty
   io.ready        := (rob_state === s_normal) && !full && !r_xcpt_val
 
-  // IFT bridge: cross-bank squash arbitration (bank 0 wins, then 1, ...).
-  // Only the winning bank clears its pending bit; others retain and retry next cycle.
-  val ift_sq_winner_oh  = PriorityEncoderOH(ift_sq_bank_valid.asUInt)
-  val ift_sq_any_bank   = ift_sq_bank_valid.asUInt.orR
-  for (w <- 0 until coreWidth) {
-    ift_sq_bank_drain_ok(w) := ift_sq_winner_oh(w)
+  // IFT bridge: per-bank raw squash FIFOs and the shared merge onto the single squash lane
+  // (spec 5.4.3, Task 2.6; Task 2.10d design 4b).  The banks never wait (D6): a full raw FIFO
+  // drops the capture and counts it; a row re-allocated before its capture is counted too
+  // (sq_reuse), and so are the pending rows a ROB pointer reset clears (D-22, Task 2.10d).
+  // Under ENABLE_IFT only (ruling 5), constant outputs otherwise.
+  // Saturating 16-bit accumulate (the +& sum is one bit wider; its carry clamps).
+  def satAdd16(a: UInt, b: UInt): UInt = { val s = a +& b; Mux(s(16), "hFFFF".U(16.W), s(15, 0)) }
+  if (ENABLE_IFT) {
+    val sqm = Module(new IftSquashMerge(coreWidth, iftNSprob, iftNIc, lsuWbPorts.length, iftNMo,
+                                        dbg = iftSqDbgOn, shadow = iftSqShadow))
+    sqm.io.cap := ift_sq_cap
+    sqm.io.dbg := ift_sq_dbg
+    io.ift_squash <> sqm.io.deq
+    // Task 2.10c (ruling 48): keep the squash readout alive in builds without the IFT
+    // bridge (the DMI config), so its logic is simulated and counted by the oracle.  No
+    // effect in FireSim, where the bridge consumes both ports.
+    dontTouch(io.ift_squash)
+    // 0xbce [47:32]: records lost before the merge path, i.e. rows re-allocated while still
+    // pending (sq_reuse) and, since Task 2.10d, pending rows cleared by a pointer reset (D-22).
+    // [QSREG R3] (Phase 4 timing, r142) the per-cycle increment is registered before the
+    // accumulate.  ift_sq_ptrrst_bank hangs off ift_rob_ptr_reset (io.cf_rob_quiesce_reset,
+    // the quiesce FSM), and PopCount + 4-way sum + saturating add was the 14-level tail of the
+    // routed worst path.  Equivalence: the same increments are summed in the same order, so
+    // reuse_cnt (and ift_squash_ovf_cnt / ovf_flag, which read it) holds exactly the old value
+    // one cycle later.  These feed only 0xbce and the bridge squash_ovf input, which the bridge
+    // ignores (IFTBridgeModule.scala); no record field carries them.  Software cannot see the
+    // lag: a reuse event is a row allocation at dispatch and a pointer reset is a quiesce or
+    // 0xbc2-commit flush, while a csrr of 0xbce is unique and executes only after the ROB has
+    // drained, many cycles later.  Cost: +10 FF (3 + 4x7 summed to 10 b), -~12 levels.
+    val reuse_inc = RegNext(PopCount(ift_sq_reuse_bank) +& ift_sq_ptrrst_bank.reduce(_ +& _), 0.U)
+    val reuse_cnt = RegInit(0.U(16.W))
+    reuse_cnt := satAdd16(reuse_cnt, reuse_inc)
+    val third_cnt = RegInit(0.U(16.W))
+    third_cnt := satAdd16(third_cnt, PopCount(ift_third_drop_bank ++ ift_third_drop_sq_bank))
+    io.ift_squash_ovf_cnt   := satAdd16(sqm.io.ovf_cnt, reuse_cnt)
+    io.ift_squash_reuse_cnt := reuse_cnt
+    io.ift_third_drop_cnt   := third_cnt
+    // Task 2.7 (D6): sticky loss flag, set once either loss counter is non-zero (both only
+    // count up and saturate).  Reads two registers, one cycle after the counter moves.
+    val ovf_flag = RegInit(false.B)
+    ovf_flag := ovf_flag || sqm.io.ovf_cnt.orR || reuse_cnt.orR
+    io.ift_squash_ovf := ovf_flag
+  } else {
+    io.ift_squash.valid     := false.B
+    io.ift_squash.bits      := 0.U
+    io.ift_squash_ovf       := false.B
+    io.ift_squash_ovf_cnt   := 0.U
+    io.ift_squash_reuse_cnt := 0.U
+    io.ift_third_drop_cnt   := 0.U
   }
-  io.ift_squash_valid   := ift_sq_any_bank
-  io.ift_squash_record  := Mux1H(ift_sq_winner_oh, ift_sq_bank_record)
-  io.ift_squash_ovf     := false.B  // no longer needed — records are retained, not dropped
 
   //-----------------------------------------------
   //-----------------------------------------------

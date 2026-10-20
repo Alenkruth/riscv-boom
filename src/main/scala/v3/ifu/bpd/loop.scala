@@ -38,8 +38,9 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     // secret-dependent loop TRIP COUNT is a real channel -- the predicted exit
     // encodes it.  Stored per entry alongside the tag; this bank is PC-tagged, so
     // provenance is exact.
-    val domain = UInt(1.W)
-    val secret = Bool()
+    // [R124GATE3] patch 28 (B51): IFT-only, absent without ENABLE_IFT (same position when present).
+    val domain = if (ENABLE_IFT) Some(UInt(1.W)) else None
+    val secret = if (ENABLE_IFT) Some(Bool()) else None
   }
 
   class LoopBranchPredictorColumn extends Module {
@@ -89,8 +90,8 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     // O4: qualified on the column's OWN tag match -- the same condition the prediction
     // path uses below -- so a mismatch is reported only when the prediction genuinely
     // came from this entry.
-    io.f3_domain_mismatch := (f3_entry.tag === f3_tag) && (f3_entry.domain =/= io.f3_req_domain)
-    io.f3_secret_mismatch := (f3_entry.tag === f3_tag) && f3_entry.secret
+    io.f3_domain_mismatch := (f3_entry.tag === f3_tag) && (f3_entry.domain.getOrElse(0.U(1.W)) =/= io.f3_req_domain)
+    io.f3_secret_mismatch := (f3_entry.tag === f3_tag) && f3_entry.secret.getOrElse(false.B)
 
     io.f3_pred := io.f3_pred_in
     io.f3_meta.s_cnt := f3_scnt
@@ -181,8 +182,8 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
         wentry.p_cnt := io.update_meta.s_cnt
       }
 
-      wentry.domain := io.update_domain
-      wentry.secret := io.update_secret
+      wentry.domain.foreach(_ := io.update_domain)
+      wentry.secret.foreach(_ := io.update_secret)
       entries(io.update_idx) := wentry
     } .elsewhen (io.update_repair && !doing_reset) {
       when (tag_match && !(f4_fire && io.update_idx === f4_idx)) {
@@ -207,7 +208,10 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // O4: the loop predictor is a direction predictor, so it reports as BPD state.
   // composer.scala ORs f3_bpd_*_mismatch across banks -- no new influencer type needed.
   io.f3_bpd_domain_mismatch := columns.map(_.io.f3_domain_mismatch).reduce(_||_)
-  io.f3_bpd_secret_mismatch := columns.map(_.io.f3_secret_mismatch).reduce(_||_)
+  // [BPDMASK] r170 A (DF-dt-sprop): a slot below the fetch PC, or a bank whose request is not
+  // valid, is not part of the packet; its secret label raises no edge.
+  io.f3_bpd_secret_mismatch := (0 until bankWidth).map(w =>
+    columns(w).io.f3_secret_mismatch && s3_mask(w) && s3_valid).reduce(_||_)
 
   for (w <- 0 until bankWidth) {
     columns(w).io.f2_req_valid := s2_valid
@@ -216,9 +220,10 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       RegNext(io.resp_in(0).f2(w).predicted_pc.valid && io.resp_in(0).f2(w).is_br))
 
     columns(w).io.f3_pred_in  := io.resp_in(0).f3(w).taken
-    columns(w).io.update_domain := s1_update.bits.cf_domain_id
-    columns(w).io.update_secret := s1_update.bits.cf_is_secret
-    columns(w).io.f3_req_domain := RegNext(RegNext(s1_domain))
+    columns(w).io.update_domain := s1_update.bits.cf_domain_id.getOrElse(0.U(1.W))
+    columns(w).io.update_secret := s1_update.bits.cf_is_secret.getOrElse(false.B)
+    // [R124GATE2] patch 27 (r124/B51): the two f3 domain flops only with ENABLE_IFT.
+    columns(w).io.f3_req_domain := (if (ENABLE_IFT) RegNext(RegNext(s1_domain)) else 0.U)
     io.resp.f3(w).taken       := columns(w).io.f3_pred
 
     columns(w).io.update_mispredict      := (s1_update.valid &&

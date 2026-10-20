@@ -30,52 +30,60 @@ class IFTTileIO(val retireWidth: Int) extends Bundle {
 // ---------------------------------------------------------------------------
 // uopToIFTBits: pack one 256-bit IFT record from MicroOp fields.
 //
-// 256-bit layout (LSB = bit 0):
+// 256-bit layout (LSB = bit 0).  Regenerated in Task 2.10d (review F10) from the Cat below
+// with the CoreFuzzingConstants widths (uopIDCounterWidthCF 16, inflOpCountWidthCF 10,
+// specBranchOpIdWidthCF 8, inflTypeWidthCF 5, numModules 24) and maxPregSz 8; it agrees
+// with base-attacks/fuzzer/boom_ift/decode_ift_bridge.py parse_record:
 //
 //   [1:0]     event_type            2b   01=commit, 10=squash, 11=cycle_anchor, 00=NOP
 //   [4:2]     priv                  3b
-//   [44:5]    pc                    40b  debug_pc[39:0]
-//   [76:45]   insn                  32b
-//   [77]      cf_domain_id          1b
-//   [78]      cf_speculated         1b
-//   [79]      cf_attacker_influence 1b
-//   [80]      cf_secret_access      1b
-//   [81]      cf_secret_propagation 1b
-//   [82]      cf_secret_transmission 1b
-//   [83]      cf_src_tainted        1b
-//   [85:84]   cf_infl_dropped       2b   saturating COUNT of discarded influencers
+//   [36:5]    pc                    32b  debug_pc[31:0]  ([PC32 2026-09-10], was 40b)
+//   [68:37]   insn                  32b  debug_inst
+//   [69]      cf_domain_id          1b
+//   [70]      cf_speculated         1b
+//   [71]      cf_attacker_influence 1b
+//   [72]      cf_secret_access      1b
+//   [73]      cf_secret_propagation 1b
+//   [74]      cf_secret_transmission 1b
+//   [75]      cf_src_tainted        1b
+//   [77:76]   cf_infl_dropped       2b   saturating COUNT of discarded influencers
 //                                        (0..3, 3 means ">=3"); was a 1b sticky flag
-//   [101:86]  cf_op_count_id        16b  uopIDCounterWidthCF -- the ANCHOR every
+//   [93:78]   cf_op_count_id        16b  uopIDCounterWidthCF -- the ANCHOR every
 //                                        truncated field below reconstructs against
-//   [102]     cf_spec_branch_is_atk 1b
-//   [103]     cf_spec_branch_is_secret 1b
-//   [111:104] cf_spec_branch_op_id  8b   specBranchOpIdWidthCF -- LOW bits only
-//   [112]     cf_single_step        1b
-//   [136:113] cf_fu_bitmap          24b  one bit per pipeline module (numModules=24)
-//   [139:137] cf_cntd_deny_count    3b   Log2Bucket -- issue-port denial cycles
-//   [142:140] cf_stall_cycles_rob   3b   Log2Bucket -- ROB-full dispatch stall cycles
-//   [145:143] cf_stall_cycles_stq   3b   Log2Bucket -- STQ head-of-line residency
-//   --- influencer[0..3]: 4 slots x 18 bits = 72 bits ---
-//   [146]     cf_infl_oc_aliased    1b   a truncated op_count on this record is OUT
+//   [94]      cf_spec_branch_is_atk 1b
+//   [95]      cf_spec_branch_is_secret 1b
+//   [103:96]  cf_spec_branch_op_id  8b   specBranchOpIdWidthCF -- LOW bits only
+//   [104]     cf_single_step        1b
+//   [128:105] cf_fu_bitmap          24b  one bit per pipeline module (numModules=24)
+//   [131:129] cf_cntd_deny_count    3b   Log2Bucket -- issue-port denial cycles
+//   [134:132] cf_stall_cycles_rob   3b   Log2Bucket -- ROB-full dispatch stall cycles
+//   [137:135] cf_stall_cycles_stq   3b   Log2Bucket -- STQ head-of-line residency
+//   [138]     cf_infl_oc_aliased    1b   a truncated op_count on this record is OUT
 //                                        of reconstructable range -- the stored low
 //                                        bits reconstruct to the WRONG producer, so
 //                                        do not build a flow through it
-//   [147]     influencer[0].valid   1b
-//   [157:148] influencer[0].op_count 10b inflOpCountWidthCF -- LOW bits only
-//   [162:158] influencer[0].infl_type 5b
-//   [163]     influencer[0].is_atk  1b
-//   [164]     influencer[0].is_secret 1b
-//   [182:165] influencer[1]         18b  same layout
-//   [200:183] influencer[2]         18b  same layout
-//   [218:201] influencer[3]         18b  same layout
-//   [226:219] pdst                   8b  maxPregSz
-//   [234:227] prs1                   8b
-//   [242:235] prs2                   8b
-//   [244:243] lrs1_rtype             2b  is prs1 really read
-//   [246:245] lrs2_rtype             2b  is prs2 really read
-//   [255:247] reserved/zero          9b
+//   --- influencer[0..3]: 4 slots x 18 bits = 72 bits ---
+//   [139]     influencer[0].valid   1b
+//   [149:140] influencer[0].op_count 10b inflOpCountWidthCF -- LOW bits only
+//   [154:150] influencer[0].infl_type 5b
+//   [155]     influencer[0].is_atk  1b
+//   [156]     influencer[0].is_secret 1b
+//   [174:157] influencer[1]         18b  same layout
+//   [192:175] influencer[2]         18b  same layout
+//   [210:193] influencer[3]         18b  same layout
+//   [218:211] pdst                   8b  maxPregSz
+//   [226:219] prs1                   8b
+//   [234:227] prs2                   8b
+//   [236:235] lrs1_rtype             2b  is prs1 really read
+//   [238:237] lrs2_rtype             2b  is prs2 really read
+//   [245:239] cf_atk_branch_ctr      7b  GHR attacker window counter
+//   [252:246] cf_sec_branch_ctr      7b  GHR secret window counter
+//   [255:253] reserved/zero          3b  squash records (event_type 10): rob.scala ORs the
+//                                        squash cause into bit [253] (0 branch kill, SRC=3;
+//                                        1 exception rollback, SRC=4); [255:254] stay 0
 //
-// Total: 147 fixed + 72 influencers + 28 operands + 9 reserved = 256 bits.
+// Total: fixedBits 167 (incl. pregs and rtypes) + 72 influencers + 14 GHR counters
+// + 3 reserved = 256 bits.
 //
 // THESE INDICES ARE DERIVED, NOT AUTHORITATIVE.  They shift whenever any width changes
 // -- they have already gone stale twice.  fixedBits/inflSlotBits below compute them from
@@ -89,18 +97,20 @@ class IFTTileIO(val retireWidth: Int) extends Bundle {
 // against this record's own cf_op_count_id, exact while the true distance is in range.
 // Widths are sized from measured tails across ten workloads, not one -- see
 // inflOpCountWidthCF in CoreFuzzing.scala.
-//
-// Total: 154 (fixed) + 64 (influencers) + 28 (operands) + 10 (reserved) = 256 bits. ✓
 // ---------------------------------------------------------------------------
 object uopToIFTBits extends CoreFuzzingConstants {
-  def apply(uop: MicroOp, event_type: UInt, priv: UInt): UInt = {
+  // [THINUOP] Phase 3 Task 3.5: every IFT field that left the MicroOp comes from `ift`; the four
+  // sticky flags (s_acc, s_prop, s_tx, atk) come from `sticky`, with the attacker flag ORed with
+  // ift.edge_atk (what IftApply did).  op_count / domain / pc / inst / pregs / rtypes stay on `uop`.
+  def apply(uop: MicroOp, ift: IftCommitInfo, sticky: (Bool, Bool, Bool, Bool), event_type: UInt, priv: UInt): UInt = {
+    val (s_acc, s_prop, s_tx, atk) = sticky
     // Per-slot bit width: valid(1) + op_count(inflOpCountWidthCF) + infl_type(5) +
     //                     is_atk(1) + is_secret(1)
     val inflSlotBits = 1 + inflOpCountWidthCF + inflTypeWidthCF + 1 + 1
     // Pack influencer entries (numInfluencerSlotsCF slots × inflSlotBits each), MSB→LSB
     val infl_bits = Cat(
       (numInfluencerSlotsCF - 1 to 0 by -1).map { k =>
-        val e = uop.cf_influencer_list(k)
+        val e = ift.influencer_list(k)
         Cat(e.is_secret,             // 1b
             e.is_atk,                // 1b
             e.infl_type,             // 5b  (inflTypeWidthCF)
@@ -148,40 +158,43 @@ object uopToIFTBits extends CoreFuzzingConstants {
       s"by design.")
     // Build 256-bit record (Cat: first arg = MSB, last arg = LSB)
     Cat(
-      0.U(reservedBits.W),                 // reserved (fills to 256)
-      uop.cf_sec_branch_ctr,               // 7b   GHR SECRET window counter -- on the
+      0.U(reservedBits.W),                 // [255:253]   3b  reserved (fills to 256)
+      ift.sec_branch_ctr,               // [252:246]   7b  GHR SECRET window counter -- on the
                                            //      bridge as of PC32; previously log-only,
                                            //      which made half of descriptor.py's GHR
                                            //      novelty axis impossible on FPGA
-      uop.cf_atk_branch_ctr,               // 7b   GHR attacker window counter;
+      ift.atk_branch_ctr,               // [245:239]   7b  GHR attacker window counter;
                                            //      globalHistoryLength - v = retirements
                                            //      back to the tainting branch
-      uop.lrs2_rtype,                      // 2b   prs2 really read?
-      uop.lrs1_rtype,                      // 2b   prs1 really read?
-      uop.prs2,                            // pregBits
-      uop.prs1,                            // pregBits
-      uop.pdst,                            // pregBits
-      infl_bits,                           // influencer slots
-      uop.cf_infl_oc_aliased,              // [146]       1b  a truncated op_count is
+      uop.lrs2_rtype,                      // [238:237]   2b  prs2 really read?
+      uop.lrs1_rtype,                      // [236:235]   2b  prs1 really read?
+      uop.prs2,                            // [234:227]   pregBits
+      uop.prs1,                            // [226:219]   pregBits
+      uop.pdst,                            // [218:211]   pregBits
+      infl_bits,                           // [210:139]   influencer slots (slot 0 lowest)
+      ift.infl_oc_aliased,              // [138]       1b  a truncated op_count is
                                            //                 out of reconstructable range
-      uop.cf_stall_cycles_stq,             // [145:143]   3b  Log2Bucket
-      uop.cf_stall_cycles_rob,             // [149:147]   3b  Log2Bucket
-      uop.cf_cntd_deny_count,              // [146:144]   3b  Log2Bucket
-      uop.cf_fu_bitmap,                    // 24b (numModules wide)
-      uop.cf_single_step,                  // 1b
-      uop.cf_spec_branch_op_id,            // uopIDCounterWidthCF bits (full width)
-      uop.cf_spec_branch_is_secret,        // 1b
-      uop.cf_spec_branch_is_atk,           // 1b
-      uop.cf_op_count_id,                  // uopIDCounterWidthCF bits (full width)
-      uop.cf_infl_dropped,                // [85:84]     2b
-      uop.cf_src_tainted,                  // [83]        1b
-      uop.cf_secret_transmission,          // [82]        1b
-      uop.cf_secret_propagation,           // [81]        1b
-      uop.cf_secret_access,                // [80]        1b
-      uop.cf_attacker_influence,           // [79]        1b
-      uop.cf_speculated,                   // [78]        1b
-      uop.cf_domain_id,                    // [77]        1b
-      uop.debug_inst,                      // [76:45]    32b
+      ift.stall_cycles_stq,             // [137:135]   3b  Log2Bucket
+      ift.stall_cycles_rob,             // [134:132]   3b  Log2Bucket
+      ift.cntd_deny_count,                // [131:129]   3b  Log2Bucket ([DENYWIDTH]: the
+                                           //      uop field is 6b; the ROB row holds the
+                                           //      3-bit bucket, so slice to keep 256 bits)
+      ift.fu_bitmap,                    // [128:105]  24b (numModules wide)
+      ift.single_step,                  // [104]       1b
+      ift.spec_branch_op_id,            // [103:96]    specBranchOpIdWidthCF bits (low bits)
+      ift.spec_branch_is_secret,        // [95]        1b
+      ift.spec_branch_is_atk,           // [94]        1b
+      uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)),                  // [93:78]     uopIDCounterWidthCF bits (full width)
+      ift.infl_dropped,                 // [77:76]     2b
+      0.U(1.W),                         // [75]        1b  cf_src_tainted: no writer since Phase 2
+                                           //      (Task 3.9 dropped the constant column bit)
+      s_tx,          // [74]        1b
+      s_prop,           // [73]        1b
+      s_acc,                // [72]        1b
+      atk || ift.edge_atk,           // [71]        1b
+      ift.speculated,                   // [70]        1b
+      uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)),                    // [69]        1b
+      uop.debug_inst,                      // [68:37]    32b
       uop.debug_pc(31, 0),                 // [36:5]     32b  [PC32 2026-09-10] was 40b
       priv(2, 0),                          // [4:2]       3b
       event_type(1, 0)                     // [1:0]       2b

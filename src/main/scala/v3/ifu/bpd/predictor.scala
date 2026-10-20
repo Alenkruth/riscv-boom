@@ -40,11 +40,20 @@ class BranchPredictionBundle(implicit p: Parameters) extends BoomBundle()(p)
   val meta = Output(Vec(nBanks, UInt(bpdMaxMetaLength.W)))
   val lhist = Output(Vec(nBanks, UInt(localHistoryLength.W)))
   // corefuzzing: TAGE/BTB entry was last updated by a different domain
-  val bpd_domain_mismatch = Bool()
-  val btb_domain_mismatch = Bool()
+  val bpd_domain_mismatch = if (ENABLE_IFT) Some(Bool()) else None
+  val btb_domain_mismatch = if (ENABLE_IFT) Some(Bool()) else None
   // corefuzzing: TAGE/BTB entry was trained by a secret-dependent instruction
-  val bpd_secret_mismatch = Bool()
-  val btb_secret_mismatch = Bool()
+  val bpd_secret_mismatch = if (ENABLE_IFT) Some(Bool()) else None
+  val btb_secret_mismatch = if (ENABLE_IFT) Some(Bool()) else None
+  // [BTBDISP] step 16: displacement-filter hit and PC[13:2] of the secret allocator
+  // [R124GATE] patch 26 (ruling 124): the three BTB-displacement fields exist only with
+  // ENABLE_IFT (None otherwise), so the IFT-off Queue1_BranchPredictionBundle ram loses their
+  // 14 bits.  Same names and order when present, so the IFT-on Verilog is unchanged.
+  val btb_sec_disp        = if (ENABLE_IFT) Some(Bool()) else None
+  val btb_sec_pc          = if (ENABLE_IFT) Some(UInt(12.W)) else None
+  // [BTBATK] DF-btbatk: displacement-filter hit on an ATTACKER record (PC in btb_sec_pc when no
+  // secret edge fires; btb.scala [BTBATK])
+  val btb_atk_disp        = if (ENABLE_IFT) Some(Bool()) else None
 }
 
 
@@ -89,9 +98,9 @@ class BranchPredictionUpdate(implicit p: Parameters) extends BoomBundle()(p)
   val meta          = Vec(nBanks, UInt(bpdMaxMetaLength.W))
 
   // corefuzzing: domain of the fetch packet that generated this update
-  val cf_domain_id  = UInt(1.W)
+  val cf_domain_id  = if (ENABLE_IFT) Some(UInt(1.W)) else None
   // corefuzzing: fetch packet contained a secret-dependent instruction (s_acc or s_prop)
-  val cf_is_secret  = Bool()
+  val cf_is_secret  = if (ENABLE_IFT) Some(Bool()) else None
 }
 
 // A branch update to a single bank
@@ -125,9 +134,9 @@ class BranchPredictionBankUpdate(implicit p: Parameters) extends BoomBundle()(p)
   val meta             = UInt(bpdMaxMetaLength.W)
 
   // corefuzzing: domain of the fetch packet that generated this update
-  val cf_domain_id     = UInt(1.W)
+  val cf_domain_id     = if (ENABLE_IFT) Some(UInt(1.W)) else None
   // corefuzzing: fetch packet contained a secret-dependent instruction
-  val cf_is_secret     = Bool()
+  val cf_is_secret     = if (ENABLE_IFT) Some(Bool()) else None
 }
 
 class BranchPredictionRequest(implicit p: Parameters) extends BoomBundle()(p)
@@ -145,11 +154,30 @@ class BranchPredictionBankResponse(implicit p: Parameters) extends BoomBundle()(
   val f3 = Vec(bankWidth, new BranchPrediction)
 }
 
+/** [BTBPICK] ruling 146 (v), review M1: two-tier BTB PC pick over BTB-type sources (components
+  * in a bank, or the banks of a packet), in priority order.  The first source with a SECRET BTB
+  * edge (secret-trainer hit or secret record) wins; else the first source with ANY BTB edge
+  * (attacker record); else the last source (default: the PC is read only when fetch_flags bit 7
+  * or 8 fires).  Each source's own PC is already secret-first (btb.scala [BTBATK]).  Two sources:
+  * choose the second = !sec0 && (sec1 || !any0), one shared LUT5 select + a 2:1 mux per bit
+  * (+1 LUT level against the old 1-tier pick; registered inputs, f3_bpd_resp queue storage after
+  * the predictor-level pick). */
+object CfBtbPcPick {
+  def apply(sec: Seq[Bool], any: Seq[Bool], pcs: Seq[UInt]): UInt = {
+    require(sec.size == pcs.size && any.size == pcs.size && pcs.nonEmpty)
+    if (pcs.size == 1) pcs.head
+    else PriorityMux(sec ++ any.init :+ true.B, pcs ++ pcs.init :+ pcs.last)
+  }
+}
+
 abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(p)
   with HasBoomFrontendParameters
 {
   val metaSz = 0
   def nInputs = 1
+  // [BTBATK] DF-btbatk: Scala-time flag, true only for the banks that drive f3_btb_sec_pc (BTB,
+  // uBTB), so the composer's PC select sees only them (no constant-zero default term).
+  def cfDrivesBtbPc: Boolean = false
 
   val mems: Seq[Tuple3[String, Int, Int]]
 
@@ -188,6 +216,14 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
     // corefuzzing: secret shadow mismatch — predictor entry was trained by secret instruction
     val f3_bpd_secret_mismatch = Output(Bool())
     val f3_btb_secret_mismatch = Output(Bool())
+    // [BTBDISP] step 16 (owner ruling 110): the fetch hit the tag a secret allocation displaced
+    // (BTB per set / uBTB one entry), and PC[13:2] of the secret allocator behind
+    // f3_btb_secret_mismatch || f3_btb_sec_disp.  Edge only (FetchIftInfo bit 7, BTB_STATE sec).
+    val f3_btb_sec_disp        = Output(Bool())
+    val f3_btb_sec_pc          = Output(UInt(12.W))
+    // [BTBATK] DF-btbatk: the fetch hit the tag an ATTACKER-domain allocation displaced; its PC is
+    // f3_btb_sec_pc when neither f3_btb_secret_mismatch nor f3_btb_sec_disp fires.
+    val f3_btb_atk_disp        = Output(Bool())
   })
   io.resp := io.resp_in(0)
 
@@ -197,6 +233,9 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
   io.f3_btb_domain_mismatch := false.B
   io.f3_bpd_secret_mismatch := false.B
   io.f3_btb_secret_mismatch := false.B
+  io.f3_btb_sec_disp        := false.B
+  io.f3_btb_sec_pc          := 0.U
+  io.f3_btb_atk_disp        := false.B
 
   val s0_idx       = fetchIdx(io.f0_pc)
   val s1_idx       = RegNext(s0_idx)
@@ -225,7 +264,7 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
   val s1_update_valid = RegNext(s0_update_valid)
 
   // corefuzzing: fetch domain piped one cycle (f0→s1) for use in domain shadow comparisons
-  val s1_domain = RegNext(io.f0_domain_id)
+  val s1_domain = if (ENABLE_IFT) RegNext(io.f0_domain_id) else 0.U   // [R124GATE3] patch 28: IFT-only flop
 
 }
 
@@ -445,10 +484,10 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
   io.resp.f1.lhist := DontCare
   io.resp.f2.lhist := DontCare
   // corefuzzing: domain mismatch only meaningful at f3; f1/f2 set to false
-  io.resp.f1.bpd_domain_mismatch := false.B
-  io.resp.f2.bpd_domain_mismatch := false.B
-  io.resp.f1.btb_domain_mismatch := false.B
-  io.resp.f2.btb_domain_mismatch := false.B
+  io.resp.f1.bpd_domain_mismatch.foreach(_ := false.B)
+  io.resp.f2.bpd_domain_mismatch.foreach(_ := false.B)
+  io.resp.f1.btb_domain_mismatch.foreach(_ := false.B)
+  io.resp.f2.btb_domain_mismatch.foreach(_ := false.B)
 
 
   for (i <- 0 until nBanks) {
@@ -546,17 +585,35 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
   // corefuzzing: wire domain to all banked predictors and aggregate mismatch at f3
   for (i <- 0 until nBanks) {
     banked_predictors(i).io.f0_domain_id              := io.f0_req_domain_id
-    banked_predictors(i).io.update.bits.cf_domain_id  := io.update.bits.cf_domain_id
-    banked_predictors(i).io.update.bits.cf_is_secret  := io.update.bits.cf_is_secret
+    banked_predictors(i).io.update.bits.cf_domain_id.foreach(_ := io.update.bits.cf_domain_id.getOrElse(0.U(1.W)))
+    banked_predictors(i).io.update.bits.cf_is_secret.foreach(_ := io.update.bits.cf_is_secret.getOrElse(false.B))
   }
-  io.resp.f3.bpd_domain_mismatch := banked_predictors.map(_.io.f3_bpd_domain_mismatch).reduce(_||_)
-  io.resp.f3.btb_domain_mismatch := banked_predictors.map(_.io.f3_btb_domain_mismatch).reduce(_||_)
-  io.resp.f3.bpd_secret_mismatch := banked_predictors.map(_.io.f3_bpd_secret_mismatch).reduce(_||_)
-  io.resp.f3.btb_secret_mismatch := banked_predictors.map(_.io.f3_btb_secret_mismatch).reduce(_||_)
-  io.resp.f1.bpd_secret_mismatch := false.B
-  io.resp.f2.bpd_secret_mismatch := false.B
-  io.resp.f1.btb_secret_mismatch := false.B
-  io.resp.f2.btb_secret_mismatch := false.B
+  io.resp.f3.bpd_domain_mismatch.foreach(_ := banked_predictors.map(_.io.f3_bpd_domain_mismatch).reduce(_||_))
+  io.resp.f3.btb_domain_mismatch.foreach(_ := banked_predictors.map(_.io.f3_btb_domain_mismatch).reduce(_||_))
+  io.resp.f3.bpd_secret_mismatch.foreach(_ := banked_predictors.map(_.io.f3_bpd_secret_mismatch).reduce(_||_))
+  io.resp.f3.btb_secret_mismatch.foreach(_ := banked_predictors.map(_.io.f3_btb_secret_mismatch).reduce(_||_))
+  io.resp.f1.bpd_secret_mismatch.foreach(_ := false.B)
+  io.resp.f2.bpd_secret_mismatch.foreach(_ := false.B)
+  io.resp.f1.btb_secret_mismatch.foreach(_ := false.B)
+  io.resp.f2.btb_secret_mismatch.foreach(_ := false.B)
+  // [BTBDISP] step 16: OR of the banks; the PC of the first bank with a BTB secret edge
+  // (registered bank outputs, 2:1 priority mux)
+  // [BTBPICK] ruling 146 (v): two-tier pick (CfBtbPcPick): the first bank with a SECRET BTB edge,
+  // else the first bank with any BTB edge (attacker record), else the last bank (default; the
+  // PC is read only when fetch_flags bit 7 or 8 fires).  Bank 0 > bank 1.
+  // [R124GATE] the fields are None without ENABLE_IFT (bundle note above): foreach is a no-op.
+  io.resp.f3.btb_sec_disp.foreach(_ := banked_predictors.map(_.io.f3_btb_sec_disp).reduce(_||_))
+  io.resp.f3.btb_atk_disp.foreach(_ := banked_predictors.map(_.io.f3_btb_atk_disp).reduce(_||_))
+  private val cf_bank_sec = banked_predictors.map(b => b.io.f3_btb_secret_mismatch || b.io.f3_btb_sec_disp)
+  io.resp.f3.btb_sec_pc.foreach(_ := CfBtbPcPick(cf_bank_sec,
+    banked_predictors.zip(cf_bank_sec).map { case (b, s) => s || b.io.f3_btb_atk_disp },
+    banked_predictors.map(_.io.f3_btb_sec_pc)))
+  io.resp.f1.btb_sec_disp.foreach(_ := false.B)
+  io.resp.f2.btb_sec_disp.foreach(_ := false.B)
+  io.resp.f1.btb_atk_disp.foreach(_ := false.B)
+  io.resp.f2.btb_atk_disp.foreach(_ := false.B)
+  io.resp.f1.btb_sec_pc.foreach(_ := 0.U)
+  io.resp.f2.btb_sec_pc.foreach(_ := 0.U)
 
   when (io.update.valid) {
     when (io.update.bits.cfi_is_br && io.update.bits.cfi_idx.valid) {

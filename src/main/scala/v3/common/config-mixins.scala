@@ -56,6 +56,23 @@ class WithIFTBridge extends Config((site, here, up) => {
   }
 })
 
+// [Task 2.10g, ruling 61] WithIFTOracle: Verilator/OOC-only IFT oracle mode. Only
+// CoreFuzzingDMIConfig uses it; no FireSim config may (BoomCoreParams rejects it together with
+// enableIFTBridge). The tile then keeps exactly what a FireSim IFT build keeps: the IFT bridge
+// record outputs and the TracerV trace port. FireSim configs turn the core trace on through
+// chipyard WithTraceIO (in WithFireSimConfigTweaks); here it is turned on in the core only, with
+// no TracePort, so the Verilator harness is unchanged. Simulated behaviour is unchanged: the
+// fragment only adds outputs.
+class WithIFTOracle extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      iftOracle = true,
+      trace     = true
+    )))
+    case other => other
+  }
+})
+
 // WithIFT: compile-time gate enabling DIFT tracking logic (domain tagging, taint
 // propagation, influencer tracking, secret detection, IFT commit log).
 // Layer on top of WithFuzzingBoom to synthesize BOOM with IFT hardware.

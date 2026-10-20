@@ -183,6 +183,50 @@ class BoomTileModuleImp(outer: BoomTile) extends BaseTileModuleImp(outer){
   outer.iftSourceNode.foreach { node =>
     node.bundle := core.ift_bridge_out.get
   }
+  // [Task 2.10g, ruling 61; keep list narrowed in Task 2.10h, ruling 66] IFT oracle mode
+  // (iftOracle): Verilator and OOC only. Only CoreFuzzingDMIConfig sets it (WithIFTOracle);
+  // no FireSim config does, and BoomCoreParams forbids it together with the bridge. Keep at
+  // the tile boundary exactly the fields a FireSim bridge module reads, and nothing else:
+  //  - IFTBridgeModule.scala:62-85 reads commit_valid, commit_record, squash_valid and
+  //    squash_record. It never reads squash_ovf (that bit stays live through 0xbce anyway).
+  //  - TracerVBridgeModule (goldengateimplementations/TracerVBridge.scala) reads per lane
+  //    valid (:29-31, :155), iaddr (:115-117 PC trigger, :155 stream) and insn (:126-128
+  //    instruction trigger). It never reads wdata, priv, exception, interrupt, cause, tval
+  //    or time. In the April 2026 FireSim synthesis each of those token channels keeps
+  //    2 FF and no data bits, and the in-tile Rob has 160 LUTRAM (no debug_wdata memory).
+  //    WithIFTOracle turns the core trace on, as WithTraceIO does in every FireSim config.
+  // Without a consumer these are pruned by firtool and Vivado, and the BoomTile oracle
+  // under-counts the FPGA build. Plain output ports plus dontTouch (a dontTouch on the
+  // trace node's bundle would keep only an internal wire, which Vivado still prunes):
+  // no logic is added.
+  val ift_oracle_out =
+    if (outer.boomParams.core.iftOracle) {
+      val src = core.ift_bridge_out.get
+      val o = IO(Output(new Bundle {
+        val commit_valid  = chiselTypeOf(src.commit_valid)
+        val commit_record = chiselTypeOf(src.commit_record)
+        val squash_valid  = chiselTypeOf(src.squash_valid)
+        val squash_record = chiselTypeOf(src.squash_record)
+      }))
+      o.commit_valid  := src.commit_valid
+      o.commit_record := src.commit_record
+      o.squash_valid  := src.squash_valid
+      o.squash_record := src.squash_record
+      dontTouch(o)
+      Some(o)
+    } else None
+  val trace_oracle_insns =
+    if (outer.boomParams.core.iftOracle) {
+      val ins = outer.traceSourceNode.bundle.insns
+      val o = IO(Output(Vec(ins.size, new Bundle {
+        val valid = Bool()
+        val iaddr = chiselTypeOf(ins.head.iaddr)
+        val insn  = chiselTypeOf(ins.head.insn)
+      })))
+      for ((p, t) <- o.zip(ins)) { p.valid := t.valid; p.iaddr := t.iaddr; p.insn := t.insn }
+      dontTouch(o)
+      Some(o)
+    } else None
 
   // Connect the core pipeline to other intra-tile modules
   outer.frontend.module.io.cpu <> core.io.ifu

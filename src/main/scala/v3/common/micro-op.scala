@@ -61,6 +61,16 @@ class CF_SAccUpdate(implicit p: Parameters) extends BoomBundle with CoreFuzzingC
   val op_count_id = UInt(uopIDCounterWidthCF.W)
 }
 
+/** [FIFO10] step 10 (owner ruling 93, R-STICKY): the TLB-stage s_acc message also carries a
+  * LOAD's issue-path attacker / s_prop flags (operand taint from register-read and the slot's
+  * wakeup-time secret), so a load killed between the TLB stage and writeback reaches its
+  * squash record with the same summary bits a committed load gets at writeback. */
+class CF_TlbFlagsUpdate(implicit p: Parameters) extends CF_SAccUpdate {
+  val s_acc  = Bool()
+  val atk    = Bool()
+  val s_prop = Bool()
+}
+
 // [MEMORD 2026-09-08] Routes an INFL_MEM_ORDER edge from the LSU into the ROB entry.
 //
 // WHY THIS PORT EXISTS.  lsu.scala writes the ty=8 edge into `ldq(i).bits.uop` when a
@@ -248,119 +258,65 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
 
   // Corefuzzing - IFT tags for every micro-op
   // adding the tag to the Microp to let it propagate through the pipeline once created
-  val cf_domain_id            = UInt(iftTagWidth.W)
-  val cf_speculated           = Bool()      // set when the micro-op is speculatively issued
-  val cf_attacker_influence   = Bool()
-  // [GHISTFIELD 2026-09-08] Branch-history influence as a COUNTER-VALUED FIELD, not an
-  // influencer entry and not a bare flag.  0 = not armed; non-zero = the GHR holds a
-  // tainted branch outcome and `globalHistoryLength - value` is the number of branch
-  // retirements back to the branch that tainted it.
-  //
-  // WHY IT LEFT THE INFLUENCER VECTOR (measured on spectre, not on unit tests):
-  //   ty=19 became the highest-frequency edge (1,249,341 -- more than BPD's 793,107),
-  //   because the GHR window is armed almost continuously in a real attack.  It is LAST
-  //   in the fetch-buffer batch, so I expected append-and-drop to sacrifice it.  It does
-  //   not: 100% of records with OVF>0 still CARRY their ty=19, while only 60.8% of OVF=0
-  //   records do.  GHIST claims a slot at FETCH and survives; the edges actually lost are
-  //   the later, more precise ones -- REG_DATAFLOW / MEM_DATAFLOW arriving from writeback
-  //   and the LSU to find all four slots taken.  43,396 records lost a dataflow edge to a
-  //   window flag.  Drop rate went 0.107% -> 2.63% (25x).
-  //
-  // As a field it keeps the provenance (the counter) AND stops squatting a slot.
-  // A flag alone would have kept the slot free but thrown the provenance away; an edge
-  // alone kept the provenance but cost the slot.  This is both.
-  val cf_atk_branch_ctr = UInt(7.W)   // attacker-tainted GHR window counter
-  val cf_sec_branch_ctr = UInt(7.W)   // secret-tainted   GHR window counter      // set when the micro-op is either fetched/dispatched based on an attacker/secret dependent thread/micro-op
-  val cf_secret_access        = Bool()      // set when the micro-op accesses a secret
-  val cf_secret_propagation   = Bool()      // set when the micro-op is in the dependence chain of originating in a secret
-  val cf_secret_transmission  = Bool()      // set when a secret dependent micro-op makes a update to a stateful unit
+  // [THINUOP] Phase 3 Task 3.5: the uop carries only the closed-loop IFT fields (D13) plus
+  // cf_spec_branch_is_secret (ruling 74).  Everything else lives in the sidecars/side
+  // bundles (FetchIftInfo, IftDispatchInfo, IssueCntdCarry, IftCommitInfo, IftEdgeList).
+  // [R124GATE3] patch 28 (B51): the pre-overhaul uop IFT fields below are Option fields, Some
+  // only with ENABLE_IFT (the patch-27 method, see cf_mem_*).  IFT off they do not exist, so no
+  // uop copy (ROB, LDQ/STQ, IQ slots, BKQs, fetch buffer, FU pipes, D$ s1/s2, MSHRs) holds them.
+  // IFT on: the same type at the same position, so the IFT-on bundle and Verilog are unchanged.
+  val cf_domain_id            = if (ENABLE_IFT) Some(UInt(iftTagWidth.W)) else None
+  val cf_attacker_influence   = if (ENABLE_IFT) Some(Bool()) else None
+  val cf_secret_access        = if (ENABLE_IFT) Some(Bool()) else None      // set when the micro-op accesses a secret
+  val cf_secret_propagation   = if (ENABLE_IFT) Some(Bool()) else None      // set when the micro-op is in the dependence chain of originating in a secret
+  val cf_secret_transmission  = if (ENABLE_IFT) Some(Bool()) else None      // set when a secret dependent micro-op makes a update to a stateful unit
 
-  // Corefuzzing - IFT tags for every micro-op shadow
-  val cf_op_count_id = UInt(uopIDCounterWidthCF.W) // 16-bit sequential uop counter, assigned in fetch-buffer.
+  val cf_op_count_id = if (ENABLE_IFT) Some(UInt(uopIDCounterWidthCF.W)) else None // 16-bit sequential uop counter, assigned in fetch-buffer.
                                // Wraps at 65536. Provides comfortable headroom for all current workloads.
 
-  val cf_single_step          = Bool()      // set when the micro-op is single-stepped (quiesce mode)
-  val cf_ras_pred_xdom        = Bool()      // ret whose RAS-predicted top was cross-domain (doc 67 Part B); RAS edge raised at ret-mispredict in ROB
+  val cf_ras_pred_xdom        = if (ENABLE_IFT) Some(Bool()) else None      // ret whose RAS-predicted top was cross-domain (doc 67 Part B); RAS edge raised at ret-mispredict in ROB
 
   // Bitmap of all pipeline modules this uop has visited (one bit per module, see CoreFuzzingConstants)
-  val cf_fu_bitmap            = UInt(numModules.W)
+  val cf_fu_bitmap            = if (ENABLE_IFT) Some(UInt(numModules.W)) else None
 
-  // IFT Phase 2: multi-slot influencer list (replaces cf_influencer_uop_count)
-  // Records up to numInfluencerSlotsCF cross-domain influence events
-  val cf_influencer_list      = Vec(numInfluencerSlotsCF, new InfluencerEntry)
-  // How many influencers were DISCARDED because the slots were full, saturating at 3.
-  // Was a sticky Bool that said only "some were lost".  See SatDropped in util.scala.
-  val cf_infl_dropped         = UInt(2.W)
-  // Set when an influencer's op_count was truncated BEYOND the reconstructable range,
-  // i.e. the true distance exceeded 2^inflOpCountWidthCF and the stored low bits will
-  // reconstruct to the WRONG producer.  Without this the failure is silent, and for a
-  // flow-discovery tool a fabricated edge is worse than a missing one: it becomes a
-  // false novel flow someone has to chase.  Costs one bit and a 6-bit compare -- no
-  // subtract, because delta < 2^W iff the producer and consumer agree on the high bits
-  // or differ by exactly one.  The parser refuses to build flows through a record that
-  // has this set.
-  val cf_infl_oc_aliased      = Bool()
+  // Summary flags set by dcache to avoid scanning an influencer list on writeback paths.
+  // [R124GATE2] patch 27 (r124/B51): this field and the step-20/21 window fields below are
+  // Option fields, Some only with ENABLE_IFT.  firtool does not fold a constant through the
+  // uop register copies (issue-slot collapse, FU pipelines, LSU queues, BKQs, D$ s1/s2, MSHRs),
+  // so a constant-0 source still left one flop per copy IFT off.  IFT off the field does not
+  // exist; writers use `.foreach(_ := rhs)`, readers `.getOrElse(<zero>)`.  IFT on it is the
+  // same Bool/UInt at the same position, so the IFT-on bundle and Verilog are unchanged.
+  val cf_mem_dataflow_atk  = if (ENABLE_IFT) Some(Bool()) else None  // INFL_MEM_DATAFLOW(is_atk=true)  injected at dcache
+  val cf_mem_sec_dataflow  = if (ENABLE_IFT) Some(Bool()) else None  // INFL_MEM_DATAFLOW(is_atk=false, is_secret=true) injected
 
-  // Summary flags set by dcache to avoid scanning cf_influencer_list on writeback paths.
-  val cf_mem_dataflow_atk  = Bool()  // INFL_MEM_DATAFLOW(is_atk=true)  injected at dcache
-  val cf_mem_sec_dataflow  = Bool()  // INFL_MEM_DATAFLOW(is_atk=false, is_secret=true) injected
+  // Ruling 74: stays in MicroOp (read by the dispatch s_prop set; the dispatch column takes it from the uop).
+  val cf_spec_branch_is_secret = if (ENABLE_IFT) Some(Bool()) else None  // any outstanding branch in br_mask was from secret domain
 
-  // IFT Phase 2: register taint (set in rename; used at dispatch in core.scala)
-  val cf_src_tainted              = Bool()                       // any source preg tainted by attacker
-
-  // IFT Phase 2: speculative-branch domain tracking (set at dispatch in core.scala)
-  // cf_spec_branch_is_atk: true if any outstanding branch in br_mask was from attacker domain.
-  //   Enables detecting victim ops fetched/executed under an attacker speculative branch.
-  // cf_spec_branch_op_id: cf_op_count_id of the first (lowest br_tag index) attacker-domain
-  //   branch under which this uop is speculated.  Zero when cf_spec_branch_is_atk=false.
-  val cf_spec_branch_is_atk    = Bool()
-  // LOW specBranchOpIdWidthCF bits of the speculating branch's op_count_id; software
-  // reconstructs against this uop's own cf_op_count_id.  Bounded by construction (the
-  // distance cannot exceed the speculation window) -- measured max across five
-  // workloads is 76, so 8 bits carries a 3.4x margin.
-  val cf_spec_branch_op_id     = UInt(specBranchOpIdWidthCF.W)
-  val cf_spec_branch_is_secret = Bool()  // any outstanding branch in br_mask was from secret domain
-
-  // Issue-slot contention carry: accumulated INFL_ISSUE_CONTENTION state that survives
-  // collapsing-queue shifts.  Set in issue-slot, propagated via out_uop → in_uop.
-  // Consumed when the slot fires cf_contend_out on grant.
-  val cf_cntd_valid      = Bool()
-  val cf_cntd_winner_op  = UInt(inflOpCountWidthCF.W)  // [NARROW 2026-09-10] was
-                                                       // uopIDCounterWidthCF (16b).  The
-  // ty=2 edge truncates to inflOpCountWidthCF anyway (rob.scala:715:
-  // `ic_pending_winner_op.pad(inflOpCountWidthCF)(inflOpCountWidthCF-1,0)`), so the top
-  // 6 bits were carried through EVERY pipeline stage, ROB row and LSU queue entry and
-  // then discarded at the last step.  Narrowing is provably lossless for anything that
-  // reaches software.
-  val cf_cntd_winner_atk = Bool()
-  val cf_cntd_winner_sec = Bool()
-  // Cycles this uop was denied an issue port by a cross-domain instruction, as a
-  // 3-bit Log2Bucket.  Was replicated into every influencer slot; a uop holds at
-  // most one INFL_ISSUE_CONTENTION entry, so it belongs here.
-  val cf_cntd_deny_count = UInt(3.W)
-  // Dispatch-stall duration, same 3-bit Log2Bucket scale as cf_cntd_deny_count.
-  // [DOCFIX 2026-09-12] STALE CLAIM REMOVED.  This said INFL_ROB_FULL is "the dominant
-  // structural influence in the log (392,138 entries in run_00016)".  At the shipped geometry
-  // it fires ZERO times -- 0 in 2.7M records of spectre_v2/btb2, and 0 across 8 dedicated
-  // microbenchmarks.  A 256-entry ROB does not fill at decodeWidth=4.  It fires only when the
-  // ROB is shrunk via CSR 0xbc2 (idx 5 = 32 entries), reaching ~5.5k.  Note it is then mutually
-  // exclusive with INFL_REG_PRESSURE.  See claude-artifacts/53-open-gaps.md (B4).
-  // INFL_ROB_FULL was purely binary -- you knew a uop was blocked at dispatch,
-  // never for how long.  Counted linearly at dispatch (coreWidth instances, ~24
-  // flops) and compressed once at capture, so no encoder is replicated per uop.
-  // NOTE: there is deliberately no INFL_MEM_HOL equivalent.  dis_hol_ldq/stq are
-  // gated on dis_fire, i.e. MEM_HOL marks "dispatched WHILE a cross-domain entry
-  // sat at the queue head" -- the uop does not stall, so there is no dispatch-side
-  // duration to count.  Measuring it would need an LSU-side counter.
-  val cf_stall_cycles_rob = UInt(3.W)
-  // Cycles the STQ head entry had already held the head when this uop dispatched, same
-  // 3-bit Log2Bucket scale.  This is the head-of-line duration INFL_MEM_HOL lacks.
-  // Note MEM_HOL itself is gated on dis_fire and, for its LDQ variant (64.7% of its
-  // 290,714 records in run_00016), checks a head that does not gate cacheable load
-  // execution -- only fullness and uncacheable wakeup.  Loads are ordered by OLDER
-  // STORES via st_dep_mask, which clears as stq_head advances, so the STQ head is the
-  // structure that actually blocks.  This counter measures that.
-  val cf_stall_cycles_stq = UInt(3.W)
+  // [IMPLWIN] step 20 (rulings 132/134/135): WINDOW taint, a second register-taint kind beside
+  // the DATA taint (regfile `secret` / `taint_atk`).  Window-secret means "produced under
+  // secret-dependent control"; it never upgrades to data-secret and never re-arms the window.
+  //   cf_win_sec/atk   : this uop is IN the open window (fetched or dispatched while it is
+  //                      open; fetch-buffer.scala, core.scala dispatch).  Seeds its result.
+  //                      [WINEXP] step 21: core.scala dispatch rewrites it to "dispatched while
+  //                      open" (stamped cf_wep_*); the fetch-time bit still gives s_prop.
+  //   cf_opnd_wsec/watk: an operand this uop read carried window taint (register-read.scala).
+  // Result window taint = cf_win_* || cf_opnd_* (regfile write ports, bypass).  1 bit each.
+  val cf_win_sec   = if (ENABLE_IFT) Some(Bool()) else None   // [R124GATE2] Option, see cf_mem_*
+  val cf_win_atk   = if (ENABLE_IFT) Some(Bool()) else None
+  val cf_opnd_wsec = if (ENABLE_IFT) Some(Bool()) else None
+  val cf_opnd_watk = if (ENABLE_IFT) Some(Bool()) else None
+  // [WINEXP] step 21 (owner r139, F3): the window EPOCH of each kind at this uop's DISPATCH.
+  // Window taint that this uop produces (membership or window operands) is stamped with it and
+  // counts only while it equals the core's current epoch, which advances when that window
+  // CLOSES (counter reaches 0, or [WINDISARM]).  Every uop in flight at a close is younger than
+  // the branch that closed it, i.e. outside the window, so its result and its memory marks die.
+  val cf_wep_sec   = if (ENABLE_IFT) Some(UInt(2.W)) else None   // [R124GATE2]
+  val cf_wep_atk   = if (ENABLE_IFT) Some(UInt(2.W)) else None
+  // [WINMEM] step 21 (owner r139, F2): STORES only (uses_stq).  Register-read gives a store's
+  // ADDRESS (rs1) window taint in cf_opnd_* and its DATA (rs2) window taint here, so the STQ
+  // keeps them apart even for a fused STA+STD issue.  0 for every other uop.
+  val cf_dwin_sec  = if (ENABLE_IFT) Some(Bool()) else None   // [R124GATE2]
+  val cf_dwin_atk  = if (ENABLE_IFT) Some(Bool()) else None
 
   // Do we allocate a branch tag for this?
   // SFB branches don't get a mask, they get a predicate bit
@@ -375,11 +331,14 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   def fu_code_is(_fu: UInt) = (fu_code & _fu) =/= 0.U
 
   override def toPrintable: Printable = {
-    val cf_info = Cat(cf_domain_id, cf_speculated, cf_attacker_influence, cf_secret_access, cf_secret_propagation, cf_secret_transmission)
+    val cf_info = Cat(cf_domain_id.getOrElse(0.U(iftTagWidth.W)), cf_attacker_influence.getOrElse(false.B),
+                      cf_secret_access.getOrElse(false.B), cf_secret_propagation.getOrElse(false.B),
+                      cf_secret_transmission.getOrElse(false.B))   // [R124GATE3]
+    val cf_oc   = cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
     // val cf_taint = Cat(cf_taint_module_id_1, cf_taint_type_1, cf_taint_op_count_1, cf_taint_module_id_2, cf_taint_type_2, cf_taint_op_count_2, cf_taint_module_id_3, cf_taint_type_3, cf_taint_op_count_3)
     
     cf"UOP Code is $uopc " +
-    cf"UOP running count is $cf_op_count_id " +
+    cf"UOP running count is $cf_oc " +
     cf"PC is $debug_pc " +
     cf"IQ type $iq_type FU type $fu_code " +
     cf"is branch $is_br, is taken $taken " +

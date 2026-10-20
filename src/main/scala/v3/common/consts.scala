@@ -287,33 +287,16 @@ trait ScalarOpConstants
 
     uop.ctrl := cs
     // Initialize all CoreFuzzing IFT fields to deterministic zero values
-    uop.cf_domain_id            := 0.U
-    uop.cf_speculated           := false.B
-    uop.cf_attacker_influence   := false.B
-    uop.cf_secret_access        := false.B
-    uop.cf_secret_propagation   := false.B
-    uop.cf_secret_transmission  := false.B
-    uop.cf_op_count_id          := 0.U
-    uop.cf_single_step          := false.B
-    uop.cf_ras_pred_xdom        := false.B
-    uop.cf_fu_bitmap            := 0.U
-    uop.cf_influencer_list      := 0.U.asTypeOf(uop.cf_influencer_list)
-    uop.cf_infl_dropped         := 0.U
-    uop.cf_infl_oc_aliased      := false.B
-    uop.cf_mem_dataflow_atk     := false.B
-    uop.cf_mem_sec_dataflow     := false.B
-    uop.cf_src_tainted              := false.B
-    uop.cf_spec_branch_is_atk   := false.B
-    uop.cf_atk_branch_ctr       := 0.U
-    uop.cf_sec_branch_ctr       := 0.U
-    uop.cf_spec_branch_op_id    := 0.U
-    uop.cf_cntd_valid      := false.B
-    uop.cf_cntd_winner_op  := 0.U
-    uop.cf_cntd_winner_atk := false.B
-    uop.cf_cntd_winner_sec := false.B
-    uop.cf_cntd_deny_count := 0.U
-    uop.cf_stall_cycles_rob := 0.U
-    uop.cf_stall_cycles_stq := 0.U
+    uop.cf_domain_id.foreach(_ := 0.U)
+    uop.cf_attacker_influence.foreach(_ := false.B)
+    uop.cf_secret_access.foreach(_ := false.B)
+    uop.cf_secret_propagation.foreach(_ := false.B)
+    uop.cf_secret_transmission.foreach(_ := false.B)
+    uop.cf_op_count_id.foreach(_ := 0.U)
+    uop.cf_ras_pred_xdom.foreach(_ := false.B)
+    uop.cf_fu_bitmap.foreach(_ := 0.U)
+    uop.cf_mem_dataflow_atk.foreach(_ := false.B)   // [R124GATE2] Option field (micro-op.scala)
+    uop.cf_mem_sec_dataflow.foreach(_ := false.B)
     uop
   }
 }

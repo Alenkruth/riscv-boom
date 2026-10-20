@@ -272,8 +272,9 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   // Secret mismatch: hit way was filled during a secret-range fetch, but current fetch is not secret.
   // Covers the same-domain channel where secret instruction's cache fill affects a non-secret fetch.
   val s1_secret_mismatch = s1_hit && s1_way_secret && !io.s1_is_secret
-  val s2_domain_mismatch = RegNext(s1_domain_mismatch && !io.s1_kill)
-  val s2_secret_mismatch = RegNext(s1_secret_mismatch && !io.s1_kill)
+  // [R124GATE3] patch 28 (B51): the two s2 flops only with ENABLE_IFT (IFT off the resp bits are 0).
+  val s2_domain_mismatch = if (ENABLE_IFT) RegNext(s1_domain_mismatch && !io.s1_kill) else false.B
+  val s2_secret_mismatch = if (ENABLE_IFT) RegNext(s1_secret_mismatch && !io.s1_kill) else false.B
 
   val ramDepth = if (refillsToOneBank && nBanks == 2) {
     nSets * refillCycles / 2

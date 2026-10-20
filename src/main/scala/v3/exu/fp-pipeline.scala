@@ -57,11 +57,26 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
     val debug_wb_wdata   = Output(Vec(numWakeupPorts, UInt((fLen+1).W)))
     // corefuzzing: runtime gates for speculative logging
     val cf_debug_exu_enable = Input(Bool())
+    // [WINSHADOW] step 20: window shadow ranges (writeback-time mark) and commit-time set ports
+    val wsh_sec          = Input(new WinShadowInfo)
+    val wsh_atk          = Input(new WinShadowInfo)
+    val win_set_sec      = Flipped(Vec(coreWidth, Valid(UInt(maxPregSz.W))))
+    val win_set_atk      = Flipped(Vec(coreWidth, Valid(UInt(maxPregSz.W))))
+    // [WINCLR] patch 35 C (r166): window-close pulses {atk, sec}; the fregfile flash-clears its marks
+    val cf_wclr          = Input(UInt(2.W))
     val cf_debug_issue_enable = Input(Bool())
     // 2-bit index into issueQueueEntryOptions for FP issue queue size selection
     val cf_iq_idx = Input(UInt(2.W))
     // corefuzzing: FP issue contention updates (one per FP issue port)
     val cf_contention_upd = Output(Vec(fpIssueParams.issueWidth, Valid(new IssueContentionUpdate)))
+    // Task 3.4 (D18): the FP IQ's kill-time contention records and overflow flag
+    val cf_kill_rec = Decoupled(new IftKillRecord)
+    val cf_kill_ovf = Output(Bool())
+    // [IQFULL] step 16: the FP IQ's occupancy summary (issue-unit.scala); [IQHEAD] patch 49: kept only
+    // with IFT off (constant 0, IFT-off Verilog unchanged); IFT on the FP IQ's registered head instead
+    val cf_iq_sec_any = if (!ENABLE_IFT) Some(Output(Bool())) else None
+    val cf_iq_atk_any = if (!ENABLE_IFT) Some(Output(Bool())) else None
+    val cf_iq_head    = if (ENABLE_IFT) Some(Output(new IftIqHead)) else None
   })
 
   //**********************************
@@ -77,8 +92,8 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
                          exe_units.numFrfWritePorts + memWidth,
                          fLen+1,
                          // No bypassing for any FP units, + memWidth for ll_wb
-                         Seq.fill(exe_units.numFrfWritePorts + memWidth){ false }
-                         ))
+                         Seq.fill(exe_units.numFrfWritePorts + memWidth){ false },
+                         coreWidth))   // [WINSHADOW] commit-time window-taint set ports
   val fregister_read = Module(new RegisterRead(
                          issue_unit.issueWidth,
                          exe_units.withFilter(_.readsFrf).map(_.supportedFuncUnits).toSeq,
@@ -107,7 +122,8 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
   // Don't support ld-hit speculation to FP window.
   for (w <- 0 until memWidth) {
     issue_unit.io.spec_ld_wakeup(w).valid := false.B
-    issue_unit.io.spec_ld_wakeup(w).bits := 0.U
+    issue_unit.io.spec_ld_wakeup(w).bits.pdst   := 0.U
+    issue_unit.io.spec_ld_wakeup(w).bits.secret := false.B   // [WAKESEC] bundle now {pdst, secret}
   }
   issue_unit.io.ld_miss := false.B
 
@@ -142,7 +158,7 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
     // dis_wire.valid := io.dis_uops(w).valid
     // io.dis_uops(w).ready := dis_wire.ready
     issue_unit.io.dis_uops(w) <> io.dis_uops(w)
-    issue_unit.io.dis_uops(w).bits.cf_fu_bitmap := io.dis_uops(w).bits.cf_fu_bitmap | (1.U << fpissqTagCF.U)
+    issue_unit.io.dis_uops(w).bits.cf_fu_bitmap.foreach(_ := io.dis_uops(w).bits.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << fpissqTagCF.U))
   }
 
   //-------------------------------------------------------------
@@ -166,6 +182,11 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
 
   // corefuzzing: expose FP issue contention updates as module IO
   io.cf_contention_upd := issue_unit.io.cf_contention_upd
+  io.cf_kill_rec <> issue_unit.io.cf_kill_rec     // Task 3.4
+  io.cf_kill_ovf := issue_unit.io.cf_kill_ovf
+  io.cf_iq_sec_any.foreach(_ := issue_unit.io.cf_iq_sec_any.get)   // [IQFULL] step 16 (IFT off only)
+  io.cf_iq_atk_any.foreach(_ := issue_unit.io.cf_iq_atk_any.get)
+  io.cf_iq_head.foreach(_ := issue_unit.io.cf_iq_head.get)          // [IQHEAD] patch 49
 
   // Wakeup
   for ((writeback, issue_wakeup) <- io.wakeups zip issue_unit.io.wakeup_ports) {
@@ -173,6 +194,9 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
     issue_wakeup.bits.pdst  := writeback.bits.uop.pdst
     issue_wakeup.bits.poisoned := false.B
     issue_wakeup.bits.secret   := writeback.bits.secret
+    // [IQHEAD] patch 49: the attacker twin = the FP regfile write's taint_atk seed (below)
+    issue_wakeup.bits.atk.foreach(_ := writeback.bits.taint_atk ||
+                                       writeback.bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U)
   }
   // O1: the FP issue unit's non-pipelined unit (fdivsqrt) sits in this pipeline;
   // aggregate its occupancy taint here.
@@ -183,7 +207,10 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
       issue_unit.io.cf_fu_busy.bits  := DontCare
       issue_unit.io.cf_fu_busy.bits.is_atk := false.B
       issue_unit.io.cf_fu_busy.bits.is_sec := false.B
+      issue_unit.io.cf_fu_busy.bits.fu_code := 0.U   // [I2BUSYFU]
     } else {
+      // [I2BUSYFU] (ruling 100, I-2) FU class mask of the busy FP divider(s)
+      issue_unit.io.cf_fu_busy.bits.fu_code   := fbusy.map(u => Mux(u.io.cf_fu_busy.valid, FU_FDV, 0.U(FUC_SZ.W))).reduce(_|_)
       val sel = PriorityEncoderOH(VecInit(fbusy.map(_.io.cf_fu_busy.valid)).asUInt)
       issue_unit.io.cf_fu_busy.valid          := fbusy.map(_.io.cf_fu_busy.valid).reduce(_||_)
       issue_unit.io.cf_fu_busy.bits.op_count  := Mux1H(sel, fbusy.map(_.io.cf_fu_busy.bits.op_count))
@@ -202,7 +229,8 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
   fregister_read.io.rf_read_ports <> fregfile.io.read_ports
   // FP pipeline has no predicate file; tie off both the value and its taint.
   fregister_read.io.prf_read_ports map { port =>
-    port.data := false.B; port.secret := false.B; port.taint_atk := false.B }
+    port.data := false.B; port.secret := false.B; port.taint_atk := false.B
+    port.wsec := false.B; port.watk := false.B }   // [IMPLWIN]
 
   fregister_read.io.iss_valids <> iss_valids
   fregister_read.io.iss_uops := iss_uops
@@ -245,14 +273,44 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
   // Cut up critical path by delaying the write by a cycle.
   // Wakeup signal is sent on cycle S0, write is now delayed until end of S1,
   // but Issue happens on S1 and RegRead doesn't happen until S2 so we're safe.
-  fregfile.io.write_ports(0) := RegNext(WritePort(ll_wbarb.io.out, fpregSz, fLen+1, RT_FLT))
+  // [WINEXP] step 21 (owner r139, F3): the regfile stamps window taint with the epoch of the
+  // WRITE cycle.  These two port groups write one cycle after WritePort live-checked the bit,
+  // so a bit checked in the cycle a window closed would be stamped with the new epoch: drop
+  // it when the epoch moved (one AND after the RegNext).
+  // [R124GATE] patch 26 (r151): the epoch flops exist only with ENABLE_IFT (IFT off the
+  // regfile has no window-taint memories and ignores wsec/watk).
+  val wep_same_sec = if (ENABLE_IFT) RegNext(io.wsh_sec.ep) === io.wsh_sec.ep else true.B
+  val wep_same_atk = if (ENABLE_IFT) RegNext(io.wsh_atk.ep) === io.wsh_atk.ep else true.B
+  // [WINCLR] patch 35 C (r166): the fregfile flash-clears on a close instead of comparing epochs.
+  // wep_same_* above still drops a bit checked in a close cycle and written one cycle later (the
+  // clear on that close edge has already passed), exactly as it kept the stale stamp out before.
+  fregfile.io.cf_wclr := io.cf_wclr
+  val fll_wport0 = RegNext(WritePort(ll_wbarb.io.out, fpregSz, fLen+1, RT_FLT, io.wsh_sec, io.wsh_atk))
+  fregfile.io.write_ports(0) := fll_wport0
+  fregfile.io.write_ports(0).bits.wsec := fll_wport0.bits.wsec && wep_same_sec
+  fregfile.io.write_ports(0).bits.watk := fll_wport0.bits.watk && wep_same_atk
+  // [R124GATE2] patch 27 (r124/B51): IFT off the regfile has no taint memory; zero the data-taint
+  // bits so the fll_wport0 secret/taint_atk flops have no reader (IFT-on: nothing emitted).
+  if (!ENABLE_IFT) {
+    fregfile.io.write_ports(0).bits.secret    := false.B
+    fregfile.io.write_ports(0).bits.taint_atk := false.B
+  }
+  fregfile.io.win_set_sec := io.win_set_sec   // [WINSHADOW]
+  fregfile.io.win_set_atk := io.win_set_atk
 
   assert (ll_wbarb.io.in(0).ready) // never backpressure the memory unit.
   when (ifpu_resp.valid) { assert (ifpu_resp.bits.uop.rf_wen && ifpu_resp.bits.uop.dst_rtype === RT_FLT) }
 
   var w_cnt = 1
   for (i <- 1 until memWidth) {
-    fregfile.io.write_ports(w_cnt) := RegNext(WritePort(io.ll_wports(i), fpregSz, fLen+1, RT_FLT))
+    val fll_wport = RegNext(WritePort(io.ll_wports(i), fpregSz, fLen+1, RT_FLT, io.wsh_sec, io.wsh_atk))
+    fregfile.io.write_ports(w_cnt) := fll_wport
+    fregfile.io.write_ports(w_cnt).bits.wsec := fll_wport.bits.wsec && wep_same_sec   // [WINEXP]
+    fregfile.io.write_ports(w_cnt).bits.watk := fll_wport.bits.watk && wep_same_atk
+    if (!ENABLE_IFT) {   // [R124GATE2] as for fll_wport0
+      fregfile.io.write_ports(w_cnt).bits.secret    := false.B
+      fregfile.io.write_ports(w_cnt).bits.taint_atk := false.B
+    }
     fregfile.io.write_ports(w_cnt).bits.data := RegNext(recode(io.ll_wports(i).bits.data,
                                                                io.ll_wports(i).bits.uop.mem_size =/= 2.U))
     w_cnt += 1
@@ -263,6 +321,12 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
       fregfile.io.write_ports(w_cnt).bits.addr := eu.io.fresp.bits.uop.pdst
       fregfile.io.write_ports(w_cnt).bits.data := eu.io.fresp.bits.data
       fregfile.io.write_ports(w_cnt).bits.secret := eu.io.fresp.bits.secret
+      // [IMPLWIN] window taint of the result
+      // [WINEXP] step 21: live only while the uop's dispatch epoch is current
+      fregfile.io.write_ports(w_cnt).bits.wsec := io.wsh_sec.res(eu.io.fresp.bits.uop.cf_win_sec.getOrElse(false.B) || eu.io.fresp.bits.uop.cf_opnd_wsec.getOrElse(false.B),
+                                                                 eu.io.fresp.bits.uop.cf_wep_sec.getOrElse(0.U(2.W)), eu.io.fresp.bits.uop.rob_idx)   // [WINSHADOW]
+      fregfile.io.write_ports(w_cnt).bits.watk := io.wsh_atk.res(eu.io.fresp.bits.uop.cf_win_atk.getOrElse(false.B) || eu.io.fresp.bits.uop.cf_opnd_watk.getOrElse(false.B),
+                                                                 eu.io.fresp.bits.uop.cf_wep_atk.getOrElse(0.U(2.W)), eu.io.fresp.bits.uop.rob_idx)
       // [FPTAINT 2026-09-08] Was OWNERSHIP ONLY -- it dropped fresp.bits.taint_atk, so any
       // attacker- or secret-derived value passing through an FP register lost its taint.
       // The LSU computes fresp.bits.taint_atk correctly (lsu.scala:2009, including the
@@ -270,7 +334,7 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
       // Mirrors the integer path at core.scala:1977.  Note the SECRET line above already
       // takes the propagated value -- only the attacker side was broken.
       fregfile.io.write_ports(w_cnt).bits.taint_atk := eu.io.fresp.bits.taint_atk ||
-                                                      (eu.io.fresp.bits.uop.cf_domain_id =/= 0.U)
+                                                      (eu.io.fresp.bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U)
       eu.io.fresp.ready                        := true.B
       when (eu.io.fresp.valid) {
         assert(eu.io.fresp.ready, "No backpressuring the FPU")
@@ -303,14 +367,19 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
   // Ensure the wakeup carries the FRF writeback tag so the ROB receives
   // the tagged micro-op on writeback.
   val ll_out_bits = WireInit(ll_wbarb.io.out.bits)
-  ll_out_bits.uop.cf_fu_bitmap := ll_wbarb.io.out.bits.uop.cf_fu_bitmap | (1.U << frfTagCF.U)
+  ll_out_bits.uop.cf_fu_bitmap.foreach(_ := ll_wbarb.io.out.bits.uop.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << frfTagCF.U))
+  // [G7FFLAGS] (ruling 100, G-7; functional, upstream BOOM) the ROB writes rob_fflags on
+  // fflags.valid alone.  An idle arbiter presents in(1).bits = the IntToFP queue's stale
+  // ram(deq_ptr) entry with fflags.valid = 1, rewriting that (possibly reused) row's flags
+  // every idle cycle.  Gate with out.valid: one LUT.
+  ll_out_bits.fflags.valid := ll_wbarb.io.out.valid && ll_wbarb.io.out.bits.fflags.valid
   io.wakeups(0).bits := ll_out_bits
   ll_wbarb.io.out.ready := true.B
 
   w_cnt = 1
   for (i <- 1 until memWidth) {
     val mem_wb = WireInit(io.ll_wports(i).bits)
-    mem_wb.uop.cf_fu_bitmap := io.ll_wports(i).bits.uop.cf_fu_bitmap | (1.U << frfTagCF.U)
+    mem_wb.uop.cf_fu_bitmap.foreach(_ := io.ll_wports(i).bits.uop.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << frfTagCF.U))
     io.wakeups(w_cnt) := io.ll_wports(i)
     io.wakeups(w_cnt).bits := mem_wb
     io.wakeups(w_cnt).bits.data := recode(io.ll_wports(i).bits.data,
@@ -323,7 +392,7 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
       val wb_uop = eu.io.fresp.bits.uop
       val wport = io.wakeups(w_cnt)
       val fpu_wb_bits = WireInit(exe_resp.bits)
-      fpu_wb_bits.uop.cf_fu_bitmap := exe_resp.bits.uop.cf_fu_bitmap | (1.U << frfTagCF.U)
+      fpu_wb_bits.uop.cf_fu_bitmap.foreach(_ := exe_resp.bits.uop.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << frfTagCF.U))
       wport.valid := exe_resp.valid && wb_uop.dst_rtype === RT_FLT
       wport.bits := fpu_wb_bits
 

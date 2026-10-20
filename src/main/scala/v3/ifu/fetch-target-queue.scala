@@ -67,9 +67,12 @@ class FTQBundle(implicit p: Parameters) extends BoomBundle
   val start_bank = UInt(1.W)
 
   // corefuzzing: domain of the fetch packet (0=victim, 1=attacker)
-  val cf_fetch_domain = UInt(1.W)
+  val cf_fetch_domain = if (ENABLE_IFT) Some(UInt(1.W)) else None
   // corefuzzing: fetch packet contained a secret-dependent instruction (updated at commit)
-  val cf_fetch_secret = Bool()
+  val cf_fetch_secret = if (ENABLE_IFT) Some(Bool()) else None
+  // [FTQATK] patch 47 (r173 (5)): a CFI of this packet resolved with an attacker-tainted condition
+  // or target (brinfos cond_atk); ORed into the domain sent with the predictor update
+  val cf_fetch_atk = if (ENABLE_IFT) Some(Bool()) else None
 
   // // Metadata for the branch predictor
   // val bpd_meta = Vec(nBanks, UInt(bpdMaxMetaLength.W))
@@ -148,23 +151,17 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   // export the RAS slot index so the frontend can mark ras_secret retroactively.
   val cf_ras_secret_upd_valid = Output(Vec(coreWidth + memWidth, Bool()))
   val cf_ras_secret_upd_idx   = Output(Vec(coreWidth + memWidth, UInt(log2Ceil(nRasEntries).W)))
-  // C3: the GHR still contains a secret-influenced branch outcome.  See the counter
-  // at the bpdupdate site for why this is a window and not a per-entry flag.
-  val cf_ghist_secret_active  = Output(Bool())
-  // [GHISTATK 2026-09-08] The attacker twin.  Spectre-v1's whole premise is the attacker
-  // MISTRAINING the predictor: N attacker branches commit before the mispredicted victim
-  // branch, so the GHR genuinely holds attacker-determined outcomes.  Without this the
-  // ty=19 candidate is hardcoded is_atk=false and that influence can never be recorded.
-  val cf_ghist_atk_active     = Output(Bool())
-  // [GHISTOC 2026-09-08] Export the COUNTER VALUES so the influencer edge can carry real
-  // provenance instead of oc=0.  The counter is armed to globalHistoryLength when the
-  // tainting branch retires and decrements once per retired branch, so
-  //     k = globalHistoryLength - ctr
-  // is exactly the number of branch retirements between the arming branch and this fetch.
-  // A parser/fuzzer walks back k branch retirements in the commit stream and lands on the
-  // branch that tainted the GHR.  7 bits into a 10-bit oc field.
-  val cf_ghist_secret_ctr_val = Output(UInt(log2Ceil(globalHistoryLength + 1).W))
-  val cf_ghist_atk_ctr_val    = Output(UInt(log2Ceil(globalHistoryLength + 1).W))
+  // [WINDEAD] review 3.9b: cf_ghist_secret_active / cf_ghist_atk_active / cf_ghist_*_ctr_val removed
+  // (unread since step 20; the window counters are io.cpu.cf_win_*_ctr from the core).
+  // [WINFTQ] patch 29b (owner r160): the FTQ index of the OLDEST secret-window arming branch that
+  // resolved (registered in core.scala), and the RAS late write of the window-range calls.
+  val cf_win_ftq_rs  = if (ENABLE_IFT) Some(Input(Valid(UInt(idx_sz.W)))) else None
+  // [WINFTQPOST] patch 38: the secret window is open (core winCtr counter != 0), for the enqueue tag
+  val cf_win_sec_open = if (ENABLE_IFT) Some(Input(Bool())) else None
+  val cf_ras_win_upd = if (ENABLE_IFT) Some(Output(Valid(UInt(log2Ceil(nRasEntries).W)))) else None
+  // [FTQATK] patch 47: one port per brinfos lane (core.scala), valid = a br/jalr resolved with
+  // cond_atk; bits = its ftq_idx.  Direct ports, no compactor (brinfos is already a register).
+  val cf_atk_ftq_updates = if (ENABLE_IFT) Some(Flipped(Vec(coreWidth, Valid(UInt(idx_sz.W))))) else None
 
     val bpdupdate = Output(Valid(new BranchPredictionUpdate))
 
@@ -172,26 +169,22 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     val ras_update_idx = Output(UInt(log2Ceil(nRasEntries).W))
     val ras_update_pc  = Output(UInt(vaddrBitsExtended.W))
 
+    // [F-RAS-3b] (22c2, review B1) active RAS size = frontend cf_ras_active (rasOptionsVec(cf_ras_idx)),
+    // the SAME wire the frontend uses at F1/F2/F3, so the FTQ's stored ghist.ras_idx advances in the
+    // same window as the frontend pointer.  Port exists only with ENABLE_RECONF (reconf-off FTQ
+    // Verilog unchanged: it keeps the nRasEntries constant).
+    val cf_ras_active = if (ENABLE_RECONF) Some(Input(UInt(log2Ceil(nRasEntries + 1).W))) else None
+
   })
   val bpd_ptr    = RegInit(0.U(idx_sz.W))
-  // C3: branches remaining before the secret branch shifts out of the GHR (0 = clean)
-  val cf_ghist_secret_ctr = RegInit(0.U(log2Ceil(globalHistoryLength + 1).W))
-  io.cf_ghist_secret_active := cf_ghist_secret_ctr =/= 0.U
-  // [GHISTATK] Same window shape as the secret counter: a branch outcome is resident in
-  // the GHR for exactly globalHistoryLength subsequent branch shifts, so the taint is a
-  // WINDOW that decays precisely when the bit shifts out.  That is a liveness model of
-  // predictor state, NOT the sticky "attacker branched at some point" context doc 16
-  // sec.B forbids -- it decays on its own, deterministically.
-  val cf_ghist_atk_ctr = RegInit(0.U(log2Ceil(globalHistoryLength + 1).W))
-  io.cf_ghist_atk_active := cf_ghist_atk_ctr =/= 0.U
-  io.cf_ghist_secret_ctr_val := cf_ghist_secret_ctr
-  io.cf_ghist_atk_ctr_val    := cf_ghist_atk_ctr
   val deq_ptr    = RegInit(0.U(idx_sz.W))
   val enq_ptr    = RegInit(1.U(idx_sz.W))
 
   // Runtime FTQ size selection: ftQueueEntryOptions = Seq(32, 24, 16, 8)
   val ftqOptionsVec = VecInit(ftQueueEntryOptions.map(_.U))
   val cf_ftq_active = ftqOptionsVec(io.cf_ftq_idx)
+  // [F-RAS-3b] active RAS window for the stored-ghist update below (reconf off: nRasEntries, the default).
+  val cf_ftq_ras_active = io.cf_ras_active.getOrElse(nRasEntries.U)
 
   val full = ((WrapInc(WrapInc(enq_ptr, cf_ftq_active), cf_ftq_active) === bpd_ptr) ||
               (WrapInc(enq_ptr, cf_ftq_active) === bpd_ptr))
@@ -206,6 +199,9 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   } else {
     None
   }
+
+  // [D4RAS] D4 probe cycle counter (same reset as frontend d4_cyc, so the c= values align)
+  val d4_cyc_q = if (ENABLE_CF_DEBUG_PRINTF) { val c = RegInit(0.U(40.W)); c := c + 1.U; c } else 0.U
 
   val do_enq = io.enq.fire
 
@@ -234,8 +230,28 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     new_entry.br_mask       := io.enq.bits.br_mask & io.enq.bits.mask
     new_entry.start_bank    := bank(io.enq.bits.pc)
     // corefuzzing: store fetch domain for bpdupdate path; secret flag updated lazily at commit
-    new_entry.cf_fetch_domain  := io.enq.bits.cf_fetch_domain
-    new_entry.cf_fetch_secret  := false.B
+    new_entry.cf_fetch_domain.foreach(_ := io.enq.bits.cf_fetch_domain.getOrElse(0.U(1.W)))
+    // [WINFTQPOST] patch 38 (p4-38-author.md, owner r158/r160): a packet ENQUEUED while the secret
+    // window is open is younger than the arming branch B (B resolved before the counter opened; the
+    // FTQ is in fetch order), so every uop in it is a window member and the predictor training and
+    // RAS push it makes are results produced inside the window.  [WINFTQ] below covers only the
+    // entries in flight when a CORRECTLY predicted B resolves; a packet fetched after a mispredicted
+    // B (the redirect refetch) or after any B once its range is set was tagged only by a window-
+    // operand writeback or a linking JAL, so a `j`, a jalr call or a branch on a clean register
+    // trained the BTB / uBTB / BPD clean (t60 m60: br_s's displacement went in clean and cleared
+    // both records).  Membership is the fetch-time bit (ghist_secret, f3 counter, carried in the
+    // FetchBundle) OR the enqueue-time counter, so a packet that sat in f4 across the opening is
+    // covered too.  A packet fetched in the window but dispatched after it closed is tagged
+    // (over-taint, accepted: its record already has s_prop through the same fetch-time bit,
+    // core.scala d_win_sec).  Wrong-path entries are dropped by the redirect, as before.
+    // Levels: core winCtr register -> 7-bit zero detect (shared with f3 ghist_secret, 2 LUT) OR the
+    // f4-registered ghist_secret -> new_entry.cf_fetch_secret, a DATA input of each entry's
+    // existing write mux (the select, do_enq && enq_ptr === e, is unchanged): 0 added levels on
+    // any existing path.  Cost: about 1 LUT per entry (the constant-0 data input becomes a signal).
+    if (ENABLE_IFT) {
+      new_entry.cf_fetch_secret.get := io.cf_win_sec_open.get || io.enq.bits.ghist_secret.getOrElse(false.B)
+      new_entry.cf_fetch_atk.get    := false.B   // [FTQATK] set only at resolution (below)
+    }
 
     val new_ghist = Mux(io.enq.bits.ghist.current_saw_branch_not_taken,
       io.enq.bits.ghist,
@@ -247,9 +263,22 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
         prev_entry.cfi_idx.valid,
         prev_pc,
         prev_entry.cfi_is_call,
-        prev_entry.cfi_is_ret
+        prev_entry.cfi_is_ret,
+        // [F-RAS-3b] wrap ras_idx in the ACTIVE window (was the 32-entry default): this stored
+        // ghist is what the core's mispredict repair reads back (get_pc(1).ghist).
+        cf_ftq_ras_active
       )
     )
+    // [D4RAS] D4 probe (measurement only): the FTQ's sequential ghist chain (what a mispredict
+    // redirect restores, core.scala get_pc(1).ghist) vs the f3 ras_idx carried in the packet (what
+    // the f3 push/pop used and what the entry stores for the top repair, line 226).  Mismatch-only,
+    // so no runtime gate (the FTQ sees only the frontend debug bit, which ENABLE_DEBUG leaves off).
+    if (ENABLE_CF_DEBUG_PRINTF) {
+      when (!io.enq.bits.ghist.current_saw_branch_not_taken && new_ghist.ras_idx =/= io.enq.bits.ghist.ras_idx) {
+        printf("[D4RAS] c=%d DESYNC ftq=%d pc=0x%x f3idx=%d ftqidx=%d\n",
+          d4_cyc_q, enq_ptr, io.enq.bits.pc, io.enq.bits.ghist.ras_idx, new_ghist.ras_idx)
+      }
+    }
 
     lhist.map( l => l.write(enq_ptr, io.enq.bits.lhist))
     ghist.map( g => g.write(enq_ptr, new_ghist))
@@ -273,7 +302,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   io.cf_ras_secret_upd_idx   := VecInit(Seq.fill(coreWidth + memWidth)(0.U(log2Ceil(nRasEntries).W)))
   for ((u, i) <- io.cf_secret_ftq_updates.zipWithIndex) {
     when (u.valid) {
-      ram(u.bits).cf_fetch_secret := true.B
+      ram(u.bits).cf_fetch_secret.foreach(_ := true.B)
       // If the FTQ entry had a call CFI, propagate its RAS write index for the secret shadow
       when (ram(u.bits).cfi_is_call) {
         io.cf_ras_secret_upd_valid(i) := true.B
@@ -395,28 +424,13 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     io.bpdupdate.bits.lhist      := bpd_lhist
     io.bpdupdate.bits.meta       := bpd_meta
     // corefuzzing: carry fetch domain and secret flag to BPD shadow writes
-    io.bpdupdate.bits.cf_domain_id := bpd_entry.cf_fetch_domain
-    io.bpdupdate.bits.cf_is_secret := bpd_entry.cf_fetch_secret
-    // C3 (2026-09-03): taint the GLOBAL HISTORY, not just the predictor rows.
-    // A branch outcome stays in a globalHistoryLength-bit GHR for exactly that many
-    // subsequent branch shifts, so the taint is a WINDOW, not a per-entry field.
-    // It cannot be attached at GlobalHistory.update(): that runs at ENQUEUE (:213)
-    // off `prev_entry`, a Reg snapshot taken at :232 where cf_fetch_secret is still
-    // false -- the secret bit is written later into ram(idx) (:247).  Verified, not
-    // assumed; wiring it there would have been inert.
-    // Here at bpd_ptr the retiring entry's true secret bit IS known, so: arm the
-    // window on a secret branch, age it by one on every other retired branch.
-    when (RegNext(do_commit_update) && io.bpdupdate.valid && io.bpdupdate.bits.cfi_is_br) {
-      cf_ghist_secret_ctr := Mux(bpd_entry.cf_fetch_secret,
-                                 globalHistoryLength.U,
-                                 Mux(cf_ghist_secret_ctr =/= 0.U, cf_ghist_secret_ctr - 1.U, 0.U))
-      // [GHISTATK] Armed by an ATTACKER-OWNED retiring branch.  cf_fetch_domain is already
-      // stored per FTQ entry (:70) and is already read at :375 for bpdupdate, so this
-      // costs the counter and a comparator -- NO new per-entry state.
-      cf_ghist_atk_ctr := Mux(bpd_entry.cf_fetch_domain === 1.U,
-                              globalHistoryLength.U,
-                              Mux(cf_ghist_atk_ctr =/= 0.U, cf_ghist_atk_ctr - 1.U, 0.U))
-    }
+    // [FTQATK] patch 47: | the attacker-steered CFI bit (one OR, before the predictors' s1 RegNext)
+    io.bpdupdate.bits.cf_domain_id.foreach(_ := bpd_entry.cf_fetch_domain.getOrElse(0.U(1.W)) |
+                                                bpd_entry.cf_fetch_atk.getOrElse(false.B).asUInt)
+    io.bpdupdate.bits.cf_is_secret.foreach(_ := bpd_entry.cf_fetch_secret.getOrElse(false.B))
+    // [WINDEAD] review 3.9b: the retire-time GHR window counters (cf_ghist_secret_ctr / cf_ghist_atk_ctr)
+    // were removed; the implicit-flow window lives in the core since step 20 ([ARMRES], core.scala winCtr)
+    // and nothing read the FTQ copies any more.
 
     first_empty := false.B
   }
@@ -477,6 +491,91 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     prev_pc    := bpd_pc
 
     ram(RegNext(io.redirect.bits)) := RegNext(redirect_new_entry)
+    // [WINFTQ] patch 29b: the write-back of the redirect entry carries the secret bit READ a cycle
+    // earlier; a tag that landed in between (a cf_secret_ftq_updates port or the window range
+    // below) was lost.  The bit is monotone, so the write keeps the current value too.
+    if (ENABLE_IFT) {
+      ram(RegNext(io.redirect.bits)).cf_fetch_secret.get :=
+        RegNext(redirect_new_entry.cf_fetch_secret.get) || ram(RegNext(io.redirect.bits)).cf_fetch_secret.get
+      // [FTQATK] patch 47: the same race for the attacker bit (a packet-mate's cond_atk port can
+      // land between the read and this write-back).
+      ram(RegNext(io.redirect.bits)).cf_fetch_atk.get :=
+        RegNext(redirect_new_entry.cf_fetch_atk.get) || ram(RegNext(io.redirect.bits)).cf_fetch_atk.get
+    }
+  }
+
+  // [FTQATK] patch 47 (r173 (5), DF-42-btbatk; task-reports/p4-owner-gap-check.md B): a VICTIM
+  // packet whose br/jalr resolved with an attacker-tainted condition or target (cond_atk =
+  // rs1/rs2 taint_atk) trains BTB / uBTB / BIM / TAGE / loop as attacker-influenced: the bit is
+  // ORed into bpdupdate.cf_domain_id above, so every predictor domain shadow, the BTB / uBTB
+  // attacker displacement record (r140/r146: written by an update with cf_domain_id 1, the
+  // r168b "allocating access attacker-tainted" rule) and every existing domain-mismatch fetch
+  // edge (victim packets only) work unchanged.  No RAS term: the pushed value is pc+4 of the
+  // call, independent of its target data.  Same write discipline as cf_fetch_secret (monotone,
+  // cleared at enqueue, kept across the redirect write-back above; placed after it so a set
+  // in the write-back cycle wins, last connect).  Value taint only: a fetch
+  // edge sets only the sticky cf_attacker_influence, which never re-enters taint_atk, so no
+  // train -> edge -> train chain.
+  // Levels: brinfos registers -> 5-bit ftq_idx decode AND valid (1 LUT) -> OR into the entry's
+  // D mux (1 LUT) -> ram FF.  Off the fetch / prediction path.  Cost: 32 FF + about 5 LUT/entry.
+  io.cf_atk_ftq_updates.foreach { ports =>
+    for (u <- ports) {
+      when (u.valid) { ram(u.bits).cf_fetch_atk.get := true.B }
+    }
+  }
+
+  // [WINFTQ] patch 29b (DF-step20 risk (i), owner r160): when a secret-window arming branch B
+  // resolves, every FTQ entry YOUNGER than B is window-secret (all younger uops are window
+  // members), so its secret bit is set at once.  This replaces, for the BPD / BTB / RAS secret
+  // shadows, the writeback-time tags that a consumer of a register written back BEFORE B
+  // resolved could not raise (its operand read clean: the step-20 commit-time set).  Packets
+  // fetched after the resolution are tagged at enqueue (patch 38) and by [RASJAL] calls (the
+  // writeback feed is removed, r170 B [FTQCFI]).
+  // Over-taint, accepted: a range entry on a path a younger branch then
+  // redirects stays tagged until it is re-enqueued, and a queued RAS write of such a wrong-path
+  // call can land on a slot a correct-path call re-pushed (both clear on the next push / enqueue).
+  // Range: IsOlder(b, e, bpd_ptr) && IsOlder(e, enq_ptr, bpd_ptr) over the live region
+  // [bpd_ptr, enq_ptr) (B is not committed, so it lies inside it); entries at or beyond the
+  // active size are excluded.  B's own entry is tagged by the existing brinfos cond_secret input.
+  // RAS: a call in a range entry pushed a slot that is now window-secret.  The range entries
+  // holding a call are queued (pend) and sent one per cycle on one extra late-write port (the
+  // existing per-port path, WrapInc(ras_idx) in frontend.scala); an entry re-enqueued before it
+  // is sent is dropped from the queue (its slot was never pushed by that call any more).
+  // Levels: rs is a register (core.scala RegNext); per entry 3 five-bit compares against
+  // registers/constants -> 1 LUT (XOR/AND) -> the entry's existing cf_fetch_secret D mux (one
+  // more term).  RAS queue: 32 FF -> PriorityEncoderOH -> 32:1 Mux1H of ras_idx -> FF.
+  // Cost: about 4 LUT per entry (about 130 LUT), the queue 32 FF + about 60 LUT, 6 FF out.
+  io.cf_ras_win_upd.foreach { o => o.valid := false.B; o.bits := 0.U }
+  if (ENABLE_IFT) {
+    val rs       = io.cf_win_ftq_rs.get
+    val h        = bpd_ptr
+    val b_lt_h   = rs.bits < h
+    val enq_lt_h = enq_ptr < h
+    val inr = (0 until num_entries).map { e =>
+      val E = e.U(idx_sz.W)
+      ((rs.bits < E) ^ b_lt_h ^ (E < h)) && ((E < enq_ptr) ^ (E < h) ^ enq_lt_h) && (E < cf_ftq_active)
+    }
+    val pend = RegInit(VecInit(Seq.fill(num_entries)(false.B)))
+    val psel = PriorityEncoderOH(pend.asUInt)
+    io.cf_ras_win_upd.get.valid := RegNext(pend.asUInt.orR, false.B)
+    io.cf_ras_win_upd.get.bits  := RegNext(Mux1H(psel, ram.map(_.ras_idx)))
+    for (e <- 0 until num_entries) {
+      when (psel(e)) { pend(e) := false.B }
+      when (do_enq && enq_ptr === e.U) { pend(e) := false.B }
+      when (rs.valid && inr(e)) {
+        ram(e).cf_fetch_secret.get := true.B
+        when (ram(e).cfi_is_call) { pend(e) := true.B }
+      }
+      // [WINFTQPOST] patch 38: a call packet enqueued while the window is open whose push at f3
+      // preceded the opening (fetch-time bit 0: it sat in f4 across B's resolution) pushed a slot
+      // the f3 push mark (frontend.scala) did not cover; queue it like a range call.  Rare (the
+      // one or two packets in f3/f4 at the opening), so the one-per-cycle queue is not loaded.
+      // Last connect: overrides the enqueue clear above for this entry.  Same per-entry enq_ptr
+      // decode as that clear; about 1 LUT per entry.
+      when (do_enq && enq_ptr === e.U && io.cf_win_sec_open.get &&
+            !io.enq.bits.ghist_secret.getOrElse(false.B) && io.enq.bits.cfi_is_call) { pend(e) := true.B }
+    }
+    when (io.cf_ftq_quiesce_reset) { pend.foreach(_ := false.B) }
   }
 
   // On quiesce drain (QS_DRAINING→QS_FETCH), reset FTQ state to clear any

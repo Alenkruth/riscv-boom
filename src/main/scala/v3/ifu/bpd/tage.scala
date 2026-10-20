@@ -115,9 +115,12 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
   val s2_req_rlous = lo_us.read(s1_hashed_idx, io.f1_req_valid)
   val s2_req_rhits = VecInit(s2_req_rtage.map(e => e.valid && e.tag === s2_tag && !doing_reset))
   // corefuzzing: domain shadow read — same index/enable as main table
-  val s2_req_rshadow  = table_shadow.read(s1_hashed_idx, io.f1_req_valid)
+  // [R124GATE3] patch 28 (B51): the shadow memory is read/written and the domain/mismatch flops exist
+  // only with ENABLE_IFT; IFT off table_shadow has no ports (removed) and the outputs are 0.
+  val s2_req_rshadow  = if (ENABLE_IFT) table_shadow.read(s1_hashed_idx, io.f1_req_valid)
+                        else VecInit(Seq.fill(bankWidth)(0.U(2.W)))
   val s2_req_rdomain  = VecInit(s2_req_rshadow.map(_(1,1)))
-  val s2_fetch_domain = RegNext(io.f1_req_domain_id)
+  val s2_fetch_domain = if (ENABLE_IFT) RegNext(io.f1_req_domain_id) else 0.U   // [R124GATE3]
   // corefuzzing: secret shadow read — same index/enable
   val s2_req_rsecret  = VecInit(s2_req_rshadow.map(_(0)))
 
@@ -127,9 +130,10 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
     io.f3_resp(w).bits.u   := RegNext(Cat(s2_req_rhius(w), s2_req_rlous(w)))
     io.f3_resp(w).bits.ctr := RegNext(s2_req_rtage(w).ctr)
     // corefuzzing: domain mismatch if hit entry was written by a different domain
-    io.f3_domain_mismatch(w) := RegNext(s2_req_rhits(w) && (s2_req_rdomain(w) =/= s2_fetch_domain))
+    io.f3_domain_mismatch(w) := (if (ENABLE_IFT) RegNext(s2_req_rhits(w) && (s2_req_rdomain(w) =/= s2_fetch_domain))
+                                 else false.B)   // [R124GATE3]
     // corefuzzing: secret mismatch if hit entry was trained by a secret-dependent instruction
-    io.f3_secret_mismatch(w) := RegNext(s2_req_rhits(w) && s2_req_rsecret(w).asBool)
+    io.f3_secret_mismatch(w) := (if (ENABLE_IFT) RegNext(s2_req_rhits(w) && s2_req_rsecret(w).asBool) else false.B)
   }
 
   val clear_u_ctr = RegInit(0.U((log2Ceil(uBitPeriod) + log2Ceil(nRows) + 1).W))
@@ -154,12 +158,14 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
   // IFT gate: with ENABLE_IFT=false the secret bit is a constant 0, which firtool folds
   // away -- the same dead-state elimination the split version relied on, minus a memory.
   val shadow_secret_bit = if (ENABLE_IFT) io.update_cf_is_secret else false.B
+  if (ENABLE_IFT) {   // [R124GATE3]
   table_shadow.write(
     Mux(doing_reset, reset_idx, update_idx),
     Mux(doing_reset, VecInit(Seq.fill(bankWidth)(0.U(2.W))),
                      VecInit(Seq.fill(bankWidth)(Cat(io.update_cf_domain_id, shadow_secret_bit)))),
     Mux(doing_reset, ~(0.U(bankWidth.W)), io.update_mask.asUInt).asBools
   )
+  }
 
   val update_hi_wdata = Wire(Vec(bankWidth, Bool()))
   hi_us.write(
@@ -428,14 +434,18 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
     tables(i).io.update_pc             := RegNext(s1_update.bits.pc)
     tables(i).io.update_hist           := RegNext(s1_update.bits.ghist)
     // corefuzzing: wire update domain and secret to table for shadow writes
-    tables(i).io.update_cf_domain_id   := RegNext(s1_update.bits.cf_domain_id)
-    tables(i).io.update_cf_is_secret   := RegNext(s1_update.bits.cf_is_secret)
+    // [R124GATE3] patch 28: IFT off the update domain/secret flops do not exist (constant 0 into the table).
+    tables(i).io.update_cf_domain_id   := (if (ENABLE_IFT) RegNext(s1_update.bits.cf_domain_id.getOrElse(0.U(1.W))) else 0.U)
+    tables(i).io.update_cf_is_secret   := (if (ENABLE_IFT) RegNext(s1_update.bits.cf_is_secret.getOrElse(false.B)) else false.B)
   }
 
   // corefuzzing: TAGE domain mismatch — any table hit a row last updated by a different domain
   io.f3_bpd_domain_mismatch := tables.map(t => t.io.f3_domain_mismatch.reduce(_||_)).reduce(_||_)
   // corefuzzing: TAGE secret mismatch — any table hit a row trained by a secret instruction
-  io.f3_bpd_secret_mismatch := tables.map(t => t.io.f3_secret_mismatch.reduce(_||_)).reduce(_||_)
+  // [BPDMASK] r170 A (DF-dt-sprop): a slot below the fetch PC, or a bank whose request is not
+  // valid, is not part of the packet; its secret label raises no edge.
+  io.f3_bpd_secret_mismatch := tables.map(t =>
+    (t.io.f3_secret_mismatch.asUInt & s3_mask & Fill(bankWidth, s3_valid)).orR).reduce(_||_)
 
   //io.f3_meta := Cat(f3_meta.asUInt, micro.io.f3_meta(micro.metaSz-1,0), base.io.f3_meta(base.metaSz-1, 0))
   io.f3_meta := f3_meta.asUInt

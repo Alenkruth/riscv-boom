@@ -64,17 +64,19 @@ abstract class AbstractRenameStage(
     val ren_stalls = Output(Vec(plWidth, Bool()))
 
     val kill = Input(Bool())
-    // corefuzzing: gate for speculative rename prints
-    val cf_debug_rename_enable = Input(Bool())
-    // corefuzzing: cycle-N mispredicting branch UOP (same cycle as b1.mispredict_mask)
-    val cf_mispredict_uop = Input(Valid(new MicroOp))
+    // (Task 3.9: cf_debug_rename_enable and cf_mispredict_uop removed; their only readers were
+    // the commented-out SRC=2 [FLUSH] printfs that Task 3.3 deleted.)
 
     val dec_fire  = Input(Vec(plWidth, Bool())) // will commit state updates
     val dec_uops  = Input(Vec(plWidth, new MicroOp()))
+    // IFT overhaul Phase 3, Task 3.3: fetch-time IFT info, carried beside the uop.  Only the
+    // INT rename stage's copy is read (dispatch); the FP and predicate stages get DontCare.
+    val dec_ift   = Input(Vec(plWidth, new FetchIftInfo))
 
     // physical specifiers available AND busy/ready status available.
     val ren2_mask = Vec(plWidth, Output(Bool())) // mask of valid instructions
     val ren2_uops = Vec(plWidth, Output(new MicroOp()))
+    val ren2_ift  = Vec(plWidth, Output(new FetchIftInfo))
 
     // branch resolution (execute)
     val brupdate = Input(new BrUpdateInfo())
@@ -143,67 +145,22 @@ abstract class AbstractRenameStage(
     val r_valid  = RegInit(false.B)
     val r_uop    = Reg(new MicroOp)
     val next_uop = Wire(new MicroOp)
+    // Task 3.3: FetchIftInfo beside r_uop, loaded under the same condition, no bypass.
+    // [R124GATE] patch 26 (ruling 124): a register only with ENABLE_IFT; constant 0 otherwise.
+    val r_ift    = if (ENABLE_IFT) Reg(new FetchIftInfo) else WireInit(0.U.asTypeOf(new FetchIftInfo))
 
     next_uop := r_uop
 
-    // corefuzzing: [FLUSH] for ren2 uops killed by branch mispredict. SRC=2 (rename).
-    // corefuzzing [FLUSH] rename-branch log — compile-time gated (see ENABLE_CF_DEBUG_PRINTF).
-    if (ENABLE_CF_DEBUG_PRINTF) {
-      when (r_valid && IsKilledByBranch(io.brupdate, r_uop.br_mask) && io.cf_debug_rename_enable) {
-        // corefuzzing: read pipeline register directly — fl/floc are separate fields.
-        val ren_fu = r_uop
-        val fl_cross_domain = io.cf_mispredict_uop.valid &&
-          (io.cf_mispredict_uop.bits.cf_domain_id =/= ren_fu.cf_domain_id)
-        val fl_op_count = Mux(io.cf_mispredict_uop.valid,
-          io.cf_mispredict_uop.bits.cf_op_count_id, 0.U)
-        val renBrInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d}"}.mkString(" ")
-        val renBrFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d floc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d $renBrInflFmt\n"
-        val renBrArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
-          ren_fu.cf_influencer_list(k).valid,
-          ren_fu.cf_influencer_list(k).op_count,
-          ren_fu.cf_influencer_list(k).infl_type,
-          ren_fu.cf_influencer_list(k).is_atk,
-          ren_fu.cf_influencer_list(k).is_secret
-        ))
-        // [CFNOISE-COMMENTED] printf(renBrFmt, (Seq[Bits](
-          // [CFNOISE-COMMENTED] Sext.apply(ren_fu.debug_pc(vaddrBits-1,0), xLen), ren_fu.debug_inst,
-          // [CFNOISE-COMMENTED] ren_fu.cf_domain_id, ren_fu.cf_speculated, ren_fu.cf_attacker_influence,
-          // [CFNOISE-COMMENTED] ren_fu.cf_secret_access, ren_fu.cf_secret_propagation, ren_fu.cf_secret_transmission,
-          // [CFNOISE-COMMENTED] ren_fu.cf_op_count_id, ren_fu.cf_spec_branch_is_atk, ren_fu.cf_spec_branch_op_id,
-          // [CFNOISE-COMMENTED] fl_cross_domain, fl_op_count,
-          // [CFNOISE-COMMENTED] ren_fu.cf_fu_bitmap, 2.U, inflBitmapFromList(ren_fu.cf_influencer_list), ren_fu.cf_infl_dropped, ren_fu.cf_cntd_deny_count, ren_fu.cf_stall_cycles_rob, ren_fu.cf_stall_cycles_stq, ren_fu.cf_infl_oc_aliased
-        // [CFNOISE-COMMENTED] ) ++ renBrArgs): _*)
-      }
-    }
+    // corefuzzing: the SRC=2 (rename) [FLUSH] printfs were commented out ([CFNOISE]); Task 3.3
+    // deleted their dead argument lists (they read the uop influencer list, which no longer
+    // carries the fetch or dispatch edges).
 
     when (io.kill) {
-      // corefuzzing: [FLUSH] for ren2 uops killed by pipeline flush (exception/ROB flush). SRC=2.
-      // corefuzzing [FLUSH] rename-kill log — compile-time gated (see ENABLE_CF_DEBUG_PRINTF).
-      if (ENABLE_CF_DEBUG_PRINTF) {
-        when (r_valid && io.cf_debug_rename_enable) {
-          val renKillInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d}"}.mkString(" ")
-          val renKillFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d floc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d $renKillInflFmt\n"
-          val renKillArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
-            r_uop.cf_influencer_list(k).valid,
-            r_uop.cf_influencer_list(k).op_count,
-            r_uop.cf_influencer_list(k).infl_type,
-            r_uop.cf_influencer_list(k).is_atk,
-            r_uop.cf_influencer_list(k).is_secret
-          ))
-          // [CFNOISE-COMMENTED] printf(renKillFmt, (Seq[Bits](
-            // [CFNOISE-COMMENTED] Sext.apply(r_uop.debug_pc(vaddrBits-1,0), xLen), r_uop.debug_inst,
-            // [CFNOISE-COMMENTED] r_uop.cf_domain_id, r_uop.cf_speculated, r_uop.cf_attacker_influence,
-            // [CFNOISE-COMMENTED] r_uop.cf_secret_access, r_uop.cf_secret_propagation, r_uop.cf_secret_transmission,
-            // [CFNOISE-COMMENTED] r_uop.cf_op_count_id, r_uop.cf_spec_branch_is_atk, r_uop.cf_spec_branch_op_id,
-            // [CFNOISE-COMMENTED] 0.U, 0.U,  // fl=0 floc=0: ROB flush has no flushing branch
-            // [CFNOISE-COMMENTED] r_uop.cf_fu_bitmap, 2.U, inflBitmapFromList(r_uop.cf_influencer_list), r_uop.cf_infl_dropped, r_uop.cf_cntd_deny_count, r_uop.cf_stall_cycles_rob, r_uop.cf_stall_cycles_stq, r_uop.cf_infl_oc_aliased
-          // [CFNOISE-COMMENTED] ) ++ renKillArgs): _*)
-        }
-      }
       r_valid := false.B
     } .elsewhen (ren2_ready) {
       r_valid := ren1_fire(w)
       next_uop := ren1_uops(w)
+      if (ENABLE_IFT) r_ift := io.dec_ift(w)
     } .otherwise {
       r_valid := r_valid && !ren2_fire(w) // clear bit if uop gets dispatched
       next_uop := r_uop
@@ -213,6 +170,7 @@ abstract class AbstractRenameStage(
 
     ren2_valids(w) := r_valid
     ren2_uops(w)   := r_uop
+    io.ren2_ift(w) := r_ift
   }
 
   //-------------------------------------------------------------
@@ -451,7 +409,7 @@ class RenameStage(
 
     io.ren2_uops(w) := GetNewUopAndBrMask(bypassed_uop, io.brupdate)
     // corefuzzing: stamp irf/frf bitmap bit at rename output
-    io.ren2_uops(w).cf_fu_bitmap := GetNewUopAndBrMask(bypassed_uop, io.brupdate).cf_fu_bitmap | (1.U << moduleTagCF.U)
+    io.ren2_uops(w).cf_fu_bitmap.foreach(_ := GetNewUopAndBrMask(bypassed_uop, io.brupdate).cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << moduleTagCF.U))
   }
 
   //-------------------------------------------------------------

@@ -61,10 +61,13 @@ class BIMBranchPredictorBank(params: BoomBIMParams = BoomBIMParams())(implicit p
   val mems = Seq(("bim", nSets, bankWidth * 2))
 
   val s2_req_rdata    = RegNext(data.read(s0_idx   , s0_valid))
-  val s2_req_rshadow  = RegNext(data_shadow.read(s0_idx, s0_valid))
+  // [R124GATE3] patch 28 (B51): data_shadow is read/written and the domain/mismatch flops exist only with
+  // ENABLE_IFT; IFT off the memory has no ports (removed) and the mismatch outputs are 0.
+  val s2_req_rshadow  = if (ENABLE_IFT) RegNext(data_shadow.read(s0_idx, s0_valid))
+                        else VecInit(Seq.fill(bankWidth)(0.U(2.W)))
   val s2_req_rdomain  = VecInit(s2_req_rshadow.map(_(1,1)))   // UInt(1.W), compared to s2_fetch_domain
   val s2_req_rsecret  = VecInit(s2_req_rshadow.map(_(0)))     // Bool
-  val s2_fetch_domain = RegNext(s1_domain)
+  val s2_fetch_domain = if (ENABLE_IFT) RegNext(s1_domain) else 0.U   // [R124GATE3]
 
   val s2_resp         = Wire(Vec(bankWidth, Bool()))
 
@@ -80,10 +83,12 @@ class BIMBranchPredictorBank(params: BoomBIMParams = BoomBIMParams())(implicit p
   // Qualified on a valid, post-reset prediction: BIM has no tags, so without this
   // every read of an idle entry would report a mismatch.
   val s2_bim_live = s2_valid && !doing_reset
-  io.f3_bpd_domain_mismatch := RegNext(s2_bim_live &&
-    (0 until bankWidth).map(w => s2_req_rdomain(w) =/= s2_fetch_domain).reduce(_||_))
-  io.f3_bpd_secret_mismatch := RegNext(s2_bim_live &&
-    (0 until bankWidth).map(w => s2_req_rsecret(w)).reduce(_||_))
+  io.f3_bpd_domain_mismatch := (if (ENABLE_IFT) RegNext(s2_bim_live &&
+    (0 until bankWidth).map(w => s2_req_rdomain(w) =/= s2_fetch_domain).reduce(_||_)) else false.B)   // [R124GATE3]
+  // [BPDMASK] r170 A (DF-dt-sprop): a slot below the fetch PC, or a bank whose request is not
+  // valid, is not part of the packet; its secret label raises no edge.
+  io.f3_bpd_secret_mismatch := (if (ENABLE_IFT) RegNext(s2_bim_live &&
+    (0 until bankWidth).map(w => s2_req_rsecret(w) && s2_mask(w)).reduce(_||_)) else false.B)
 
 
   val s1_update_wdata   = Wire(Vec(bankWidth, UInt(2.W)))
@@ -139,11 +144,11 @@ class BIMBranchPredictorBank(params: BoomBIMParams = BoomBIMParams())(implicit p
     // O4: shadows written with the VALUE (not monotone), so a later non-secret /
     // other-domain update to the same entry UNTAINTS it -- matching the tage/btb
     // untaint semantics: when the flow breaks, the tag clears.
-    data_shadow.write(
+    if (ENABLE_IFT) data_shadow.write(   // [R124GATE3]
       Mux(doing_reset, reset_idx, s1_update_index),
       Mux(doing_reset, VecInit(Seq.fill(bankWidth)(0.U(2.W))),
-                       VecInit(Seq.fill(bankWidth)(Cat(s1_update.bits.cf_domain_id,
-                                                       s1_update.bits.cf_is_secret)))),
+                       VecInit(Seq.fill(bankWidth)(Cat(s1_update.bits.cf_domain_id.getOrElse(0.U(1.W)),
+                                                       s1_update.bits.cf_is_secret.getOrElse(false.B))))),
       Mux(doing_reset, (~(0.U(bankWidth.W))), s1_update_wmask.asUInt).asBools
     )
   }

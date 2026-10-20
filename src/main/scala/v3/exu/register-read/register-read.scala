@@ -80,13 +80,20 @@ class RegisterRead(
   val exe_reg_rs2_data = Reg(Vec(issueWidth, Bits(registerWidth.W)))
   val exe_reg_rs3_data = Reg(Vec(issueWidth, Bits(registerWidth.W)))
   val exe_reg_pred_data = Reg(Vec(issueWidth, Bool()))
-  val exe_reg_rs1_secret = Reg(Vec(issueWidth, Bool()))
-  val exe_reg_rs2_secret = Reg(Vec(issueWidth, Bool()))
+  // [R124GATE2] patch 27 (r124/B51): the operand-taint flops exist only with ENABLE_IFT (their
+  // writes below are gated); IFT off they are constant-0 wires, so no flop elaborates.
+  val exe_reg_rs1_secret = if (ENABLE_IFT) Reg(Vec(issueWidth, Bool())) else WireInit(VecInit(Seq.fill(issueWidth)(false.B)))
+  val exe_reg_rs2_secret = if (ENABLE_IFT) Reg(Vec(issueWidth, Bool())) else WireInit(VecInit(Seq.fill(issueWidth)(false.B)))
   // corefuzzing: ATTACKER taint, plumbed identically to the secret taint.  Needed so a
   // STEERED gadget is attributable: without it the regfile's taint_atk is never read back.
-  val exe_reg_rs1_atk = Reg(Vec(issueWidth, Bool()))
-  val exe_reg_rs2_atk = Reg(Vec(issueWidth, Bool()))
-  val exe_reg_rs3_secret = Reg(Vec(issueWidth, Bool()))
+  val exe_reg_rs1_atk = if (ENABLE_IFT) Reg(Vec(issueWidth, Bool())) else WireInit(VecInit(Seq.fill(issueWidth)(false.B)))
+  val exe_reg_rs2_atk = if (ENABLE_IFT) Reg(Vec(issueWidth, Bool())) else WireInit(VecInit(Seq.fill(issueWidth)(false.B)))
+  val exe_reg_rs3_secret = if (ENABLE_IFT) Reg(Vec(issueWidth, Bool())) else WireInit(VecInit(Seq.fill(issueWidth)(false.B)))
+  // [G3RS3ATK] (ruling 100, G-3) rs3 attacker taint for the FU result path; one flop per lane,
+  // pruned on lanes with < 3 read ports (driven false.B below).
+  // [R124GATE] patch 26 (ruling 124): a flop only with ENABLE_IFT; constant 0 otherwise.
+  val exe_reg_rs3_atk    = if (ENABLE_IFT) Reg(Vec(issueWidth, Bool()))
+                           else WireInit(VecInit(Seq.fill(issueWidth)(false.B)))
 
   //-------------------------------------------------------------
   // hook up inputs
@@ -115,6 +122,7 @@ class RegisterRead(
   val rrd_rs1_atk = Wire(Vec(issueWidth, Bool()))
   val rrd_rs2_atk = Wire(Vec(issueWidth, Bool()))
   val rrd_rs3_secret = Wire(Vec(issueWidth, Bool()))
+  val rrd_rs3_atk    = Wire(Vec(issueWidth, Bool()))   // [FIFO10] summary bit only (see below)
   val rrd_pred_data  = Wire(Vec(issueWidth, Bool()))
   rrd_rs1_data := DontCare
   rrd_rs2_data := DontCare
@@ -126,6 +134,11 @@ class RegisterRead(
   rrd_rs1_atk := VecInit(Seq.fill(issueWidth)(false.B))
   rrd_rs2_atk := VecInit(Seq.fill(issueWidth)(false.B))
   rrd_rs3_secret := VecInit(Seq.fill(issueWidth)(false.B))
+  rrd_rs3_atk    := VecInit(Seq.fill(issueWidth)(false.B))
+  // [IMPLWIN] step 20: operand WINDOW taint {watk, wsec}, same masking as the data taint
+  val rrd_rs1_win = WireInit(VecInit(Seq.fill(issueWidth)(0.U(2.W))))
+  val rrd_rs2_win = WireInit(VecInit(Seq.fill(issueWidth)(0.U(2.W))))
+  val rrd_rs3_win = WireInit(VecInit(Seq.fill(issueWidth)(0.U(2.W))))
   rrd_pred_data := DontCare
 
   io.prf_read_ports := DontCare
@@ -149,14 +162,23 @@ class RegisterRead(
 
     if (enableSFBOpt) io.prf_read_ports(w).addr := pred_addr
 
-    if (numReadPorts > 0) rrd_rs1_data(w) := Mux(RegNext(rs1_addr === 0.U), 0.U, io.rf_read_ports(idx+0).data)
-    if (numReadPorts > 0) rrd_rs1_secret(w) := io.rf_read_ports(idx+0).secret
-    if (numReadPorts > 1) rrd_rs2_data(w) := Mux(RegNext(rs2_addr === 0.U), 0.U, io.rf_read_ports(idx+1).data)
-    if (numReadPorts > 1) rrd_rs2_secret(w) := io.rf_read_ports(idx+1).secret
-    if (numReadPorts > 0) rrd_rs1_atk(w) := io.rf_read_ports(idx).taint_atk
-    if (numReadPorts > 1) rrd_rs2_atk(w) := io.rf_read_ports(idx+1).taint_atk
-    if (numReadPorts > 2) rrd_rs3_data(w) := Mux(RegNext(rs3_addr === 0.U), 0.U, io.rf_read_ports(idx+2).data)
-    if (numReadPorts > 2) rrd_rs3_secret(w) := io.rf_read_ports(idx+2).secret
+    // [X0MASK] Task 0.12: p0 reads as zero AND untainted.  The address-zero compare is the
+    // one RegNext the data mux already used; the taint bits share it (one AND per bit).
+    val rs1_is_p0 = RegNext(rs1_addr === 0.U)
+    val rs2_is_p0 = RegNext(rs2_addr === 0.U)
+    val rs3_is_p0 = RegNext(rs3_addr === 0.U)
+    if (numReadPorts > 0) rrd_rs1_data(w) := Mux(rs1_is_p0, 0.U, io.rf_read_ports(idx+0).data)
+    if (numReadPorts > 0) rrd_rs1_secret(w) := io.rf_read_ports(idx+0).secret && !rs1_is_p0
+    if (numReadPorts > 1) rrd_rs2_data(w) := Mux(rs2_is_p0, 0.U, io.rf_read_ports(idx+1).data)
+    if (numReadPorts > 1) rrd_rs2_secret(w) := io.rf_read_ports(idx+1).secret && !rs2_is_p0
+    if (numReadPorts > 0) rrd_rs1_atk(w) := io.rf_read_ports(idx).taint_atk && !rs1_is_p0
+    if (numReadPorts > 1) rrd_rs2_atk(w) := io.rf_read_ports(idx+1).taint_atk && !rs2_is_p0
+    if (numReadPorts > 2) rrd_rs3_data(w) := Mux(rs3_is_p0, 0.U, io.rf_read_ports(idx+2).data)
+    if (numReadPorts > 2) rrd_rs3_secret(w) := io.rf_read_ports(idx+2).secret && !rs3_is_p0
+    if (numReadPorts > 2) rrd_rs3_atk(w)    := io.rf_read_ports(idx+2).taint_atk && !rs3_is_p0
+    if (numReadPorts > 0) rrd_rs1_win(w) := Mux(rs1_is_p0, 0.U, Cat(io.rf_read_ports(idx+0).watk, io.rf_read_ports(idx+0).wsec))
+    if (numReadPorts > 1) rrd_rs2_win(w) := Mux(rs2_is_p0, 0.U, Cat(io.rf_read_ports(idx+1).watk, io.rf_read_ports(idx+1).wsec))
+    if (numReadPorts > 2) rrd_rs3_win(w) := Mux(rs3_is_p0, 0.U, Cat(io.rf_read_ports(idx+2).watk, io.rf_read_ports(idx+2).wsec))
 
     if (enableSFBOpt) rrd_pred_data(w) := Mux(RegNext(io.iss_uops(w).is_sfb_shadow), io.prf_read_ports(w).data, false.B)
 
@@ -190,6 +212,8 @@ class RegisterRead(
   val bypassed_rs2_secret = Wire(Vec(issueWidth, Bool()))
   val bypassed_rs1_atk = Wire(Vec(issueWidth, Bool()))
   val bypassed_rs2_atk = Wire(Vec(issueWidth, Bool()))
+  val bypassed_rs1_win = WireInit(VecInit(Seq.fill(issueWidth)(0.U(2.W))))   // [IMPLWIN]
+  val bypassed_rs2_win = WireInit(VecInit(Seq.fill(issueWidth)(0.U(2.W))))
 
   for (w <- 0 until issueWidth) {
     val numReadPorts = numReadPortsArray(w)
@@ -201,6 +225,8 @@ class RegisterRead(
     var rs2_secret_cases = Array((false.B, false.B))
     var rs1_atk_cases = Array((false.B, false.B))
     var rs2_atk_cases = Array((false.B, false.B))
+    var rs1_win_cases = Array((false.B, 0.U(2.W)))   // [IMPLWIN]
+    var rs2_win_cases = Array((false.B, 0.U(2.W)))
 
     val prs1       = rrd_uops(w).prs1
     val lrs1_rtype = rrd_uops(w).lrs1_rtype
@@ -224,6 +250,13 @@ class RegisterRead(
         && bypass.bits.uop.dst_rtype === RT_FIX && lrs1_rtype === RT_FIX && (prs1 =/= 0.U), bypass.bits.taint_atk))
       rs2_atk_cases ++= Array((bypass.valid && (prs2 === bypass.bits.uop.pdst) && bypass.bits.uop.rf_wen
         && bypass.bits.uop.dst_rtype === RT_FIX && lrs2_rtype === RT_FIX && (prs2 =/= 0.U), bypass.bits.taint_atk))
+      // [IMPLWIN] the producer's result window taint rides its uop on the bypass
+      val byp_win = Cat(bypass.bits.uop.cf_win_atk.getOrElse(false.B) || bypass.bits.uop.cf_opnd_watk.getOrElse(false.B),
+                        bypass.bits.uop.cf_win_sec.getOrElse(false.B) || bypass.bits.uop.cf_opnd_wsec.getOrElse(false.B))
+      rs1_win_cases ++= Array((bypass.valid && (prs1 === bypass.bits.uop.pdst) && bypass.bits.uop.rf_wen
+        && bypass.bits.uop.dst_rtype === RT_FIX && lrs1_rtype === RT_FIX && (prs1 =/= 0.U), byp_win))
+      rs2_win_cases ++= Array((bypass.valid && (prs2 === bypass.bits.uop.pdst) && bypass.bits.uop.rf_wen
+        && bypass.bits.uop.dst_rtype === RT_FIX && lrs2_rtype === RT_FIX && (prs2 =/= 0.U), byp_win))
     }
 
     for (b <- 0 until numTotalPredBypassPorts)
@@ -238,6 +271,8 @@ class RegisterRead(
     if (numReadPorts > 1) bypassed_rs2_secret(w) := MuxCase(rrd_rs2_secret(w), rs2_secret_cases)
     if (numReadPorts > 0) bypassed_rs1_atk(w) := MuxCase(rrd_rs1_atk(w), rs1_atk_cases)
     if (numReadPorts > 1) bypassed_rs2_atk(w) := MuxCase(rrd_rs2_atk(w), rs2_atk_cases)
+    if (numReadPorts > 0) bypassed_rs1_win(w) := MuxCase(rrd_rs1_win(w), rs1_win_cases)
+    if (numReadPorts > 1) bypassed_rs2_win(w) := MuxCase(rrd_rs2_win(w), rs2_win_cases)
     if (enableSFBOpt)     bypassed_pred_data(w) := MuxCase(rrd_pred_data(w), pred_cases)
   }
 
@@ -258,21 +293,27 @@ class RegisterRead(
     val rs1_reads_reg = rrd_uops(w).lrs1_rtype === rtype
     val rs2_reads_reg = rrd_uops(w).lrs2_rtype === rtype
     val rs3_reads_reg = rrd_uops(w).frs3_en
-    if (numReadPorts > 0) exe_reg_rs1_secret(w) := bypassed_rs1_secret(w) && rs1_reads_reg
-    if (numReadPorts > 1) exe_reg_rs2_secret(w) := bypassed_rs2_secret(w) && rs2_reads_reg
+    // [WINMEM] step 21 (owner r139, F2; replaces step 20's [MEMCOLLAPSE] / r136): memory keeps
+    // the WINDOW kind.  Store operand data taint (rs*_secret/atk -> STQ addr_is_* / data_is_*)
+    // is DATA-only again (-1 OR level); a store's window taint reaches the STQ through the uop
+    // instead: cf_opnd_* = ADDRESS (rs1) window, cf_dwin_* = DATA (rs2) window (below).
+    val st_coll = rrd_uops(w).uses_stq
+    if (numReadPorts > 0 && ENABLE_IFT) exe_reg_rs1_secret(w) := bypassed_rs1_secret(w) && rs1_reads_reg   // [R124GATE2]
+    if (numReadPorts > 1 && ENABLE_IFT) exe_reg_rs2_secret(w) := bypassed_rs2_secret(w) && rs2_reads_reg
     // same rtype guard as the secret path: an operand the uop does not read must not
     // contribute its stale prs index's taint.
-    if (numReadPorts > 0) exe_reg_rs1_atk(w) := bypassed_rs1_atk(w) && rs1_reads_reg
-    if (numReadPorts > 1) exe_reg_rs2_atk(w) := bypassed_rs2_atk(w) && rs2_reads_reg
-    if (numReadPorts > 2) exe_reg_rs3_secret(w) := rrd_rs3_secret(w) && rs3_reads_reg  // rs3 (FP) is not bypassed
+    if (numReadPorts > 0 && ENABLE_IFT) exe_reg_rs1_atk(w) := bypassed_rs1_atk(w) && rs1_reads_reg
+    if (numReadPorts > 1 && ENABLE_IFT) exe_reg_rs2_atk(w) := bypassed_rs2_atk(w) && rs2_reads_reg
+    if (numReadPorts > 2 && ENABLE_IFT) exe_reg_rs3_secret(w) := rrd_rs3_secret(w) && rs3_reads_reg  // rs3 (FP) is not bypassed
+    if (numReadPorts > 2 && ENABLE_IFT) exe_reg_rs3_atk(w) := rrd_rs3_atk(w) && rs3_reads_reg  // [G3RS3ATK] same guard
       // taint-follows-data: the consumer is tagged AT THE MOMENT the tainted value
       // reaches it -- i.e. here, where the bypass/RF operand taint resolves.  This is
       // before execute and before writeback, so an op that is squashed mid-flight has
       // already been tagged and its [FLUSH] record shows the transient flow.
-      exe_reg_uops(w).cf_secret_propagation := rrd_uops(w).cf_secret_propagation ||
+      exe_reg_uops(w).cf_secret_propagation.foreach(_ := rrd_uops(w).cf_secret_propagation.getOrElse(false.B) ||
         (if (numReadPorts > 0) bypassed_rs1_secret(w) && rs1_reads_reg else false.B) ||
         (if (numReadPorts > 1) bypassed_rs2_secret(w) && rs2_reads_reg else false.B) ||
-        (if (numReadPorts > 2) rrd_rs3_secret(w)      && rs3_reads_reg else false.B)
+        (if (numReadPorts > 2) rrd_rs3_secret(w)      && rs3_reads_reg else false.B))
       // [BROADATK 2026-09-08] The attacker twin of the line above, which had NO
       // counterpart.  This is the stage that tags an op AT THE MOMENT a tainted operand
       // reaches it -- before execute and before writeback -- so an op SQUASHED mid-flight
@@ -280,11 +321,36 @@ class RegisterRead(
       // directly for spectre: the interesting gadget ops are precisely the squashed ones,
       // and the only other minting site (rob.scala:1132, at writeback) never sees them.
       // Same rtype guard as the secret path: an operand the uop does not read must not
-      // contribute its stale prs index's taint.  rs3 carries no attacker taint (there is
-      // no bypassed_rs3_atk -- rs3 is the FP third operand, secret path only).
-      exe_reg_uops(w).cf_attacker_influence := rrd_uops(w).cf_attacker_influence ||
+      // contribute its stale prs index's taint.  rs3 (the FP third operand) is not bypassed,
+      // so its attacker taint is the regfile read rrd_rs3_atk.
+      exe_reg_uops(w).cf_attacker_influence.foreach(_ := rrd_uops(w).cf_attacker_influence.getOrElse(false.B) ||
         (if (numReadPorts > 0) bypassed_rs1_atk(w) && rs1_reads_reg else false.B) ||
-        (if (numReadPorts > 1) bypassed_rs2_atk(w) && rs2_reads_reg else false.B)
+        (if (numReadPorts > 1) bypassed_rs2_atk(w) && rs2_reads_reg else false.B) ||
+        // [FIFO10] step 10 (R-STICKY): the FP third operand's attacker taint was read from the
+        // regfile (taint_atk is stored beside rs3) but never used, so an FMA reading an
+        // attacker-written rs3 was not flagged.  rs3 is not bypassed (same as the secret path).
+        // Summary flag here; the FMA RESULT's value taint rides exe_reg_rs3_atk ([G3RS3ATK]).
+        (if (numReadPorts > 2) rrd_rs3_atk(w)      && rs3_reads_reg else false.B))
+      // [IMPLWIN] step 20 (ruling 135): operand WINDOW taint.  Recorded on the uop (its result
+      // is window-tainted, regfile.scala WritePort / core.scala write ports) and seen as secret
+      // / attacker for the uop's own s_prop / atk, exactly like data taint.  It never reaches
+      // rs*_secret, so brinfo.cond_secret (the window re-arm) stays DATA-only.
+      val opnd_win = (if (numReadPorts > 0) Mux(rs1_reads_reg, bypassed_rs1_win(w), 0.U) else 0.U(2.W)) |
+                     (if (numReadPorts > 1) Mux(rs2_reads_reg, bypassed_rs2_win(w), 0.U) else 0.U(2.W)) |
+                     (if (numReadPorts > 2) Mux(rs3_reads_reg, rrd_rs3_win(w),      0.U) else 0.U(2.W))
+      // [WINMEM] step 21: for a STORE (uses_stq) cf_opnd_* is the ADDRESS operand's window
+      // taint only and cf_dwin_* the DATA operand's (a fused STA+STD reads both; the STQ needs
+      // them apart: data window -> the s_tx record, address window -> the AMO result).  The
+      // store's own s_prop / atk below still take every operand.  +1 LUT (the uses_stq select)
+      // on this register input; it feeds the window bits only, not the data path.
+      val st_awin = if (numReadPorts > 0) Mux(rs1_reads_reg, bypassed_rs1_win(w), 0.U) else 0.U(2.W)
+      val st_dwin = if (numReadPorts > 1) Mux(rs2_reads_reg, bypassed_rs2_win(w), 0.U) else 0.U(2.W)
+      exe_reg_uops(w).cf_opnd_wsec.foreach(_ := Mux(st_coll, st_awin(0), opnd_win(0)))
+      exe_reg_uops(w).cf_opnd_watk.foreach(_ := Mux(st_coll, st_awin(1), opnd_win(1)))
+      exe_reg_uops(w).cf_dwin_sec.foreach(_ := st_coll && st_dwin(0))
+      exe_reg_uops(w).cf_dwin_atk.foreach(_ := st_coll && st_dwin(1))
+      when (opnd_win(0)) { exe_reg_uops(w).cf_secret_propagation.foreach(_ := true.B) }
+      when (opnd_win(1)) { exe_reg_uops(w).cf_attacker_influence.foreach(_ := true.B) }
     if (enableSFBOpt)     exe_reg_pred_data(w) := bypassed_pred_data(w)
     // ASSUMPTION: rs3 is FPU which is NOT bypassed
   }
@@ -346,6 +412,7 @@ class RegisterRead(
     io.exe_reqs(w).bits.rs1_taint_atk := (if (numReadPorts > 0) exe_reg_rs1_atk(w) else false.B)
     io.exe_reqs(w).bits.rs2_taint_atk := (if (numReadPorts > 1) exe_reg_rs2_atk(w) else false.B)
     io.exe_reqs(w).bits.rs3_secret := (if (numReadPorts > 2) exe_reg_rs3_secret(w) else false.B)
+    io.exe_reqs(w).bits.rs3_taint_atk := (if (numReadPorts > 2) exe_reg_rs3_atk(w) else false.B)  // [G3RS3ATK]
     if (enableSFBOpt)     io.exe_reqs(w).bits.pred_data := exe_reg_pred_data(w)
   }
 }

@@ -70,6 +70,9 @@ class BoomLSUShim(implicit p: Parameters) extends BoomModule()(p)
   tracegen_uop.ctrl.is_std  := isWrite(io.tracegen.req.bits.cmd)
 
   io.lsu.dis_uops(0).valid         := io.tracegen.req.fire
+  // [DISPAR] patch 51: slot 0's own full/idx never read dis_valids (no older slot)
+  io.lsu.dis_valids.foreach(_ := false.B)
+  io.lsu.dis_valids(0)             := io.tracegen.req.fire
   io.lsu.dis_uops(0).bits          := tracegen_uop
 
   when (io.tracegen.req.fire) {

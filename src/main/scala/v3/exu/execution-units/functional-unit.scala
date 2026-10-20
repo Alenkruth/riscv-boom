@@ -104,6 +104,9 @@ class FuncUnitReq(val dataWidth: Int)(implicit p: Parameters) extends BoomBundle
   val rs2_taint_atk = Bool()
   val rs2_secret = Bool()
   val rs3_secret = Bool()
+  // [G3RS3ATK] (ruling 100, G-3) attacker taint of the FMA addend (rs3, FP lanes only), the
+  // twin of rs3_secret.  ORed into the result taint of every FU that seeds from operands.
+  val rs3_taint_atk = Bool()
   val pred_data = Bool()
 
   val kill = Bool() // kill everything
@@ -257,7 +260,8 @@ abstract class FunctionalUnit(
   io.resp.bits.data_secret := false.B
   io.resp.bits.data_taint_atk := false.B
 
-  io.bypass.foreach { b => b.valid := false.B; b.bits := DontCare }
+  io.bypass.foreach { b => b.valid := false.B; b.bits := DontCare
+                         b.bits.edges := 0.U.asTypeOf(new IftEdgeList) }   // Task 3.2: zero, not DontCare
 
   io.resp.valid := false.B
   io.resp.bits := DontCare
@@ -321,16 +325,21 @@ abstract class PipelinedFunctionalUnit(
     val r_uops   = Reg(Vec(numStages, new MicroOp()))
     // corefuzzing (taint-follows-data): taint pipelined alongside the uop so a
     // multi-cycle unit's result carries the taint of the operands it consumed.
-    val r_secret = Reg(Vec(numStages, Bool()))
-    val r_atk    = Reg(Vec(numStages, Bool()))
+    // [R124GATE2] patch 27 (r124/B51): flops only with ENABLE_IFT, every write below is under
+    // ENABLE_IFT; IFT off a constant-0 wire (resp/bypass taint 0), so no flop elaborates.
+    val r_secret = if (ENABLE_IFT) Reg(Vec(numStages, Bool())) else WireInit(VecInit(Seq.fill(numStages)(false.B)))
+    val r_atk    = if (ENABLE_IFT) Reg(Vec(numStages, Bool())) else WireInit(VecInit(Seq.fill(numStages)(false.B)))
 
     // handle incoming request
     r_valids(0) := io.req.valid && !IsKilledByBranch(io.brupdate, io.req.bits.uop) && !io.req.bits.kill
     r_uops(0)   := io.req.bits.uop
     r_uops(0).br_mask := GetNewBrMask(io.brupdate, io.req.bits.uop)
+    if (ENABLE_IFT) {   // [R124GATE2]
     r_secret(0) := io.req.bits.rs1_secret || io.req.bits.rs2_secret || io.req.bits.rs3_secret
     // [SEEDFIX] see the note at r_atk_alu.
-    r_atk(0)    := io.req.bits.rs1_taint_atk || io.req.bits.rs2_taint_atk || (io.req.bits.uop.cf_domain_id =/= 0.U)
+    r_atk(0)    := io.req.bits.rs1_taint_atk || io.req.bits.rs2_taint_atk || io.req.bits.rs3_taint_atk ||  // [G3RS3ATK]
+                   (io.req.bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U)
+    }
 
     // IFT LUT optimization: zero cf_* fields not read by the FU pipeline or by
     // the ROB wb_resps merge handler. PRESERVED fields (used downstream):
@@ -346,22 +355,10 @@ abstract class PipelinedFunctionalUnit(
     // fields names the wrong op -- the same failure MEMIDFIX fixed one layer down.
     // Gated on ENABLE_IFT so non-IFT builds still constant-fold both fields away.
     if (!ENABLE_IFT) {
-      r_uops(0).cf_domain_id               := 0.U
-      r_uops(0).cf_op_count_id              := 0.U
+      r_uops(0).cf_domain_id.foreach(_ := 0.U)
+      r_uops(0).cf_op_count_id.foreach(_ := 0.U)
     }
-    r_uops(0).cf_speculated               := false.B
-    r_uops(0).cf_single_step              := false.B
-    r_uops(0).cf_src_tainted              := false.B
-    r_uops(0).cf_spec_branch_is_atk       := false.B
-    r_uops(0).cf_atk_branch_ctr       := 0.U
-    r_uops(0).cf_sec_branch_ctr       := 0.U
-    r_uops(0).cf_spec_branch_op_id        := 0.U
-    r_uops(0).cf_spec_branch_is_secret    := false.B
-    r_uops(0).cf_cntd_valid               := false.B
-    r_uops(0).cf_cntd_winner_op           := 0.U
-    r_uops(0).cf_cntd_winner_atk          := false.B
-    r_uops(0).cf_cntd_winner_sec          := false.B
-    r_uops(0).cf_cntd_deny_count          := 0.U
+    r_uops(0).cf_spec_branch_is_secret.foreach(_ := false.B)
 
     // corefuzzing: set the FU bitmap bit and detect attacker-secret coexistence at stage 0
     {
@@ -374,7 +371,7 @@ abstract class PipelinedFunctionalUnit(
         ((fu & FU_CSR) =/= 0.U)                                           -> (1.U << csrTagCF.U)
       ))
       when (io.req.valid && !IsKilledByBranch(io.brupdate, io.req.bits.uop) && !io.req.bits.kill) {
-        r_uops(0).cf_fu_bitmap := io.req.bits.uop.cf_fu_bitmap | newBit
+        r_uops(0).cf_fu_bitmap.foreach(_ := io.req.bits.uop.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | newBit)
       }
     }
 
@@ -389,12 +386,15 @@ abstract class PipelinedFunctionalUnit(
   r_valids(i) := r_valids(i-1) && !IsKilledByBranch(io.brupdate, r_uops(i-1)) && !io.req.bits.kill
   r_uops(i)   := r_uops(i-1)
   r_uops(i).br_mask := GetNewBrMask(io.brupdate, r_uops(i-1))
+      if (ENABLE_IFT) {   // [R124GATE2]
       r_secret(i) := r_secret(i-1)
       r_atk(i)    := r_atk(i-1)
+      }
 
       if (numBypassStages > 0) {
         io.bypass(i-1).bits.uop := r_uops(i-1)
         io.bypass(i-1).bits.secret := r_secret(i-1)
+        io.bypass(i-1).bits.taint_atk := r_atk(i-1)
       }
     }
 
@@ -411,10 +411,15 @@ abstract class PipelinedFunctionalUnit(
     if (numBypassStages > 0 && earliestBypassStage == 0) {
       io.bypass(0).bits.uop := io.req.bits.uop
       io.bypass(0).bits.secret := io.req.bits.rs1_secret || io.req.bits.rs2_secret || io.req.bits.rs3_secret
+      // [BYPASSATK] attacker taint on the bypass, same seed as the regfile write (D11, bug 1)
+      io.bypass(0).bits.taint_atk := io.req.bits.rs1_taint_atk || io.req.bits.rs2_taint_atk ||
+                                     io.req.bits.rs3_taint_atk ||   // [G3RS3ATK]
+                                     (io.req.bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U)
 
       for (i <- 1 until numBypassStages) {
         io.bypass(i).bits.uop := r_uops(i-1)
         io.bypass(i).bits.secret := r_secret(i-1)
+        io.bypass(i).bits.taint_atk := r_atk(i-1)
       }
     }
     // corefuzzing
@@ -464,22 +469,10 @@ abstract class PipelinedFunctionalUnit(
     // when DIFT is compiled in; a non-IFT build must still zero them so the synthesizer
     // can constant-fold fields nothing reads.  Convention follows dcache.scala:1511.
     if (!(isMemAddrCalcUnit && ENABLE_IFT)) {
-      io.resp.bits.uop.cf_domain_id             := 0.U
-      io.resp.bits.uop.cf_op_count_id           := 0.U
+      io.resp.bits.uop.cf_domain_id.foreach(_ := 0.U)
+      io.resp.bits.uop.cf_op_count_id.foreach(_ := 0.U)
     }
-    io.resp.bits.uop.cf_speculated               := false.B
-    io.resp.bits.uop.cf_single_step              := false.B
-    io.resp.bits.uop.cf_src_tainted              := false.B
-    io.resp.bits.uop.cf_spec_branch_is_atk       := false.B
-    io.resp.bits.uop.cf_atk_branch_ctr       := 0.U
-    io.resp.bits.uop.cf_sec_branch_ctr       := 0.U
-    io.resp.bits.uop.cf_spec_branch_op_id        := 0.U
-    io.resp.bits.uop.cf_spec_branch_is_secret    := false.B
-    io.resp.bits.uop.cf_cntd_valid               := false.B
-    io.resp.bits.uop.cf_cntd_winner_op           := 0.U
-    io.resp.bits.uop.cf_cntd_winner_atk          := false.B
-    io.resp.bits.uop.cf_cntd_winner_sec          := false.B
-    io.resp.bits.uop.cf_cntd_deny_count          := 0.U
+    io.resp.bits.uop.cf_spec_branch_is_secret.foreach(_ := false.B)
 
     // corefuzzing
     // Non-destructive logging for non-pipelined functional unit kills
@@ -662,15 +655,17 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
   val r_val  = RegInit(VecInit(Seq.fill(numStages) { false.B }))
   val r_data = Reg(Vec(numStages, UInt(xLen.W)))
   // corefuzzing: ALU result taint, pipelined with the result it belongs to
-  val r_secret_alu = Reg(Vec(numStages, Bool()))
-  val r_atk_alu    = Reg(Vec(numStages, Bool()))
+  // [R124GATE2] patch 27 (r124/B51): flops only with ENABLE_IFT (writes below gated); IFT off
+  // a constant-0 wire, so resp/bypass taint is 0 and no flop elaborates.
+  val r_secret_alu = if (ENABLE_IFT) Reg(Vec(numStages, Bool())) else WireInit(VecInit(Seq.fill(numStages)(false.B)))
+  val r_atk_alu    = if (ENABLE_IFT) Reg(Vec(numStages, Bool())) else WireInit(VecInit(Seq.fill(numStages)(false.B)))
   val r_pred = Reg(Vec(numStages, Bool()))
   val alu_out = Mux(io.req.bits.uop.is_sfb_shadow && io.req.bits.pred_data,
     Mux(io.req.bits.uop.ldst_is_rs1, io.req.bits.rs1_data, io.req.bits.rs2_data),
     Mux(io.req.bits.uop.uopc === uopMOV, io.req.bits.rs2_data, alu.io.out))
   r_val (0) := io.req.valid
   r_data(0) := Mux(io.req.bits.uop.is_sfb_br, pc_sel === PC_BRJMP, alu_out)
-  r_secret_alu(0) := io.req.bits.rs1_secret || io.req.bits.rs2_secret
+  if (ENABLE_IFT) r_secret_alu(0) := io.req.bits.rs1_secret || io.req.bits.rs2_secret   // [R124GATE2]
   // [SEEDFIX 2026-09-07] Seed the OWNERSHIP bit at OPERAND CAPTURE, so it rides the
   // existing taint pipeline and reaches BOTH the regfile write and the BYPASS.
   // core.scala:1977 / regfile.scala:79 apply `|| cf_domain_id =/= 0` only when WRITING
@@ -681,13 +676,15 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
   // influence therefore travelled by OWNERSHIP and through MEMORY only, and died at the
   // first cross-domain register hand-off.  spectre-v1 never saw it: its index travels
   // through attacker-WRITTEN memory, never the bypass.
-  r_atk_alu(0)    := io.req.bits.rs1_taint_atk || io.req.bits.rs2_taint_atk || (io.req.bits.uop.cf_domain_id =/= 0.U)
+  if (ENABLE_IFT) r_atk_alu(0)    := io.req.bits.rs1_taint_atk || io.req.bits.rs2_taint_atk || (io.req.bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U)
   r_pred(0) := io.req.bits.uop.is_sfb_shadow && io.req.bits.pred_data
   for (i <- 1 until numStages) {
     r_val(i)  := r_val(i-1)
     r_data(i) := r_data(i-1)
+    if (ENABLE_IFT) {   // [R124GATE2]
     r_secret_alu(i) := r_secret_alu(i-1)
     r_atk_alu(i)    := r_atk_alu(i-1)
+    }
     r_pred(i) := r_pred(i-1)
   }
   io.resp.bits.data := r_data(numStages-1)
@@ -702,10 +699,14 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
   io.bypass(0).bits.data := Mux(io.req.bits.uop.is_sfb_br, pc_sel === PC_BRJMP, alu_out)
   // taint of the ALU result = OR of its source taints, on the bypass path
   io.bypass(0).bits.secret := io.req.bits.rs1_secret || io.req.bits.rs2_secret
+  // [BYPASSATK] attacker taint on the bypass, same seed as the regfile write (D11, bug 1)
+  io.bypass(0).bits.taint_atk := io.req.bits.rs1_taint_atk || io.req.bits.rs2_taint_atk ||
+                                 (io.req.bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U)
   for (i <- 1 until numStages) {
     io.bypass(i).valid := r_val(i-1)
     io.bypass(i).bits.data := r_data(i-1)
     io.bypass(i).bits.secret := r_secret_alu(i-1)
+    io.bypass(i).bits.taint_atk := r_atk_alu(i-1)
   }
 
   // Exceptions
@@ -742,7 +743,11 @@ class MemAddrCalcUnit(implicit p: Parameters)
   // no wakeup snooping or retroactive bus is needed.
   io.resp.bits.secret := io.req.bits.rs1_secret
   // [SEEDFIX] see the note at r_atk_alu.
-  io.resp.bits.taint_atk := io.req.bits.rs1_taint_atk || io.req.bits.rs2_taint_atk || (io.req.bits.uop.cf_domain_id =/= 0.U)
+  // [I4AGUATK] (ruling 100, I-4) the ADDRESS taint is the address operand's (rs1) only, the
+  // twin of `secret` above.  rs2 is the store data; its attacker taint already travels on
+  // data_taint_atk (-> stq data_is_atk).  Was `rs1 || rs2 || domain`: an over-taint of
+  // stq.addr_is_atk, which the AMO response reads (lsu.scala AMOTAINT).
+  io.resp.bits.taint_atk := io.req.bits.rs1_taint_atk || (io.req.bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U)
   io.resp.bits.data_secret := io.req.bits.rs2_secret
   io.resp.bits.data_taint_atk := io.req.bits.rs2_taint_atk
 // [PROBE STRIPPED 2026-09-11] A1PROBE2 -- diagnostic only, purpose discharged.
@@ -918,8 +923,10 @@ abstract class IterativeFunctionalUnit(dataWidth: Int)(implicit p: Parameters)
 {
   val r_uop = Reg(new MicroOp())
   // corefuzzing: taint held for the duration of the iterative op
-  val r_secret = Reg(Bool())
-  val r_atk    = Reg(Bool())
+  // [R124GATE] patch 26 (ruling 124): flops only with ENABLE_IFT; constant 0 otherwise (the
+  // step-12 G3 cf_fu_busy.is_sec read kept r_secret alive in IFT-off builds).
+  val r_secret = if (ENABLE_IFT) Reg(Bool()) else WireInit(false.B)
+  val r_atk    = if (ENABLE_IFT) Reg(Bool()) else WireInit(false.B)
 
   val do_kill = Wire(Bool())
   do_kill := io.req.bits.kill // irrelevant default
@@ -929,9 +936,12 @@ abstract class IterativeFunctionalUnit(dataWidth: Int)(implicit p: Parameters)
     do_kill := IsKilledByBranch(io.brupdate, io.req.bits.uop) || io.req.bits.kill
     r_uop := io.req.bits.uop
     r_uop.br_mask := GetNewBrMask(io.brupdate, io.req.bits.uop)
-    r_secret := io.req.bits.rs1_secret || io.req.bits.rs2_secret || io.req.bits.rs3_secret
-    // [SEEDFIX] see the note at r_atk_alu.
-    r_atk    := io.req.bits.rs1_taint_atk || io.req.bits.rs2_taint_atk || (io.req.bits.uop.cf_domain_id =/= 0.U)
+    if (ENABLE_IFT) {   // [R124GATE]
+      r_secret := io.req.bits.rs1_secret || io.req.bits.rs2_secret || io.req.bits.rs3_secret
+      // [SEEDFIX] see the note at r_atk_alu.
+      r_atk    := io.req.bits.rs1_taint_atk || io.req.bits.rs2_taint_atk || io.req.bits.rs3_taint_atk ||  // [G3RS3ATK]
+                  (io.req.bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U)
+    }
   } .otherwise {
     do_kill := IsKilledByBranch(io.brupdate, r_uop) || io.req.bits.kill
     r_uop.br_mask := GetNewBrMask(io.brupdate, r_uop)
@@ -944,9 +954,13 @@ abstract class IterativeFunctionalUnit(dataWidth: Int)(implicit p: Parameters)
   io.cf_fu_busy.valid        := !io.req.ready
   // truncate explicitly: cf_op_count_id is uopIDCounterWidthCF wide, and only the low
   // inflOpCountWidthCF bits are ever stored (see the port declaration above).
-  io.cf_fu_busy.bits.op_count := r_uop.cf_op_count_id(inflOpCountWidthCF-1, 0)
-  io.cf_fu_busy.bits.is_atk   := r_uop.cf_domain_id =/= 0.U
-  io.cf_fu_busy.bits.is_sec   := r_secret || r_uop.cf_secret_access || r_uop.cf_secret_propagation
+  io.cf_fu_busy.bits.op_count := r_uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))(inflOpCountWidthCF-1, 0)
+  // [I3BUSYATK] (ruling 100, I-3) the occupant's attacker flag is its result attacker taint
+  // (operand taint OR ownership, held in r_atk for the whole latency), not ownership alone:
+  // a victim divide on attacker-chosen operands has attacker-chosen latency.  r_atk is a flop.
+  io.cf_fu_busy.bits.is_atk   := r_atk
+  // [R124GATE] IFT off: the port default (false) stands.
+  if (ENABLE_IFT) io.cf_fu_busy.bits.is_sec := r_secret || r_uop.cf_secret_access.getOrElse(false.B) || r_uop.cf_secret_propagation.getOrElse(false.B)
 
   // assumes at least one pipeline register between request and response
   io.resp.bits.uop := r_uop
@@ -979,7 +993,7 @@ class DivUnit(dataWidth: Int)(implicit p: Parameters)
   // Corefuzzing: OR in divTagCF when request is accepted (parent r_uop := io.req.bits.uop
   // happens first; this second when-block wins on r_uop.cf_fu_bitmap)
   when (io.req.fire) {
-    r_uop.cf_fu_bitmap := io.req.bits.uop.cf_fu_bitmap | (1.U << divTagCF.U)
+    r_uop.cf_fu_bitmap.foreach(_ := io.req.bits.uop.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << divTagCF.U))
   }
 
   // handle pipeline kills and branch misspeculations

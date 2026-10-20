@@ -111,6 +111,13 @@ case class BoomCoreParams(
    * Has no effect on Verilator simulation (CoreFuzzingConfig leaves this false). */
   enableIFTBridge: Boolean = false,
 
+  /* [Task 2.10g, ruling 61] IFT oracle mode: Verilator and OOC only. CoreFuzzingDMIConfig
+   * sets it (WithIFTOracle); no FireSim config may. The tile then keeps, at its boundary,
+   * exactly what a FireSim IFT build keeps: the IFT bridge record outputs (commit lanes and
+   * the squash lane) and the TracerV trace port (insns and time). Without a consumer both are
+   * pruned, and the BoomTile oracle under-counts the FPGA build. */
+  iftOracle: Boolean = false,
+
   /* IFT: compile-time gate for DIFT tracking logic (domain tagging, taint
    * propagation, influencer tracking, secret detection, IFT commit log).
    * When false, all IFT state and logic is elided at FIRRTL emission time.
@@ -123,6 +130,15 @@ case class BoomCoreParams(
    * structures use their hardware-built maximum sizes.
    * Set via WithReconf config fragment. */
   enableReconf: Boolean = false,
+
+  /* [r147/r149] D$ replacement policy DESIGN DEFAULT, the single source of truth for every
+   * BOOM v3 config (stock and reconfig).  Codes (= 0xbc1 bits [5:4], ruling 149):
+   *   0 = PseudoLRU, per set (design default)   1 = TrueLRU, per set
+   *   2 = PseudoLRU alias (same as 0)           3 = random (16-bit LFSR, global)
+   * Reconf off: it is the fixed policy (the cf_dcache_repl_conf fallback).  Reconf on: it is
+   * the reset value of 0xbc1 bits [5:4] (0 -> reset 0x00); software may change it at run time.
+   * DCacheParams.replacementPolicy (rocket-chip) is NOT read by the BOOM v3 D$. */
+  dcacheReplPolicy: Int = 0,
 
   /* CF debug printf: compile-time gate for the corefuzzing debug logs
    * ([FLUSH] squashed-entry dumps in the ROB, [SPECULATIVE][MISPREDICT] in the
@@ -140,6 +156,13 @@ case class BoomCoreParams(
 {
   require(!enableIFTBridge || enableIFT,
     "enableIFTBridge requires enableIFT (cannot export IFT records without IFT tracking)")
+  // [Task 2.10g] The oracle mode stands in for the bridge in Verilator builds. A bridge build
+  // already keeps the records, so the two never combine (this also stops a FireSim IFT config
+  // from inheriting the oracle mode through CoreFuzzingDMIConfig).
+  require(!iftOracle || (enableIFT && !enableIFTBridge),
+    "iftOracle is the Verilator/OOC stand-in for the IFT bridge: it needs enableIFT and no enableIFTBridge")
+  require(dcacheReplPolicy >= 0 && dcacheReplPolicy <= 3,
+    "dcacheReplPolicy must be 0/2 (PseudoLRU), 1 (TrueLRU) or 3 (LFSR random)")
 
   override def traceCustom = Some(new BoomTraceBundle)
   val xLen = 64
@@ -181,6 +204,8 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   // the pattern already used by `chickenCSR` below.
   private def cfIFTEnabled:    Boolean = tileParams.core.asInstanceOf[BoomCoreParams].enableIFT
   private def cfReconfEnabled: Boolean = tileParams.core.asInstanceOf[BoomCoreParams].enableReconf
+  // [r147] D$ replacement design default (BoomCoreParams.dcacheReplPolicy); same early-init rule.
+  private def cfDcacheReplDefault: Int = tileParams.core.asInstanceOf[BoomCoreParams].dcacheReplPolicy
 
   override def chickenCSR = {
     val params = tileParams.core.asInstanceOf[BoomCoreParams]
@@ -256,17 +281,23 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   // DCache reconfiguration CSR (0xbc1)
   // bits [1:0]: set index into dcacheSetOptions = Seq(128, 64, 32, 16)  — index 0 = max
   // bits [3:2]: way index into cacheWayOptions  = Seq(8, 4, 2, 1)       — index 0 = max
-  // bits [5:4]: replacement policy (0=random, 1=TrueLRU, 2=PseudoLRU)
+  // bits [5:4]: replacement policy (r149: 0=PseudoLRU default, 1=TrueLRU, 2=PseudoLRU alias,
+  //             3=LFSR random).  A set/way-only write (bits [5:4]=0) therefore keeps PseudoLRU.
   // Block size is NOT reconfigurable (cacheBlockBytes fixed).
   override def dcacheCSRCF = if (cfReconfEnabled) {
     val mask = BigInt(0x3F)  // 6 bits: 2 for sets, 2 for ways, 2 for replacement policy
-    val init = BigInt(0x0)   // index (0,0,0) = max sizes, random replacement
+    // [r147/r149] reset value: max sets/ways (bits [3:0] = 0) and the design-default replacement
+    // policy in bits [5:4], taken from BoomCoreParams.dcacheReplPolicy (default 0 = PseudoLRU,
+    // so 0x00).  The LRU/PLRU state and the IFT ift_repl_sec/atk memories are zeroed by the
+    // dcache.scala [REPLRST] sweep before first use.
+    val init = BigInt(cfDcacheReplDefault) << 4
     Some(CustomCSR(dcacheCSRIdCF, mask, Some(init)))
   } else None
   // 2-bit index accessors (used directly in dcache.scala)
   def cf_dcache_set_conf  = getOrElse(dcacheCSRCF, _.value(1,0), 0.U)
   def cf_dcache_way_conf  = getOrElse(dcacheCSRCF, _.value(3,2), 0.U)
-  def cf_dcache_repl_conf = getOrElse(dcacheCSRCF, _.value(5,4), 0.U)
+  // [r147] reconf off: the fixed design-default policy (same source as the 0xbc1 reset value).
+  def cf_dcache_repl_conf = getOrElse(dcacheCSRCF, _.value(5,4), cfDcacheReplDefault.U(2.W))
 
 
   // ICache reconfiguration CSR (0xbcb)
@@ -292,11 +323,11 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   def cf_cachectl_wen   = getOrElse(cachectlCSRCF, _.wen, false.B)
   def cf_cachectl_wdata = getOrElse(cachectlCSRCF, _.wdata(1,0), 0.U)
 
-  // [reconf-fix Phase C] D$ status CSR (0xbcd), hardware-published every cycle
-  // via set/sdata (see cf_dcache_status_set below); software writes have no
-  // effect (the continuous hardware set wins).  Layout (stable ABI, doc 30 T4):
-  // [10:0] dirty_count, [11] reconf_blocked, [15:12] applied set/way,
-  // [16] cfg_pending — all tied 0 until their producers land — [17] l1 wipe busy.
+  // [reconf-fix Phase C / 2.10f] D$ status CSR (0xbcd), hardware-published every cycle
+  // via set/sdata (see cf_dcache_status_set below); software writes have no effect.
+  // Layout: [11:0] reserved, read 0 (the dirty counter and guard were dropped by owner
+  // decision, doc 30 addendum); [13:12] applied set idx; [15:14] applied way idx;
+  // [16] geometry change pending (staged, draining or walking); [17] 0xbc4 wipe busy.
   override def dcacheStatusCSRCF = if (cfReconfEnabled) {
     val mask = BigInt("3ffff", 16)
     Some(CustomCSR(dcacheStatusCSRIdCF, mask, Some(BigInt(0))))
@@ -304,6 +335,18 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   // Hardware publication hook: core.scala calls this every cycle with the live
   // status vector.  No-op when the CSR is not built (baseline flavor).
   def cf_dcache_status_set(v: UInt): Unit = dcacheStatusCSRCF.foreach { c =>
+    val idx = decls.indexWhere(_.id == c.id)
+    if (idx >= 0) { csrs(idx).set := true.B; csrs(idx).sdata := v }
+  }
+
+  // [SIDECAR] Task 2.7: IFT statistics CSR (0xbce), read-only, hardware-published every cycle
+  // via set/sdata (cf_ift_stats_set below, called from core.scala under ENABLE_IFT).
+  // Layout: [15:0] squash records lost (D6), [31:16] third same-type drops (D19),
+  // [47:32] row-reuse share of [15:0], [48] sticky ift_squash_ovf.  Bits [63:49] read 0.
+  override def iftStatsCSRCF = if (cfIFTEnabled) {
+    Some(CustomCSR(iftStatsCSRIdCF, BigInt("1ffffffffffff", 16), Some(BigInt(0))))
+  } else None
+  def cf_ift_stats_set(v: UInt): Unit = iftStatsCSRCF.foreach { c =>
     val idx = decls.indexWhere(_.id == c.id)
     if (idx >= 0) { csrs(idx).set := true.B; csrs(idx).sdata := v }
   }
@@ -319,6 +362,9 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   // 3 - Core logs
   // 4 - ROB logs
   // 5 - BPD logs
+  // 6 - Frontend logs
+  // 7 - D$ replacement-port log ([REPLUPD], patch 30): OFF at init (not in `init` below), so
+  //     the per-update print is silent unless a test sets it (csrsi 0xbc0, ...)
 
   // The generateCustomCSR function in rocket/CSR.scala (line 750) requires the mask
   // value of a CSR is >= 0. Having the mask to be 0xffffffff violates that requirement
@@ -487,6 +533,7 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   def cf_debug_rob_enable = getOrElse(debugCSRCF, _.value(4), true.B)
   def cf_debug_bpd_enable = getOrElse(debugCSRCF, _.value(5), false.B)
   def cf_debug_frontend_enable = getOrElse(debugCSRCF, _.value(6), false.B)
+  def cf_debug_repl_enable = getOrElse(debugCSRCF, _.value(7), false.B)   // [REPLUPD] patch 30
 
   // Core-width reconfiguration CSR (0xbcc)
   // 2-bit index selects effective decode width: 0→N=4, 1→N=2, 2→N=1; index 3 is reserved.
@@ -647,8 +694,10 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val BRANCH_PRINTF       = boomParams.enableBranchPrintf // dump branch predictor results
   val MEMTRACE_PRINTF     = boomParams.enableMemtracePrintf // dump trace of memory accesses to L1D for debugging
   val ENABLE_IFT_BRIDGE   = boomParams.enableIFTBridge // export IFT records as tile IO for FireSim IFTBridge
+  val IFT_ORACLE          = boomParams.iftOracle       // [Task 2.10g] Verilator/OOC: keep the record outputs at the tile
   val ENABLE_IFT          = boomParams.enableIFT       // compile-time gate for DIFT tracking logic
   val ENABLE_RECONF       = boomParams.enableReconf    // compile-time gate for runtime reconfigurability
+  val DCACHE_REPL_DEFAULT = boomParams.dcacheReplPolicy // [r147] D$ replacement design default (0/1/2)
   val ENABLE_CF_DEBUG_PRINTF = boomParams.enableCfDebugPrintf // compile-time gate for [FLUSH]/[SPECULATIVE] debug printfs
 
   //************************************

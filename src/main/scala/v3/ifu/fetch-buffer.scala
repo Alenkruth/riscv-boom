@@ -24,7 +24,7 @@ import freechips.rocketchip.util._
 
 import boom.v3.common._
 import boom.v3.exu.{BrUpdateInfo}
-import boom.v3.util.{BoolToChar, MaskUpper, Sext, SpeculativePrintf, appendModuleTag, addInfluencer, addInfluencerBatch, InfluencerCandidate, inflBitmapFromList}
+import boom.v3.util.{BoolToChar, MaskUpper, Sext, SpeculativePrintf, appendModuleTag, inflBitmapFromList, fetchFlagsToList}
 import freechips.rocketchip.util.CoreFuzzingConstants
 // imports for corefuzzing
 
@@ -38,6 +38,8 @@ import freechips.rocketchip.util.CoreFuzzingConstants
 class FetchBufferResp(implicit p: Parameters) extends BoomBundle
 {
   val uops = Vec(coreWidth, Valid(new MicroOp()))
+  // IFT overhaul Phase 3, Task 3.3: fetch-time IFT information, beside the uop (not in it).
+  val ift  = Vec(coreWidth, new FetchIftInfo)
 }
 
 /**
@@ -86,6 +88,15 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   val ram = Reg(Vec(numEntries, new MicroOp))
   ram.suggestName("fb_uop_ram")
   val deq_vec = Wire(Vec(numRows, Vec(coreWidth, new MicroOp)))
+  // IFT overhaul Phase 3, Task 3.3: FetchIftInfo per entry, written and read with `ram`.
+  // [R124GATE] patch 26 (ruling 124): a register only with ENABLE_IFT.  IFT off: a constant-0
+  // wire (no write below), so the fb_ift_ram flops and the printf-only fb_list cone go: 64 x 21
+  // (fetch_flags 9 + btb_sec_pc 12, the fields the IFT-off reference kept; the full FetchIftInfo is
+  // 37 bits, run-list step 3 measures the real count).
+  val ram_ift = if (ENABLE_IFT) Reg(Vec(numEntries, new FetchIftInfo))
+                else WireInit(0.U.asTypeOf(Vec(numEntries, new FetchIftInfo)))
+  ram_ift.suggestName("fb_ift_ram")
+  val deq_ift_vec = Wire(Vec(numRows, Vec(coreWidth, new FetchIftInfo)))
 
   // corefuzzing: track which RAM slots actually hold valid (enqueued, not yet dequeued/cleared)
   // data. Used to suppress [FLUSH] printing for uninitialized or already-consumed slots.
@@ -187,6 +198,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // Input microops.
   val in_mask = Wire(Vec(fetchWidth, Bool()))
   val in_uops = Wire(Vec(fetchWidth, new MicroOp()))
+  val in_ift  = Wire(Vec(fetchWidth, new FetchIftInfo))
 
   // corefuzzing - ak
   // Running counter for CoreFuzzing uop IDs. This register holds the
@@ -195,7 +207,10 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // on overflow. We update this register when we actually commit an
   // enqueue (see when (do_enq) below).
   val uopCount = RegInit(0.U(uopIDCounterWidthCF.W))
-  dontTouch(uopCount)
+  // [R124GATE] patch 33 (p4-28-equiv.md row 7 side finding): its only reader is cf_op_count_id,
+  // an Option that is None without ENABLE_IFT, so IFT off the dontTouch alone kept 16 dead FF
+  // (and the adder) alive.  Kept with IFT on (Verilog unchanged there).
+  if (ENABLE_IFT) dontTouch(uopCount)
 
   // Step 1: Convert FetchPacket into a vector of MicroOps.
   for (b <- 0 until nBanks) {
@@ -251,7 +266,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     // Resize priorValids to the counter width before adding
     val id = (uopCount + priorValids)(uopIDCounterWidthCF - 1, 0)
     // Only assign opcount to valid slots; invalid slots get 0 to avoid gaps
-    in_uops(i).cf_op_count_id := Mux(in_mask(i), id, 0.U)
+    in_uops(i).cf_op_count_id.foreach(_ := Mux(in_mask(i), id, 0.U))
   }
 
   // corefuzzing: Initialize all IFT cf_* fields for each newly created micro-op.
@@ -262,109 +277,98 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // ras/bpd/btb bits are set unconditionally (path tracking). Domain mismatch events
   // are tracked separately via the influencer list (INFL_RAS_STATE, INFL_BPD_STATE, etc.).
   for (i <- 0 until fetchWidth) {
-    in_uops(i).cf_fu_bitmap            := (1.U << fbTagCF.U) | (1.U << icacheTagCF.U) | (1.U << itlbTagCF.U) | (1.U << ftqTagCF.U) | (1.U << rasTagCF.U) | (1.U << bpdTagCF.U) | (1.U << btbTagCF.U)
+    in_uops(i).cf_fu_bitmap.foreach(_ := (1.U << fbTagCF.U) | (1.U << icacheTagCF.U) | (1.U << itlbTagCF.U) | (1.U << ftqTagCF.U) | (1.U << rasTagCF.U) | (1.U << bpdTagCF.U) | (1.U << btbTagCF.U))
     // Compute domain_id from PC at fetch-buffer fill time (domain is purely PC-based).
     // This ensures [FLUSH] SRC=0 entries have the correct domain when clear fires.
     val fb_in_attacker = (io.cf_attacker_start_addr =/= io.cf_attacker_end_addr) &&
                          (in_uops(i).debug_pc >= io.cf_attacker_start_addr) &&
                          (in_uops(i).debug_pc < io.cf_attacker_end_addr)
-    in_uops(i).cf_domain_id            := fb_in_attacker.asUInt
-    in_uops(i).cf_speculated           := false.B
-    in_uops(i).cf_attacker_influence   := false.B
-    in_uops(i).cf_secret_access        := false.B
-    in_uops(i).cf_secret_propagation   := false.B
-    in_uops(i).cf_secret_transmission  := false.B
-    in_uops(i).cf_single_step          := false.B
+    in_uops(i).cf_domain_id.foreach(_ := fb_in_attacker.asUInt)
+    in_uops(i).cf_attacker_influence.foreach(_ := false.B)
+    in_uops(i).cf_secret_access.foreach(_ := false.B)
+    in_uops(i).cf_secret_propagation.foreach(_ := false.B)
+    in_uops(i).cf_secret_transmission.foreach(_ := false.B)
+    in_uops(i).cf_win_sec.foreach(_ := false.B)   // [IMPLWIN] set below
+    in_uops(i).cf_win_atk.foreach(_ := false.B)
+    in_uops(i).cf_opnd_wsec.foreach(_ := false.B)   // set at register-read
+    in_uops(i).cf_opnd_watk.foreach(_ := false.B)
+    in_uops(i).cf_wep_sec.foreach(_ := 0.U)   // [WINEXP] set at dispatch
+    in_uops(i).cf_wep_atk.foreach(_ := 0.U)
+    in_uops(i).cf_dwin_sec.foreach(_ := false.B)   // [WINMEM] set at register-read
+    in_uops(i).cf_dwin_atk.foreach(_ := false.B)
     // doc 67 Part B: carry "this ret's RAS-predicted top was cross-domain" to the ROB, where
     // the RAS edge is raised ONLY if the ret then mispredicts (real ret2spec) -- not at fetch
     // on every cross-domain call (that was the co-location pollution).
-    in_uops(i).cf_ras_pred_xdom        := io.enq.bits.ras_domain_mismatch && in_uops(i).taken
-    in_uops(i).cf_influencer_list      := 0.U.asTypeOf(in_uops(i).cf_influencer_list)
-    in_uops(i).cf_infl_dropped         := 0.U
-    in_uops(i).cf_src_tainted          := false.B
+    in_uops(i).cf_ras_pred_xdom.foreach(_ := io.enq.bits.ras_domain_mismatch.getOrElse(false.B) && in_uops(i).taken)
+    // [ABRGATE] zero defaults so the victim-only `when` below is the only writer; with the
+    // DontCare default firtool folded the gate away (D11, bug 3).
+    // [CNTDZERO] Task 0.14 (0.10 review Minor 4): the slot's contention state is loaded from
+    // in_uop at dispatch; without these the DontCare above reaches it (Bug 3 pattern).
   }
 
-  // corefuzzing: inject fetch-side influencers in parallel using addInfluencerBatch.
-  // All 8 candidates are evaluated from a single zero-base template and the result is
-  // broadcast to all fetchWidth uops (~10 gate levels, computed once vs fetchWidth times).
+  // corefuzzing: fetch-side influencers.  IFT overhaul Phase 3, Task 3.3: the fetch buffer no
+  // longer builds a list.  It records the 10 packet-level flags in FetchIftInfo; dispatch
+  // turns them into the first candidates of the base list (fetchFlagCandidates in util.scala,
+  // same order as the old fetch batch).
   //
   // is_atk approximation: use any_is_victim = OR(domain=0 across all uops in packet).
   // This is conservative (never a false negative): if any uop is a victim, all uops get
   // is_atk=true for domain-mismatch influencers. Attacker-domain uops in a mixed-domain
   // packet may get is_atk=true (false positive), which is acceptable.
-  val any_is_victim  = VecInit((0 until fetchWidth).map(i => in_uops(i).cf_domain_id === 0.U)).reduce(_ || _)
-  val ras_pop_secret = io.enq.bits.ras_pop_secret
+  val any_is_victim  = VecInit((0 until fetchWidth).map(i => in_uops(i).cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U)).reduce(_ || _)
+  val ras_pop_secret = io.enq.bits.ras_pop_secret.getOrElse(false.B)   // [R124GATE3] Option field
+  // doc 67 Part B: ras_domain_mismatch is not a fetch flag (the RAS edge is raised at the ROB
+  // only when a cross-domain ret mispredicts); ras_pop_secret stays.
+  // [GHISTFIELD/GHISTATK 2026-09-08] the GHR window rides the two counters, not a slot.
+  // [FIFO10] step 10 (ruling 94): bits 8/9 (ITLB domain/secret) removed with the ITLB shadow.
+  // [BTBDISP] step 16 (owner ruling 110): bit 7 also takes the BTB/uBTB displacement filter
+  // (a fetch of the tag a secret allocation displaced).  No value taint: the s_prop below still
+  // reads btb_secret_mismatch alone.  The edge's s_prop SUMMARY bit is set at ROB enqueue from
+  // the base list ([RSTICKY] step 17, R-STICKY: every is_secret edge sets sticky s_prop).
+  // [BTBATK] DF-btbatk: bit 8 = fetch of a tag an ATTACKER-domain BTB/uBTB allocation displaced,
+  // victim packets only (any_is_victim, the gate of every other attacker fetch edge: the
+  // attacker's own fetches are not influenced by themselves).  Its PC rides btb_sec_pc.
+  // [R124GATE] btb_atk_disp / btb_sec_disp / btb_sec_pc are None without ENABLE_IFT.
+  val fetch_flags = Cat(io.enq.bits.btb_atk_disp.getOrElse(false.B) && any_is_victim, // 8
+                        io.enq.bits.btb_secret_mismatch.getOrElse(false.B) ||
+                        io.enq.bits.btb_sec_disp.getOrElse(false.B),           // 7
+                        io.enq.bits.btb_target_xdom.getOrElse(false.B),        // 6
+                        io.enq.bits.btb_domain_mismatch.getOrElse(false.B),    // 5
+                        io.enq.bits.bpd_secret_mismatch.getOrElse(false.B),    // 4
+                        io.enq.bits.bpd_domain_mismatch.getOrElse(false.B),    // 3
+                        ras_pop_secret,                     // 2
+                        io.enq.bits.icache_secret_mismatch.getOrElse(false.B), // 1
+                        io.enq.bits.icache_domain_mismatch.getOrElse(false.B)) // 0
+  // [BROADATK] the attacker flag the old batch raised: every domain-mismatch candidate is
+  // is_atk = any_is_victim, the secret-mismatch ones are is_atk = false.
+  val fetch_dom_atk = (io.enq.bits.icache_domain_mismatch.getOrElse(false.B) || io.enq.bits.bpd_domain_mismatch.getOrElse(false.B) ||
+                       io.enq.bits.btb_domain_mismatch.getOrElse(false.B) || io.enq.bits.btb_target_xdom.getOrElse(false.B)) && any_is_victim
 
-  // Zero-base template: ensures base_idx=0 so slot = prefix(k) only.
-  val fb_base_tmpl = Wire(in_uops(0).cloneType)
-  fb_base_tmpl := in_uops(0)
-  fb_base_tmpl.cf_influencer_list    := 0.U.asTypeOf(in_uops(0).cf_influencer_list)
-  fb_base_tmpl.cf_infl_dropped       := 0.U
-  // Break combinational cycle: addInfluencerBatch reads cf_attacker_influence via WireInit,
-  // and the result is written back to in_uops.cf_attacker_influence.  Zero it here so the
-  // batch output depends only on candidate conditions, not on its own output.
-  // Semantics are preserved: in_uops(i).cf_attacker_influence is already false.B at line 250.
-  fb_base_tmpl.cf_attacker_influence := false.B
-
-  val fb_post = addInfluencerBatch(fb_base_tmpl, Seq(
-    InfluencerCandidate(io.enq.bits.icache_domain_mismatch, 0.U, INFL_ICACHE_STATE, any_is_victim, false.B),
-    InfluencerCandidate(io.enq.bits.icache_secret_mismatch, 0.U, INFL_ICACHE_STATE, false.B,       true.B),
-    // doc 67 Part B: ras_domain_mismatch influencer REMOVED from fetch (co-location pollution
-    // -- fired on every cross-domain call). RAS edge is now raised at the ROB only when a
-    // cross-domain ret MISPREDICTS (cf_ras_pred_xdom + b2.mispredict). ras_pop_secret stays.
-    InfluencerCandidate(ras_pop_secret,                      0.U, INFL_RAS_STATE,    false.B,       true.B),
-    InfluencerCandidate(io.enq.bits.bpd_domain_mismatch,    0.U, INFL_BPD_STATE,    any_is_victim, false.B),
-    InfluencerCandidate(io.enq.bits.bpd_secret_mismatch,    0.U, INFL_BPD_STATE,    false.B,       true.B),
-    InfluencerCandidate(io.enq.bits.btb_domain_mismatch,    0.U, INFL_BTB_STATE,    any_is_victim, false.B),
-    InfluencerCandidate(io.enq.bits.btb_target_xdom,        0.U, INFL_BTB_TARGET_INJECT, any_is_victim, false.B),
-    InfluencerCandidate(io.enq.bits.btb_secret_mismatch,    0.U, INFL_BTB_STATE,    false.B,       true.B),
-    InfluencerCandidate(io.enq.bits.itlb_domain_mismatch,   0.U, INFL_ITLB_STATE,   any_is_victim, false.B),
-    InfluencerCandidate(io.enq.bits.itlb_secret_mismatch,   0.U, INFL_ITLB_STATE,   false.B,       true.B),
-    // C3 -- deliberately LAST.  addInfluencerBatch appends-and-drops into 4 slots, so
-    // position is priority.  The GHR window stays armed for up to globalHistoryLength
-    // branches, making this the highest-frequency candidate here; giving it an early
-    // slot would evict REG_DATAFLOW value edges, a loss no parser can undo.
-    // [GHISTOC 2026-09-08] oc is no longer 0.  It carries the GHR window counter, so the
-    // edge has real provenance: k = globalHistoryLength - oc is the number of branch
-    // retirements between the branch that tainted the GHR and this fetch, letting the
-    // parser/fuzzer walk back k retirements and name that branch.  This is what makes
-    // ty=19 a legitimate edge rather than a producer-less window flag -- and is why it
-    // stays in the influencer vector instead of becoming a uop bit.
-    // [GHISTFIELD 2026-09-08] Both INFL_GHIST_STATE candidates REMOVED -- they squatted a
-    // slot at fetch and caused later precise edges to be dropped (see micro-op.scala).
-    // The information now rides cf_atk_branch_ctr / cf_sec_branch_ctr, set below.
-    // [GHISTATK 2026-09-08] The attacker twin, gated by any_is_victim exactly like the
-    // BPD/BTB/ITLB/RAS/ICACHE domain-mismatch candidates above.  That gate is what keeps
-    // it useful: the attacker's OWN fetches are domain=1 and excluded, so this fires only
-    // on VICTIM fetches whose prediction consulted a GHR the attacker filled -- which is
-    // precisely spectre-v1's mistraining.  Placed last with the secret twin for the same
-    // slot-priority reason: the GHR window is high-frequency and must never evict a
-    // REG_DATAFLOW value edge.
-  ))
-
-  // Broadcast shared influencer list to all uops in the packet.
   for (i <- 0 until fetchWidth) {
-    in_uops(i).cf_influencer_list := fb_post.cf_influencer_list
-    in_uops(i).cf_infl_dropped    := fb_post.cf_infl_dropped
-    when (fb_post.cf_attacker_influence) {
-      in_uops(i).cf_attacker_influence := true.B
-    }
-    // Secret propagation: set when BPD, BTB, or RAS was trained/pushed by a secret instruction
-    when (io.enq.bits.bpd_secret_mismatch || io.enq.bits.btb_secret_mismatch || ras_pop_secret ||
-          io.enq.bits.ghist_secret) {
-      in_uops(i).cf_secret_propagation := true.B
-    }
+    in_ift(i).fetch_flags   := fetch_flags
+    in_ift(i).any_is_victim := any_is_victim
+    in_ift(i).single_step   := false.B     // set at decode
+    in_ift(i).btb_sec_pc    := io.enq.bits.btb_sec_pc.getOrElse(0.U)   // [BTBDISP] PC[13:2] for bit 7 (else bit 8)
     // [GHISTFIELD] Carry the window counters.  any_is_victim on the attacker side, matching
     // the gate the other domain-mismatch channels use: the attacker's own fetches are
-    // domain=1 and must not be marked as influenced by themselves.  The summary bits are
-    // still raised, so BROADATK coverage is unchanged -- only the slot squatting is gone.
-    when (io.enq.bits.ghist_secret) {
-      in_uops(i).cf_sec_branch_ctr     := io.enq.bits.ghist_secret_ctr
-      in_uops(i).cf_secret_propagation := true.B
+    // domain=1 and must not be marked as influenced by themselves.  Explicit zero when the
+    // gate is off ([ABRGATE]: a DontCare default let firtool fold the gate away, Bug 3).
+    in_ift(i).sec_branch_ctr := Mux(io.enq.bits.ghist_secret.getOrElse(false.B), io.enq.bits.ghist_secret_ctr.getOrElse(0.U(7.W)), 0.U)
+    in_ift(i).atk_branch_ctr := Mux(io.enq.bits.ghist_atk.getOrElse(false.B) && any_is_victim, io.enq.bits.ghist_atk_ctr.getOrElse(0.U(7.W)), 0.U)
+
+    when (fetch_dom_atk || (io.enq.bits.ghist_atk.getOrElse(false.B) && any_is_victim)) {
+      in_uops(i).cf_attacker_influence.foreach(_ := true.B)
     }
-    when (io.enq.bits.ghist_atk && any_is_victim) {
-      in_uops(i).cf_atk_branch_ctr     := io.enq.bits.ghist_atk_ctr
-      in_uops(i).cf_attacker_influence := true.B
+    // [IMPLWIN] step 20: fetched inside the open window -> window-tainted result register
+    // (destination rule for control flow).  Same gates as the uop bits.  core.scala ORs the
+    // dispatch-time window in for uops fetched before the arming branch resolved.
+    in_uops(i).cf_win_sec.foreach(_ := io.enq.bits.ghist_secret.getOrElse(false.B))
+    in_uops(i).cf_win_atk.foreach(_ := io.enq.bits.ghist_atk.getOrElse(false.B) && any_is_victim)
+    // Secret propagation: set when BPD, BTB, or RAS was trained/pushed by a secret instruction,
+    // or the GHR window is secret.
+    when (io.enq.bits.bpd_secret_mismatch.getOrElse(false.B) || io.enq.bits.btb_secret_mismatch.getOrElse(false.B) || ras_pop_secret ||
+          io.enq.bits.ghist_secret.getOrElse(false.B)) {
+      in_uops(i).cf_secret_propagation.foreach(_ := true.B)
     }
   }
 
@@ -421,6 +425,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     for (j <- 0 until numEntries) {
       when (do_enq && in_mask(i) && enq_idxs(i)(j)) {
         ram(j) := in_uops(i) // in_uops_tagged(i)
+        if (ENABLE_IFT) ram_ift(j) := in_ift(i)   // [R124GATE]
         ram_valid(j) := true.B
         // for debugging: printing ram index for every enqueue - alex
         // printf(p"($rowsUsed, $coreWidth, enq, $j), ")
@@ -454,6 +459,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // Generate vec for dequeue read port.
   for (i <- 0 until numEntries) {
     deq_vec(i/coreWidth)(i%coreWidth) := ram(i)
+    deq_ift_vec(i/coreWidth)(i%coreWidth) := ram_ift(i)
   }
 
   // Sub-row mask: slot w is active when it belongs to the current sub-group.
@@ -470,6 +476,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   val deq_valids_sub = VecInit(deq_valids.zip(sub_row_mask).map { case (v, m) => v && m })
   io.deq.bits.uops zip deq_valids_sub        map {case (d,v) => d.valid := v}
   io.deq.bits.uops zip deq_vec(head_row)      map {case (d,q) => d.bits  := q}
+  io.deq.bits.ift  := deq_ift_vec(head_row)
   io.deq.valid := deq_valids_sub.reduce(_||_)
 
   //-------------------------------------------------------------
@@ -577,34 +584,36 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
           // corefuzzing: read RAM entry directly — no WireInit copy needed since we don't
           // modify the influencer list here.  fl/floc are separate fields (like spec_atk/spec_oc).
           val base_uop = ram(i)
+          // Task 3.3: the fetch list is no longer in the uop; rebuild it (printf only).
+          val fb_list  = fetchFlagsToList(ram_ift(i).fetch_flags, ram_ift(i).any_is_victim, ram_ift(i).btb_sec_pc)
           val fl_cross_domain = io.brupdate.b2.mispredict &&
-            (io.brupdate.b2.uop.cf_domain_id =/= base_uop.cf_domain_id)
+            (io.brupdate.b2.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= base_uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)))
           val fl_op_count = Mux(io.brupdate.b2.mispredict,
-            io.brupdate.b2.uop.cf_op_count_id, 0.U)
+            io.brupdate.b2.uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)), 0.U)
           when (ram_valid(i)) {
             val inflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
-              base_uop.cf_influencer_list(k).valid,
-              base_uop.cf_influencer_list(k).op_count,
-              base_uop.cf_influencer_list(k).infl_type,
-              base_uop.cf_influencer_list(k).is_atk,
-              base_uop.cf_influencer_list(k).is_secret
+              fb_list.edges(k).valid,
+              fb_list.edges(k).op_count,
+              fb_list.edges(k).infl_type,
+              fb_list.edges(k).is_atk,
+              fb_list.edges(k).is_secret
             ))
             printf(flushFmt, (Seq[Bits](
               Sext.apply(base_uop.debug_pc(vaddrBits-1,0), xLen),
               base_uop.debug_inst,
-              base_uop.cf_domain_id,
-              base_uop.cf_speculated,
-              base_uop.cf_attacker_influence,
-              base_uop.cf_secret_access,
-              base_uop.cf_secret_propagation,
-              base_uop.cf_secret_transmission,
-              base_uop.cf_op_count_id,
-              base_uop.cf_spec_branch_is_atk,
-              base_uop.cf_spec_branch_op_id,
+              base_uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)),
+              0.U,   // [THINUOP] Task 3.5: spec / spec_atk / spec_oc / dcy / srob / sstq were the removed
+                     // MicroOp fields, always zero at the fetch buffer (the SRC=0 record); printed as 0
+              base_uop.cf_attacker_influence.getOrElse(false.B),
+              base_uop.cf_secret_access.getOrElse(false.B),
+              base_uop.cf_secret_propagation.getOrElse(false.B),
+              base_uop.cf_secret_transmission.getOrElse(false.B),
+              base_uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)),
+              0.U, 0.U,
               fl_cross_domain, fl_op_count,
-              base_uop.cf_fu_bitmap,
-              0.U, inflBitmapFromList(base_uop.cf_influencer_list),
-              base_uop.cf_infl_dropped, base_uop.cf_cntd_deny_count, base_uop.cf_stall_cycles_rob, base_uop.cf_stall_cycles_stq, base_uop.cf_infl_oc_aliased
+              base_uop.cf_fu_bitmap.getOrElse(0.U(numModules.W)),
+              0.U, inflBitmapFromList(fb_list.edges),
+              fb_list.dropped, 0.U, 0.U, 0.U, fb_list.aliased
             ) ++ inflArgs): _*)
           }
         }
