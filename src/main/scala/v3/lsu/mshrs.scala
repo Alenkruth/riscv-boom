@@ -888,6 +888,11 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     // primary or a merged secondary: cf_req_addr_atk).  Its PC rides on cf_asec_busy.bits, which
     // is now the PC of the nack's blocking access, secret-first.  IFT only.
     val cf_aatk_busy = if (ENABLE_IFT) Some(Output(Bool())) else None
+    // [NACKCONF] patch 68 (V12): per lane, the MSHR(s) this lane's request CONFLICTS with hold an
+    // attacker-influenced request: the same-set MSHR when one matches (same-set miss, a hit on a line it is
+    // evicting, its same-set writeback), else any valid MSHR (MSHRs full).  Same registered state as
+    // cf_aatk_busy.  IFT only.
+    val cf_nack_aatk = if (ENABLE_IFT) Some(Output(Vec(memWidth, Bool()))) else None
     // corefuzzing: fill-completion event — fires when an MSHR meta_write completes
     val cf_meta_write_fill = Output(Valid(new Bundle {
       val idx      = UInt(idxBits.W)
@@ -1142,6 +1147,16 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
   if (ENABLE_IFT) {
     val cf_aatk_live = mshrs.map(m => m.io.way.valid && (m.io.cf_req_domain(0) || m.io.cf_req_addr_atk))
     io.cf_aatk_busy.get := RegNext(cf_aatk_live.reduce(_ || _), false.B)
+    // [NACKCONF] patch 68 (V12, owner 2026-10-19 16:3x): the nack's attacker flag names the CONFLICTING MSHR, not
+    // ANY attacker MSHR.  The per-MSHR bits are registered (as cf_aatk_busy: nMSHRs FF); idx_matches(w) is the
+    // existing same-set compare of lane w's request (it also feeds tag_match / pri_val -> ready -> s2_nack, so
+    // this AND-OR + 2:1 select runs beside the much deeper nack path; it ends at the LSU's LDQ flag write,
+    // whose enable is that nack): 0 levels on every endpoint.  About 2 x (8 AND-OR + 1) LUT.
+    val cf_aatk_q = cf_aatk_live.map(RegNext(_, false.B))
+    for (w <- 0 until memWidth) {
+      io.cf_nack_aatk.get(w) := Mux(idx_match(w), (idx_matches(w) zip cf_aatk_q).map { case (m, a) => m && a }.reduce(_ || _),
+                                    cf_aatk_q.reduce(_ || _))
+    }
     io.cf_asec_busy.bits  := RegNext(PriorityMux(cf_asec_live ++ cf_aatk_live :+ true.B,
                                                  mshrs.map(_.io.cf_req_res_pc) ++ mshrs.map(_.io.cf_req_pc12) :+
                                                  0.U(inflPcBitsCF.W)))

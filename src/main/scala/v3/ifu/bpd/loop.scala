@@ -182,7 +182,15 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
         wentry.p_cnt := io.update_meta.s_cnt
       }
 
-      wentry.domain.foreach(_ := io.update_domain)
+      // [LOOPAGE] patch 69 (V14, owner 2026-10-19 16:3x): an update whose tag does not match and that does not
+      // replace the entry (a learned entry: "do nothing"; a confident entry with age > 0: age - 1) leaves the
+      // entry's tag / counters / confidence as they are, so it keeps its writer's domain (P5: a state entry takes
+      // the domain of the update that writes it).  Every other branch (a tag match, or a replacement with the
+      // new tag) takes the update's domain as before.  The secret shadow below keeps its rewrite (not in V14;
+      // the same shape, listed as open).  About 2 LUT (a 2:1 on the 1-bit domain by terms the when-chain already
+      // computes), 0 FF, 0 levels (it ends at the entries register).  IFT off: domain is None.
+      val cf_no_owner = !tag_match && (entry.conf === 7.U || (entry.conf =/= 0.U && entry.age =/= 0.U))
+      wentry.domain.foreach(_ := Mux(cf_no_owner, entry.domain.getOrElse(0.U(1.W)), io.update_domain))
       wentry.secret.foreach(_ := io.update_secret)
       entries(io.update_idx) := wentry
     } .elsewhen (io.update_repair && !doing_reset) {

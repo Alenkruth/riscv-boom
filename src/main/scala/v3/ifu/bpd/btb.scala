@@ -97,6 +97,12 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   val btb_domain  = Seq.fill(nWays) { SyncReadMem(nSets, Vec(bankWidth, UInt(1.W))) }
   // corefuzzing: secret shadow — 1 if entry was trained by a secret-dependent instruction
   val btb_secret  = Seq.fill(nWays) { SyncReadMem(nSets, Vec(bankWidth, Bool())) }
+  // [EBTBDOM] patch 65 (V9, owner 2026-10-19 16:3x): domain shadow of the extended-target table.  ebtb holds
+  // ONE target per set, shared by every way and slot whose entry has extended = 1, so an allocation of either
+  // domain overwrites the target a resident entry of the other domain jumps to, while that entry's meta domain
+  // is unchanged (no BTB_STATE edge: under-taint of a branch-target-injection path).  1 bit per ebtb set,
+  // written with ebtb (the update's domain), read with it.  IFT only (no memory, no port IFT off).
+  val ebtb_domain = if (ENABLE_IFT) Some(SyncReadMem(extendedNSets, UInt(1.W))) else None
 
   val mems = (((0 until nWays) map ({w:Int => Seq(
     (f"btb_meta_way$w", nSets, bankWidth * btbMetaSz),
@@ -105,6 +111,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   val s1_req_rbtb    = VecInit(btb.map { b => VecInit(b.read(s0_idx_masked, s0_valid).map(_.asTypeOf(new BTBEntry))) })
   val s1_req_rmeta   = VecInit(meta.map { m => VecInit(m.read(s0_idx_masked, s0_valid).map(_.asTypeOf(new BTBMeta))) })
   val s1_req_rebtb   = ebtb.read(s0_idx_masked, s0_valid)
+  val s1_req_rebdom  = ebtb_domain.map(_.read(s0_idx_masked, s0_valid)).getOrElse(0.U(1.W))   // [EBTBDOM] patch 65
   val s1_req_tag     = s1_idx >> log2Ceil(nSets)
   // corefuzzing: domain shadow read — same index/enable as btb/meta
   // [R124GATE3] patch 28 (B51): btb_domain is read/written only with ENABLE_IFT; IFT off it has no ports
@@ -165,8 +172,12 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   }
 
   // corefuzzing: BTB domain mismatch — any hit entry was last updated by a different domain
+  // [EBTBDOM] patch 65: ...or the hit entry jumps through ebtb (extended) and ebtb was last written by the other
+  // domain.  entry.extended comes through the same hit-way select as the domain bit (parallel); the slot term
+  // goes from 3 to 5 inputs, still one LUT after the selects: 0 levels (it ends at the f2 RegNext).
   val s1_btb_domain_mismatch = VecInit((0 until bankWidth).map { w =>
-    s1_hits(w) && (s1_req_rdomain(s1_hit_ways(w))(w) =/= s1_domain)
+    s1_hits(w) && ((s1_req_rdomain(s1_hit_ways(w))(w) =/= s1_domain) ||
+                   (s1_req_rbtb(s1_hit_ways(w))(w).extended && s1_req_rebdom =/= s1_domain))
   }).reduce(_||_)
   // corefuzzing: BTB secret mismatch — any hit entry was trained by a secret instruction
   // [BPDMASK] r170 A (DF-dt-sprop): a slot below the fetch PC, or a bank whose request is not
@@ -288,6 +299,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   }
   when (s1_update_wbtb_mask =/= 0.U && offset_is_extended) {
     ebtb.write(s1_update_idx_masked, s1_update.bits.target)
+    ebtb_domain.foreach(_.write(s1_update_idx_masked, s1_update.bits.cf_domain_id.getOrElse(0.U(1.W))))   // [EBTBDOM]
   }
 
   // [BTBDISP 2026-10-13, series-r step 16, owner ruling 110] BTB displacement residue, tracked

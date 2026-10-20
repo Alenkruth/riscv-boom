@@ -421,6 +421,10 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   // [FTQATK] patch 47 (r173 (5)): per brinfos lane, a br/jalr resolved with an attacker-tainted
   // condition / target (cond_atk) at this ftq_idx; the FTQ ORs it into the predictor update domain.
   val cf_atk_ftq_updates = if (ENABLE_IFT) Some(Output(Vec(coreWidth, Valid(UInt(log2Ceil(ftqSz).W))))) else None
+  // [FTQFULL] patch 59 (was 57; owner 2026-10-19, item D3): a fetch packet was held at f4 because the FTQ was
+  // full (ftq.io.enq.ready = 0), registered here so the route to the core starts at a flop.  Read
+  // only by the core's FTQ-starvation edge (core.scala [FTQFULL]).  IFT only.
+  val cf_ftq_full = if (ENABLE_IFT) Some(Input(Bool())) else None
 }
 
 /**
@@ -1249,6 +1253,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f4.io.enq.valid := f3.io.deq.valid && !f3_clear
   f4.io.enq.bits  := f3_fetch_bundle
   f4.io.deq.ready := fb.io.enq.ready && ftq.io.enq.ready && !f4_delay
+  // [FTQFULL] patch 59: ftq.io.enq.ready and f4.io.deq.valid are registers (FTQ RegNext, f4 Queue),
+  // so this is 1 LUT -> 1 FF, off every fetch path (a new leaf).  IFT off: no port, no flop.
+  io.cpu.cf_ftq_full.foreach(_ := RegNext(f4.io.deq.valid && !ftq.io.enq.ready, false.B))
 
   fb.io.enq.valid := f4.io.deq.valid && ftq.io.enq.ready && !f4_delay
   fb.io.enq.bits  := f4.io.deq.bits

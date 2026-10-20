@@ -209,14 +209,23 @@ class IssueUnitCollapsing(
       // ty=2 edge discarded these bits anyway (rob.scala:715), so cutting here keeps
       // it visible instead of relying on an implicit Chisel width truncation.
       val winner_op     = io.iss_uops(w).cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))(inflOpCountWidthCF-1, 0)
-    val winner_is_atk = io.iss_uops(w).cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U
+    // [WINATK] patch 66 (V10, owner 2026-10-19 16:3x; P6 full occupant bit): the winner is attacker when it is
+    // attacker-owned OR attacker-influenced (io.iss_uops(w).cf_attacker_influence = the slot's dispatch seed
+    // (window, packet tag, dispatch edges) || its wakeup operand taint cf_src_atk), as FU_BUSY ([I3BUSYATK])
+    // already uses.  It also makes a same-domain (victim vs victim) loss a contention event, like a secret
+    // winner.  The field comes through the same issue select as cf_domain_id (parallel): the domain-test LUT
+    // goes from 4 to 5 inputs, 0 levels; is_cross_loser ends at the slot's cf_contend_in register.
+    // More ISSUE_CONTENTION edges (slot pressure).  IFT off: both fields are None (constant 0).
+    val winner_is_atk = io.iss_uops(w).cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U ||
+                        io.iss_uops(w).cf_attacker_influence.getOrElse(false.B)
     val winner_is_sec = io.iss_uops(w).cf_secret_access.getOrElse(false.B) || io.iss_uops(w).cf_secret_propagation.getOrElse(false.B)
     for (i <- 0 until numIssueSlots) {
       val can_use_port   = slot_can_use_port(i)(w)
       // Gate with io.iss_valids(w) here — all signals are in the outer scope.
       // Also fires when winner is same-domain but secret (same-domain secret contention).
       val is_cross_loser = io.iss_valids(w) && requests(i) && !issue_slots(i).grant &&
-                           can_use_port && (issue_slots(i).uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= winner_domain || winner_is_sec)
+                           can_use_port && (issue_slots(i).uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= winner_domain || winner_is_sec ||
+                                            winner_is_atk)   // [WINATK] patch 66
       when (is_cross_loser && !already_denied(i)) {
         issue_slots(i).cf_contend_in.valid                    := true.B
         issue_slots(i).cf_contend_in.bits.winner_op_count     := winner_op

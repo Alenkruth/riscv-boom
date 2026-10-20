@@ -1778,7 +1778,16 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   val iftFillBits    = CF_SUBLINE + 1 + inflPcBitsCF        // {secMask, domain, pc[13:2]}
   // [WLEDGE]/[WINMEM] step 21 (owner r139): + edgeMask (F1) + {wsecEp, wsecMask, watkEp, watkMask}
   // (F2/F3): 28 -> 56 bits per way entry.
-  val iftStoreBits   = CF_SUBLINE + CF_SUBLINE + inflPcBitsCF + CF_SUBLINE + 2 * (CF_SUBLINE + 2)
+  // [STDW] patch 60 (V1 (a), owner 2026-10-19 16:3x; claude-artifacts/20-attacker-taint-lifecycle.md V1):
+  // + stMask, IFT only, at the TOP of the entry (every older field keeps its offset): bit k = "DW k has been
+  // stored to since this line was filled".  Cleared with the rest of the entry at the first refill beat (the
+  // FILLINIT zero), set by every store to DW k (clean or not; [G9STMETA] hit and replay paths).  The
+  // line-STATE value taint (r116 / r119: an attacker-domain fill, an attacker-address residency mark, an
+  // attacker-caused eviction) now applies to a DW only while its bit is 0, so a clean overwrite clears it, as
+  // atkMask already does for store data (P5 "value: overwrite").  The edges are unchanged (line-level record).
+  // IFT off the width is unchanged (the dead ift_sm_last_dat register keeps its _RANDOM layout).
+  val iftStoreBits   = CF_SUBLINE + CF_SUBLINE + inflPcBitsCF + CF_SUBLINE + 2 * (CF_SUBLINE + 2) +
+                       (if (ENABLE_IFT) CF_SUBLINE else 0)
   def cfSubIdx(addr: UInt): UInt = addr(log2Up(dcacheParams.blockBytes)-1, 3)
   def cfSubOH(addr: UInt): UInt  = UIntToOH(cfSubIdx(addr))(CF_SUBLINE-1, 0)
 
@@ -1801,9 +1810,11 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // windows) with the epoch of the store that set them.  A store keeps the old window bits only
   // when their epoch equals its own (otherwise they expired) and writes its own epoch.
   def mkIftStore(pc12: UInt, secMask: UInt, atkMask: UInt, edgeMask: UInt,
-                 wsecMask: UInt, wsecEp: UInt, watkMask: UInt, watkEp: UInt): UInt =
-    Cat(watkEp(1,0), watkMask(CF_SUBLINE-1,0), wsecEp(1,0), wsecMask(CF_SUBLINE-1,0),
-        edgeMask(CF_SUBLINE-1,0), atkMask(CF_SUBLINE-1,0), secMask(CF_SUBLINE-1,0), pc12(inflPcBitsCF-1, 0))
+                 wsecMask: UInt, wsecEp: UInt, watkMask: UInt, watkEp: UInt, stMask: UInt): UInt = {
+    val lo = Cat(watkEp(1,0), watkMask(CF_SUBLINE-1,0), wsecEp(1,0), wsecMask(CF_SUBLINE-1,0),
+                 edgeMask(CF_SUBLINE-1,0), atkMask(CF_SUBLINE-1,0), secMask(CF_SUBLINE-1,0), pc12(inflPcBitsCF-1, 0))
+    if (ENABLE_IFT) Cat(stMask(CF_SUBLINE-1,0), lo) else lo   // [STDW] patch 60
+  }
   def iftPc(e: UInt)      : UInt = e(inflPcBitsCF - 1, 0)      // PC[13:2] of the last storer
   def iftSecMask(e: UInt) : UInt = e(inflPcBitsCF + CF_SUBLINE - 1, inflPcBitsCF)
   def iftAtkMask(e: UInt) : UInt = e(inflPcBitsCF + 2*CF_SUBLINE - 1, inflPcBitsCF + CF_SUBLINE)
@@ -1815,6 +1826,9 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   def iftWsecEp(e: UInt)  : UInt = e(iftWsecLo + CF_SUBLINE + 1, iftWsecLo + CF_SUBLINE)
   def iftWatkMask(e: UInt): UInt = e(iftWatkLo + CF_SUBLINE - 1, iftWatkLo)
   def iftWatkEp(e: UInt)  : UInt = e(iftWatkLo + CF_SUBLINE + 1, iftWatkLo + CF_SUBLINE)
+  // [STDW] patch 60: the stored-since-fill mask (IFT only; constant 0 IFT off)
+  def iftStMask(e: UInt)  : UInt = if (ENABLE_IFT) e(iftStoreBits - 1, iftStoreBits - CF_SUBLINE) else 0.U(CF_SUBLINE.W)
+  def iftStAt(e: UInt, addr: UInt): Bool = (iftStMask(e) & cfSubOH(addr)).orR
   // [PCPROV] one candidate per PC[13:12] value: infl_type_int must stay a Scala constant
   // (the batch constant-folds on it), so the 2 high bits select among 4 static codes.
   def pcCandidates(fire: Bool, pc12: UInt, base: Int, is_atk: Bool, is_secret: Bool): Seq[InfluencerCandidate] =
@@ -2035,8 +2049,10 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
         val old_wa     = Mux(iftWatkEp(s2_store_entry) === st_ep_a, iftWatkMask(s2_store_entry), 0.U)
         val new_ws_m   = (old_ws & ~sub_oh) | Mux(st_wsec, sub_oh, 0.U)
         val new_wa_m   = (old_wa & ~sub_oh) | Mux(st_watk, sub_oh, 0.U)
+        // [STDW] patch 60: every store marks its DW as overwritten since the fill (one OR, parallel to atkMask)
+        val new_st_m   = iftStMask(s2_store_entry) | sub_oh
         val entry      = mkIftStore(iftPcSlice(s2_req(w).uop.debug_pc), new_sec_m, new_atk_m, new_edge_m,
-                                    new_ws_m, st_ep_s, new_wa_m, st_ep_a)   // [PCPROV]
+                                    new_ws_m, st_ep_s, new_wa_m, st_ep_a, new_st_m)   // [PCPROV]
         cf_sm_lane_v(w) := true.B   // [D1FIXA]
         for (way <- 0 until nWays) {
           when (s2_tag_match_way(w)(way)) {
@@ -2068,15 +2084,21 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     val cf_lsu_hit = s2_valid(w) && s2_hit(w) && s2_type === t_lsu && !s2_nack_hp.map(_(w)).getOrElse(s2_nack(w))
     val cf_rp_load = s2_valid(w) && s2_type === t_replay && isRead(s2_req(w).uop.mem_cmd)
     // [RESID] a secret-ADDRESS load/store hit marks the line it touched (slot 2+w).
-    // [ATKRES] step 17: so does an attacker-ADDRESS hit.  The marks OR into the line's entry
+    // [ATKRES] step 17: so did an attacker-ADDRESS hit (removed by [RESFILL] patch 61).  The marks OR into the line's entry
     // (read in s2, as the store meta is), so one kind never erases the other; the PC follows
     // the secret cause first.  2 OR + one 12-b 2:1 mux on the slot data.
+    // [RESFILL] patch 61 (V2 (a), owner 2026-10-19 16:3x): the ATTACKER kind of the residency mark is set
+    // at the FILL only (MSHR meta write, slot 1: an attacker-address primary or merged secondary), no longer
+    // ORed by every attacker-address HIT (with ownership-seeded attacker AGU addresses that was every attacker
+    // touch of a resident line, kept for the line's whole residency).  A hit's replacement-state influence is
+    // recorded by ift_repl_atk (overwrite, the eviction attribution).  The secret kind ([RESID], r116 A(2)) is
+    // unchanged.  A secret hit keeps the line's attacker bit (old value) and, as before, takes the PC.
+    // Cost: -2 LUT inputs (when + data), 0 FF, 0 levels.  IFT off: cf_addr_* are None (constant 0).
     val cf_mark_sec = s2_req(w).cf_addr_sec.getOrElse(false.B)
-    val cf_mark_atk = s2_req(w).cf_addr_atk.getOrElse(false.B)
-    when (cf_lsu_hit && (cf_mark_sec || cf_mark_atk)) {
+    when (cf_lsu_hit && cf_mark_sec) {
       val old_s = iftResSec(s2_res_entry)
       val mk_pc = Mux(cf_mark_sec || !old_s, iftPcSlice(s2_req(w).uop.debug_pc), iftResPc(s2_res_entry))
-      val mk_d  = Cat(old_s || cf_mark_sec, iftResAtk(s2_res_entry) || cf_mark_atk, mk_pc)
+      val mk_d  = Cat(old_s || cf_mark_sec, iftResAtk(s2_res_entry), mk_pc)
       cf_rm_lane_v(w) := true.B   // [D1FIXA]
       cf_rm_lane_d(w) := mk_d
       for (way <- 0 until nWays) {
@@ -2181,10 +2203,25 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       // attacker placed there: attacker taint on the value (preg taint_atk via the LSU's
       // cf_mem_dataflow_atk term; the flag also gates the ROB's duplicate type-0 atk edge,
       // [MEMATKGATE]).  cf_attacker_influence is already promoted from the atk=1 edge.
-      when (is_load && evict_fire) { uop_resp_final.cf_mem_dataflow_atk.foreach(_ := true.B) }
+      // [STDW] patch 60 (V1 (a)): ...only while this DW has not been stored to since the fill (iftStAt): a
+      // store (clean or not) overwrote it, and atkMask / memdf now carry that store's own taint.  The
+      // CACHE_EVICTION edge (evict_fire, a line-level record) is unchanged.  Levels: iftStAt is the same
+      // Mux1H + 8:1 DW select as iftAtkAt (memdf), parallel; the AND joins the flag's OR LUT: 0 added.
+      val st_dw = iftStAt(s2_store_entry, s2_req(w).addr)
+      when (is_load && evict_fire && !st_dw) { uop_resp_final.cf_mem_dataflow_atk.foreach(_ := true.B) }
       // [ATKRES] step 17 (owner ruling 119 (3)): ...and on a line marked by an attacker-ADDRESS
-      // access.  Miss path: mshrs.scala cf_rp_vatk.
-      when (ratk_fire) { uop_resp_final.cf_mem_dataflow_atk.foreach(_ := true.B) }
+      // access.  Miss path: mshrs.scala cf_rp_vatk.  [STDW] patch 60: per DW, as above.
+      when (ratk_fire && !st_dw) { uop_resp_final.cf_mem_dataflow_atk.foreach(_ := true.B) }
+      // [STDW] patch 60, MSHR replay (t_replay) loads: the replay uop carries the MSHR's line-level value
+      // taint (mshrs.scala cf_rp_vatk: attacker-caused eviction or attacker-address fill).  The store meta of
+      // the new line is valid here (zeroed at the first refill beat, then written by this MSHR's store
+      // replays, which precede this load in rpq order), so: a DW a replayed store overwrote loses the
+      // line-level taint and takes that store's own (atkMask, VALUE only: the memdf EDGE stays hit-only as
+      // before).  Line-buffer (s_drain_rpq_loads) responses keep cf_rp_vatk unchanged: no store precedes them.
+      when (ENABLE_IFT.B && cf_rp_load && is_load) {
+        when (st_dw) { uop_resp_final.cf_mem_dataflow_atk.foreach(_ := false.B) }
+        when (iftAtkAt(s2_store_entry, s2_req(w).addr)) { uop_resp_final.cf_mem_dataflow_atk.foreach(_ := true.B) }
+      }
 
       // corefuzzing: ift_store_meta writes are collected per-way and merged after the
       // memWidth loop so each SyncReadMem sees exactly ONE write port (Vivado dissolves
@@ -2629,6 +2666,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // MSHR-ready -> s2_nack path: 0 added levels.  A nack with an MSHR cause AND a probe/bank cause
   // in the same cycle records nothing (under-taint only).
   io.lsu.cf_aatk_busy.foreach(_ := mshrs.io.cf_aatk_busy.get)
+  io.lsu.cf_nack_aatk.foreach(_ := mshrs.io.cf_nack_aatk.get)   // [NACKCONF] patch 68 (V12)
   io.lsu.cf_nack_mshr.foreach(v => for (w <- 0 until memWidth) {
     v(w) := !s2_nack_hit(w) && !s2_nack_data(w)
   })

@@ -141,6 +141,8 @@ with CoreFuzzingConstants
   // IFT only (None otherwise).
   val cf_aatk_busy = if (ENABLE_IFT) Some(Flipped(Bool())) else None
   val cf_nack_mshr = if (ENABLE_IFT) Some(Flipped(Vec(memWidth, Bool()))) else None
+  // [NACKCONF] patch 68 (V12): lane w's CONFLICTING MSHR(s) hold an attacker-influenced request (mshrs.scala)
+  val cf_nack_aatk = if (ENABLE_IFT) Some(Flipped(Vec(memWidth, Bool()))) else None
 
   val brupdate     = Output(new BrUpdateInfo)
   val exception    = Output(Bool())
@@ -193,6 +195,9 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   val no_pending_mem  = Output(Bool()) // No outstanding memory requests
   // Pulse to reset LSQ pointers to 0 on quiesce drain (queues are empty at this point)
   val cf_lsq_quiesce_reset = Input(Bool())
+  // [LSQWCLR] patch 64 (V7): the attacker window CLOSED this cycle (core win_atk_close, the pulse that
+  // flash-clears the register files' watk).  IFT only.
+  val cf_wclr_atk = if (ENABLE_IFT) Some(Input(Bool())) else None
 
   val ldq_full    = Output(Vec(coreWidth, Bool()))
   val stq_full    = Output(Vec(coreWidth, Bool()))
@@ -2335,7 +2340,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           // The PC (cf_asec_busy.bits: the secret MSHR's when one is valid, else the attacker
           // MSHR's) is written only if no secret nack is recorded (secret-first, per entry: no
           // LDQ read mux).  The data input is the same register as the secret write's.
-          val nk_atk = io.dmem.cf_aatk_busy.get && io.dmem.cf_nack_mshr.get(w) &&
+          // [NACKCONF] patch 68 (V12): the conflicting MSHR, not any valid MSHR (was cf_aatk_busy)
+          val nk_atk = io.dmem.cf_nack_aatk.get(w) && io.dmem.cf_nack_mshr.get(w) &&
                        io.dmem.nack(w).bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U
           when (nk_atk) {
             ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.cf_nack_res_atk.foreach(_ := true.B)
@@ -2577,7 +2583,13 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       // own attacker address taints its value, as on the D$ response path (iresp taint_atk above).
       val stl_fwd_victim      = forward_uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U
       val stl_atk_v           = (stl_store_is_atk || stq_e.bits.addr_is_atk.getOrElse(false.B)) && stl_fwd_victim
-      val stl_val_atk         = stl_store_is_atk || (stq_e.bits.addr_is_atk.getOrElse(false.B) && stl_fwd_victim) ||
+      // [STLDOM] patch 67 (V11, owner 2026-10-19 16:3x): ...and the store's attacker DOMAIN, as the D$ store-meta
+      // write marks atkMask with (domain || data_is_atk) (dcache.scala st_atk).  An attacker store of x0 or of a
+      // victim-written register forwarded a clean value and then committed a tainted doubleword.  P1: ownership
+      // seeds the value the attacker writes.  The domain comes through the same forward-entry select as
+      // data_is_atk (parallel): +1 OR input, 0 levels.  IFT off: cf_domain_id is None (constant 0).
+      val stl_val_atk         = stl_store_is_atk || stl_infl_uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U ||
+                                (stq_e.bits.addr_is_atk.getOrElse(false.B) && stl_fwd_victim) ||
                                 ldq(f_idx).bits.addr_is_atk.getOrElse(false.B)
       // Task 3.2 (D16): the two STL_FORWARD edges are built on a zero base and travel on the
       // response (iresp/fresp.edges), not in the uop.  Cross-domain: the store's domain as
@@ -3035,7 +3047,32 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // form is kept so those configs' Verilog does not change.
   io.core.no_pending_mem := (if (ENABLE_RECONF) io.core.queues_empty && hella_state === h_ready && !io.hellacache.req.valid
                              else io.core.queues_empty && !io.dmem.req.valid)
-  // 
+
+  // [LSQWCLR] patch 64 (V7, owner 2026-10-19 16:3x; claude-artifacts/20-attacker-taint-lifecycle.md V7): the
+  // ATTACKER-window bits of the LDQ / STQ entries expire with the window, as the register files' watk does
+  // ([WINCLR] patch 35 C flash clear on win_atk_close).  Before: ldq.uop.cf_opnd_watk, stq.addr_is_watk /
+  // data_is_watk and stq.uop.cf_win_atk kept 1 for the entry's life, so ldq_head_atk / stq_head_atk (MEM_HOL,
+  // LDQ_FULL, STQ_FULL) and ldq/stq_atk_infl (MEM_ORDER) stayed is_atk after the close.  Every uop in flight
+  // at a close is younger than the closing branches (outside the window), so clearing every entry is exact;
+  // the D$ window marks (epoch-stamped) and the STL forward (epoch compare) see the same verdict.  The clear
+  // is the close REGISTERED (one FF, so the core -> LSU route starts at a flop) and is the LAST connection
+  // (it wins over a write in the same cycle: such a write is from a uop already outside the window, or it
+  // is the write of the close cycle itself).  Cost: 1 FF + a synchronous-clear term on 40 + 3 x 40 = 160
+  // FF bits (the FDRE R pin when the clear is the highest priority, else 1 LUT each), 0 levels on every
+  // reader.  IFT off: the port and the clear are not elaborated.
+  if (ENABLE_IFT) {
+    val cf_wclr_atk_q = RegNext(io.core.cf_wclr_atk.get, false.B)
+    when (cf_wclr_atk_q) {
+      for (i <- 0 until numLdqEntries) {
+        ldq(i).bits.uop.cf_opnd_watk.foreach(_ := false.B)
+      }
+      for (i <- 0 until numStqEntries) {
+        stq(i).bits.addr_is_watk.foreach(_ := false.B)
+        stq(i).bits.data_is_watk.foreach(_ := false.B)
+        stq(i).bits.uop.cf_win_atk.foreach(_ := false.B)
+      }
+    }
+  }
 }
 
 /**

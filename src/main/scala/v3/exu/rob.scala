@@ -101,6 +101,13 @@ class RobIo(
   // (its C_sprob is_atk column, written at writeback by the existing port; registered like the
   // other head fields, [HEADREG]).  IFT only.
   val rob_head_valatk    = if (ENABLE_IFT) Some(Output(Bool())) else None
+  // [FTQFULL] patch 59 (owner 2026-10-19 16:1x, D3 "FULL bits"): the head uop's FULL attacker and
+  // secret status, as it would retire: atk = sticky atk || attacker domain || commit-time attacker
+  // window (cf_com_win_atk) || value taint (commit_valatk); sec = s_acc || s_prop || commit-time
+  // secret window (cf_com_win_sec).  Registered and bank-selected like the other head fields
+  // ([HEADREG], [ROBHEAD] patch 58).  Read only by the core's FTQ-starvation edge.  IFT only.
+  val rob_head_full_atk  = if (ENABLE_IFT) Some(Output(Bool())) else None
+  val rob_head_full_sec  = if (ENABLE_IFT) Some(Output(Bool())) else None
   // corefuzzing: cycle-N mispredicting branch UOP (same cycle as b1.mispredict_mask)
   val cf_mispredict_uop  = Input(Valid(new MicroOp))
 
@@ -406,8 +413,8 @@ class Rob(
   val rob_head_uses_stq   = Wire(Vec(coreWidth, Bool()))
   val rob_head_uses_ldq   = Wire(Vec(coreWidth, Bool()))
   val rob_head_fflags     = Wire(Vec(coreWidth, UInt(freechips.rocketchip.tile.FPConstants.FLAGS_SZ.W)))
-  // [FFTAINT] step 18: the head row's secret (s_acc || s_prop) and attacker (atk || domain)
-  // status per bank, read beside rob_head_fflags; used only by the FP-exceptions block.
+  // [FFTAINT] step 18: the head row's secret (s_acc || s_prop) and attacker status per bank, read beside
+  // rob_head_fflags; used only by the FP-exceptions block.  Attacker = value taint || domain ([FFVAL] patch 63).
   val rob_head_ffsec      = Wire(Vec(coreWidth, Bool()))
   val rob_head_ffatk      = Wire(Vec(coreWidth, Bool()))
 
@@ -421,6 +428,22 @@ class Rob(
   val rob_head_is_secret_bank0 = Wire(Bool())
   rob_head_is_secret_bank0 := false.B
   val rob_head_valatk_bank0 = WireInit(false.B)   // [ROBHEADATK] patch 48
+  // [ROBHEAD] patch 58 (was 56, rebased on live; owner 2026-10-19; D3 root cause, scratch/secret-trace-r3/fivecfg/portsmash/N1):
+  // the same four head fields for EVERY bank of the head row.  The outputs below select the TRUE
+  // head bank (the first valid bank of the head row), not bank 0: after a partial commit of the
+  // head row (runtime width 1/2, or any head row whose first banks retired) bank 0 is a retired,
+  // stale entry, so ROB_FULL / REG_PRESSURE / C5 named the wrong uop (64/64 portsmash 0-bit trials).
+  // Bank 0 keeps its existing reads; banks 1..coreWidth-1 reuse reads that already exist: the
+  // domain and secret head-row reads of the fflags taint ([FFTAINT] rob_head_ffatk / ffsec), the
+  // commit readout's op_count (io.commit.uops(w), com_idx = rob_head outside rollback) and the
+  // bank's sidecar commit_valatk.  No new 64:1 row read.
+  val rob_head_oc_b     = Wire(Vec(coreWidth, UInt(uopIDCounterWidthCF.W)))
+  val rob_head_dom_b    = Wire(Vec(coreWidth, UInt(1.W)))
+  val rob_head_sec_b    = Wire(Vec(coreWidth, Bool()))
+  val rob_head_valatk_b = WireInit(VecInit(Seq.fill(coreWidth)(false.B)))
+  // [FTQFULL] patch 59: the FULL head status per bank (see RobIo.rob_head_full_atk), driven in the bank loop
+  val rob_head_fatk_b   = WireInit(VecInit(Seq.fill(coreWidth)(false.B)))
+  val rob_head_fsec_b   = WireInit(VecInit(Seq.fill(coreWidth)(false.B)))
   // [SIDECAR] Task 2.7 (spec 5.1.7, deferred D-9): the ROB pointer-reset pulse (quiesce drain,
   // or the ROB-size CSR change at its flush_commit).  Driven once after the bank loop (its
   // terms are computed there) and read inside the loop: it clears the squash-pending bits and
@@ -1341,7 +1364,16 @@ class Rob(
     // [FFTAINT] step 18: same head-row read as the flags; sticky_* are constant-false
     // wires without ENABLE_IFT, and the domain term is gated here.
     rob_head_ffsec(w)    := sticky_s_acc(rob_head) || sticky_s_prop(rob_head)
-    rob_head_ffatk(w)    := sticky_atk(rob_head) ||
+    // [FFVAL] patch 63 (V6, owner 2026-10-19 16:3x): the fflags ATTACKER taint comes from the retiring op's
+    // VALUE taint (the sidecar commit_valatk: taint_atk || window operand taint on a victim register write,
+    // the regfile-equivalent bit) or its attacker domain, no longer from the record label sticky_atk, which
+    // also holds reactive edges (contention, FU_BUSY, stall, fetch-state, [STEP1] shadow) that must not
+    // become VALUE taint through frflags / fcsr (P2: record taint never feeds value taint).  Read only by
+    // the FP-exceptions block (cf_ff_set_atk), at commit, where com_idx = rob_head (no rollback mask needed).
+    // Cost: 0 FF, 0 LUT (input swap); levels: the sidecar readout (2 LUT after the async row read) instead
+    // of the sticky 64:1 read, into the same AND/OR -> cf_ff_atk flop: at most +1 on a flop-ending path.
+    // IFT off: sidecar_io.commit_valatk is the constant-false default and the domain term is gated.
+    rob_head_ffatk(w)    := sidecar.io.commit_valatk ||
                             (ENABLE_IFT.B && rob_uop(rob_head).cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U)
     rob_head_uses_stq(w) := rob_uop(rob_head).uses_stq
     rob_head_uses_ldq(w) := rob_uop(rob_head).uses_ldq
@@ -1361,6 +1393,32 @@ class Rob(
     // taint of a domain-0 register write, not a line-borne load value), never a sticky summary, so
     // the stalled consumers' sticky atk can never feed it back (no chain, the r168a principle).
     if (ENABLE_IFT && w == 0) rob_head_valatk_bank0 := sidecar.io.commit_valatk && rob_state =/= s_rollback
+    // [ROBHEAD] patch 58: per bank (bank 0 = the existing wires above)
+    if (w == 0) {
+      rob_head_oc_b(w)  := rob_head_oc_bank0
+      rob_head_dom_b(w) := rob_head_dom_bank0
+      rob_head_sec_b(w) := rob_head_is_secret_bank0
+      rob_head_valatk_b(w) := rob_head_valatk_bank0
+    } else {
+      rob_head_oc_b(w)  := io.commit.uops(w).cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
+      rob_head_dom_b(w) := rob_uop(rob_head).cf_domain_id.getOrElse(0.U(iftTagWidth.W))
+      rob_head_sec_b(w) := rob_head_ffsec(w)   // = sticky_s_acc(rob_head) || sticky_s_prop(rob_head)
+      if (ENABLE_IFT) rob_head_valatk_b(w) := sidecar.io.commit_valatk && rob_state =/= s_rollback
+    }
+    // [FTQFULL] patch 59: the bank's FULL head status.  Every term is an EXISTING read of this bank's head
+    // entry: sticky_atk / the domain and rob_head_ffsec on the rob_head row (the [FFTAINT] reads: sticky atk,
+    // domain, s_acc || s_prop; written out here, not through rob_head_ffatk, whose definition patch 63 [V6]
+    // narrows to value taint for fflags), the commit-time window bits cf_com_win_atk / cf_com_win_sec
+    // (head-relative age, register-sourced, about 5 levels, parallel to the readout) and the sidecar's
+    // commit_valatk (patch 48).  The commit-readout terms (win_atk reads rob_uop(com_idx).cf_domain_id, valatk
+    // the com_idx row) are masked in rollback (com_idx = rob_tail), as patch 48 masks valatk; the rob_head reads
+    // are exact in every state.  One LUT after those reads -> a headReg flop: no deeper than the existing
+    // ffatk -> cf_ff_set_atk path.
+    if (ENABLE_IFT) {
+      rob_head_fatk_b(w) := sticky_atk(rob_head) || rob_uop(rob_head).cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U ||
+                            ((io.cf_com_win_atk(w) || sidecar.io.commit_valatk) && rob_state =/= s_rollback)
+      rob_head_fsec_b(w) := rob_head_ffsec(w) || io.cf_com_win_sec(w)
+    }
 
     // IFT bridge commit records: one per retire slot, valid on arch_valids.  Packed from
     // io.commit.uops (the Wire carrying the sidecar readout, Task 2.4), not from rob_uop.
@@ -1836,10 +1894,25 @@ class Rob(
   // consumers read it only one cycle after a stall cycle (see [HEADREG] there), so every
   // record is unchanged.  Cost: 16 + 1 + 1 = 18 FF.
   def headReg[T <: Data](x: T): T = if (ENABLE_IFT) RegNext(x, 0.U.asTypeOf(x)) else x
-  io.rob_head_op_count  := headReg(rob_head_oc_bank0)
-  io.rob_head_domain    := headReg(rob_head_dom_bank0)
-  io.rob_head_is_secret := headReg(rob_head_is_secret_bank0)
-  io.rob_head_valatk.foreach(_ := headReg(rob_head_valatk_bank0))   // [ROBHEADATK] patch 48: 1 FF
+  // [ROBHEAD] patch 58: every bank's head fields are registered (headReg), together with the
+  // index of the first valid bank of the head row (the PriorityEncoder com_load_is_at_rob_head
+  // already builds, registered: exact for the cycle the fields describe, unlike rob_head_lsb,
+  // which lags a partial commit by one cycle).  The bank select is AFTER the flops: a 4:1 mux on
+  // registers in front of consumers that read these outputs only as candidate DATA (oc, is_secret,
+  // is_atk under the deep dis_valids / dis_stall_was_* conds) or as a RegEnable D next to its
+  // (1-LUT) enable, so no consumer endpoint deepens; every D path into the new flops is an
+  // existing read (bank 0 unchanged).  IFT off: bank 0 as before (no flops, headReg = wire).
+  // Cost: (coreWidth-1) x 19 + 2 FF (57 + 2 at coreWidth 4), ~19 LUT mux + 3 x 2 LUT valatk ORs.
+  val rob_head_bank_q = headReg(PriorityEncoder(rob_head_vals.asUInt))
+  def headSel[T <: Data](v: Vec[T]): T =
+    if (ENABLE_IFT && coreWidth > 1) VecInit(v.map(x => headReg(x)))(rob_head_bank_q) else headReg(v(0))
+  io.rob_head_op_count  := headSel(rob_head_oc_b)
+  io.rob_head_domain    := headSel(rob_head_dom_b)
+  io.rob_head_is_secret := headSel(rob_head_sec_b)
+  io.rob_head_valatk.foreach(_ := headSel(rob_head_valatk_b))   // [ROBHEADATK] patch 48 / [ROBHEAD] 58
+  // [FTQFULL] patch 59: 2 x coreWidth FF (headReg) + two 1-bit 4:1 selects (one LUT6 each) after the flops
+  io.rob_head_full_atk.foreach(_ := headSel(rob_head_fatk_b))
+  io.rob_head_full_sec.foreach(_ := headSel(rob_head_fsec_b))
   io.empty        := empty
   io.ready        := (rob_state === s_normal) && !full && !r_xcpt_val
 

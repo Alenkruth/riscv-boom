@@ -1002,7 +1002,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val winW = log2Ceil(globalHistoryLength + 1)
   require(winW <= 7, "window counter must fit the 7-bit sbr/abr fields")
   val win_arm_sec_v = brinfos.map(b => ENABLE_IFT.B && !cf_sec_disarm_c && b.valid && b.uop.is_br && b.cond_secret)
-  val win_arm_atk_v = brinfos.map(b => ENABLE_IFT.B && b.valid && b.uop.is_br && b.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U)
+  // [GHRWIN] patch 62 (V3 (a), owner 2026-10-19 16:3x): the attacker window also ARMS on a VICTIM conditional
+  // branch whose condition is attacker-tainted (cond_atk = rs1/rs2 taint_atk, the [FTQATK] bit): its outcome is
+  // attacker-steered and enters the GHR like an attacker branch's (BHI-style steering).  +1 LUT input per lane
+  // on a brinfos-register term (0 levels on the counter, whose arm mux already waits on the youngest-select).
+  val win_arm_atk_v = brinfos.map(b => ENABLE_IFT.B && b.valid && b.uop.is_br &&
+                                       (b.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U || b.cond_atk))
   val win_arm_sec = win_arm_sec_v.reduce(_||_)
   val win_arm_atk = win_arm_atk_v.reduce(_||_)
   def winRow(x: UInt): UInt  = if (coreWidth == 1) x else (x >> log2Ceil(coreWidth))
@@ -1020,9 +1025,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // ctr > cnt compare (not on the counter's own path).
   // [R124GATE] patch 26 (r151): the window state exists only with ENABLE_IFT; IFT off the
   // counter, epoch and close are constant 0 (winCtrIft is the unchanged step-20/21 logic).
-  def winCtr(arms: Seq[Bool], clr: Bool): (UInt, UInt, Bool) =
-    if (ENABLE_IFT) winCtrIft(arms, clr) else (0.U(winW.W), 0.U(2.W), false.B)
-  def winCtrIft(arms: Seq[Bool], clr: Bool): (UInt, UInt, Bool) = {
+  def winCtr(arms: Seq[Bool], clr: Bool, ghrDecay: Boolean = false): (UInt, UInt, Bool) =
+    if (ENABLE_IFT) winCtrIft(arms, clr, ghrDecay) else (0.U(winW.W), 0.U(2.W), false.B)
+  def winCtrIft(arms: Seq[Bool], clr: Bool, ghrDecay: Boolean): (UInt, UInt, Bool) = {
     val ctr   = RegInit(0.U(winW.W))
     val ep    = RegInit(0.U(2.W))
     val b     = Reg(UInt(robAddrSz.W))
@@ -1039,9 +1044,48 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       nv = nv || a
     }
     val b_head_row = winRow(b) === winRow(head)
-    val cnt = PopCount((0 until coreWidth).map { w =>
+    // [GHRWIN] patch 62 (V3 (a)): ghrDecay = decay by the number of committed GHR SHIFTS, not of committed
+    // conditional branches.  GlobalHistory.update (frontend.scala) shifts the history once per fetch BANK
+    // whose executed part holds a conditional branch (any number of not-taken ones, or the taken one), so
+    // a committed conditional branch adds a shift iff its (FTQ entry, bank) differs from that of the
+    // previous committed conditional branch.  The commit lanes are registered first (valid-branch,
+    // B-gate, key = {ftq_idx, pc bank bit}; coreWidth x (2 + key) FF), and the shifts are counted one
+    // cycle late from flops: a late decay only closes the window late (P5: never early), a re-arm in that
+    // cycle overrides it as before.  B's own bank: B is the previous branch of a same-bank successor, so
+    // that successor adds no shift (exact).  Residual (late, safe): an FTQ index that recurs after exactly
+    // ftqSz branch-free packets merges two banks into one shift.  The secret window keeps the branch count.
+    // Levels: the old cnt read the commit valids (deep) directly; this one starts at flops (shallower).
+    // Cost: coreWidth x (2 + log2(ftqSz) + 1) + key + 1 FF (about 40), about 40 LUT (prev-key chain,
+    // compares, popcount).  IFT off: winCtrIft is not elaborated.
+    val cnt = if (!ghrDecay) PopCount((0 until coreWidth).map { w =>
       rob.io.commit.valids(w) && rob.io.commit.uops(w).is_br &&
-        (bpass || (b_head_row && winBank(b) < w.U)) })
+        (bpass || (b_head_row && winBank(b) < w.U)) }) else {
+      def bankBit(u: MicroOp): UInt = if (nBanks == 1) 0.U(1.W) else u.pc_lob(log2Ceil(bankBytes))
+      val vbr_q  = (0 until coreWidth).map(w => RegNext(rob.io.commit.valids(w) && rob.io.commit.uops(w).is_br, false.B))
+      val gate_q = (0 until coreWidth).map(w => RegNext(bpass || (b_head_row && winBank(b) < w.U), false.B))
+      // key = {ftq_idx, bank bit}: typed flops (a RegNext of a UInt leaves its width to inference, and
+      // last_k needs it at elaboration)
+      val keyW   = log2Ceil(ftqSz) + 1
+      val key_q  = (0 until coreWidth).map(w => Reg(UInt(keyW.W)))
+      for (w <- 0 until coreWidth) key_q(w) := Cat(rob.io.commit.uops(w).ftq_idx, bankBit(rob.io.commit.uops(w)))
+      val last_v = RegInit(false.B)
+      val last_k = Reg(UInt(keyW.W))
+      var pv = last_v
+      var pk = last_k
+      val shift = for (w <- 0 until coreWidth) yield {
+        val sh = vbr_q(w) && (!pv || key_q(w) =/= pk)
+        pv = pv || vbr_q(w)
+        pk = Mux(vbr_q(w), key_q(w), pk)
+        sh && gate_q(w)
+      }
+      last_v := pv
+      last_k := pk
+      // a re-arm in cycle c discards cycle c's commits (the old rule: `when (nv) ctr := 64` wins over that
+      // cycle's decrement); they are counted one cycle late here, so drop them explicitly (else the new
+      // window would start up to coreWidth shifts short: an early close)
+      val arm_q = RegNext(nv, false.B)
+      Mux(arm_q, 0.U, PopCount(shift))
+    }
     val b_com  = b_head_row && (0 until coreWidth).map(w =>
       rob.io.commit.valids(w) && winBank(b) === w.U).reduce(_||_)
     val killed = (bmask & brupdate.b1.mispredict_mask) =/= 0.U
@@ -1061,7 +1105,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     (ctr, ep, close)
   }
   val (win_sec_ctr, win_sec_ep, win_sec_close) = winCtr(win_arm_sec_v, cf_sec_disarm_c)
-  val (win_atk_ctr, win_atk_ep, win_atk_close) = winCtr(win_arm_atk_v, false.B)
+  val (win_atk_ctr, win_atk_ep, win_atk_close) = winCtr(win_arm_atk_v, false.B, ghrDecay = true)   // [GHRWIN] patch 62
   io.ifu.cf_win_sec_ctr := win_sec_ctr
   io.ifu.cf_win_atk_ctr := win_atk_ctr
   val win_sec_now = win_sec_ctr =/= 0.U || win_arm_sec
@@ -1198,6 +1242,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // revive (over-taint); it now stays clear.  The epochs stay for uops (cf_wep_*, res()) and
   // memory (STQ, D$ store meta).  close is the signal that advances ep on the same edge.
   iregfile.io.cf_wclr := Cat(win_atk_close, win_sec_close)
+  io.lsu.cf_wclr_atk.foreach(_ := win_atk_close)   // [LSQWCLR] patch 64 (V7): the LSQ window bits expire too
   pregfile.io.cf_wclr := Cat(win_atk_close, win_sec_close)
   rob.io.cf_wsh_sec := wsh_sec
   rob.io.cf_wsh_atk := wsh_atk
@@ -1823,6 +1868,56 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val dis_stall_reg_head_op_count  = (0 until coreWidth).map(w => reg_stuck_oc)
   val dis_stall_reg_head_domain    = (0 until coreWidth).map(w => reg_stuck_dom)
   val dis_stall_reg_head_is_secret = (0 until coreWidth).map(w => reg_stuck_sec)
+  // [FTQFULL] patch 59 (was 57, rebased on live without 55; owner 2026-10-19 item D3 and the 16:1x
+  // ruling "is_atk / is_secret from the blocker's FULL bits"; root cause scratch/secret-trace-r3/fivecfg/
+  // portsmash/N1/REPORT.md Phase C).  While the FTQ is full, fetch stops (frontend f4 gate) and
+  // the FTQ frees entries only when the ROB head commits (io.ifu.commit above), so a ROB head
+  // with a secret-dependent latency starves DISPATCH: no uop reaches dispatch, no dispatch
+  // candidate can fire, and the delay of the next dispatched uop carried no edge (portsmash
+  // width 1: the secret div holds the head 61-64 of the 82-98 FTQ-full cycles; 4-cycle leak).
+  // Edge: the FIRST uop dispatched after an FTQ-starved interval gets a ROB_FULL (ty 5) edge
+  // naming the ROB-head blocker (op_count) with the blocker's FULL bits (rob.scala rob_head_full_*,
+  // true head bank, [ROBHEAD] patch 58): is_secret = s_acc || s_prop || commit-time secret window,
+  // is_atk = (attacker domain || sticky atk || commit-time attacker window || value taint || the 42b
+  // attacker-address load head) and this uop is a victim.  Same type as ROB_FULL because the
+  // blocker is the same structure (the ROB head that does not retire); it is merged INTO the ROB_FULL
+  // candidate (no new candidate: the 16-candidate prefix network and the 4-slot pressure are
+  // unchanged).  The record tells the two apart by stall_cycles_rob = 0 (no ROB stall).
+  //   starved(k-1) = cf_ftq_full(k-1) && no dispatch-valid uop at k-1 (both registered);
+  //   capture: the [HEADREG] head fields, on the first starved cycle of an interval and then on
+  //            every starved cycle whose head did NOT commit ([REGSTUCK] rob_nocom_q rule), so
+  //            they hold the last head that blocked;
+  //   pending: set by a starved cycle, cleared by the first dispatch FIRE (state, kept on
+  //            dis_fire as the [DISPAR] stall counters); the candidate reads it (registered, so
+  //            the capture is valid) on the lowest valid lane only.  Fires only when the edge has a
+  //            flag: the blocker is secret, or attacker-flagged and this uop a victim (no flagless
+  //            edges: slot pressure).
+  // Levels: every term is an FF or 1 LUT over FFs (the per-lane ftq_edge: ftq_pend, the two capture
+  // FFs and d_victim, a ren2 register); the candidate cond gains (ftq_edge && no lower lane valid) on
+  // the LUT that already ANDs dis_valids(w) (<= 6 inputs, 0 added); oc / is_* get a
+  // 2:1 select by the dis_stall_was_rob FF on their DATA legs (the deep dis_valids cond and the
+  // prefix network select are unchanged).  Cost: 16 + 4 capture + 3 control FF (+1 FF frontend),
+  // ~16 LUT oc select + ~8 (+2 x coreWidth FF / 2 LUT full-bit head outputs in rob.scala).
+  // IFT off: constants (no flop), cond term && ENABLE_IFT.B.
+  val ftq_full_q   = io.ifu.cf_ftq_full.getOrElse(false.B)
+  val dis_none_q   = if (ENABLE_IFT) RegNext(!dis_valids.reduce(_||_), false.B) else false.B
+  val ftq_starve_q = ftq_full_q && dis_none_q
+  val ftq_pend     = if (ENABLE_IFT) RegInit(false.B) else false.B
+  val ftq_active   = ftq_pend || ftq_starve_q
+  if (ENABLE_IFT) ftq_pend := ftq_active && !dis_fire.reduce(_||_)
+  val ftq_cap_en   = ftq_starve_q && (rob_nocom_q || !ftq_pend)
+  def ftqCap[T <: Data](x: T): T =
+    if (ENABLE_IFT) RegEnable(x, 0.U.asTypeOf(x), ftq_cap_en) else 0.U.asTypeOf(x)
+  val ftq_cap_oc   = ftqCap(rob.io.rob_head_op_count)
+  val ftq_cap_sec  = ftqCap(rob.io.rob_head_full_sec.getOrElse(false.B))
+  val ftq_cap_atk  = ftqCap(rob.io.rob_head_full_atk.getOrElse(false.B) ||
+                            (rob.io.com_load_is_at_rob_head && io.lsu.ldq_head_atk.getOrElse(false.B)))
+  // fires from the cycle AFTER the first capture (ftq_pend = 1): the capture is then valid, and a single
+  // starved cycle immediately followed by a dispatch (a pipeline bubble, not starvation) gives no edge.
+  // The flag test is per lane (ftq_edge, in the dispatch loop: is_atk needs a victim uop).
+  val ftq_hot      = ENABLE_IFT.B && ftq_pend
+  // the lowest valid lane is the oldest uop of the dispatch group
+  val ftq_first    = (0 until coreWidth).map(w => if (w == 0) true.B else !dis_valids.take(w).reduce(_||_))
   // [IQFULL 2026-10-13, series-r step 16, owner ruling 110] issue queue full / dispatcher not
   // ready.  [IQHEAD] patch 49 (owner r175, "IQ full should follow the same"): attributed like
   // ROB_FULL / LDQ_FULL / STQ_FULL: the edge names the refusing IQ's STALLING occupant (its oldest
@@ -1951,6 +2046,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     // candidate (one edge, never counted twice).  Levels: one FF + d_victim (FF) on the existing
     // is_atk LUT (5 -> 6 inputs); is_atk feeds only the prefix network's register inputs.
     val rob_head_val_atk = rob.io.rob_head_valatk.getOrElse(false.B) && d_victim
+    // [FTQFULL] patch 59: this lane's FTQ-starvation edge has a flag (blocker secret, or attacker-flagged
+    // with a victim uop).  1 LUT over FFs (ftq_pend, ftq_cap_sec, ftq_cap_atk, d_victim).
+    val ftq_edge = ftq_hot && (ftq_cap_sec || (ftq_cap_atk && d_victim))
     // [DISPAR] patch 51 (B3): the dispatch candidates, MEM_HOL, the C5 s_prop set and the two
     // stall-duration fields are gated by dis_valids(w), not dis_fire(w).  Each is DATA of lane w's
     // enqueue (dis_ift(w), dis_uops(w).cf_*, dis_sec_any(w)) and lands only through
@@ -1962,7 +2060,13 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     val dispCands = Seq(
       // [REGSTUCK] 52d: the is_atk terms come from the same stuck-head capture (d_victim stays live).
       InfluencerCandidate(dis_valids(w) && dis_stall_was_reg(w), dis_stall_reg_head_op_count(w),  INFL_REG_PRESSURE, dis_stall_reg_head_domain(w) === 1.U || ((reg_stuck_ldatk || reg_stuck_valatk) && d_victim),  dis_stall_reg_head_is_secret(w)),
-      InfluencerCandidate(dis_valids(w) && dis_stall_was_rob(w), dis_stall_rob_head_op_count(w),  INFL_ROB_FULL,     dis_stall_rob_head_domain(w) === 1.U || rob_head_ld_atk || rob_head_val_atk,  dis_stall_rob_head_is_secret(w)),
+      // [FTQFULL] patch 59: the FTQ-starvation edge rides this candidate (see above); a real ROB_FULL
+      // stall of the same uop has priority (its blocker is the more recent one).
+      InfluencerCandidate(dis_valids(w) && (dis_stall_was_rob(w) || (ftq_edge && ftq_first(w))),
+                          Mux(dis_stall_was_rob(w), dis_stall_rob_head_op_count(w), ftq_cap_oc),  INFL_ROB_FULL,
+                          Mux(dis_stall_was_rob(w), dis_stall_rob_head_domain(w) === 1.U || rob_head_ld_atk || rob_head_val_atk,
+                              ftq_cap_atk && d_victim),
+                          Mux(dis_stall_was_rob(w), dis_stall_rob_head_is_secret(w), ftq_cap_sec)),
       // [MEMORDATK] patch 42: is_atk also when the queue head's address is attacker-tainted and this uop is a victim
       InfluencerCandidate(dis_valids(w) && dis_stall_was_ldq(w), dis_stall_ldq_head_op_count(w),  INFL_LDQ_FULL,     dis_stall_ldq_head_domain(w) === 1.U || ldq_head_atk,  dis_stall_ldq_head_is_secret(w)),
       InfluencerCandidate(dis_valids(w) && dis_stall_was_stq(w), dis_stall_stq_head_op_count(w),  INFL_STQ_FULL,     dis_stall_stq_head_domain(w) === 1.U || stq_head_atk,  dis_stall_stq_head_is_secret(w)),
