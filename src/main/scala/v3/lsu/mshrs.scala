@@ -1272,9 +1272,22 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     // this AND-OR + 2:1 select runs beside the much deeper nack path; it ends at the LSU's LDQ flag write,
     // whose enable is that nack): 0 levels on every endpoint.  About 2 x (8 AND-OR + 1) LUT.
     val cf_aatk_q = cf_aatk_live.map(RegNext(_, false.B))
+    // [NACKFULL] t83 m124 root cause (2026-10-26, task-reports/stalledge-t83-rootcause-20261026.md): the "any MSHR"
+    // leg of the nack flags (here and [NACKCONFSEC] below) is for the MSHRs-FULL nack only, as the [NACKCONFSEC]
+    // comment and lsu.scala say.  A nack with no same-set MSHR while an MSHR is free (the MSHR port takes one lane per
+    // cycle: req_idx; the same-set writeback s2_nack_wb; sdq full) has NO conflicting MSHR, so it raises no secret /
+    // attacker nack edge.  Before, it took "any live secret MSHR" and the [NACKPC] fallback PC named the lowest one:
+    // t83 m124 V (set 0x19) took such a nack after B's MSHR (set 0x19) had retired and it named A (set 9), overwriting
+    // the LDQ's PC(B).  cf_full_q = no MSHR can take a primary (s_invalid / s_prefetch give req_pri_rdy), one cycle
+    // old like cf_aatk_q / cf_asec_q and like the registered allocator pick mshr_alloc_idx.
+    // Cost: 1 FF + ~2 LUT (nMSHRs=8 input NOR); one more input on the existing 2:1 select LUT of each flag
+    // (idx_match, same-set OR, any OR, full: 4 inputs, one LUT).  Levels: all inputs are flops or the existing
+    // beside-the-nack AND-OR trees, ending at the LDQ flag / PC flops: 0 on s2_nack and on every endpoint.
+    // IFT off: not elaborated (inside if (ENABLE_IFT)).  RECORD CHANGE: fewer DC_NACK slots (non-conflict nacks).
+    val cf_full_q = RegNext(!mshrs.map(_.io.req_pri_rdy).reduce(_ || _), false.B)
     for (w <- 0 until memWidth) {
       io.cf_nack_aatk.get(w) := Mux(idx_match(w), (idx_matches(w) zip cf_aatk_q).map { case (m, a) => m && a }.reduce(_ || _),
-                                    cf_aatk_q.reduce(_ || _))
+                                    cf_full_q && cf_aatk_q.reduce(_ || _))   // [NACKFULL]
     }
     // [NACKCONFSEC] lean58 (M8): the same form for the secret side (patch 68's attacker rule): per-MSHR registered
     // secret bits (nMSHRs FF; cf_asec_busy.valid is their OR one cycle old, so the timing reference is the same),
@@ -1283,7 +1296,7 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     val cf_asec_q = cf_asec_live.map(RegNext(_, false.B))
     for (w <- 0 until memWidth) {
       io.cf_nack_asec.get(w) := Mux(idx_match(w), (idx_matches(w) zip cf_asec_q).map { case (m, a) => m && a }.reduce(_ || _),
-                                    cf_asec_q.reduce(_ || _))
+                                    cf_full_q && cf_asec_q.reduce(_ || _))   // [NACKFULL]
     }
     io.cf_asec_busy.bits  := RegNext(PriorityMux(cf_asec_live ++ cf_aatk_live :+ true.B,
                                                  mshrs.map(_.io.cf_req_res_pc) ++ mshrs.map(_.io.cf_req_pc12) :+
