@@ -2050,11 +2050,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // unchanged).  The record tells the two apart by stall_cycles_rob = 0 (no ROB stall).
   //   starved(k-1) = cf_ftq_full(k-1) && no dispatch-valid uop at k-1 (both registered);
   //   capture: the [HEADREG] head fields, on the first starved cycle of an interval and then on
-  //            every starved cycle whose head did NOT commit ([REGSTUCK] rob_nocom_q rule), so
-  //            they hold the last head that blocked;
+  //            the interval's first head RELEASE ([FTQREL] below; was: every starved no-commit cycle);
   //   pending: set by a starved cycle, cleared by the first dispatch FIRE (state, kept on
   //            dis_fire as the [DISPAR] stall counters); the candidate reads it (registered, so
-  //            the capture is valid) on the lowest valid lane only.  Fires only when the edge has a
+  //            the capture is valid) on every valid lane ([FTQLANE]; was the lowest valid lane only).  Fires only when the edge has a
   //            flag: the blocker is secret, or attacker-flagged and this uop a victim (no flagless
   //            edges: slot pressure).
   // Levels: every term is an FF or 1 LUT over FFs (the per-lane ftq_edge: ftq_pend, the two capture
@@ -2070,19 +2069,47 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val ftq_pend     = if (ENABLE_IFT) RegInit(false.B) else false.B
   val ftq_active   = ftq_pend || ftq_starve_q
   if (ENABLE_IFT) ftq_pend := ftq_active && !dis_fire.reduce(_||_)
-  val ftq_cap_en   = ftq_starve_q && (rob_nocom_q || !ftq_pend)
+  // [FTQREL] (owner 2026-10-26 14:1x, decision (a), RULES C "Stall-edge fixes"; the F2/F3 shape of
+  // task-reports/regpressure-check-20261026.md in the FTQ capture).  The old enable (every starved cycle whose
+  // head did not commit) kept the head's comb state of its last no-commit cycle, i.e. BEFORE its own writeback-cycle
+  // s_prop / atk (F2: a `ld secret; div` head gave sec=0, and since the edge needs a flag, NO edge), and a dependent
+  // op still busy after the blocker committed replaced it while the frontend refilled (F3).  New enable:
+  //   (i)  the first starved cycle of an interval (!ftq_pend), as before: the head that starts the starvation;
+  //   (ii) the FIRST release of the interval: a commit at k-1 after a no-commit cycle at k-2 (the [REGREL] rule,
+  //        rob_nocom_q2 shared), read as of its commit cycle (writeback labels included).
+  // Only the FIRST release is kept (ftq_rel_done): the starvation is ended by the commit that frees an FTQ entry,
+  // which the frontend sees 2-3 cycles later and dispatch 4-6 cycles later; in that refill window a dependent
+  // op of the same fetch packet (busy 2-3 cycles after the blocker's writeback) releases too, while ftq_starve_q
+  // is still high (the owner's plain form `ftq_starve_q && ((!rob_nocom_q && rob_nocom_q2) || !ftq_pend)` would
+  // name it, depending on the refill latency).  The first release is the head that was stuck when the starvation
+  // set in.  Residual: if that head stalled only briefly and does not free an FTQ entry (same packet as a later
+  // long op), the later long op is not named (README ftq-addon).  The release capture is not gated by
+  // ftq_starve_q (it needs ftq_pend), so the FTQ-full drop cannot race it.
+  // The 42b load term reads rob_ld_head_q on a release (the [REGREL] k-2 alignment), com_load_is_at_rob_head on the
+  // first starved cycle (as before).
+  // Cost: +1 FF (ftq_rel_done; rob_nocom_q2 shared with [REGREL]).  CE = 1 LUT6 over FFs (ftq_full_q, dis_none_q,
+  // ftq_pend, rob_nocom_q, rob_nocom_q2, ftq_rel_done).  ftq_rel_done's D has the same form and depth as ftq_pend's
+  // (one LUT after dis_fire into a flop, an existing endpoint shape).  The ldatk D gains one 2:1 select by the
+  // ftq_pend FF over two FFs (same LUT).  0 levels on dis_fire.  IFT off: all constants, as before.
+  val ftq_rel      = !rob_nocom_q && rob_nocom_q2
+  val ftq_rel_done = if (ENABLE_IFT) RegInit(false.B) else false.B
+  val ftq_cap_en   = (ftq_starve_q && !ftq_pend) || (ftq_pend && ftq_rel && !ftq_rel_done)
+  if (ENABLE_IFT) ftq_rel_done := ftq_active && !dis_fire.reduce(_||_) && (ftq_rel_done || (ftq_pend && ftq_rel))
   def ftqCap[T <: Data](x: T): T =
     if (ENABLE_IFT) RegEnable(x, 0.U.asTypeOf(x), ftq_cap_en) else 0.U.asTypeOf(x)
   val ftq_cap_oc   = ftqCap(rob.io.rob_head_op_count)
   val ftq_cap_sec  = ftqCap(rob.io.rob_head_full_sec.getOrElse(false.B))
   val ftq_cap_atk  = ftqCap(rob.io.rob_head_full_atk.getOrElse(false.B) ||
-                            (rob.io.com_load_is_at_rob_head && io.lsu.ldq_head_atk.getOrElse(false.B)))
+                            (Mux(ftq_pend, rob_ld_head_q, rob.io.com_load_is_at_rob_head) && io.lsu.ldq_head_atk.getOrElse(false.B)))
   // fires from the cycle AFTER the first capture (ftq_pend = 1): the capture is then valid, and a single
   // starved cycle immediately followed by a dispatch (a pipeline bubble, not starvation) gives no edge.
   // The flag test is per lane (ftq_edge, in the dispatch loop: is_atk needs a victim uop).
   val ftq_hot      = ENABLE_IFT.B && ftq_pend
-  // the lowest valid lane is the oldest uop of the dispatch group
-  val ftq_first    = (0 until coreWidth).map(w => if (w == 0) true.B else !dis_valids.take(w).reduce(_||_))
+  // [FTQLANE] (owner 2026-10-26 14:1x, decision (b)): the FTQ_FULL edge tags EVERY valid lane of the first dispatch
+  // group after the starvation (each of them was delayed by it), like ROB_FULL / IQ_FULL and F5 [STALLLANE]; the
+  // old lowest-valid-lane select (ftq_first) is removed: -3 small LUT, one fewer input on the lane cond LUT.  A lane
+  // that is valid but does not fire on that cycle (another hazard) keeps that hazard's own edge: ftq_pend clears on
+  // the first fire as before ([DISPAR] state).
   // [IQFULL 2026-10-13, series-r step 16, owner ruling 110] issue queue full / dispatcher not
   // ready.  [IQHEAD] patch 49 (owner r175, "IQ full should follow the same"): attributed like
   // ROB_FULL / LDQ_FULL / STQ_FULL: the edge names the refusing IQ's STALLING occupant (its oldest
@@ -2241,7 +2268,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       // [RECV3] SP-07 (design 2.5): the FTQ edge has its own code INFL_FTQ_FULL (0x14; v1 ROB_FULL with srob = 0).  Still
       // one candidate (no prefix-network growth): the code is chosen by dis_stall_was_rob(w), the flop that already
       // chooses the key and labels (codes 0x10 / 0x14 differ in bit 2 only).  Both codes are OC-keyed.
-      InfluencerCandidate(dis_valids(w) && (dis_stall_was_rob(w) || (ftq_edge && ftq_first(w))),
+      InfluencerCandidate(dis_valids(w) && (dis_stall_was_rob(w) || ftq_edge),   // [FTQLANE] every lane
                           Mux(dis_stall_was_rob(w), dis_stall_rob_head_op_count(w), ftq_cap_oc),  INFL_ROB_FULL,
                           Mux(dis_stall_was_rob(w), (dis_stall_rob_head_domain(w) === 1.U || rob_head_ld_atk || rob_head_val_atk) && d_victim,   // [VICGATE] F1
                               ftq_cap_atk && d_victim),
