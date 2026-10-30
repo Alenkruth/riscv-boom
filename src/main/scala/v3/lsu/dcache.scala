@@ -3163,10 +3163,9 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     // 0xbcd[16:12]: pending, applied way idx, applied set idx (doc 30 T4 layout; r33 reads it).
     Cat(cfg_change || wk_state =/= sIdle, cfg_way_applied, cfg_set_applied)
   } else {
-    when (cfg_change && dcache_idle) {
-      cfg_set_applied := io.lsu.cf_dcache_set_conf
-      cfg_way_applied := io.lsu.cf_dcache_way_conf
-    }
+    // [NORECONF-LOOP] Without reconfiguration cfg_*_applied are wires tied to the CSR (declared above), so there is
+    // nothing to commit; assigning them under cfg_change (which reads them) was a combinational loop that stopped
+    // every non-reconf elaboration (FireSimBaselineBoom*, firrtl CheckCombLoops at line 621).
     0.U(5.W)
   }
   io.lsu.cf_dcache_reconf_status.foreach(_ := cf_dcache_reconf_status)
