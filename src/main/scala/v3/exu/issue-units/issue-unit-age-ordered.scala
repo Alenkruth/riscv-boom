@@ -209,15 +209,20 @@ class IssueUnitCollapsing(
     val winner_is_sec = io.iss_uops(w).cf_secret_access.getOrElse(false.B) || io.iss_uops(w).cf_secret_propagation.getOrElse(false.B)
     for (i <- 0 until numIssueSlots) {
       val can_use_port   = slot_can_use_port(i)(w)
+      // [ATKVIC] stall-edge audit D5 (owner 2026-10-26: the F1 [VICGATE] rule extends to ISSUE_CONTENTION): the
+      // winner's attacker label only on a VICTIM loser, and therefore no same-domain attacker-vs-attacker contention
+      // event without a secret winner.  The loser's domain bit is already a leaf of this LUT: 0 FF, 0 LUT, 0 levels
+      // (is_cross_loser ends at the slot's cf_contend_in register).  IFT off: domain 0 (unchanged).
+      val winner_is_atk_i = winner_is_atk && issue_slots(i).uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U
       // Gate with io.iss_valids(w) here — all signals are in the outer scope.
       // Also fires when winner is same-domain but secret (same-domain secret contention).
       val is_cross_loser = io.iss_valids(w) && requests(i) && !issue_slots(i).grant &&
                            can_use_port && (issue_slots(i).uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= winner_domain || winner_is_sec ||
-                                            winner_is_atk)   // [WINATK] patch 66
+                                            winner_is_atk_i)   // [WINATK] patch 66, [ATKVIC]
       when (is_cross_loser && !already_denied(i)) {
         issue_slots(i).cf_contend_in.valid                    := true.B
         issue_slots(i).cf_contend_in.bits.winner_op_count     := winner_op
-        issue_slots(i).cf_contend_in.bits.winner_is_atk       := winner_is_atk
+        issue_slots(i).cf_contend_in.bits.winner_is_atk       := winner_is_atk_i   // [ATKVIC]
         issue_slots(i).cf_contend_in.bits.winner_is_sec       := winner_is_sec
         issue_slots(i).cf_contend_in.bits.infl_type           := INFL_ISSUE_CONTENTION.U
       }
@@ -230,7 +235,8 @@ class IssueUnitCollapsing(
   if (ENABLE_IFT) {
     for (i <- 0 until numIssueSlots) {
       issue_slots(i).cf_contend_in.bits.multi   := PopCount(cross_loser(i).toSeq) > 1.U
-      issue_slots(i).cf_contend_in.bits.any_atk := (0 until issueWidth).map(w => cross_loser(i)(w) && port_atk(w)).reduce(_ || _)
+      issue_slots(i).cf_contend_in.bits.any_atk := (0 until issueWidth).map(w => cross_loser(i)(w) && port_atk(w)).reduce(_ || _) &&
+                                                   issue_slots(i).uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U   // [ATKVIC] D5
       // [R117SWEEP] patch 33 (r117): the secret twin, same AND-OR shape beside any_atk (registered
       // in the slot; 0 levels on the select/grant path, which it does not feed)
       issue_slots(i).cf_contend_in.bits.any_sec.foreach(_ := (0 until issueWidth).map(w => cross_loser(i)(w) && port_sec(w)).reduce(_ || _))
@@ -282,11 +288,13 @@ class IssueUnitCollapsing(
       when (fu_busy_denial && !already_denied(i)) {
         issue_slots(i).cf_contend_in.valid                := true.B
         issue_slots(i).cf_contend_in.bits.winner_op_count := io.cf_fu_busy.bits.op_count(inflKeyWidthCF-1, 0)
-        issue_slots(i).cf_contend_in.bits.winner_is_atk   := io.cf_fu_busy.bits.is_atk
+        // [ATKVIC] stall-edge audit D5: the occupant's attacker label only on a VICTIM denied slot (0 FF/LUT/levels)
+        val fu_atk_i = io.cf_fu_busy.bits.is_atk && issue_slots(i).uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U
+        issue_slots(i).cf_contend_in.bits.winner_is_atk   := fu_atk_i
         issue_slots(i).cf_contend_in.bits.winner_is_sec   := io.cf_fu_busy.bits.is_sec
         issue_slots(i).cf_contend_in.bits.infl_type       := INFL_FU_BUSY.U
         issue_slots(i).cf_contend_in.bits.multi           := false.B                  // [FIFO10] one occupant
-        issue_slots(i).cf_contend_in.bits.any_atk         := io.cf_fu_busy.bits.is_atk // [FIFO10]
+        issue_slots(i).cf_contend_in.bits.any_atk         := fu_atk_i                 // [FIFO10] [ATKVIC]
         issue_slots(i).cf_contend_in.bits.any_sec.foreach(_ := io.cf_fu_busy.bits.is_sec) // [R117SWEEP]
       }
     }
@@ -310,7 +318,9 @@ class IssueUnitCollapsing(
       val s = issue_slots(i)
       val h = Wire(new IftIqHead)
       h.oc  := s.uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
-      h.atk := s.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U || s.cf_src_atk.get
+      // [CNTDSUM] stall-edge audit D3(a): io.uop's attacker bit = cf_src_atk || the slot's latched contention / FU_BUSY
+      // attacker winners (issue-slot.scala); same flop-sourced LUT, 0 levels.
+      h.atk := s.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U || s.uop.cf_attacker_influence.getOrElse(false.B)
       h.sec := s.uop.cf_secret_access.getOrElse(false.B) || s.uop.cf_secret_propagation.getOrElse(false.B) ||
                s.cf_pend_sec.get
       h

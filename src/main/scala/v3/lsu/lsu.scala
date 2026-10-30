@@ -157,6 +157,9 @@ with CoreFuzzingConstants
   // (req.valid && !req.ready); bits = the winning read-port user's key and record-summary labels (0 when it has
   // no single culprit).  IFT only.
   val cf_port_blk = if (ENABLE_IFT) Some(Flipped(Valid(new CF_BankNack))) else None
+  // [NACKPC] stall-edge audit D6 (owner 2026-10-26, RULES C "Stall-edge audit fixes"): lane w's nack PC[13:2] names
+  // the CONFLICTING MSHR (mshrs.scala [NACKPC]), chosen by the same mask as cf_nack_asec / cf_nack_aatk.  IFT only.
+  val cf_nack_pc = if (ENABLE_IFT) Some(Flipped(Vec(memWidth, UInt(inflPcBitsCF.W)))) else None
 
   val brupdate     = Output(new BrUpdateInfo)
   val exception    = Output(Bool())
@@ -738,8 +741,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   io.core.stq_head_op_count  := headReg(Mux(stq(stq_head).valid, stq(stq_head).bits.uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)), 0.U))
   io.core.ldq_head_domain    := headReg(Mux(ldq(ldq_head).valid, ldq(ldq_head).bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)), 0.U))
   io.core.stq_head_domain    := headReg(Mux(stq(stq_head).valid, stq(stq_head).bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)), 0.U))
+  // [LDQRESP] stall-edge audit D1: + addr_is_secret, the [SECDEST] leaf of the load's record s_prop (its writeback
+  // secret, RULES D1 l.16; the [L9LDSEC] MEM_ORDER searcher label already reads it).  One more leaf on the same
+  // head-entry mux into the existing headReg flop: 0 FF, 0 levels.  IFT off: getOrElse(false) (unchanged).
   io.core.ldq_head_is_secret := headReg(Mux(ldq(ldq_head).valid,
-    ldq(ldq_head).bits.uop.cf_secret_access.getOrElse(false.B) || ldq(ldq_head).bits.uop.cf_secret_propagation.getOrElse(false.B), false.B))
+    ldq(ldq_head).bits.uop.cf_secret_access.getOrElse(false.B) || ldq(ldq_head).bits.uop.cf_secret_propagation.getOrElse(false.B) ||
+    ldq(ldq_head).bits.addr_is_secret.getOrElse(false.B), false.B))
   // [STSACC] patch 52 / [SACCU] 2026-10-21: the store's s_acc is its entry uop's cf_secret_access, now set at the
   // TLB stage for every in-range LSQ op (was the separate addr_in_secret; same value, same entry mux, 0 levels).
   io.core.stq_head_is_secret := headReg(Mux(stq(stq_head).valid,
@@ -756,7 +763,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
      ldq(ldq_head).bits.uop.cf_attacker_influence.getOrElse(false.B))))
   io.core.stq_head_atk.foreach(_ := headReg(stq(stq_head).valid &&
     (stq(stq_head).bits.addr_is_atk.getOrElse(false.B) || stq(stq_head).bits.addr_is_watk.getOrElse(false.B) ||
-     stq(stq_head).bits.cf_dis_atk.getOrElse(false.B) || stq(stq_head).bits.uop.cf_attacker_influence.getOrElse(false.B))))
+     stq(stq_head).bits.cf_dis_atk.getOrElse(false.B) || stq(stq_head).bits.uop.cf_attacker_influence.getOrElse(false.B) ||
+     stq(stq_head).bits.data_is_atk.getOrElse(false.B))))   // [STQDATK] stall-edge audit D2: the store's record (cfStAtk) has it;
+  // one more leaf on the per-entry OR (6 inputs: one LUT) ahead of the existing head mux -> headReg flop: 0 FF, 0 levels
   io.core.ldq_head_valid     := headReg(ldq(ldq_head).valid)
   io.core.stq_head_valid     := headReg(stq(stq_head).valid)
   // [HOLFIX] `succeeded` = the D$ has acked; until then the head holds the line.
@@ -1630,6 +1639,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       // uop, so this is the register-read-resolved taint, not a dispatch snapshot.
       ldq(ldq_idx).bits.uop.cf_secret_propagation.foreach(_ :=
         ldq(ldq_idx).bits.uop.cf_secret_propagation.getOrElse(false.B) || exe_tlb_uop_cf(w).cf_secret_propagation.getOrElse(false.B))
+      // [CNTDLSQ] stall-edge audit D3(a): the ISSUED uop's attacker bit (the slot's cf_src_atk || its latched contention /
+      // FU_BUSY winners, issue-slot.scala [CNTDSUM]) reaches the LDQ copy as its s_prop does on the line above, so the
+      // LDQ head (LDQ_FULL / MEM_HOL), the wakeup / retry fill marks (cfLdAtk) and the response see it.  Same select and
+      // enable as the s_prop bit: 0 FF, one more write leg per entry bit (~40 LUT), 0 levels.  Retry: the entry ORs itself.
+      ldq(ldq_idx).bits.uop.cf_attacker_influence.foreach(_ :=
+        ldq(ldq_idx).bits.uop.cf_attacker_influence.getOrElse(false.B) || exe_tlb_uop_cf(w).cf_attacker_influence.getOrElse(false.B))
       ldq(ldq_idx).bits.uop.cf_secret_access.foreach(_ :=
         ldq(ldq_idx).bits.uop.cf_secret_access.getOrElse(false.B) || exe_tlb_uop_cf(w).cf_secret_access.getOrElse(false.B))
       ldq(ldq_idx).bits.uop.cf_secret_transmission.foreach(_ :=
@@ -1665,6 +1680,13 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         stq(stq_idx).bits.uop.cf_secret_transmission.getOrElse(false.B) || exe_tlb_uop_cf(w).cf_secret_transmission.getOrElse(false.B))
       stq(stq_idx).bits.uop.cf_secret_access.foreach(_ :=
         stq(stq_idx).bits.uop.cf_secret_access.getOrElse(false.B) || exe_tlb_uop_cf(w).cf_secret_access.getOrElse(false.B))
+      // [CNTDLSQ] stall-edge audit D3(a): the issued store's attacker bit (incl. its latched contention / FU_BUSY winners)
+      // joins cf_dis_atk, the STQ's attacker record summary (readers: STQ head, MEM_ORDER, STL_PARTIAL / STL_FORWARD
+      // labels, LSU_LANE winner).  The uop copy stays zeroed (Change 8: the commit request / AMO response read it).
+      // Existing flop, same select and enable as the s_prop bit above: 0 FF, ~40 LUT, 0 levels.  sta_retry: the entry's
+      // zeroed uop bit (no-op).
+      stq(stq_idx).bits.cf_dis_atk.foreach(_ :=
+        stq(stq_idx).bits.cf_dis_atk.getOrElse(false.B) || exe_tlb_uop_cf(w).cf_attacker_influence.getOrElse(false.B))
 
       assert(!(will_fire_sta_incoming(w) && stq_incoming_e(w).bits.addr.valid),
         "[lsu] Incoming store is overwriting a valid address")
@@ -2247,7 +2269,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
             io.core.cf_memord_upd(w).bits.rob_idx      := l_bits.uop.rob_idx
             io.core.cf_memord_upd(w).bits.op_count_id  := l_bits.uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
             io.core.cf_memord_upd(w).bits.prod_op_count := stq_infl_uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
-            io.core.cf_memord_upd(w).bits.is_atk       := stq_infl_uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U || st_atk_infl   // [MEMORDATK]
+            // [ATKVIC] stall-edge audit D5 (the F1 [VICGATE] rule): atk only on a VICTIM squashed load (l_bits is ldq(i),
+            // whose domain bit is already a leaf of this when's LUT): 0 FF, 0 LUT, 0 levels.  IFT off: domain 0 (unchanged).
+            io.core.cf_memord_upd(w).bits.is_atk       := (stq_infl_uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U || st_atk_infl) &&
+                                                          l_bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U   // [MEMORDATK] [ATKVIC]
             io.core.cf_memord_upd(w).bits.is_secret    := stq_infl_sacc || stq_infl_uop.cf_secret_propagation.getOrElse(false.B)
           }
         }
@@ -2278,7 +2303,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
               io.core.cf_memord_upd(w).bits.rob_idx      := l_bits.uop.rob_idx
               io.core.cf_memord_upd(w).bits.op_count_id  := l_bits.uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
               io.core.cf_memord_upd(w).bits.prod_op_count := lcam_uop(w).cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
-              io.core.cf_memord_upd(w).bits.is_atk       := lcam_uop(w).cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U || ld_atk_infl   // [MEMORDATK]
+              io.core.cf_memord_upd(w).bits.is_atk       := (lcam_uop(w).cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U || ld_atk_infl) &&
+                                                            l_bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U   // [MEMORDATK] [ATKVIC] D5
               io.core.cf_memord_upd(w).bits.is_secret    := ld_sec_sel(w)   // [L9LDSEC]
             }
           }
@@ -2521,6 +2547,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     val p_atk   = Reg(Vec(numLdqEntries, Bool()))
     val p_bank  = if (dcbOn) Some(Reg(Vec(numLdqEntries, Bool()))) else None
     val elig    = (0 until numLdqEntries).map(i => pend(i) && ldq(i).valid)
+    val rdeTabSec = Wire(Vec(numLdqEntries, Bool()))   // [LDQRDE] D4: this cycle's staged table events, per entry
+    val rdeTabAtk = Wire(Vec(numLdqEntries, Bool()))
     val gv      = elig.reduce(_ || _)
     val gidx    = AgePriorityEncoder(elig, ldq_head)
     for (i <- 0 until numLdqEntries) {
@@ -2536,6 +2564,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       } .elsewhen (gnti || !ldq(i).valid) {
         pend(i)  := false.B
       }
+      rdeTabSec(i) := hits.zip(stg).map { case (h, s) => h && s.is_secret }.reduce(_ || _)   // [LDQRDE] (shares the
+      rdeTabAtk(i) := hits.zip(stg).map { case (h, s) => h && s.is_atk    }.reduce(_ || _)   //  p_sec / p_atk terms)
     }
     // [V3EDGE] SP-20 (record v3 design 6.2 / 6.2.1, V3-D11, N-D3 a): LSU_LANE (0x24) and DC_PORT_BLOCK (0x25),
     // same cycle, on this port, drop-and-count.  Each edge lands on the DELAYED instruction's ROB row: {type, key =
@@ -2554,6 +2584,21 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       (u.cf_op_count_id.get, u.cf_domain_id.get === 1.U || u.cf_attacker_influence.get,
        u.cf_secret_access.get || u.cf_secret_propagation.get)
     def v3eLive(u: MicroOp): Bool = !IsKilledByBranch(io.core.brupdate, u) && !io.core.exception
+    // [V3EWIN] stall-edge audit D7: a winner from an LSQ ENTRY takes the entry's record summary, not its uop copy alone:
+    //   LDQ (load_retry / load_wakeup): atk = domain || uop atk (dispatch seed, [CNTDLSQ] issue bits) || addr_is_atk (the
+    //        record has it through tlb_ld_atk, as the [RECEDGE] LDQ head); sec = s_acc || s_prop || addr_is_secret ([SECDEST]).
+    //   STQ (sta_retry / store_commit): atk = domain || cf_dis_atk || addr_is_atk || data_is_atk (the store's record, rob
+    //        [M7STATK] / [CNTDLSQ]; the uop copy is zeroed at enqueue); sec = s_acc || s_prop (incl. STD data, [M7STSP]).
+    // Entry flops through the existing winner Mux1H into the port register: ~4 LUT inputs per winner, 0 FF, 0 levels.
+    def v3eWinLd(e: LDQEntry): (UInt, Bool, Bool) =
+      (e.uop.cf_op_count_id.get, e.uop.cf_domain_id.get === 1.U || e.uop.cf_attacker_influence.get || e.addr_is_atk.get,
+       e.uop.cf_secret_access.get || e.uop.cf_secret_propagation.get || e.addr_is_secret.get)
+    def v3eWinSt(e: STQEntry): (UInt, Bool, Bool) =
+      (e.uop.cf_op_count_id.get, e.uop.cf_domain_id.get === 1.U || e.cf_dis_atk.get || e.addr_is_atk.get || e.data_is_atk.get,
+       e.uop.cf_secret_access.get || e.uop.cf_secret_propagation.get)
+    // [ATKVIC] stall-edge audit D5 (the F1 [VICGATE] rule): LSU_LANE / DC_PORT_BLOCK atk only on a VICTIM loser (its uop
+    // domain bit is a flop leaf of the same label LUT): 0 FF, 0 LUT, 0 levels.
+    def v3eVic(u: MicroOp): Bool = u.cf_domain_id.get === 0.U
     // (edge, kind: 1 DC_PORT_BLOCK / 0 LSU_LANE, lane, LSU_LANE candidate index 8..11 or 0)
     val v3eCands = scala.collection.mutable.ArrayBuffer[(Valid[CF_MemOrdUpdate], Int, Int, Int)]()
     val v3eBlk   = io.dmem.cf_port_blk.get
@@ -2561,37 +2606,69 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       val u  = dmem_req(w).bits.uop
       val cm = will_fire_store_commit(w) && stq_commit_e.bits.committed
       v3eCands += ((rdeUpd(v3eBlk.valid && dmem_req(w).valid && !dmem_req(w).bits.is_hella && !cm && v3eLive(u),
-                           u, v3eBlk.bits.oc, v3eBlk.bits.atk, v3eBlk.bits.sec, INFL_DC_PORT_BLOCK), 1, w, 0))
+                           u, v3eBlk.bits.oc, v3eBlk.bits.atk && v3eVic(u), v3eBlk.bits.sec, INFL_DC_PORT_BLOCK), 1, w, 0))   // [ATKVIC]
     }
     for (w <- 0 until memWidth) {
       // lane w in lsu_sched priority order: (can_fire, will_fire, resources T tlb / D dcache / L lcam / R rob, winner uop)
+      // (can_fire, will_fire, resources, the candidate's uop (loser row), its winner labels ([V3EWIN] D7 for LSQ entries))
       val ord = Seq(
-        (can_fire_load_incoming(w),  will_fire_load_incoming(w),  "TDL", Some(exe_req(w).bits.uop)),
-        (can_fire_stad_incoming(w),  will_fire_stad_incoming(w),  "TLR", Some(exe_req(w).bits.uop)),
-        (can_fire_sta_incoming(w),   will_fire_sta_incoming(w),   "TLR", Some(exe_req(w).bits.uop)),
-        (can_fire_std_incoming(w),   will_fire_std_incoming(w),   "R",   Some(exe_req(w).bits.uop)),
-        (can_fire_sfence(w),         will_fire_sfence(w),         "TR",  Some(exe_req(w).bits.uop)),
-        (can_fire_release(w),        will_fire_release(w),        "L",   None),
-        (can_fire_hella_incoming(w), will_fire_hella_incoming(w), "TD",  None),
-        (can_fire_hella_wakeup(w),   will_fire_hella_wakeup(w),   "D",   None),
-        (can_fire_load_retry(w),     will_fire_load_retry(w),     "TDL", Some(ldq_retry_e.bits.uop)),
-        (can_fire_sta_retry(w),      will_fire_sta_retry(w),      "TLR", Some(stq_retry_e.bits.uop)),
-        (can_fire_load_wakeup(w),    will_fire_load_wakeup(w),    "DL",  Some(ldq_wakeup_e.bits.uop)),
-        (can_fire_store_commit(w),   will_fire_store_commit(w),   "D",   Some(stq_commit_e.bits.uop)))
+        (can_fire_load_incoming(w),  will_fire_load_incoming(w),  "TDL", Some(exe_req(w).bits.uop), Some(v3eWin(exe_req(w).bits.uop))),
+        (can_fire_stad_incoming(w),  will_fire_stad_incoming(w),  "TLR", Some(exe_req(w).bits.uop), Some(v3eWin(exe_req(w).bits.uop))),
+        (can_fire_sta_incoming(w),   will_fire_sta_incoming(w),   "TLR", Some(exe_req(w).bits.uop), Some(v3eWin(exe_req(w).bits.uop))),
+        (can_fire_std_incoming(w),   will_fire_std_incoming(w),   "R",   Some(exe_req(w).bits.uop), Some(v3eWin(exe_req(w).bits.uop))),
+        (can_fire_sfence(w),         will_fire_sfence(w),         "TR",  Some(exe_req(w).bits.uop), Some(v3eWin(exe_req(w).bits.uop))),
+        (can_fire_release(w),        will_fire_release(w),        "L",   None, None),
+        (can_fire_hella_incoming(w), will_fire_hella_incoming(w), "TD",  None, None),
+        (can_fire_hella_wakeup(w),   will_fire_hella_wakeup(w),   "D",   None, None),
+        (can_fire_load_retry(w),     will_fire_load_retry(w),     "TDL", Some(ldq_retry_e.bits.uop),  Some(v3eWinLd(ldq_retry_e.bits))),
+        (can_fire_sta_retry(w),      will_fire_sta_retry(w),      "TLR", Some(stq_retry_e.bits.uop),  Some(v3eWinSt(stq_retry_e.bits))),
+        (can_fire_load_wakeup(w),    will_fire_load_wakeup(w),    "DL",  Some(ldq_wakeup_e.bits.uop), Some(v3eWinLd(ldq_wakeup_e.bits))),
+        (can_fire_store_commit(w),   will_fire_store_commit(w),   "D",   Some(stq_commit_e.bits.uop), Some(v3eWinSt(stq_commit_e.bits))))
       for (j <- 8 until 12) {   // load_retry, sta_retry, load_wakeup, store_commit (live only before commit: an AMO)
-        val (can, will, res, lu) = ord(j)
-        val ws   = ord.take(j).filter { case (_, _, r, _) => r.exists(c => res.contains(c)) }
+        val (can, will, res, lu, _) = ord(j)
+        val ws   = ord.take(j).filter { case (_, _, r, _, _) => r.exists(c => res.contains(c)) }
         val wsel = PriorityEncoderOH(ws.map(_._2))
-        val wv   = ws.map(_._4.map(v3eWin))
+        val wv   = ws.map(_._5)
         val key  = Mux1H(wsel, wv.map(_.map(_._1).getOrElse(0.U(uopIDCounterWidthCF.W))))
         val atk  = Mux1H(wsel, wv.map(_.map(_._2).getOrElse(false.B)))
         val sec  = Mux1H(wsel, wv.map(_.map(_._3).getOrElse(false.B)))
         val live = if (j == 11) !stq_commit_e.bits.committed else true.B
-        v3eCands += ((rdeUpd(can && !will && live && v3eLive(lu.get), lu.get, key, atk, sec, INFL_LSU_LANE), 0, w, j))
+        v3eCands += ((rdeUpd(can && !will && live && v3eLive(lu.get), lu.get, key, atk && v3eVic(lu.get), sec, INFL_LSU_LANE), 0, w, j))   // [ATKVIC]
         if (ENABLE_CF_DEBUG_PRINTF) {
           assert(!(can && !will) || ws.map(_._2).reduce(_ || _), "[V3EDGE] LSU_LANE loser without a firing winner")
         }
       }
+    }
+    // [LDQRDE] stall-edge audit D4 (owner 2026-10-26: "all of it"): the labels of the reader edges a pending LOAD takes
+    // (STL_PARTIAL through the [B61LDQ] table; LSU_LANE as the load_retry / load_wakeup loser; DC_PORT_BLOCK on a
+    // refused load request) also land on its LDQ entry, so the LDQ head (MEM_HOL / LDQ_FULL / C5), the replay request's
+    // fill mark (cfLdSprop / cfLdAtk, RULES A reading 3) and the response see what the ROB record sees.  Set-only and
+    // gated by ldq(i).valid: a freed entry (kill / flush in the event cycle) is never written, so the enqueue of a new
+    // load into it cannot be overridden; every other writer of these two bits is earlier in source (TLB-stage OR) or
+    // set-only too ([LDQRESP]), so no write is lost.  A V3EDGE candidate sets the label whether or not it wins the edge
+    // port (drop-and-count drops the SLOT, not the label: R-STICKY).
+    // V3EDGE kinds are STAGED one cycle (their valid ends deep in the will_fire / D$-ready cone): 4 stage entries
+    // {v, ldq idx, sec, atk} (DC_PORT_BLOCK per lane; LSU_LANE retry / wakeup, lanes ORed: one LDQ entry each).
+    // Cost: 4 x (1 + ldqAddrSz + 2) = 36 FF; per LDQ entry 6 idx compares (4 staged + the table's own) and a set-only
+    // D leg on 2 bits: ~4 LUT per entry, ~160 LUT.  Levels: stage flops -> idx compare (1-2) -> entry D (1): flop to
+    // flop, new endpoints only, 0 levels on the grant / nack / will_fire paths (the candidates end in a flop as before).
+    val l4src = (0 until memWidth).map { w =>
+                  val e = v3eCands.collect { case (c, 1, `w`, _) => c }.head
+                  (e.valid && dmem_req(w).bits.uop.uses_ldq, dmem_req(w).bits.uop.ldq_idx, e.bits.is_secret, e.bits.is_atk) } ++
+                Seq((8, ldq_retry_idx), (10, ldq_wakeup_idx)).map { case (j, ix) =>
+                  val es = v3eCands.collect { case (c, 0, _, `j`) => c }.toSeq
+                  (es.map(_.valid).reduce(_ || _), ix, es.map(c => c.valid && c.bits.is_secret).reduce(_ || _),
+                   es.map(c => c.valid && c.bits.is_atk).reduce(_ || _)) }
+    val l4v   = l4src.map { case (v, _, s, a) => RegNext(v && (s || a), false.B) }
+    val l4idx = l4src.map { case (_, ix, _, _) => RegNext(ix) }
+    val l4sec = l4src.map { case (_, _, s, _) => RegNext(s) }
+    val l4atk = l4src.map { case (_, _, _, a) => RegNext(a) }
+    for (i <- 0 until numLdqEntries) {
+      val h  = l4v.zip(l4idx).map { case (v, ix) => v && ix === i.U }
+      val ls = rdeTabSec(i) || h.zip(l4sec).map { case (x, s) => x && s }.reduce(_ || _)
+      val la = rdeTabAtk(i) || h.zip(l4atk).map { case (x, a) => x && a }.reduce(_ || _)
+      when (ldq(i).valid && ls) { ldq(i).bits.uop.cf_secret_propagation.foreach(_ := true.B) }
+      when (ldq(i).valid && la) { ldq(i).bits.uop.cf_attacker_influence.foreach(_ := true.B) }
     }
     val v3eAll = v3eCands.map(_._1).toSeq
     val v3eSel = PriorityEncoderOH(v3eAll.map(_.valid))
@@ -2829,7 +2906,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           val nk_sec = io.dmem.cf_nack_asec.get(w) && io.dmem.cf_nack_mshr.get(w)
           when (nk_sec) {
             ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.cf_nack_res_v.foreach(_ := true.B)
-            ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.cf_nack_res_pc.foreach(_ := io.dmem.cf_asec_busy.bits)
+            ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.cf_nack_res_pc.foreach(_ := io.dmem.cf_nack_pc.get(w))   // [NACKPC] D6
           }
           // [NACKATK] patch 44 (r111 extended, r173 (3)): a VICTIM load nacked by an MSHR/WB conflict
           // while a valid MSHR holds an attacker-influenced request.  Edge only (no value taint).
@@ -2845,7 +2922,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           for (i <- 0 until numLdqEntries) {
             when (nk_atk && !nk_sec && io.dmem.nack(w).bits.uop.ldq_idx === i.U &&   // [NACKCONFSEC] (was !cf_asec_busy.valid)
                   !ldq(i).bits.cf_nack_res_v.get) {
-              ldq(i).bits.cf_nack_res_pc.foreach(_ := io.dmem.cf_asec_busy.bits)
+              ldq(i).bits.cf_nack_res_pc.foreach(_ := io.dmem.cf_nack_pc.get(w))   // [NACKPC] D6: the conflicting MSHR's PC
             }
           }
         }
@@ -2968,6 +3045,19 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
         ldq(ldq_idx).bits.succeeded      := io.core.exe(w).iresp.valid || io.core.exe(w).fresp.valid
         ldq(ldq_idx).bits.debug_wb_data  := io.dmem.resp(w).bits.data
+        // [LDQRESP] stall-edge audit D1 (owner 2026-10-26): the response-time record labels (the D$ edges' sec / atk,
+        // the secret-marked DW (cf_mem_sec_dataflow) and the attacker line value (cf_mem_dataflow_atk)) also land on
+        // the LDQ entry, so the LDQ head (LDQ_FULL / C5 / MEM_HOL), the LD-LD MEM_ORDER searcher and the [B60LDB]
+        // blocker labels see what the ROB record sees (merged_base_cf above already carries them to the writeback, so
+        // the record and the register tag are unchanged).  Set-only (monotone, as merged_base_cf): no other writer of
+        // these bits can be lost; the responded entry makes no later D$ request.  Conditions use only response-bus
+        // terms (no LDQ read mux), into the same ldq_idx decode as `succeeded`: 0 FF, ~2 x 40 LUT, 0 levels.
+        if (ENABLE_IFT) {
+          when (respEdgeSec(io.dmem.resp(w).bits.edges) || resp_cf.cf_mem_sec_dataflow.getOrElse(false.B)) {
+            ldq(ldq_idx).bits.uop.cf_secret_propagation.foreach(_ := true.B) }
+          when (respEdgeAtk(io.dmem.resp(w).bits.edges) || resp_cf.cf_mem_dataflow_atk.getOrElse(false.B)) {
+            ldq(ldq_idx).bits.uop.cf_attacker_influence.foreach(_ := true.B) }
+        }
       }
         .elsewhen (io.dmem.resp(w).bits.uop.uses_stq)
       {

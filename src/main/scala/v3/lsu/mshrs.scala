@@ -342,7 +342,12 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   val cf_rp_res_v  = req.cf_res_v.getOrElse(false.B) || cf_rp_asec_e || cf_rp_aatk_e || cf_rp_nk
   val cf_rp_res_pc = Mux(req.cf_res_v.getOrElse(false.B) || (cf_rp_nk && !cf_rp_asec_e && !cf_rp_aatk_e),
                          req.cf_res_pc.getOrElse(0.U), cf_pri_pc12)
-  val cf_rp_res_atk  = Mux(req.cf_res_v.getOrElse(false.B), req.cf_res_atk.getOrElse(false.B),  !cf_rp_asec_e || cf_rp_nk)
+  // [RESBOTH] E2 (owner 2026-10-26 14:59, RULES C "D$ residency fixes"; evict-dataflow-dup F4): a fill carrying BOTH
+  // marks gives its victim secondaries {atk=1, sec=1} (was {atk=0, sec=1}: the D1 l.24 attacker edge was dropped while
+  // the hit path on the same line gives it).  cf_rp_aatk_e already carries the victim-reader gate.  One more input on
+  // the existing LUT (flops / rpq output bit): 0 FF, 0 levels.  RECORD CHANGE (atk=1 on those slots).
+  val cf_rp_res_atk  = Mux(req.cf_res_v.getOrElse(false.B), req.cf_res_atk.getOrElse(false.B),
+                           !cf_rp_asec_e || cf_rp_aatk_e || cf_rp_nk)   // [RESBOTH]
   // !cf_res_v: sec = !atk || esec = asec_e both with and without cf_rp_nk (was esec = 0, same sec)
   val cf_rp_res_esec = Mux(req.cf_res_v.getOrElse(false.B), req.cf_res_esec.getOrElse(false.B), cf_rp_asec_e)
   // [CEREPL] lean59 (owner 2026-10-23): the edge's PC is the eviction record's (req.cf_res_v selects req.cf_res_pc) and
@@ -975,6 +980,8 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     // [NACKCONFSEC] lean58 (Fable audit M8, owner 2026-10-23): the secret twin of cf_nack_aatk: lane w's
     // CONFLICTING MSHR(s) hold a secret-address / secret-fill request (the cf_asec_live condition).  IFT only.
     val cf_nack_asec = if (ENABLE_IFT) Some(Output(Vec(memWidth, Bool()))) else None
+    // [NACKPC] stall-edge audit D6: lane w's nack PC[13:2], the CONFLICTING MSHR's (same mask as cf_nack_asec / aatk).
+    val cf_nack_pc   = if (ENABLE_IFT) Some(Output(Vec(memWidth, UInt(inflPcBitsCF.W)))) else None
     // corefuzzing: fill-completion event — fires when an MSHR meta_write completes
     val cf_meta_write_fill = Output(Valid(new Bundle {
       val idx      = UInt(idxBits.W)
@@ -1281,6 +1288,20 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     io.cf_asec_busy.bits  := RegNext(PriorityMux(cf_asec_live ++ cf_aatk_live :+ true.B,
                                                  mshrs.map(_.io.cf_req_res_pc) ++ mshrs.map(_.io.cf_req_pc12) :+
                                                  0.U(inflPcBitsCF.W)))
+    // [NACKPC] stall-edge audit D6 (owner 2026-10-26; F3: the nack flags name the CONFLICTING MSHR, but the PC was the
+    // lowest live secret MSHR's, else the lowest attacker MSHR's).  Same-set nack: the matched MSHR's PC (its secret-cause
+    // PC cf_req_res_pc when it is secret, else its primary's PC cf_req_pc12: the PC kinds of cf_asec_busy.bits), chosen
+    // by idx_matches(w) (one-hot: one MSHR per set row, the reconf-fix invariant way_match's Mux1H already relies on).
+    // No same-set MSHR (MSHRs full): the flags are "any", so the secret-first lowest-index cf_asec_busy.bits stays right.
+    // The per-MSHR choice is from flops (cf_asec_q one cycle old; the PC registers are stable while live and a freed
+    // MSHR is not re-written within that cycle; cf_sec_asec is sticky).  Levels: idx_matches -> 8:1 AND-OR (12 bits)
+    // -> 2:1 by idx_match: the same shape as the cf_nack_asec flag beside it, ending at the LDQ cf_nack_res_pc flops
+    // whose write enable is that flag: 0 levels on s2_nack.  Cost: 0 FF; ~8 x 12 (per-MSHR 2:1, from flops) +
+    // 2 x ~3 x 12 LUT, ~170 LUT.
+    val cf_pc_q = (cf_asec_q zip mshrs).map { case (s, m) => Mux(s, m.io.cf_req_res_pc, m.io.cf_req_pc12) }
+    for (w <- 0 until memWidth) {
+      io.cf_nack_pc.get(w) := Mux(idx_match(w), Mux1H(idx_matches(w), cf_pc_q), io.cf_asec_busy.bits)
+    }
   } else {
     io.cf_asec_busy.bits  := RegNext(PriorityMux(cf_asec_live :+ true.B,
                                                  mshrs.map(_.io.cf_req_res_pc) :+ 0.U(inflPcBitsCF.W)))

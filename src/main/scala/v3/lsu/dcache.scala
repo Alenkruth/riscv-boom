@@ -2430,7 +2430,13 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       val (resp_edges, _) = addInfluencerBatchList(0.U.asTypeOf(new IftEdgeList), s2_req(w).uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)),
         // [ATKRES] step 17: an attacker-ADDRESS-marked line shares the attacker CACHE_EVICTION
         // candidate (same class {atk=1}); the attacker-FILLED case keeps priority for PC/sec.
-        pcCandidates(evict_fire || ratk_fire,
+        // [RESONE] E1 (owner 2026-10-26 14:59, RULES C "D$ residency fixes"; evict-dataflow-dup F3): ONE residency entry
+        // gives ONE edge.  With the entry's secret bit set (res_line) its attacker half rides on the residency candidate
+        // below as {atk=1, sec=1, the entry's PC, secret cause first}; this shared attacker candidate keeps evict_fire and
+        // the attacker-only entry.  Cost: one more input on this candidate's cond LUT (s2 terms already in it) and one OR
+        // on the residency is_atk: 0 FF, 0 levels.  Value taint (cf_atk_v reads ratk_fire) and the LSU promotion (an
+        // is_atk=1 edge still fires) are unchanged.  RECORD CHANGE: {atk=1,sec=1} in one slot instead of two slots.
+        pcCandidates(evict_fire || (ratk_fire && !res_line),
                      Mux(evict_fire, iftFillPc(s2_fill_entry), iftResPc(s2_res_entry)),
                      INFL_CACHE_EVICTION, true.B, evict_fire && iftFillSecMask(s2_fill_entry).orR) ++
         pcCandidates(memdf_fire,  iftPc(s2_store_entry),    INFL_MEM_DATAFLOW,   true.B,  s2_dw_edge) ++   // [WLEDGE] [F9DW]
@@ -2442,7 +2448,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
         // eviction-filter edge, cf_res_nack needs none): at most one fires; with evict / memdf|memsec / LRSC at most 3.
         pcCandidates(res_fire && (res_line || (cf_rp_load && !s2_req(w).cf_res_repl.getOrElse(false.B) &&
                                                  !s2_req(w).cf_res_nack.getOrElse(false.B))),
-                     res_pc, INFL_CACHE_EVICTION, res_atk, res_sec) ++   // [RESID]
+                     res_pc, INFL_CACHE_EVICTION, res_atk || (ratk_fire && res_line), res_sec) ++   // [RESID] [RESONE] E1
         pcCandidates(res_fire && !res_line && cf_rp_load && s2_req(w).cf_res_repl.getOrElse(false.B),
                      res_pc, INFL_REPL_STATE, res_atk, res_sec) ++
         pcCandidates(res_fire && !res_line && (cf_lsu_hit || (cf_rp_load && s2_req(w).cf_res_nack.getOrElse(false.B))),
@@ -2955,6 +2961,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   io.lsu.cf_aatk_busy.foreach(_ := mshrs.io.cf_aatk_busy.get)
   io.lsu.cf_nack_aatk.foreach(_ := mshrs.io.cf_nack_aatk.get)   // [NACKCONF] patch 68 (V12)
   io.lsu.cf_nack_asec.foreach(_ := mshrs.io.cf_nack_asec.get)   // [NACKCONFSEC] lean58 (M8)
+  io.lsu.cf_nack_pc.foreach(_ := mshrs.io.cf_nack_pc.get)       // [NACKPC] stall-edge audit D6
   io.lsu.cf_nack_mshr.foreach(v => for (w <- 0 until memWidth) {
     v(w) := !s2_nack_hit(w) && !s2_nack_data(w)
   })

@@ -428,7 +428,19 @@ class IssueSlot(val numWakeupPorts: Int, val numPendPorts: Int = 0, val pendFlt:
   io.valid := is_valid
   io.uop := slot_uop
   if (ENABLE_IFT) {
-    io.uop.cf_secret_propagation.foreach(_ := slot_uop.cf_secret_propagation.getOrElse(false.B) || cf_src_secret)
+    // [CNTDSUM] stall-edge audit D3 option (a) (owner 2026-10-26): the ISSUED uop also carries the labels this slot
+    // received from issue-time edges (cf_cntd_any_sec / _any_atk: every ISSUE_CONTENTION / FU_BUSY winner that denied
+    // it, R-STICKY), the [M4RECSUM] rule applied to issue-time edges.  Before, they reached only the ROB sticky at this
+    // issue (rob.scala), so every site naming this op from an in-flight copy saw a stale label: the IQ_FULL head
+    // (issue-unit-age-ordered.scala headOf), the ISSUE_CONTENTION winner label, the FU_BUSY occupant (functional-unit
+    // r_uop), the LDQ/STQ copies at the TLB stage (lsu.scala, [CNTDLSQ]).  VALUE-TAINT change: the result register is
+    // tagged at writeback (regfile [ONETAG]) instead of only by the commit-time set, and a load's fill marks follow
+    // (flood check, RULES C).  The registered latch, not nc_*: a same-cycle denial is of a loser, which does not issue
+    // that cycle.  io.out_uop (the shift) is unchanged: the latch rides beside it on out_cntd.  Cost: 0 FF; one more
+    // flop input on each of the 2 bits per slot (3-input OR: same LUT), 0 levels on request / grant (data legs of the
+    // issue-select mux).  IFT off: not elaborated (inside if (ENABLE_IFT)).
+    io.uop.cf_secret_propagation.foreach(_ := slot_uop.cf_secret_propagation.getOrElse(false.B) || cf_src_secret ||
+                                              cf_cntd_any_sec)   // [CNTDSUM]
     // [ATKSEED] r205-10b (t206 aT2/aT3, 2026-10-20): the issued uop carries the slot's attacker seed (cf_src_atk =
     // the core's dispatch seed dis_iq_atk = fetch-time attacker influence || attacker-window membership, || the
     // wakeup attacker bits), the twin of the line above.  slot_uop's copy stays zeroed on load (the LUT optimization
@@ -439,7 +451,7 @@ class IssueSlot(val numWakeupPorts: Int, val numPendPorts: Int = 0, val pendFlt:
     // Cost: cf_src_atk is an existing flop; one more bit on each issue-select mux and on the register-read
     // rrd_uops flops (about issueWidth x 1 FF, about issueWidth x 8 LUT).  Levels: flop -> select mux, as every other
     // uop bit: 0 added.  IFT off: cf_src_atk is None and the field is None (nothing emitted).
-    io.uop.cf_attacker_influence.foreach(_ := cf_src_atk.get)
+    io.uop.cf_attacker_influence.foreach(_ := cf_src_atk.get || cf_cntd_any_atk)   // [CNTDSUM]
   }
   io.uop.iw_p1_poisoned := p1_poisoned
   io.uop.iw_p2_poisoned := p2_poisoned
