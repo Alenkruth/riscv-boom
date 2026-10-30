@@ -1405,25 +1405,40 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // secret shadows trained by those packets are tagged even when a consumer of a register that
   // was written back before the resolution read it clean.  The missing ty-0 edges of such
   // consumers are rebuilt by the parser (ift_core.reconstruct_window_edges).  The register files are
-  // not touched: 0 levels on the regfile write path.  Secret kind only: the FTQ has no attacker
-  // bit (its domain bit is the fetch OWNER, and the BPD/BTB/RAS attacker shadows are ownership).
+  // not touched: 0 levels on the regfile write path.
   // Levels: brinfos registers -> coreWidth-1 IsOlder (8 b) + mux steps (the same chain as the
   // shadow's oldest-B select) -> FF.  Cost: 6 FF, about 30 LUT.
+  // [WINFTQATK] (DF-ftq-atk-window-range, owner 2026-10-28 "Stage the RTL fix"; RULES A U8 "Yes, symmetric",
+  // O11 "a jalr with an attacker-tagged target arms the attacker window"): the attacker twin.  The same select
+  // over the ATTACKER-window arming lanes (win_arm_atk_v: an attacker-domain conditional branch, a victim
+  // conditional branch with an attacker-tainted condition, a jalr with an attacker-tainted target), same `ok`
+  // filter; the FTQ sets cf_fetch_atk on every entry younger than it, so a victim packet fetched after B and
+  // enqueued before B resolved trains the BTB / uBTB / BIM / TAGE with the attacker label (bpdupdate
+  // cf_domain_id |= cf_fetch_atk), exactly as a packet enqueued after the resolution ([M3ATKWIN]).  The old
+  // note here ("the FTQ has no attacker bit") predates [FTQATK] / [M3ATKWIN].  Levels: as the secret port (a
+  // parallel copy, from the same brinfos registers to its own flops).  Cost: 6 FF, about 30 LUT.
   if (ENABLE_IFT) {
     val wf_head = rob.io.rob_head_idx
-    val wf_ok = (brinfos zip win_arm_sec_v).map { case (bi, a) =>
-      a && !bi.mispredict && (bi.uop.br_mask & brupdate.b1.mispredict_mask) === 0.U }
-    var wf_v = false.B
-    var wf_b = brinfos(0).uop.rob_idx
-    var wf_f = brinfos(0).uop.ftq_idx
-    for ((bi, a) <- brinfos zip wf_ok) {
-      val take = a && (!wf_v || IsOlder(bi.uop.rob_idx, wf_b, wf_head))   // oldest
-      wf_b = Mux(take, bi.uop.rob_idx, wf_b)
-      wf_f = Mux(take, bi.uop.ftq_idx, wf_f)
-      wf_v = wf_v || a
+    def winFtqRs(arms: Seq[Bool]): (Bool, UInt) = {
+      val wf_ok = (brinfos zip arms).map { case (bi, a) =>
+        a && !bi.mispredict && (bi.uop.br_mask & brupdate.b1.mispredict_mask) === 0.U }
+      var wf_v = false.B
+      var wf_b = brinfos(0).uop.rob_idx
+      var wf_f = brinfos(0).uop.ftq_idx
+      for ((bi, a) <- brinfos zip wf_ok) {
+        val take = a && (!wf_v || IsOlder(bi.uop.rob_idx, wf_b, wf_head))   // oldest
+        wf_b = Mux(take, bi.uop.rob_idx, wf_b)
+        wf_f = Mux(take, bi.uop.ftq_idx, wf_f)
+        wf_v = wf_v || a
+      }
+      (RegNext(wf_v, false.B), RegNext(wf_f))
     }
-    io.ifu.cf_win_ftq_rs.get.valid := RegNext(wf_v, false.B)
-    io.ifu.cf_win_ftq_rs.get.bits  := RegNext(wf_f)
+    val (wfs_v, wfs_f) = winFtqRs(win_arm_sec_v)
+    io.ifu.cf_win_ftq_rs.get.valid := wfs_v
+    io.ifu.cf_win_ftq_rs.get.bits  := wfs_f
+    val (wfa_v, wfa_f) = winFtqRs(win_arm_atk_v)   // [WINFTQATK]
+    io.ifu.cf_win_ftq_ra.get.valid := wfa_v
+    io.ifu.cf_win_ftq_ra.get.bits  := wfa_f
   }
 
   // [RASJAL] step 15 (residue audit row 16): a JAL that links (call) under secret-dependent

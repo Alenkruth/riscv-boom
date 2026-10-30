@@ -427,6 +427,9 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   // [WINFTQ] patch 29b (owner r160): the FTQ index of the oldest secret-window arming branch
   // that resolved (registered); the FTQ tags every entry younger than it (fetch-target-queue.scala).
   val cf_win_ftq_rs = if (ENABLE_IFT) Some(Output(Valid(UInt(log2Ceil(ftqSz).W)))) else None
+  // [WINFTQATK] (DF-ftq-atk-window-range, owner 2026-10-28): the attacker twin, the FTQ index of the oldest
+  // attacker-window arming branch that resolved (registered); the FTQ sets cf_fetch_atk on every younger entry.
+  val cf_win_ftq_ra = if (ENABLE_IFT) Some(Output(Valid(UInt(log2Ceil(ftqSz).W)))) else None
   // [FTQATK] patch 47 (r173 (5)): per brinfos lane, a br/jalr resolved with an attacker-tainted
   // condition / target (cond_atk) at this ftq_idx; the FTQ ORs it into the predictor update domain.
   val cf_atk_ftq_updates = if (ENABLE_IFT) Some(Output(Vec(coreWidth, Valid(UInt(log2Ceil(ftqSz).W))))) else None
@@ -1255,6 +1258,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   ras.io.late_write_secret_idx   := VecInit(ftq.io.cf_ras_secret_upd_idx.map(i => WrapInc(i, cf_ras_active)))
   // [WINFTQ] patch 29b: the window range's calls (FTQ queue, one per cycle), same slot rule
   ftq.io.cf_win_ftq_rs.foreach(_ := io.cpu.cf_win_ftq_rs.get)
+  ftq.io.cf_win_ftq_ra.foreach(_ := io.cpu.cf_win_ftq_ra.get)   // [WINFTQATK]
   ftq.io.cf_win_sec_open.foreach(_ := io.cpu.cf_win_sec_ctr =/= 0.U)   // [WINFTQPOST] patch 38
   ftq.io.cf_win_atk_open.foreach(_ := io.cpu.cf_win_atk_ctr =/= 0.U)   // [M3ATKWIN] lean58
   ftq.io.cf_atk_ftq_updates.foreach(_ := io.cpu.cf_atk_ftq_updates.get)   // [FTQATK] patch 47
@@ -1262,6 +1266,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     l.valid := ftq.io.cf_ras_win_upd.get.valid
     l.bits  := WrapInc(ftq.io.cf_ras_win_upd.get.bits, cf_ras_active)
   }
+  ras.io.late_write_win_kind.foreach(_ := ftq.io.cf_ras_win_kind.get)   // [WINFTQATK] {atk, sec} of that slot
   ras.io.quiesce_flush           := io.cpu.cf_ras_quiesce_flush
   // corefuzzing
   // Wire frontend cf_debug gate into fetch buffer and FTQ

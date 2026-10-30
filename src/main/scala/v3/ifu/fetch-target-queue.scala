@@ -167,6 +167,11 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   // [M3ATKWIN] lean58 (Fable audit M3; RULES A U8 "symmetric", reading 1): the attacker window is open (core winCtr != 0)
   val cf_win_atk_open = if (ENABLE_IFT) Some(Input(Bool())) else None
   val cf_ras_win_upd = if (ENABLE_IFT) Some(Output(Valid(UInt(log2Ceil(nRasEntries).W)))) else None
+  // [WINFTQATK] (DF-ftq-atk-window-range, owner 2026-10-28; RULES A U8, O11): the attacker twin of cf_win_ftq_rs
+  // (the oldest ATTACKER-window arming branch that resolved, registered in core.scala), and the kind of the slot
+  // sent on cf_ras_win_upd: bit 0 = secret window range (as before), bit 1 = attacker window range.
+  val cf_win_ftq_ra   = if (ENABLE_IFT) Some(Input(Valid(UInt(idx_sz.W)))) else None
+  val cf_ras_win_kind = if (ENABLE_IFT) Some(Output(UInt(2.W))) else None
   // [FTQATK] patch 47: one port per brinfos lane (core.scala), valid = a br/jalr resolved with
   // cond_atk; bits = its ftq_idx.  Direct ports, no compactor (brinfos is already a register).
   val cf_atk_ftq_updates = if (ENABLE_IFT) Some(Flipped(Vec(coreWidth, Valid(UInt(idx_sz.W))))) else None
@@ -612,26 +617,75 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   // registers/constants -> 1 LUT (XOR/AND) -> the entry's existing cf_fetch_secret D mux (one
   // more term).  RAS queue: 32 FF -> PriorityEncoderOH -> 32:1 Mux1H of ras_idx -> FF.
   // Cost: about 4 LUT per entry (about 130 LUT), the queue 32 FF + about 60 LUT, 6 FF out.
+  // [WINFTQATK] (DF-ftq-atk-window-range, owner 2026-10-28 "Stage the RTL fix"; RULES A U8 "Yes, symmetric", O11):
+  // the ATTACKER twin of the range set above.  When an attacker-window arming branch B resolves (cf_win_ftq_ra,
+  // core.scala: attacker-domain conditional branch, victim conditional branch with an attacker-tainted condition,
+  // jalr with an attacker-tainted target; oldest B of the cycle, not mispredicted, not killed), every FTQ entry
+  // younger than B gets cf_fetch_atk, so its commit-time predictor update carries cf_domain_id = 1 (bpdupdate,
+  // above), the twin of cf_fetch_secret.  Before, cf_fetch_atk was set only at enqueue ([M3ATKWIN]: window open or
+  // ghist_atk at f3) or by an attacker-operand CFI of the packet itself ([FTQATK]), so a VICTIM packet fetched after
+  // B and enqueued before B resolved (a window member by age: its commit records have shadow_atk = 1) trained the
+  // BTB / uBTB / BIM / TAGE / loop with u_dom = 0 (measured, ift_graph pred_model.writers on cfg19-plru: spectre-v1
+  // 106, spectre-v2 358, spectreRSB 1 such updates; the secret twin 0).  Same range, same over-taint (an entry on a
+  // path a younger branch redirects stays tagged until re-enqueued), same write discipline as cf_fetch_secret
+  // (monotone set; the redirect write-back above ORs the current bit; this block is after it, so a set in the
+  // write-back cycle wins).  B's own entry: an attacker-domain B is domain 1 already; a cond_atk B is set by
+  // [FTQATK].
+  // RAS: needed, for the same reason as the secret queue.  A call in a range entry pushed its slot while it was in
+  // B's shadow, but before the attacker window counter opened, so ras_watk (frontend.scala: the f3 push writes the
+  // counter's zero detect) is 0 there, and a VICTIM ret that pops that slot gets no RAS_STATE atk edge, while the
+  // same call fetched one cycle after the resolution does (B60RAS).  The existing one-per-cycle queue is shared:
+  // each entry has a secret and an attacker pending bit, the priority select runs over their OR, and the slot
+  // goes out once with both bits (cf_ras_win_kind) on the existing late port; ras.scala sets ras_secret and/or
+  // ras_watk.  The [WINFTQPOST] f4-crossing case is twinned too (a call packet enqueued while the attacker window
+  // is open whose f3 push preceded the opening: ghist_atk = 0).
+  // Levels: rs / ra are registers; per entry the "below enq_ptr" half of the range (2 compares + XOR/AND) is
+  // shared by both kinds; the attacker half is one 5-bit compare against a constant plus 1 LUT (XOR/AND) -> one
+  // more set term in the entry's existing cf_fetch_atk D logic (beside the coreWidth [FTQATK] decodes): <= +1
+  // level on a flop-to-flop path off the fetch path.  RAS queue: the OR of the two pending bits enters the
+  // existing PriorityEncoderOH (absorbed in its first LUT level, <= +1), the Mux1H of ras_idx is unchanged, the
+  // two kind bits are (psel & pend).orR -> FF.
+  // Cost (attacker half): about 3 LUT per entry (range term, set term, pending set/clear), 32 FF (pending bits),
+  // 2 FF (kind), about 30 LUT (queue OR, kind reduce); the 29b secret half is unchanged in function.
   io.cf_ras_win_upd.foreach { o => o.valid := false.B; o.bits := 0.U }
+  io.cf_ras_win_kind.foreach(_ := 0.U)
   if (ENABLE_IFT) {
     val rs       = io.cf_win_ftq_rs.get
+    val ra       = io.cf_win_ftq_ra.get                // [WINFTQATK]
     val h        = bpd_ptr
     val b_lt_h   = rs.bits < h
+    val a_lt_h   = ra.bits < h                         // [WINFTQATK]
     val enq_lt_h = enq_ptr < h
+    // the entry is older than enq_ptr (inside the live region) and inside the active size: shared by both kinds
+    val below = (0 until num_entries).map { e =>
+      val E = e.U(idx_sz.W)
+      ((E < enq_ptr) ^ (E < h) ^ enq_lt_h) && (E < cf_ftq_active)
+    }
     val inr = (0 until num_entries).map { e =>
       val E = e.U(idx_sz.W)
-      ((rs.bits < E) ^ b_lt_h ^ (E < h)) && ((E < enq_ptr) ^ (E < h) ^ enq_lt_h) && (E < cf_ftq_active)
+      ((rs.bits < E) ^ b_lt_h ^ (E < h)) && below(e)
     }
-    val pend = RegInit(VecInit(Seq.fill(num_entries)(false.B)))
-    val psel = PriorityEncoderOH(pend.asUInt)
-    io.cf_ras_win_upd.get.valid := RegNext(pend.asUInt.orR, false.B)
+    val ina = (0 until num_entries).map { e =>        // [WINFTQATK] younger than the attacker B
+      val E = e.U(idx_sz.W)
+      ((ra.bits < E) ^ a_lt_h ^ (E < h)) && below(e)
+    }
+    val pend  = RegInit(VecInit(Seq.fill(num_entries)(false.B)))
+    val penda = RegInit(VecInit(Seq.fill(num_entries)(false.B)))   // [WINFTQATK] attacker-window pending call
+    val pany  = pend.asUInt | penda.asUInt
+    val psel  = PriorityEncoderOH(pany)
+    io.cf_ras_win_upd.get.valid := RegNext(pany.orR, false.B)
     io.cf_ras_win_upd.get.bits  := RegNext(Mux1H(psel, ram.map(_.ras_idx)))
+    io.cf_ras_win_kind.get      := RegNext(Cat((psel & penda.asUInt).orR, (psel & pend.asUInt).orR), 0.U)
     for (e <- 0 until num_entries) {
-      when (psel(e)) { pend(e) := false.B }
-      when (do_enq && enq_ptr === e.U) { pend(e) := false.B }
+      when (psel(e)) { pend(e) := false.B; penda(e) := false.B }
+      when (do_enq && enq_ptr === e.U) { pend(e) := false.B; penda(e) := false.B }
       when (rs.valid && inr(e)) {
         ram(e).cf_fetch_secret.get := true.B
         when (ram(e).cfi_is_call) { pend(e) := true.B }
+      }
+      when (ra.valid && ina(e)) {                      // [WINFTQATK]
+        ram(e).cf_fetch_atk.get := true.B
+        when (ram(e).cfi_is_call) { penda(e) := true.B }
       }
       // [WINFTQPOST] patch 38: a call packet enqueued while the window is open whose push at f3
       // preceded the opening (fetch-time bit 0: it sat in f4 across B's resolution) pushed a slot
@@ -641,8 +695,11 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
       // decode as that clear; about 1 LUT per entry.
       when (do_enq && enq_ptr === e.U && io.cf_win_sec_open.get &&
             !io.enq.bits.ghist_secret.getOrElse(false.B) && io.enq.bits.cfi_is_call) { pend(e) := true.B }
+      // [WINFTQATK] the attacker twin (ras_watk is written at the f3 push from the same counter as ghist_atk)
+      when (do_enq && enq_ptr === e.U && io.cf_win_atk_open.get &&
+            !io.enq.bits.ghist_atk.getOrElse(false.B) && io.enq.bits.cfi_is_call) { penda(e) := true.B }
     }
-    when (io.cf_ftq_quiesce_reset) { pend.foreach(_ := false.B) }
+    when (io.cf_ftq_quiesce_reset) { pend.foreach(_ := false.B); penda.foreach(_ := false.B) }
   }
 
   // On quiesce drain (QS_DRAINING→QS_FETCH), reset FTQ state to clear any

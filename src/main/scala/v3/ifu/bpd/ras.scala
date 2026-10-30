@@ -50,6 +50,9 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
     val late_write_secret_idx   = Input(Vec(coreWidth + memWidth, UInt(log2Ceil(nRasEntries).W)))
     // [WINFTQ] patch 29b: one more late port, the calls of a secret-window FTQ range
     val late_write_win = if (ENABLE_IFT) Some(Input(Valid(UInt(log2Ceil(nRasEntries).W)))) else None
+    // [WINFTQATK] (owner 2026-10-28): which window range queued that slot: bit 0 secret (ras_secret), bit 1 attacker
+    // (ras_watk); both may be set
+    val late_write_win_kind = if (ENABLE_IFT) Some(Input(UInt(2.W))) else None
 
     // corefuzzing: quiesce flush — clear all domain/secret shadow bits on campaign boundary.
     // Fired from core.scala on QS_DRAINING→QS_FETCH transition (quiesce_flush_pulse).
@@ -104,15 +107,29 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
     val ras_watk = RegInit(VecInit(Seq.fill(nRasEntries)(false.B)))
     when (io.write_valid) {
       ras_domain(io.write_idx) := io.write_domain
-      // [B60RAS] the window label is written like the domain: a push writes the push-time window bit, the FTQ top
-      // repair restores the label saved beside ras_top (frontend.scala).  Same write select as ras_domain (0 levels
-      // on it); data = one more f3 / FTQ bit.  Cost: nRasEntries FF + 1 LUT each.
-      ras_watk(io.write_idx)   := io.write_watk.get
     }
-    // [B60RAS] read side, forwarded on a same-cycle write exactly like read_domain (one read flop, one forward flop)
-    io.read_watk.get := Mux(RegNext(io.write_valid && io.write_idx === io.read_idx),
-      RegNext(io.write_watk.get),
-      RegNext(ras_watk(io.read_idx)))
+    // [B60RAS] the window label is written with the domain: a push writes the push-time window bit, the FTQ top
+    // repair restores the label saved beside ras_top (frontend.scala).  Same write select as ras_domain (0 levels
+    // on it); data = one more f3 / FTQ bit.  Cost: nRasEntries FF + 1 LUT each.
+    // [WINFTQATK] (owner 2026-10-28; RULES A U8 "symmetric"): the label can now also be set AFTER the push (the
+    // attacker window range's late write below), so the top repair keeps the slot's current bit like ras_secret
+    // ([RASLBL]: a repair is not an overwrite by new content): saved OR current on a repair, the push-time bit on a
+    // push.  Over-taint only (a wrong-path push's window bit can survive a repair of the same slot, as for the
+    // secret bit).  One more input on the slot's existing D LUT (!write_push && q), 0 added levels.
+    for (i <- 0 until nRasEntries) {
+      when (io.write_valid && io.write_idx === i.U) {
+        ras_watk(i) := io.write_watk.get || (!io.write_push && ras_watk(i))
+      }
+    }
+    // [B60RAS] read side, forwarded on a same-cycle write exactly like read_domain (one read flop, one forward flop);
+    // [WINFTQATK] a forwarded repair ORs the slot's current bit, as read_secret does ([RASLBL]): +1 flop (the push
+    // bit), one more input on the output LUT.
+    io.read_watk.get := {
+      val rwatk_q = RegNext(ras_watk(io.read_idx))
+      Mux(RegNext(io.write_valid && io.write_idx === io.read_idx),
+        RegNext(io.write_watk.get) || (RegNext(!io.write_push) && rwatk_q),
+        rwatk_q)
+    }
     // [RASLBL] DF-ras-repair-label: a push (write_push) replaces the slot's secret bit (window bit;
     // late_write_secret marks true later).  The FTQ top repair (write_push false) restores the slot to
     // the content its packet read at f3, with the labels read beside it (frontend.scala, FTQ
@@ -136,7 +153,12 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
         ras_secret(io.late_write_secret_idx(i)) := true.B
       }
     }
-    io.late_write_win.foreach { l => when (l.valid) { ras_secret(l.bits) := true.B } }   // [WINFTQ]
+    io.late_write_win.foreach { l => when (l.valid && io.late_write_win_kind.get(0)) { ras_secret(l.bits) := true.B } }   // [WINFTQ]
+    // [WINFTQATK] the attacker window range's calls: their slots get the attacker-window label.  Placed after the
+    // push / repair write above (last connect, as ras_secret's late ports), before the quiesce clear.  Levels: the
+    // FTQ queue flops -> WrapInc (frontend) -> slot decode with one more input (the kind bit) -> ras_watk FF: <= +1
+    // LUT on that flop-to-flop path.  Cost: about 1 LUT per slot.
+    io.late_write_win.foreach { l => when (l.valid && io.late_write_win_kind.get(1)) { ras_watk(l.bits) := true.B } }
 
     // [RASPTR] patch 29 (F-RAS-1): an attacker that only MOVES the pointer (extra pops or pushes
     // without a matching return) makes a victim ret pop an entry the victim pushed for another
