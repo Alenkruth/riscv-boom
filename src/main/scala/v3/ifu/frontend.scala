@@ -490,7 +490,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val ras = Module(new BoomRAS)
 
   // RAS runtime size selection: rasEntryCountOptions = Seq(32, 16, 8, 4)
-  val rasOptionsVec = VecInit(rasEntryCountOptions.map(_.U))
+  // [STATIC-CLAMP] each option is capped at the built size: identical constants when the module is built at
+  // the max option (the fuzzing build); a static smaller build with reconf off (index 0) gets its own size.
+  val rasOptionsVec = VecInit(rasEntryCountOptions.map(o => (o min nRasEntries).U))
   val cf_ras_active = rasOptionsVec(io.cpu.cf_ras_idx)
 
   val icache = outer.icache.module

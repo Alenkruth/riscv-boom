@@ -198,7 +198,9 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val enq_ptr    = RegInit(1.U(idx_sz.W))
 
   // Runtime FTQ size selection: ftQueueEntryOptions = Seq(32, 24, 16, 8)
-  val ftqOptionsVec = VecInit(ftQueueEntryOptions.map(_.U))
+  // [STATIC-CLAMP] each option is capped at the built size: identical constants when the module is built at
+  // the max option (the fuzzing build); a static smaller build with reconf off (index 0) gets its own size.
+  val ftqOptionsVec = VecInit(ftQueueEntryOptions.map(o => (o min num_entries).U))
   val cf_ftq_active = ftqOptionsVec(io.cf_ftq_idx)
   // [F-RAS-3b] active RAS window for the stored-ghist update below (reconf off: nRasEntries, the default).
   val cf_ftq_ras_active = io.cf_ras_active.getOrElse(nRasEntries.U)

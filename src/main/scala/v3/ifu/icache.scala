@@ -162,8 +162,10 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   // corefuzzing: runtime ICache set/way reconfiguration
   // icacheSetOptions = Seq(64, 32, 16, 8); cacheWayOptions = Seq(8, 4, 2, 1)
   // All options are powers of 2, so (active_sets - 1) is a valid AND-mask.
-  val icacheSetOptionsVec = VecInit(icacheSetOptions.map(_.U))
-  val cacheWayOptionsVec  = VecInit(cacheWayOptions.map(_.U))
+  // [STATIC-CLAMP] each option is capped at the built size: identical constants when the module is built at
+  // the max option (the fuzzing build); a static smaller build with reconf off (index 0) gets its own size.
+  val icacheSetOptionsVec = VecInit(icacheSetOptions.map(o => (o min nSets).U))
+  val cacheWayOptionsVec  = VecInit(cacheWayOptions.map(o => (o min nWays).U))
   val cf_icache_active_sets = icacheSetOptionsVec(io.cf_icache_set_conf)
   val cf_icache_active_ways = cacheWayOptionsVec(io.cf_icache_way_conf)
   val icache_set_mask = cf_icache_active_sets - 1.U

@@ -387,7 +387,9 @@ class Rob(
   val rob_state = RegInit(s_reset)
 
   // corefuzzing values
-  val optionsVec = VecInit(robEntryOptions.map(_.U))
+  // [STATIC-CLAMP] each option is capped at the built size: identical constants when the module is built at
+  // the max option (the fuzzing build); a static smaller build with reconf off (index 0) gets its own size.
+  val optionsVec = VecInit(robEntryOptions.map(o => (o min numRobEntries).U))
   def entryCount = optionsVec(io.cf_rob_entries)
 
   // Make sure entryCount is a multiple of coreWidth ALWAYS
@@ -471,7 +473,13 @@ class Rob(
   // ll_wports(0) + int->fp, then ll_wports(1)); the FPU itself is last
   // (core.scala:2071-2128, fp-pipeline.scala:299-330).  Task 2.10d: hoisted out of the bank
   // loop because the raw squash entry's shape (IftSqEntry) is needed before it.
-  val lsuWbPorts  = Seq(0, 1) ++ (if (usingFPU) Seq(numWakeupPorts - 3, numWakeupPorts - 2) else Nil)
+  // [OOC-WIDTH] derived from memWidth and the FP issue width instead of the memWidth=2 / FP-width-1
+  // literals: int ports 0..memWidth-1 are ll_wbarb + mem_resps(1..), and the FP pipeline's wakeups
+  // (fp-pipeline.scala:35, memWidth ll ports first, then the FPUs) are the last ports.  Identical to the
+  // old Seq(0, 1, n-3, n-2) at memWidth 2, FP issue width 1; at memWidth 1 the old list repeated port 1.
+  val iftFpWakeups = if (usingFPU) issueParams.find(_.iqType == IQT_FP.litValue).get.issueWidth + memWidth else 0
+  val lsuWbPorts  = (0 until memWidth) ++
+                    (if (usingFPU) (0 until memWidth).map(numWakeupPorts - iftFpWakeups + _) else Nil)
   val iftNSprob   = numWakeupPorts                               // the sidecar's sprobPorts
   val iftNIc      = io.cf_issue_contention_upd.length
   val iftNMo      = memWidth + 1   // [RDEDGE] patch 80: + the reader-edge port's column

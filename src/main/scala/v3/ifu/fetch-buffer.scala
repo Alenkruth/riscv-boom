@@ -121,7 +121,9 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
 
   // fetch-buffer size: runtime-reconfigurable via cf_fb_idx CSR
   // rows per option = fetchBufferEntryOptions.map(_ / coreWidth)
-  val rowsOptionsVec = VecInit(fetchBufferEntryOptions.map(e => (e / coreWidth).U))
+  // [STATIC-CLAMP] each option is capped at the built size: identical constants when the module is built at
+  // the max option (the fuzzing build); a static smaller build with reconf off (index 0) gets its own size.
+  val rowsOptionsVec = VecInit(fetchBufferEntryOptions.map(e => ((e min numEntries) / coreWidth).U))
   val rowsUsed = WireInit(rowsOptionsVec(io.cf_fb_idx))
   dontTouch(rowsUsed)
   val rowNum_tail = Reg(UInt(5.W))
@@ -132,15 +134,20 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // groups_per_row: how many N-slot sub-groups fit in one coreWidth row.
   // Derived from coreWidth and active width so values update if parameters change.
   // N=coreWidth → 1 group (no slicing), N=coreWidth/2 → 2 groups, N=1 → coreWidth groups
+  // [STATIC-CLAMP] the width keys 2 and 1 are absolute; only a key BELOW the built coreWidth is a
+  // narrowing.  In a static narrower core (reconf off, cf_active_width = coreWidth = 2 or 1) the
+  // unfiltered keys made the build's own full width look like a narrowed one (fetch throttled with a
+  // cooldown of fetchWidth/2-1 cycles at coreWidth 2).  The filter keeps every key at coreWidth 4,
+  // so the fuzzing build elaborates identically.
   val groups_per_row = MuxLookup(io.cf_active_width, 1.U(3.W))(
-    Seq(2.U -> (coreWidth/2).U, 1.U -> coreWidth.U))
+    Seq(2 -> (coreWidth/2), 1 -> coreWidth).filter(_._1 < coreWidth).map { case (n, g) => n.U -> g.U })
   // last_group: true when this is the final sub-group of the current row
   // At N=coreWidth: groups_per_row=1, sub_row_cnt=0, 0===0 → always true (no change to head advance)
   val last_group = (sub_row_cnt === groups_per_row - 1.U)
   // fetch_cooldown_period: (fetchWidth/N) - 1; 0 at N=coreWidth so gate is always open.
   // Derived from fetchWidth/coreWidth parameters so values update if parameters change.
-  val fetch_cooldown_period = MuxLookup(io.cf_active_width, 0.U(3.W))(
-    Seq(2.U -> (fetchWidth/2 - 1).U, 1.U -> (fetchWidth - 1).U))
+  val fetch_cooldown_period = MuxLookup(io.cf_active_width, 0.U(3.W))(   // [STATIC-CLAMP] keys < coreWidth only
+    Seq(2 -> (fetchWidth/2 - 1), 1 -> (fetchWidth - 1)).filter(_._1 < coreWidth).map { case (n, c) => n.U -> c.U })
 
   // used ChatGPT to write these switch statements (head and tail) for debugging - alex, corefuzzing
   // for numRows = 16
@@ -483,10 +490,10 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // N=2: sub_row_cnt=0 → slots 0,1 (w/2==0); sub_row_cnt=1 → slots 2,3 (w/2==1)
   // N=1: sub_row_cnt==w → exactly one slot active per cycle
   val sub_row_mask = VecInit((0 until coreWidth).map { w =>
-    MuxCase(true.B, Seq(
-      (io.cf_active_width === 2.U) -> (sub_row_cnt === (w/2).U),
-      (io.cf_active_width === 1.U) -> (sub_row_cnt === w.U)
-    ))
+    MuxCase(true.B, Seq(   // [STATIC-CLAMP] keys < coreWidth only (see groups_per_row)
+      2 -> (w/2),
+      1 -> w
+    ).filter(_._1 < coreWidth).map { case (n, k) => (io.cf_active_width === n.U) -> (sub_row_cnt === k.U) })
   })
   val deq_valids_sub = VecInit(deq_valids.zip(sub_row_mask).map { case (v, m) => v && m })
   io.deq.bits.uops zip deq_valids_sub        map {case (d,v) => d.valid := v}

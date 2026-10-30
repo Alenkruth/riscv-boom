@@ -79,7 +79,9 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   }
 
   // corefuzzing: runtime BTB set count selection
-  val btbSetOptionsVec    = VecInit(btbSetOptions.map(_.U))
+  // [STATIC-CLAMP] each option is capped at the built size: identical constants when the module is built at
+  // the max option (the fuzzing build); a static smaller build with reconf off (index 0) gets its own size.
+  val btbSetOptionsVec    = VecInit(btbSetOptions.map(o => (o min nSets).U))
   val cf_btb_active_sets  = btbSetOptionsVec(io.cf_btb_set_idx)
   // Mask s0/s1_update indices to keep accesses within the active set range
   val s0_idx_masked        = s0_idx       & (cf_btb_active_sets - 1.U)
@@ -87,7 +89,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
 
   // corefuzzing: runtime BTB way count selection — gates READ hits to active ways only
   // Without this, stale entries in deactivated ways cause false BTB hits and corrupt IFT records
-  val btbWayOptionsVec   = VecInit(btbWayOptions.map(_.U))
+  val btbWayOptionsVec   = VecInit(btbWayOptions.map(o => (o min nWays).U))   // [STATIC-CLAMP]
   val cf_btb_active_ways = btbWayOptionsVec(io.cf_btb_way_idx)
 
   val meta     = Seq.fill(nWays) { SyncReadMem(nSets, Vec(bankWidth, UInt(btbMetaSz.W))) }

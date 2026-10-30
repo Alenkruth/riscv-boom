@@ -335,7 +335,9 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
   // corefuzzing: runtime TAGE active table count selection
   // tagetableCountOptions = Seq(7,6,5,3,2,1): values are shifted past table 3 for
   // the upper options so that the real TAGE table count is correct (see CoreFuzzing.scala).
-  val tageOptionsVec = VecInit(tagetableCountOptions.map(_.U))
+  // [STATIC-CLAMP] each option is capped at the built size: identical constants when the module is built at
+  // the max option (the fuzzing build); a static smaller build with reconf off (index 0) gets its own size.
+  val tageOptionsVec = VecInit(tagetableCountOptions.map(o => (o min tageNTables).U))
   val cf_tage_active = tageOptionsVec(io.cf_tage_count_idx)
 
   // Per-table enable mask: in GShare mode only table 3 is active; in TAGE mode

@@ -644,8 +644,10 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   
   // === Dynamic DCache Reconfiguration Support ===
   // Block size (cacheBlockBytes) is NOT reconfigurable per user requirement.
-  val dcacheSetOptionsVec = VecInit(dcacheSetOptions.map(_.U))
-  val cacheWayOptionsVec  = VecInit(cacheWayOptions.map(_.U))
+  // [STATIC-CLAMP] each option is capped at the built size: identical constants when the module is built at
+  // the max option (the fuzzing build); a static smaller build with reconf off (index 0) gets its own size.
+  val dcacheSetOptionsVec = VecInit(dcacheSetOptions.map(o => (o min nSets).U))
+  val cacheWayOptionsVec  = VecInit(cacheWayOptions.map(o => (o min nWays).U))
 
   // ==== [reconf-fix 2026-08-06] Config commit gate ==========================
   // The 0xbc1 CSR value is a REQUEST; it is applied to the live mapping only on a
@@ -1655,7 +1657,8 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   val uw  = Mux(cf_repl_fire.reduce(_||_), PriorityEncoder(cf_repl_fire), PriorityEncoder(s2_repl_upd))
   val set = dcacheMaskIdx(s2_req(uw).addr)
   val way = s2_repl_way(uw)
-  val cf_lru_next  = lru_replacer.get_next_state(s2_lru_state(uw), way)
+  // [OOC 1-way] rocket-chip TrueLRU.get_next_state is undefined for one way (empty Vec); a 1-way set has no LRU state.
+  val cf_lru_next  = if (nWays > 1) lru_replacer.get_next_state(s2_lru_state(uw), way) else 0.U
   val cf_plru_next = plru_replacer.get_next_state(s2_plru_state(uw), way)
   val cf_lru_upd   = upd && io.lsu.cf_dcache_repl_conf === 1.U
   val cf_plru_upd  = upd && cf_repl_is_plru

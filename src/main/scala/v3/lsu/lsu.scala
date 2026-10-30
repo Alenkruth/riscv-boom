@@ -479,8 +479,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
 
   // Runtime LDQ/STQ size selection via CSR index
-  val ldqOptionsVec = VecInit(ldQueueEntryOptions.map(_.U))
-  val stqOptionsVec = VecInit(stQueueEntryOptions.map(_.U))
+  // [STATIC-CLAMP] each option is capped at the built size: identical constants when the module is built at
+  // the max option (the fuzzing build); a static smaller build with reconf off (index 0) gets its own size.
+  val ldqOptionsS = ldQueueEntryOptions.map(_ min numLdqEntries)
+  val stqOptionsS = stQueueEntryOptions.map(_ min numStqEntries)
+  val ldqOptionsVec = VecInit(ldqOptionsS.map(_.U))
+  val stqOptionsVec = VecInit(stqOptionsS.map(_.U))
   // [reconf-fix 2026-08-13] DEFERRED RESIZE.
   // Previously cf_ldq_active/cf_stq_active tracked the CSR combinationally, so a write to
   // 0x7c4 shrank the queue *underneath live entries*. Any pointer already >= the new size is
@@ -611,8 +615,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       (0 until coreWidth).scanLeft(v)((c, _) => WrapInc(c, n_active))
     }
   }
-  val ldq_succ = cfWrapSucc(ldq_tail, ldQueueEntryOptions, cf_ldq_idx_applied, cf_ldq_active)
-  val stq_succ = cfWrapSucc(stq_tail, stQueueEntryOptions, cf_stq_idx_applied, cf_stq_active)
+  val ldq_succ = cfWrapSucc(ldq_tail, ldqOptionsS, cf_ldq_idx_applied, cf_ldq_active)
+  val stq_succ = cfWrapSucc(stq_tail, stqOptionsS, cf_stq_idx_applied, cf_stq_active)
   val ldq_full_k = (0 until coreWidth).map(k => ldq_succ(k + 1) === ldq_head)
   val stq_full_k = (0 until coreWidth).map(k => stq_succ(k + 1) === stq_head)
   val dis_pre_ld = (0 until coreWidth).map(w => io.core.dis_valids(w) && io.core.dis_uops(w).bits.uses_ldq && !io.core.dis_uops(w).bits.exception)

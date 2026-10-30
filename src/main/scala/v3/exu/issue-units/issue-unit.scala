@@ -244,7 +244,9 @@ abstract class IssueUnit(
   //   _GEN = '{6'h8, 6'h10, 6'h18, 6'h20}   (packed literal: index 3 FIRST)
   //   => idx0..3 = 32, 24, 16, 8, and _active_offset_T = 6'h20 - _GEN[idx]  -- never underflows.
   // Do not restate the option values here without checking CoreFuzzing.scala.
-  val iqOptionsVec = VecInit(issueQueueEntryOptions.map(_.U))
+  // [STATIC-CLAMP] each option is capped at the built size: identical constants when the module is built at
+  // the max option (the fuzzing build); a static smaller build with reconf off (index 0) gets its own size.
+  val iqOptionsVec = VecInit(issueQueueEntryOptions.map(o => (o min numIssueSlots).U))
   val cf_iq_active = iqOptionsVec(io.cf_iq_idx)
 
   //-------------------------------------------------------------
