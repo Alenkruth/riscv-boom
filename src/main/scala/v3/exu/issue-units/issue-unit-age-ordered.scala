@@ -150,16 +150,47 @@ class IssueUnitCollapsing(
     (issue_slots(i).uop.fu_code & io.fu_types(w)) =/= 0.U
   }
 
+  // [WCAP] width CSR 0xbcc issue-grant cap (owner 2026-10-28, RULES C "Width CSR design"): this queue grants at most
+  // cap = min(N, issueWidth) uops per cycle (INT 4 ports: N; MEM 2: 1 at N=1, else 2; FP 1: never capped, no input).
+  // A stop-after-cap-grants term on the existing select; no FU/port remapping; the contention pass is unchanged.
+  //  - Mode flops: one per binding cap k (k in coreWidthOptions, k < issueWidth: INT k = 2, 1; MEM k = 1), wcap_m(k) =
+  //    RegNext(idx == index of k).  The CSR changes only with the queues empty (csrw is unique + flush_on_commit; DMI
+  //    writes in debug halt), so the one-cycle lag is invisible.  INT 2 FF, MEM 1 FF.
+  //  - Count: every grant takes one distinct port, so the grants made by the slots below slot i are exactly the set
+  //    port_issued carries entering slot i (chain nodes that already exist; never io.iss_valids, which would close a
+  //    combinational loop).  wcap_ok(i) = AND_k !(wcap_m(k) && atLeast_k(carries)): a 6-input LUT on INT
+  //    (4 carries + 2 mode flops), a 3-input term on MEM.
+  //  - Parallel form: the chain itself is NOT changed; wcap_ok(i) only qualifies slot i's grant and iss_valids
+  //    outputs.  That equals gating the request at the front of the slot (the serial form): up to the cap-th grant the
+  //    two chains are identical (fewer than cap grants below), and from there on the count stays >= cap, so the
+  //    serial form blocks every later request and this form drops every later grant: same grants, same ports.  The
+  //    ports a dropped slot would have taken are visible only to slots that are dropped too.  The oldest eligible
+  //    slot always gets the first grant (all ports free), so the cap never starves it.
+  //  - io.iss_uops(w) and port_winner_idx(w) keep the unqualified select (0 logic on the uop mux, the deepest
+  //    select-to-wakeup path): with io.iss_valids(w) low no consumer reads them (fast/pred wakeup, regread, idiv
+  //    back-to-back, jmp_pc_req, contention routing are all gated by the valid).  At N=4 (idx 0) every wcap_m is 0:
+  //    cycle-identical to the stock select.  Reconf off / FP: wcap_ok is the literal true.B, the Verilog is unchanged.
+  val wcap_m: Seq[(Int, Bool)] = io.cf_width_idx.map { idx =>
+    coreWidthOptions.filter(_ < issueWidth).map(k => k -> RegNext(idx === coreWidthOptions.indexOf(k).U, false.B))
+  }.getOrElse(Nil)
+  def wcapAtLeast(c: Seq[Bool], k: Int): Bool = c.combinations(k).map(_.reduce(_ && _)).reduce(_ || _)
+  def wcapOk(c: Seq[Bool]): Bool =
+    if (wcap_m.isEmpty) true.B else wcap_m.map { case (k, m) => !(m && wcapAtLeast(c, k)) }.reduce(_ && _)
+  val wcap_dbg   = wcap_m.nonEmpty && ENABLE_CF_DEBUG_PRINTF
+  val wcap_g_unc = Array.fill(numIssueSlots)(false.B)   // debug only: the unqualified per-slot grant
+
   for (i <- 0 until numIssueSlots) {
     issue_slots(i).grant := false.B
     var uop_issued = false.B
+    val wcap_ok = wcapOk(port_issued.toSeq)             // the carries entering slot i; true.B without the cap
 
     for (w <- 0 until issueWidth) {
       val can_allocate = slot_can_use_port(i)(w)
+      if (wcap_dbg) wcap_g_unc(i) = wcap_g_unc(i) || (requests(i) && !uop_issued && can_allocate && !port_issued(w))
 
       when (requests(i) && !uop_issued && can_allocate && !port_issued(w)) {
-        issue_slots(i).grant := true.B
-        io.iss_valids(w) := true.B
+        issue_slots(i).grant := wcap_ok
+        io.iss_valids(w) := wcap_ok
         io.iss_uops(w) := issue_slots(i).uop
         port_winner_idx(w) := i.U
         // probably not necessary. Hence commented.
@@ -171,6 +202,26 @@ class IssueUnitCollapsing(
       val was_port_issued_yet = port_issued(w)
       port_issued(w) = (requests(i) && !uop_issued && can_allocate) | port_issued(w)
       uop_issued = (requests(i) && can_allocate && !was_port_issued_yet) | uop_issued
+    }
+  }
+
+  // [WCAP] debug-print builds only (Verilator; never FireSim / oracle synthesis): the cap is a hard invariant, and
+  // +cf_wcap=1 prints one line per cycle in which the cap dropped a grant or more than one uop issued, plus a line
+  // whenever the mode flops change (cap = the live cap of this queue; q = iqType: 1 INT, 2 MEM).
+  if (wcap_dbg) {
+    val wcapIss    = PopCount(io.iss_valids)
+    val wcapCap    = wcap_m.foldLeft(issueWidth.U(3.W)) { case (acc, (k, m)) => Mux(m, k.U(3.W), acc) }
+    val wcapCapped = PopCount((0 until numIssueSlots).map(i => wcap_g_unc(i) && !issue_slots(i).grant))
+    for ((k, m) <- wcap_m) {
+      assert(!(m && wcapIss > k.U), "[WCAP] issue queue granted more uops than the width cap")
+    }
+    assert(PopCount(wcap_m.map(_._2)) <= 1.U, "[WCAP] more than one width-cap mode flop set")
+    val wcapPa = freechips.rocketchip.util.PlusArg("cf_wcap", 0, "[WCAP] width-cap debug prints (1 = on)", 1)(0)
+    when (wcapPa && (wcapCapped =/= 0.U || wcapIss > 1.U)) {
+      printf("[WCAP] c=%d q=%d cap=%d iss=%d capped=%d\n", io.tsc_reg, iqType.U, wcapCap, wcapIss, wcapCapped)
+    }
+    when (wcapPa && (wcapCap =/= RegNext(wcapCap, issueWidth.U(3.W)))) {
+      printf("[WCAP-MODE] c=%d q=%d cap=%d\n", io.tsc_reg, iqType.U, wcapCap)
     }
   }
 

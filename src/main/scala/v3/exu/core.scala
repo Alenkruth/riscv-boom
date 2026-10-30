@@ -487,6 +487,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // Issue queue size reconfiguration: 2-bit index into issueQueueEntryOptions
   mem_iss_unit.io.cf_iq_idx := custom_csrs.cf_iq_idx
   int_iss_unit.io.cf_iq_idx := custom_csrs.cf_iq_idx
+  // [WCAP] width CSR 0xbcc -> the INT / MEM issue-grant caps (min(N, 4) / min(N, 2)); FP (1 port) has no cap input.
+  // Reconf only (the IQ port is None otherwise).
+  mem_iss_unit.io.cf_width_idx.foreach(_ := custom_csrs.cf_core_width_idx)
+  int_iss_unit.io.cf_width_idx.foreach(_ := custom_csrs.cf_core_width_idx)
   if (usingFPU) {
     fp_pipeline.io.cf_iq_idx := custom_csrs.cf_iq_idx
   }
