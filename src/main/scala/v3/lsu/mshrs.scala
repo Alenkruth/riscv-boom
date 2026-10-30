@@ -227,6 +227,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   rpq.io.enq.bits.cf_res_atk.foreach(_ := false.B)   // [ATKEVICT] per-MSHR too
   rpq.io.enq.bits.cf_res_esec.foreach(_ := false.B)
   rpq.io.enq.bits.cf_res_repl.foreach(_ := false.B)   // [CEREPL] per-MSHR (req), like cf_res_v/pc
+  rpq.io.enq.bits.cf_res_nack.foreach(_ := false.B)
   // [G9STMETA] (ruling 101, G-9) the store replay writes D$ store metadata, whose attacker
   // bit is `domain || cf_attacker_influence` on the hit path.  The domain is zeroed above, so
   // fold it into the (kept) attacker bit for STORES only: one LUT, no extra rpq bit.  The
@@ -322,6 +323,8 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   // that record named the replacement-state advancer (dcache.scala [CEREPL]).  The MSHR's own residency edges
   // (asec_e / aatk_e) and the attacker-only nack edge never are.  1 FF per MSHR (req), one AND, 0 levels.
   val cf_rp_res_repl = req.cf_res_v.getOrElse(false.B) && req.cf_res_repl.getOrElse(false.B)
+  // [RECV3] SP-07 3.D: the edge's PC is the primary's nack-edge PC (cf_rp_res_pc selects req.cf_res_pc for both cases)
+  val cf_rp_res_nack = (req.cf_res_v.getOrElse(false.B) && req.cf_res_nack.getOrElse(false.B)) || (cf_rp_nk && !cf_rp_asec_e && !cf_rp_aatk_e)
   // [RPQSKIP] D2-b2 (owner-approved scope 2026-10-21): a branch-killed or exception-flushed PRIMARY leaves the
   // rpq through the BranchKillableQueue head skip (util.scala do_deq with !valids(head): deq_ptr moves, no
   // deq.fire), so cf_first_rp stayed 1 and the first SURVIVING secondary was taken for the primary itself
@@ -379,6 +382,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   io.resp.bits.cf_res_atk.foreach(_ := false.B)   // [ATKEVICT]
   io.resp.bits.cf_res_esec.foreach(_ := false.B)
   io.resp.bits.cf_res_repl.foreach(_ := false.B)   // [CEREPL]
+  io.resp.bits.cf_res_nack.foreach(_ := false.B)
   io.commit_val          := false.B
   io.commit_addr         := req.addr
   io.commit_coh          := coh_on_grant
@@ -578,8 +582,17 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     io.resp.bits.cf_res_atk.foreach(_ := cf_rp_res_atk)   // [ATKEVICT]/[ATKRES] edge flags (per-MSHR)
     io.resp.bits.cf_res_esec.foreach(_ := cf_rp_res_esec)
     io.resp.bits.cf_res_repl.foreach(_ := cf_rp_res_repl)   // [CEREPL]
+    io.resp.bits.cf_res_nack.foreach(_ := cf_rp_res_nack)
     io.resp.bits.cf_res_v.foreach(_ := cf_rp_res_v)   // [RESID] line-buffer (miss) response edge
     io.resp.bits.cf_res_pc.foreach(_ := cf_rp_res_pc)
+    // [RECV3] SP-08 (design 6.1.1, audit E2): the answering MSHR's own line: kind 2, set = its masked index (the index the
+    // refill writes, req_idx & dcache_set_mask), way = its victim / hit way (req.way_en).  From MSHR registers through the
+    // existing resp_arb and respq (+12 bits there); the 8:3 encoder is the MSHR-side +1 on a parallel 3-bit path.
+    io.resp.bits.edges.dc.foreach { d =>
+      d.kind := 2.U(2.W)
+      d.set  := (req_idx & io.dcache_set_mask).pad(7)
+      d.way  := OHToUInt(req.way_en).pad(3)
+    }
     when (rpq.io.deq.fire) {
       commit_line   := true.B
     }
@@ -672,6 +685,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     io.replay.bits.cf_res_atk.foreach(_ := cf_rp_res_atk)   // [ATKEVICT]/[ATKRES]
     io.replay.bits.cf_res_esec.foreach(_ := cf_rp_res_esec)
     io.replay.bits.cf_res_repl.foreach(_ := cf_rp_res_repl)   // [CEREPL]
+    io.replay.bits.cf_res_nack.foreach(_ := cf_rp_res_nack)
     io.replay.bits.cf_res_v.foreach(_ := cf_rp_res_v)   // [RESID] replay (t_replay) response edge
     io.replay.bits.cf_res_pc.foreach(_ := cf_rp_res_pc)
     io.replay.bits.addr := Cat(req_tag, req_idx(cfIdxLowBits-1, 0), rpq.io.deq.bits.addr(blockOffBits-1,0))
@@ -787,11 +801,13 @@ class BoomIOMSHR(id: Int)(implicit edge: TLEdgeOut, p: Parameters) extends BoomM
   io.resp.bits.uop  := req.uop
   io.resp.bits.data := loadgen.data
   io.resp.bits.edges := 0.U.asTypeOf(new IftEdgeList)   // Task 3.2 (D16): an uncached response has no D$ edge
+  io.resp.bits.edges.dc.foreach { d => d.kind := 3.U(2.W); d.set := 0.U; d.way := 0.U }   // [RECV3] SP-08: uncached, no line
   io.resp.bits.cf_res_v.foreach(_ := false.B)   // [RESID]
   io.resp.bits.cf_res_pc.foreach(_ := 0.U)
   io.resp.bits.cf_res_atk.foreach(_ := false.B)   // [ATKEVICT]
   io.resp.bits.cf_res_esec.foreach(_ := false.B)
   io.resp.bits.cf_res_repl.foreach(_ := false.B)   // [CEREPL]
+  io.resp.bits.cf_res_nack.foreach(_ := false.B)
 
   when (io.req.fire) {
     req   := io.req.bits

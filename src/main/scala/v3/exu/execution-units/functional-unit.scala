@@ -229,7 +229,7 @@ abstract class FunctionalUnit(
       // parser reconstructs the rest, so the upper bits were routed out of every
       // non-pipelined FU and through the aggregation mux tree only to be discarded.
       // Behaviour-preserving by construction: the stored value is unchanged.
-      val op_count = UInt(inflOpCountWidthCF.W)
+      val op_count = UInt(inflKeyWidthCF.W)
       val is_atk   = Bool()
       val is_sec   = Bool()
     }))
@@ -380,11 +380,12 @@ abstract class PipelinedFunctionalUnit(
     {
       val fu = io.req.bits.uop.fu_code
       val newBit = MuxCase(0.U(numModules.W), Seq(
-        ((fu & FU_ALU) =/= 0.U)                                           -> (1.U << aluTagCF.U),
-        ((fu & FU_MUL) =/= 0.U)                                           -> (1.U << mulTagCF.U),
-        ((fu & FU_DIV) =/= 0.U)                                           -> (1.U << divTagCF.U),
-        ((fu & (FU_FPU | FU_FDV | FU_I2F | FU_F2I)) =/= 0.U)             -> (1.U << fpuTagCF.U),
-        ((fu & FU_CSR) =/= 0.U)                                           -> (1.U << csrTagCF.U)
+        // [RECV3] SP-09 (design 3.2 bits 7-9, 3.3 item 4): ALU and the pipelined multiplier are one unit (same execution unit,
+        // issue port, iresp port and latency: execution-unit.scala :250-252, :300-303, :389); conditional branches are FU_ALU.
+        // The jump unit (FU_JMP: jal, jalr) gets its own bit.  FPU / CSR are out of scope (owner): no bit.
+        ((fu & (FU_ALU | FU_MUL)) =/= 0.U) -> (1 << UNIT_ALU).U(numModules.W),
+        ((fu & FU_DIV) =/= 0.U)            -> (1 << UNIT_DIV).U(numModules.W),
+        ((fu & FU_JMP) =/= 0.U)            -> (1 << UNIT_JMP).U(numModules.W)
       ))
       when (io.req.valid && !IsKilledByBranch(io.brupdate, io.req.bits.uop) && !io.req.bits.kill) {
         r_uops(0).cf_fu_bitmap.foreach(_ := io.req.bits.uop.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | newBit)
@@ -970,7 +971,7 @@ abstract class IterativeFunctionalUnit(dataWidth: Int)(implicit p: Parameters)
   io.cf_fu_busy.valid        := !io.req.ready
   // truncate explicitly: cf_op_count_id is uopIDCounterWidthCF wide, and only the low
   // inflOpCountWidthCF bits are ever stored (see the port declaration above).
-  io.cf_fu_busy.bits.op_count := r_uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))(inflOpCountWidthCF-1, 0)
+  io.cf_fu_busy.bits.op_count := r_uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))(inflKeyWidthCF-1, 0)
   // [I3BUSYATK] (ruling 100, I-3) the occupant's attacker flag is its result attacker taint
   // (operand taint OR ownership, held in r_atk for the whole latency), not ownership alone:
   // a victim divide on attacker-chosen operands has attacker-chosen latency.  r_atk is a flop.
@@ -1011,7 +1012,7 @@ class DivUnit(dataWidth: Int)(implicit p: Parameters)
   // Corefuzzing: OR in divTagCF when request is accepted (parent r_uop := io.req.bits.uop
   // happens first; this second when-block wins on r_uop.cf_fu_bitmap)
   when (io.req.fire) {
-    r_uop.cf_fu_bitmap.foreach(_ := io.req.bits.uop.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << divTagCF.U))
+    r_uop.cf_fu_bitmap.foreach(_ := io.req.bits.uop.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1 << UNIT_DIV).U(numModules.W))
   }
 
   // handle pipeline kills and branch misspeculations

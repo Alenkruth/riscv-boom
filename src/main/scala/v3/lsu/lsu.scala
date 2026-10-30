@@ -57,7 +57,7 @@ import boom.v3.exu.{BrUpdateInfo, Exception, FuncUnitResp, CommitSignals, ExeUni
 
 // fore corefuzzing - SpeculativePRintf and Sext
 import boom.v3.util.{BoolToChar, AgePriorityEncoder, IsKilledByBranch, GetNewBrMask, WrapInc, IsOlder, UpdateBrMask, SpeculativePrintf}
-import boom.v3.util.{Sext, appendModuleTag, addInfluencerBatchList, InfluencerCandidate, SatDropped}
+import boom.v3.util.{Sext, appendModuleTag, addInfluencerBatchList, InfluencerCandidate, SatDropped, CfStatePlusArg}
 
 class LSUExeIO(implicit p: Parameters) extends BoomBundle()(p)
 {
@@ -99,6 +99,7 @@ class BoomDCacheReq(implicit p: Parameters) extends BoomBundle()(p)
   // [CEREPL] lean59: the edge's PC (cf_res_pc, from the D$ eviction record) names the access that last advanced the
   // set's replacement state, not the evicting access (dcache.scala [CEREPL]).  D$-internal; LSU drives 0.
   val cf_res_repl = if (ENABLE_IFT) Some(Bool()) else None
+  val cf_res_nack = if (ENABLE_IFT) Some(Bool()) else None   // [RECV3] SP-07 3.D: the cf_res_* PC is a nack edge's (DC_NACK)
 }
 
 class BoomDCacheResp(implicit p: Parameters) extends BoomBundle()(p)
@@ -115,6 +116,7 @@ class BoomDCacheResp(implicit p: Parameters) extends BoomBundle()(p)
   val cf_res_atk  = if (ENABLE_IFT) Some(Bool()) else None   // [ATKEVICT] step 17, as in BoomDCacheReq
   val cf_res_esec = if (ENABLE_IFT) Some(Bool()) else None
   val cf_res_repl = if (ENABLE_IFT) Some(Bool()) else None   // [CEREPL] as in BoomDCacheReq
+  val cf_res_nack = if (ENABLE_IFT) Some(Bool()) else None   // [RECV3] SP-07 3.D, as in BoomDCacheReq
   // IFT overhaul Task 3.2 (D16): the D$ edges of this response (CACHE_EVICTION,
   // MEM_DATAFLOW), built on a zero base.  Zero on every MSHR/uncached response.
   val edges = new IftEdgeList
@@ -636,8 +638,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     {
       ldq(ld_enq_idx).valid                := true.B
       ldq(ld_enq_idx).bits.uop             := io.core.dis_uops(w).bits
-      // corefuzzing: stamp ldqTagCF into cf_fu_bitmap at LDQ enqueue
-      ldq(ld_enq_idx).bits.uop.cf_fu_bitmap.foreach(_ := io.core.dis_uops(w).bits.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << ldqTagCF.U))
+      // corefuzzing: stamp the LDQ unit bit into cf_fu_bitmap at LDQ enqueue ([RECV3] UNIT_LDQ, design 3.2 bit 2)
+      ldq(ld_enq_idx).bits.uop.cf_fu_bitmap.foreach(_ := io.core.dis_uops(w).bits.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1 << UNIT_LDQ).U(numModules.W))
       // IFT LUT optimization (Change 8): zero cf_* fields not read by LSU logic.
       // PRESERVED: cf_op_count_id, cf_domain_id (head reads), cf_secret_access,
       //   cf_secret_propagation (head + TLB update), cf_secret_transmission (TLB update),
@@ -676,12 +678,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     {
       stq(st_enq_idx).valid           := true.B
       stq(st_enq_idx).bits.uop        := io.core.dis_uops(w).bits
-      // corefuzzing: stamp STQ/DTLB/DCache bits at STQ enqueue for non-fence stores
-      // All committed non-fence stores in BOOM go through DTLB (STA) then DCache (store_commit).
-      // Pre-mark these bits here so the ROB sees them at commit time via clr_bsy_cf_bitmap.
-      val store_bitmap_extra = (1.U << stqTagCF.U) |
-        Mux(!io.core.dis_uops(w).bits.is_fence,
-            (1.U << dtlbTagCF.U) | (1.U << dcacheTagCF.U), 0.U)
+      // corefuzzing: stamp the STQ and D$ unit bits at STQ enqueue for non-fence stores ([RECV3] SP-09, design 3.3 item 5:
+      // STQ | DC; the DTLB bit is out of scope).  Every committed non-fence store reaches the D$ at store_commit; the
+      // pre-mark lets the ROB see it at commit time via clr_bsy_cf_bitmap (the store's own D$ event is a STATE R group).
+      val store_bitmap_extra = (1 << UNIT_STQ).U(numModules.W) |
+        Mux(!io.core.dis_uops(w).bits.is_fence, (1 << UNIT_DC).U(numModules.W), 0.U(numModules.W))
       stq(st_enq_idx).bits.uop.cf_fu_bitmap.foreach(_ := io.core.dis_uops(w).bits.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | store_bitmap_extra)
       // IFT LUT optimization (Change 8): same zeroing as LDQ above.
       stq(st_enq_idx).bits.uop.cf_attacker_influence.foreach(_ := false.B)
@@ -1178,7 +1179,6 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   for (w <- 0 until memWidth) {
     // Stage 1: bitmap + secret_access, based on exe_tlb_uop (register-backed, no feedback)
     val uop_tlb_base = WireInit(exe_tlb_uop(w))
-    uop_tlb_base.cf_fu_bitmap.foreach(_ := exe_tlb_uop(w).cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << dtlbTagCF.U))
     // [DBGFREEZE] patch 85 (b): a debug-mode access (fesvr reading or writing program memory through the program
     // buffer) is never a secret access: no s_acc, no FTQ secret mark, no secret D$ / MSHR / DTLB mark, no STQ
     // addr_in_secret.  One input on the range-valid LUT (CSR flops): 0 levels on the TLB-stage compare.
@@ -1438,6 +1438,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     dmem_req(w).bits.cf_res_atk.foreach(_ := false.B)   // [ATKEVICT] D$-internal
     dmem_req(w).bits.cf_res_esec.foreach(_ := false.B)
     dmem_req(w).bits.cf_res_repl.foreach(_ := false.B)   // [CEREPL] D$-internal (a nack edge is never replacement-state)
+    dmem_req(w).bits.cf_res_nack.foreach(_ := false.B)   // [RECV3] D$-internal (an LSU request's edge is known by s2_type)
     dmem_req(w).bits.cf_res_pc.foreach(_ := 0.U)
 
     io.dmem.s1_kill(w) := false.B
@@ -2396,7 +2397,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       r.valid              := v
       r.bits.rob_idx       := u.rob_idx
       r.bits.op_count_id   := u.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
-      r.bits.prod_op_count := oc.pad(inflOpCountWidthCF)(inflOpCountWidthCF - 1, 0)
+      r.bits.prod_op_count := oc.pad(inflKeyWidthCF)(inflKeyWidthCF - 1, 0)
       r.bits.is_atk        := atk
       r.bits.is_secret     := sec
       r.bits.infl_type.get := ty.U(inflTypeWidthCF.W)
@@ -2450,11 +2451,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       val lbs  = lb & ld_lab_sec
       val lba  = lb & ld_lab_atk
       val lsel = PriorityEncoderOH(lbs | lba)
-      val l_oc = Mux1H(lsel, ldq.map(_.bits.uop.cf_op_count_id.get(inflOpCountWidthCF - 1, 0)))
+      val l_oc = Mux1H(lsel, ldq.map(_.bits.uop.cf_op_count_id.get(inflKeyWidthCF - 1, 0)))
       val blk  = lb.orR
       val sec  = Mux(blk, lbs.orR, (m & stq_lab_sec).orR)
       val atk  = Mux(blk, lba.orR, (m & stq_lab_atk).orR)
-      val oc   = Mux(blk, l_oc, stq(forwarding_idx(w)).bits.uop.cf_op_count_id.get(inflOpCountWidthCF - 1, 0))
+      val oc   = Mux(blk, l_oc, stq(forwarding_idx(w)).bits.uop.cf_op_count_id.get(inflKeyWidthCF - 1, 0))
       rdeUpd(do_ld_search(w) && m.orR && !mem_forward_valid(w) && (sec || atk) &&
              !IsKilledByBranch(io.core.brupdate, lcam_uop(w)) && !io.core.exception && !RegNext(io.core.exception),
              lcam_uop(w), oc, atk, sec, INFL_STL_PARTIAL)
@@ -2511,7 +2512,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     val stg_ldq = srcLdq.map(i => RegNext(i))
     val isBank  = (0 until src.length).map(k => dcbOn && k < memWidth)   // src order: dcb lanes first when banked
     val pend    = RegInit(VecInit(Seq.fill(numLdqEntries)(false.B)))
-    val p_oc    = Reg(Vec(numLdqEntries, UInt(inflOpCountWidthCF.W)))
+    val p_oc    = Reg(Vec(numLdqEntries, UInt(inflKeyWidthCF.W)))
     val p_sec   = Reg(Vec(numLdqEntries, Bool()))
     val p_atk   = Reg(Vec(numLdqEntries, Bool()))
     val p_bank  = if (dcbOn) Some(Reg(Vec(numLdqEntries, Bool()))) else None
@@ -2799,7 +2800,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         // ldq | (req | dcacheBit) == ldq | dcacheBit.  This relies on the D$ answering only the live load its ldq_idx
         // names (BOOM's own invariant: killed loads are dropped in s1/s2 and in the rpq), the same invariant every
         // other field of this merge already relies on.  IFT off: the field is None.
-        merged_base_cf.cf_fu_bitmap.foreach(_ := ldq_base_cf.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << dcacheTagCF.U))
+        // [RECV3] SP-09 (design 3.2 bits 5-6): DC = the D$ answered this load (every path); MSHR = it answered through the
+        // MSHR file or an IOMSHR, i.e. the response footprint kind is 2 or 3 (SP-08 dc.kind bit 1).  One OR input: 0 levels.
+        merged_base_cf.cf_fu_bitmap.foreach(_ := ldq_base_cf.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1 << UNIT_DC).U(numModules.W) |
+          Mux(io.dmem.resp(w).bits.edges.dc.get.kind(1), (1 << UNIT_MSHR).U(numModules.W), 0.U(numModules.W)))
         merged_base_cf.cf_secret_access.foreach(_ := ldq_base_cf.cf_secret_access.getOrElse(false.B) || resp_cf.cf_secret_access.getOrElse(false.B))
         merged_base_cf.cf_secret_transmission.foreach(_ := ldq_base_cf.cf_secret_transmission.getOrElse(false.B) || resp_cf.cf_secret_transmission.getOrElse(false.B))
         // [MERGEFIX 2026-09-07] VALIDATED. merged_base_cf = WireInit(ldq_base_cf), so any
@@ -3044,6 +3048,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       val fwd_uop_cf = WireInit(forward_uop)
       when (data_ready && live && stl_store_is_secret) { fwd_uop_cf.cf_secret_propagation.foreach(_ := true.B) }
       fwd_uop_cf.cf_attacker_influence.foreach(_ := forward_uop.cf_attacker_influence.getOrElse(false.B) || stl_atk)
+      // [RECV3] SP-09 (design 3.2 bit 4, 3.3 item 6): the data came from the store-to-load forwarding path (no D$ data).
+      fwd_uop_cf.cf_fu_bitmap.foreach(_ := forward_uop.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1 << UNIT_STQ_FWD).U(numModules.W))
       // [WINMEM] step 21 (owner r139, F2): forwarding from a WINDOW-tainted store (address, data
       // or membership) hands the load WINDOW taint, live when both were dispatched in the same
       // window epoch (a store is older than its load, so a later epoch means the window closed
@@ -3494,6 +3500,25 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   // [ONETAGATK] r205 U8 (owner 2026-10-20: the attacker side is symmetric, no flash clear at close): the patch-64
   // LSQ close clear of the attacker window bits is removed with those bits (-1 FF, -160 FF-bit clear terms).
+
+  // [RECV3] SP-08 / FIX-04: [DCFOOT] one line per load response from the D$: the footprint that load's record carries
+  // (FT-3 oracle).  oc = the LDQ entry's op_count, the identity the record uses (merged_base_cf above); the response
+  // uop's own cf_op_count_id is 0 for an MSHR replay (kind 2: mshrs.scala zeroes it at rpq enqueue), which is why the
+  // print moved here from dcache.scala.  Verilator debug builds with +cf_state=1 (CfStatePlusArg, SP-05) only; no
+  // hardware in any other build.  c = cycles since reset (the core's ift_cyc16 is its low 16 bits: same reset).
+  if (ENABLE_CF_DEBUG_PRINTF && ENABLE_IFT) {
+    val cf_df_on  = CfStatePlusArg(true)
+    val cf_df_cyc = RegInit(0.U(32.W))
+    cf_df_cyc := cf_df_cyc + 1.U
+    for (w <- 0 until memWidth) {
+      val d   = io.dmem.resp(w).bits.edges.dc.get
+      val dli = io.dmem.resp(w).bits.uop.ldq_idx
+      when (cf_df_on && io.dmem.resp(w).valid && io.dmem.resp(w).bits.uop.uses_ldq && ldq(dli).valid) {
+        printf("[DCFOOT] c=%d oc=%d set=%d way=%d kind=%d\n", cf_df_cyc,
+               ldq(dli).bits.uop.cf_op_count_id.get, d.set, d.way, d.kind)
+      }
+    }
+  }
 }
 
 /**

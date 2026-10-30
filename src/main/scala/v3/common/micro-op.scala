@@ -35,11 +35,12 @@ abstract trait HasBoomUOP extends BoomBundle
  */
 class InfluencerEntry(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
   val valid     = Bool()
-  // LOW inflOpCountWidthCF bits of the influencing uop's op_count_id; software
-  // reconstructs the full value against the consuming record's own op_count.
-  // See inflOpCountWidthCF in CoreFuzzing.scala for the range argument.
-  val op_count  = UInt(inflOpCountWidthCF.W)
-  val infl_type = UInt(inflTypeWidthCF.W)       // 5 bits: influence type (INFL_*)
+  // [RECV3] SP-06 (design 2.4): the 12-bit key.  OC-keyed codes: the producer's op_count[11:0] (software reconstructs
+  // the full value against the consuming record's own op_count); PC-keyed codes: PC[13:2]; NONE-keyed codes: 0
+  // (CoreFuzzing.scala inflKeyKind).  `valid` above is internal only: the record slot is {sec, atk, type, key} and an
+  // empty slot is all zero (type 0 = INFL_EMPTY).
+  val key       = UInt(inflKeyWidthCF.W)
+  val infl_type = UInt(inflTypeWidthCF.W)       // 6 bits: influence type (v3 INFL_*, 0 = EMPTY)
   val is_atk    = Bool()   // influencer instruction was from attacker domain (domain=1)
   val is_secret = Bool()   // influencer instruction had s_acc=1 or s_prop=1
   // NOTE: deny_count used to live here, replicated into every slot.  It is now the
@@ -91,7 +92,7 @@ class CF_TlbFlagsUpdate(implicit p: Parameters) extends CF_SAccUpdate {
 class CF_MemOrdUpdate(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
   val rob_idx       = UInt(robAddrSz.W)
   val op_count_id   = UInt(uopIDCounterWidthCF.W)   // guard against ROB slot reuse
-  val prod_op_count = UInt(inflOpCountWidthCF.W)    // the conflicting store/load's op_count
+  val prod_op_count = UInt(inflKeyWidthCF.W)        // the conflicting store/load's op_count[11:0] (slot key)
   val is_atk        = Bool()
   val is_secret     = Bool()
   // [RDEDGE] patch 80: the edge's type.  INFL_MEM_ORDER on the two MEM_ORDER ports; INFL_STL_PARTIAL /
@@ -103,7 +104,7 @@ class CF_MemOrdUpdate(implicit p: Parameters) extends BoomBundle with CoreFuzzin
   * won the bank (dcache.scala cf_bank_nack): its op_count (the edge key) and whether its address is attacker-tainted /
   * attacker-domain (atk) or secret-derived (sec).  Valid only when one of the two is set. */
 class CF_BankNack(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
-  val oc  = UInt(inflOpCountWidthCF.W)
+  val oc  = UInt(inflKeyWidthCF.W)
   val atk = Bool()
   val sec = Bool()
 }

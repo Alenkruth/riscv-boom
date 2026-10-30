@@ -23,8 +23,26 @@ import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.util.CoreFuzzingConstants
 import boom.v3.common._
-import boom.v3.util.{Sext, inflBitmapFromList}
+import boom.v3.util.{Sext}
 
+/** [RECV3] SP-04: the v3 SQUASH record (design 2.2-2.3, SQUASH column; IFTRecordV3.scala).  Shared by the shipped packer
+  * (IftSquashMerge, from the FIFO entry) and the rob.scala capture-time shadow (Verilator printf builds), so the shadow
+  * assert compares the same function of the same inputs.  dbg 0, shadow_sec/atk 0, fflags 0 (table 2.3); everything
+  * else from the raw-row merge (`info`) and the side data. */
+object IftSquashPack extends CoreFuzzingConstants {
+  def apply(side: IftSqSide, domain: UInt, info: IftCommitInfo)(implicit p: Parameters): UInt =
+    IFTRecordV3.instr(
+      IFTRecordV3.prefix(REC_SQUASH.U(4.W), Cat(0.U(3.W), side.kind), false.B, domain, side.stamp, side.op_count, side.pc),
+      atk = side.atk || info.edge_atk, s_acc = side.s_acc, s_prop = side.s_prop, s_tx = side.s_tx,
+      shadow_sec = false.B, shadow_atk = false.B, spec = info.speculated, oc_aliased = info.infl_oc_aliased,
+      infl_dropped = info.infl_dropped, dcy = info.cntd_deny_count, srob = info.stall_cycles_rob,
+      sstq = info.stall_cycles_stq, sftq = info.sftq,
+      dc_kind = info.dc.kind, dc_set = info.dc.set, dc_way = info.dc.way,
+      fflags = 0.U(5.W), unit = info.fu_bitmap,
+      pdst = side.pdst, prs1 = side.prs1, prs2 = side.prs2, rt1 = side.lrs1_rtype, rt2 = side.lrs2_rtype,
+      abr = info.atk_branch_ctr, sbr = info.sec_branch_ctr,
+      slots = info.influencer_list.map(e => IFTRecordV3.slot(e.key, e.infl_type, e.is_atk, e.is_secret)))
+}
 /** IO of IftSquashMerge (Task 2.10d, design 4b).  A named class so member access from
   * rob.scala is not reflective (Task 2.1 review convention). */
 class IftSquashMergeIO(nBanks: Int, nSprob: Int, nIc: Int, nWb: Int, nMemord: Int, shadow: Boolean)
@@ -103,17 +121,8 @@ class IftSquashMerge(nBanks: Int, nSprob: Int, nIc: Int, nWb: Int, nMemord: Int,
   val m_sel   = RegEnable(arb.io.chosen, arb.io.out.fire)
   val e       = rdat(m_sel)
   val (info, _) = IftMerge(e.raw)                              // D19 is counted at capture (Rob)
-  val u = WireInit(0.U.asTypeOf(new MicroOp))
-  u.debug_pc       := e.side.pc
-  u.debug_inst     := e.side.inst
-  u.cf_domain_id.foreach(_ := e.raw.domain)
-  u.cf_op_count_id.foreach(_ := e.side.op_count)
-  u.pdst           := e.side.pdst
-  u.prs1           := e.side.prs1
-  u.prs2           := e.side.prs2
-  u.lrs1_rtype     := e.side.lrs1_rtype
-  u.lrs2_rtype     := e.side.lrs2_rtype
-  val rec = uopToIFTBits(u, info, (e.side.s_acc, e.side.s_prop, e.side.s_tx, e.side.atk), 2.U, e.side.priv) | (e.side.cause.asUInt << 253)
+  // [RECV3] SP-04: the v3 SQUASH record (IftSquashPack above): class 2, kind and capture stamp from the side data.
+  val rec = IftSquashPack(e.side, e.raw.domain, info)
 
   // ---- lane, cycle t1+2: the record is registered once, in the output queue's entry (no
   //      merge logic on the path to the bridge).  Task 3.9 removed the separate o_valid/o_rec
@@ -141,28 +150,27 @@ class IftSquashMerge(nBanks: Int, nSprob: Int, nIc: Int, nWb: Int, nMemord: Int,
   // ---- printf builds: [FLUSH] from the shipped path, [SQREC], [SQDROP], [SQRAW], shadow check
   rdbg.foreach { dv =>
     val d     = dv(m_sel)
-    val cause = e.side.cause
+    val cause = e.side.kind
     when (m_valid && d.en) {
       val fl_cross_domain = !cause && (d.fl_dom =/= e.raw.domain)
       val fl_is_secret    = !cause && d.fl_sec
       val fl_op_count     = Mux(cause, 0.U, d.fl_oc)
       val inflFmt = (0 until numInfluencerSlotsCF).map(k => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d}").mkString(" ")
-      val fmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d fl_sec=%d floc=%d FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d sftq=%d pdst=%d prs1=%d prs2=%d rt1=%d rt2=%d brmask=0x%x brtag=%d abr=%d sbr=%d ce_repl=%d) $inflFmt\n"
+      val fmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d cyc=%d fl=%d fl_sec=%d floc=%d FU=0x%x SRC=%d OVF=%d dcy=%d srob=%d sstq=%d alias=%d sftq=%d dc=%d/%d/%d pdst=%d prs1=%d prs2=%d rt1=%d rt2=%d brmask=0x%x brtag=%d abr=%d sbr=%d) $inflFmt\n"
       val inflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
-        info.influencer_list(k).valid, info.influencer_list(k).op_count, info.influencer_list(k).infl_type,
+        info.influencer_list(k).valid, info.influencer_list(k).key, info.influencer_list(k).infl_type,
         info.influencer_list(k).is_atk, info.influencer_list(k).is_secret))
       printf(fmt, (Seq[Bits](
         Sext(d.pc, xLen), d.inst,
-        u.cf_domain_id.getOrElse(0.U(iftTagWidth.W)), info.speculated, e.side.atk || info.edge_atk,
+        e.raw.domain, info.speculated, e.side.atk || info.edge_atk,
         e.side.s_acc, e.side.s_prop, e.side.s_tx,
-        u.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)), info.spec_branch_is_atk, info.spec_branch_op_id,
+        e.side.op_count, e.side.stamp,                       // [RECV3] cyc = the record's capture stamp
         fl_cross_domain, fl_is_secret, fl_op_count,
-        info.fu_bitmap, Mux(cause, 4.U, 3.U), inflBitmapFromList(info.influencer_list), info.infl_dropped,
+        info.fu_bitmap, Mux(cause, 4.U, 3.U), info.infl_dropped,
         info.cntd_deny_count, info.stall_cycles_rob, info.stall_cycles_stq, info.infl_oc_aliased,
-        Cat(!info.fu_bitmap(1), info.fu_bitmap(3), info.fu_bitmap(2)),   // [FTQHOLD] sftq from fu bits 3..1 (printf only)
-        u.pdst, u.prs1, u.prs2, u.lrs1_rtype, u.lrs2_rtype, d.br_mask, d.br_tag,
-        info.atk_branch_ctr, info.sec_branch_ctr,
-        info.ce_repl.getOrElse(false.B)) ++ inflArgs): _*)   // [CEREPL] lean59: record bit [254]
+        info.sftq, info.dc.kind, info.dc.set, info.dc.way,   // [RECV3] sftq field (SP-09), D$ footprint (SP-08)
+        e.side.pdst, e.side.prs1, e.side.prs2, e.side.lrs1_rtype, e.side.lrs2_rtype, d.br_mask, d.br_tag,
+        info.atk_branch_ctr, info.sec_branch_ctr) ++ inflArgs): _*)
     }
     d.old_rec.foreach { o =>
       assert(!m_valid || rec === o, "[rob] 4b squash record differs from the capture-time record (Task 2.10d shadow)")
@@ -174,7 +182,7 @@ class IftSquashMerge(nBanks: Int, nSprob: Int, nIc: Int, nWb: Int, nMemord: Int,
     for (b <- 0 until nBanks) {
       when (drop(b)) {
         printf("[SQDROP] bank=%d SRC=%d opcount=%d pc=0x%x\n", b.U,
-               Mux(io.cap(b).bits.side.cause, 4.U, 3.U), io.cap(b).bits.side.op_count, io.cap(b).bits.side.pc)
+               Mux(io.cap(b).bits.side.kind, 4.U, 3.U), io.cap(b).bits.side.op_count, io.cap(b).bits.side.pc)
       }
       val hw = RegInit(0.U((ptrW + 1).W))
       when (cnt(b) > hw) { hw := cnt(b); printf("[SQRAW] bank=%d hw=%d\n", b.U, cnt(b)) }

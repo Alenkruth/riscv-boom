@@ -250,10 +250,11 @@ class RobIo(
   // IFT bridge outputs: 256-bit records for committed and squashed IFT-active instructions.
   // Driven unconditionally (zero when ENABLE_IFT_BRIDGE=false in BoomCoreParams).
   // core.scala gates them behind ENABLE_IFT_BRIDGE before forwarding to tile IO.
-  val ift_priv            = Input(UInt(3.W))               // current privilege mode (from csr.io.status.prv)
   // [DBGFREEZE] patch 85 (b): the hart is in debug mode (core.scala cf_dbg).  A commit record then has no labels and
-  // priv[2] = 1.  IFT only.
+  // dbg = 1 ([RECV3] record bit [8], v1 priv[2]).  IFT only.  ([RECV3] SP-04: the v1 ift_priv input is deleted.)
   val cf_dbg              = if (ENABLE_IFT) Some(Input(Bool())) else None
+  // [RECV3] SP-03: the core's 16-bit cycle stamp (core.scala ift_cyc16) for the COMMIT and SQUASH records.  IFT only.
+  val ift_cyc             = if (ENABLE_IFT) Some(Input(UInt(16.W))) else None
   val ift_commit_valids   = Output(Vec(retireWidth, Bool())) // arch_valids
   val ift_commit_records  = Output(Vec(retireWidth, UInt(256.W)))
   // [THINUOP] Task 3.5: the IFT record fields that left the MicroOp, per retire slot, for the
@@ -684,12 +685,6 @@ class Rob(
                                    io.enq_uops(w).is_fencei)
       rob_unsafe(rob_tail)    := io.enq_uops(w).unsafe
       rob_uop(rob_tail)       := io.enq_uops(w)
-      // corefuzzing: stamp robTagCF bit into cf_fu_bitmap at enqueue.  IFT off only: with IFT
-      // the sidecar's dispatch column stamps it (rob-ift-sidecar.scala, enqueue) and the copy
-      // here is zeroed below (Task 2.10).
-      if (!ENABLE_IFT) {
-        rob_uop(rob_tail).cf_fu_bitmap.foreach(_ := io.enq_uops(w).cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << robTagCF.U))
-      }
       // IFT LUT optimization (Change 3): zero dead fields at ROB enqueue.
       //   cf_cntd_*: consumed at issue time via cf_contend_out → the C_ic sidecar
       //              columns (io.cf_issue_contention_upd); never read from rob_uop after enqueue.
@@ -799,9 +794,6 @@ class Rob(
           // [STTY0] bundle61: the store's operand labels for its REG_DATAFLOW (ty0) edge (rob-ift-sidecar.scala IftMerge)
           sidecar.io.clr(ci).bits.is_secret := cf_sprop
           sidecar.io.clr(ci).bits.is_atk    := io.lsu_clr_bsy_cf_atk.get(ci)
-          // [FTQHOLD] as the writeback-column assert: the store clr_bsy column never carries sftq bits.
-          if (ENABLE_CF_DEBUG_PRINTF)
-            assert(!cf_bmap(3, 1).orR, "[rob] [FTQHOLD] a store clr_bsy column sets fu_bitmap bits 3..1 (reserved for sftq)")
           when (cf_stx)   { sticky_s_tx(cidx)   := true.B }
           when (cf_sprop) { sticky_s_prop(cidx) := true.B }
           // [M7STATK] bundle61: the attacker twin (RULES A reading 4 / U8): one more set term on the row's sticky
@@ -1035,6 +1027,7 @@ class Rob(
       // IFT off: no sidecar; the record's retained fields come from the uop, as before.
       com_ift.fu_bitmap             := io.commit.uops(w).cf_fu_bitmap.getOrElse(0.U(numModules.W))
       com_ift.spec_branch_is_secret := io.commit.uops(w).cf_spec_branch_is_secret.getOrElse(false.B)
+      com_ift.fflags                := rob_head_fflags(w)   // [RECV3] SP-03 (the record is dead IFT off; kept uniform)
       com_sticky := Cat(io.commit.uops(w).cf_attacker_influence.getOrElse(false.B), io.commit.uops(w).cf_secret_transmission.getOrElse(false.B),
                         io.commit.uops(w).cf_secret_propagation.getOrElse(false.B), io.commit.uops(w).cf_secret_access.getOrElse(false.B))
     }
@@ -1057,15 +1050,24 @@ class Rob(
       val cdbg   = io.cf_dbg.get
       val com_ci = WireInit(sidecar.io.commit_out)
       when (cdbg) {
-        com_ci.influencer_list.foreach(_.valid := false.B)
+        com_ci.influencer_list.foreach(_ := 0.U.asTypeOf(new InfluencerEntry))   // [RECV3] an empty slot is all zero (type 0 = EMPTY)
         com_ci.infl_dropped          := 0.U
         com_ci.infl_oc_aliased       := false.B
         com_ci.edge_atk              := false.B
-        com_ci.ce_repl.foreach(_ := false.B)   // [CEREPL] record bit [254]: no label in debug mode
-        com_ci.spec_branch_is_atk    := false.B
         com_ci.spec_branch_is_secret := false.B
       }
       com_ift    := com_ci
+      // [RECV3] SP-06: the record has no slot valid bit, so an empty slot must be all zero and a used one must have a
+      // non-zero type (every v3 code is >= 1).  Verilator printf builds only (no FireSim / NoLog / oracle Verilog).
+      if (ENABLE_CF_DEBUG_PRINTF) {
+        for (e <- com_ift.influencer_list) {
+          assert(!io.commit.arch_valids(w) || (e.valid && e.infl_type =/= 0.U) || (!e.valid && e.asUInt === 0.U),
+            "[rob] [RECV3] commit slot: an empty slot is not all zero, or a used slot has type 0")
+        }
+      }
+      // [RECV3] SP-03: the lane's own FP flags at commit (record [118:114]).  arch_valids(w) implies com_idx = rob_head,
+      // so the existing head-row read rob_head_fflags(w) is exact for every valid record (no new read port).
+      com_ift.fflags := rob_head_fflags(w)
       // [WINSHADOW] step 20: a committing entry in the window shadow range is in the window
       // [WINAGE] Phase 4 Task 4.3c (gate review C3, the ROB commit instance): the test no longer
       // reads the committing uop's rob_idx out of the rob_uop readout (com_idx mux -> 64:1 row
@@ -1170,7 +1172,6 @@ class Rob(
       cap.valid                := rbk_emit || drain_emit
       cap.bits.raw             := sidecar.io.sq_raw
       cap.bits.side.pc         := su.debug_pc(31, 0)
-      cap.bits.side.inst       := su.debug_inst                 // the record packs debug_inst (4c review F3)
       cap.bits.side.op_count   := su.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
       cap.bits.side.pdst       := su.pdst
       cap.bits.side.prs1       := su.prs1
@@ -1181,8 +1182,8 @@ class Rob(
       cap.bits.side.s_prop     := sticky_s_prop(sq_row)
       cap.bits.side.s_tx       := sticky_s_tx(sq_row)
       cap.bits.side.atk        := sticky_atk(sq_row)
-      cap.bits.side.priv       := io.ift_priv
-      cap.bits.side.cause      := sq_cause
+      cap.bits.side.stamp      := io.ift_cyc.get                // [RECV3] SP-04: the SQUASH record's cyc (capture cycle)
+      cap.bits.side.kind       := sq_cause
       when (rbk_emit)   { ift_squash_pending(com_idx) := false.B }
       when (drain_emit) { ift_squash_pending(sq_ptr)  := false.B }
       when (!rbk_row && sq_any) { sq_ptr := WrapInc(sq_ptr, cf_rob_rows) }   // emit or skip
@@ -1239,9 +1240,7 @@ class Rob(
           // the pre-4b record, packed at capture exactly as the old drain did (Verilator only;
           // IftSquashMerge asserts the shipped record equals it, design 7.9 B5)
           val old_ift = IftMerge(sidecar.io.sq_raw)._1
-          d.old_rec.get := uopToIFTBits(rob_uop(sq_row), old_ift,
-            (sticky_s_acc(sq_row), sticky_s_prop(sq_row), sticky_s_tx(sq_row), sticky_atk(sq_row)),
-            2.U, io.ift_priv) | (sq_cause.asUInt << 253)
+          d.old_rec.get := IftSquashPack(cap.bits.side, sidecar.io.sq_raw.domain, old_ift)   // [RECV3] SP-04
         }
         when (ift_sq_ptrrst_bank(w) =/= 0.U) {
           printf("[SQPTRRST] bank=%d lost=%d\n", w.U, ift_sq_ptrrst_bank(w))
@@ -1331,14 +1330,14 @@ class Rob(
             val fl_op_count = Mux(io.cf_mispredict_uop.valid,
               io.cf_mispredict_uop.bits.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)), 0.U)
             val robFlushInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d}"}.mkString(" ")
-            val robFlushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d fl_sec=%d floc=%d FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d sftq=%d pdst=%d prs1=%d prs2=%d rt1=%d rt2=%d brmask=0x%x brtag=%d abr=%d sbr=%d) $robFlushInflFmt\n"
+            val robFlushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d cyc=%d fl=%d fl_sec=%d floc=%d FU=0x%x SRC=%d OVF=%d dcy=%d srob=%d sstq=%d alias=%d sftq=%d dc=%d/%d/%d pdst=%d prs1=%d prs2=%d rt1=%d rt2=%d brmask=0x%x brtag=%d abr=%d sbr=%d) $robFlushInflFmt\n"
             // [THINUOP] Task 3.5: this IFT-off printf used to read the removed MicroOp IFT fields,
             // which are constant zero in an IFT-off build (only the fetch buffer ever wrote them,
             // with zeros), so it prints the same zeros from a zero IftCommitInfo.
             val fu_ift = 0.U.asTypeOf(new IftCommitInfo)
             val robInflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
               fu_ift.influencer_list(k).valid,
-              fu_ift.influencer_list(k).op_count,
+              fu_ift.influencer_list(k).key,
               fu_ift.influencer_list(k).infl_type,
               fu_ift.influencer_list(k).is_atk,
               fu_ift.influencer_list(k).is_secret
@@ -1347,9 +1346,9 @@ class Rob(
               Sext(fu.debug_pc(vaddrBits-1,0), xLen), fu.inst,
               fu.cf_domain_id.getOrElse(0.U(iftTagWidth.W)), fu_ift.speculated, (sticky_atk(i) || cf_in_atk_shadow),
               fu.cf_secret_access.getOrElse(false.B), fu.cf_secret_propagation.getOrElse(false.B), fu.cf_secret_transmission.getOrElse(false.B),
-              fu.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)), fu_ift.spec_branch_is_atk, fu_ift.spec_branch_op_id,
+              fu.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)), 0.U(16.W) /* [RECV3] cyc: IFT off */,
               fl_cross_domain, fl_is_secret, fl_op_count,
-              fu.cf_fu_bitmap.getOrElse(0.U(numModules.W)), Mux(rbk_kill_i, 4.U, 3.U), inflBitmapFromList(fu_ift.influencer_list), fu_ift.infl_dropped, fu_ift.cntd_deny_count, fu_ift.stall_cycles_rob, fu_ift.stall_cycles_stq, fu_ift.infl_oc_aliased, 0.U /* [FTQHOLD] sftq: IFT off */, fu.pdst, fu.prs1, fu.prs2, fu.lrs1_rtype, fu.lrs2_rtype,
+              fu.cf_fu_bitmap.getOrElse(0.U(numModules.W)), Mux(rbk_kill_i, 4.U, 3.U), fu_ift.infl_dropped, fu_ift.cntd_deny_count, fu_ift.stall_cycles_rob, fu_ift.stall_cycles_stq, fu_ift.infl_oc_aliased, 0.U /* sftq: IFT off */, 0.U, 0.U, 0.U /* [RECV3] dc: IFT off */, fu.pdst, fu.prs1, fu.prs2, fu.lrs1_rtype, fu.lrs2_rtype,
               // [BRMASK 2026-09-08] full speculation shadow + own tag; see core.scala
               br_mask, rob_uop(i).br_tag,
               fu_ift.atk_branch_ctr, fu_ift.sec_branch_ctr   // [GHISTFIELD]
@@ -1478,40 +1477,34 @@ class Rob(
       rob_head_fsec_b(w) := rob_head_ffsec(w) || io.cf_com_win_sec(w)
     }
 
-    // IFT bridge commit records: one per retire slot, valid on arch_valids.  Packed from
-    // io.commit.uops (the Wire carrying the sidecar readout, Task 2.4), not from rob_uop.
-    // D2a (Task 2.4): an invalid retire lane packs event_type 0 instead of a constant 1, so
-    // the bridge can compact the valid records (D12).  2-bit literals: uopToIFTBits slices
-    // event_type(1, 0), which Chisel rejects on a 1-bit Mux result.  Under ENABLE_IFT only.
-    val com_evt = if (ENABLE_IFT) Mux(io.commit.arch_valids(w), 1.U(2.W), 0.U(2.W)) else 1.U(2.W)
-    // [RECREG] (Phase 4 Task 4.3, spec 5.3, ruling 44) the bridge record and its valid are
-    // registered together under ENABLE_IFT, so the ROB readout -> uopToIFTBits -> core -> tile
-    // -> ChipTop -> bridge leg starts at a flop beside the ROB.  The commit printf and every
-    // commit-time consumer in core.scala still read io.commit.* in the commit cycle (unchanged
-    // logs).  Record-identical: each record is the same bits one cycle later, with its valid.
-    // The squash lane gets the matching extra cycle in core.scala ([RECREG] there), so the
-    // commit/squash order on the bridge token stream is unchanged.  Cost: retireWidth x 257 FF.
-    // [HW1BIT75] (owner ruling R-b, 2026-10-20; readerless-bridge-study.md HW1) record bit [75] := this
-    // lane's commit-time secret-window shadow bit, the win_sec above (= io.cf_com_win_sec(w), the inAge
-    // test whose only record effect so far was the OR into s_prop, bit [73]).  It tells the host that
-    // the record sat in the WINSHADOW range at commit, i.e. its s_prop is (at least) control-dependent,
-    // which a shadow member otherwise shows as a bare s_prop with no explaining slot and sbr = 0.
-    // Squash / kill records keep 0 (their packers use the default).  An invalid lane may carry a 1:
-    // it is event_type 0 and the driver drops it (D2a), as for every other field of that lane.
-    // Cost: the RECREG bit [75] of each lane (RegNext below) was constant 0 and is pruned; it becomes
-    // live: +1 FF per lane, 0 LUT (win_sec drives the flop D directly; bit [73] already gets
-    // win_sec through one OR).  Levels: win_sec -> D is one LUT shorter than the existing
-    // win_sec -> com_sticky(1) -> bit [73] -> D leg, so 0 added.  IFT off: the literal false.B, so
-    // the record (and the Verilog) is exactly as before.
-    // [DBGFREEZE] patch 85 (b): a debug-mode commit record also carries bit [75] = 0 (the shadow range is invalid in
-    // debug mode, its range dies on the entry flush and nothing arms; the AND makes the mask explicit, 1 LUT input).
-    val com_wsh = if (ENABLE_IFT) io.cf_com_win_sec(w) && !io.cf_dbg.get else false.B
-    // [DBGFREEZE] patch 85 (b): priv[2] = 1 marks a commit record of a debug-mode uop (the trace port's convention,
-    // core.scala io.trace priv = {debug, prv}).  Squash records keep priv[2] = 0: their drain can lag the halt, so
-    // the parser classifies them by PC (the Debug Module range 0x0-0xfff), see p4-85-author.md.
-    val com_priv = if (ENABLE_IFT) Cat(io.cf_dbg.get, io.ift_priv(1, 0)) else io.ift_priv
-    val com_rec = uopToIFTBits(io.commit.uops(w), com_ift,
-      (com_sticky(0), com_sticky(1), com_sticky(2), com_sticky(3)), com_evt, com_priv, com_wsh)
+    // [RECV3] SP-03: the v3 COMMIT record (design 2.2-2.3; IFTRecordV3.scala), one per retire slot.  Class COMMIT on a
+    // valid lane, NOP (0) otherwise, so the bridge compacts the valid records (D2a/D12; the driver drops class 0).
+    // Packed from io.commit.uops (op_count, domain, pc, pregs: the sidecar readout wire, Task 2.4) and com_ift (the
+    // debug-masked sidecar readout).  cyc = io.ift_cyc in the commit cycle (RECREG below registers the record one
+    // cycle later, unchanged).  shadow_sec = the commit-time secret-window shadow test (v1 wsh, record bit [75]),
+    // shadow_atk = its attacker twin io.cf_com_win_atk(w) (driven above; the victim-domain gate is inside it); both
+    // are 0 in debug mode ([DBGFREEZE] patch 85 (b): the shadow range is invalid there).  dbg = the hart is in debug
+    // mode (v1 priv[2]); v1 priv[1:0] and insn leave the record (design 2.3: insn is host-derived from pc + ELF).
+    // Levels: every new field is a flop (ift_cyc), an existing wire (win_sec / win_atk, already ORed into com_sticky
+    // on the same RECREG leg) or the existing head-row flags read: 0 added on the RECREG D input.
+    val com_cls     = if (ENABLE_IFT) Mux(io.commit.arch_valids(w), REC_COMMIT.U(4.W), REC_NOP.U(4.W)) else REC_COMMIT.U(4.W)
+    val com_dbg     = io.cf_dbg.getOrElse(false.B)
+    val com_sh_sec  = if (ENABLE_IFT) io.cf_com_win_sec(w) && !io.cf_dbg.get else false.B
+    val com_sh_atk  = if (ENABLE_IFT) io.cf_com_win_atk(w) && !io.cf_dbg.get else false.B
+    val cu          = io.commit.uops(w)
+    val com_rec = IFTRecordV3.instr(
+      IFTRecordV3.prefix(com_cls, 0.U(4.W), com_dbg, cu.cf_domain_id.getOrElse(0.U(iftTagWidth.W)),
+                         io.ift_cyc.getOrElse(0.U(16.W)), cu.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)),
+                         cu.debug_pc(31, 0)),
+      atk = com_sticky(3) || com_ift.edge_atk, s_acc = com_sticky(0), s_prop = com_sticky(1), s_tx = com_sticky(2),
+      shadow_sec = com_sh_sec, shadow_atk = com_sh_atk, spec = com_ift.speculated, oc_aliased = com_ift.infl_oc_aliased,
+      infl_dropped = com_ift.infl_dropped, dcy = com_ift.cntd_deny_count, srob = com_ift.stall_cycles_rob,
+      sstq = com_ift.stall_cycles_stq, sftq = com_ift.sftq,
+      dc_kind = com_ift.dc.kind, dc_set = com_ift.dc.set, dc_way = com_ift.dc.way,
+      fflags = com_ift.fflags, unit = com_ift.fu_bitmap,
+      pdst = cu.pdst, prs1 = cu.prs1, prs2 = cu.prs2, rt1 = cu.lrs1_rtype, rt2 = cu.lrs2_rtype,
+      abr = com_ift.atk_branch_ctr, sbr = com_ift.sec_branch_ctr,
+      slots = com_ift.influencer_list.map(e => IFTRecordV3.slot(e.key, e.infl_type, e.is_atk, e.is_secret)))
     if (ENABLE_IFT) {
       io.ift_commit_valids(w)  := RegNext(io.commit.arch_valids(w), false.B)
       io.ift_commit_records(w) := RegNext(com_rec, 0.U)
@@ -1584,12 +1577,6 @@ class Rob(
           sidecar.io.wb(i).bits.row       := rob_row
           sidecar.io.wb(i).bits.edges     := io.wb_resps(i).bits.edges
           sidecar.io.wb(i).bits.fu_bitmap := wb_uop_i.cf_fu_bitmap.getOrElse(0.U(numModules.W))
-          // [FTQHOLD] FTQ plan T2 Step 1 (option A): fu bits 3..1 carry sftq and are written only by the dispatch column
-          // (core.scala masks the IQ / LSU copies).  A writeback column with any of them set would OR a wrong sftq into the
-          // record.  Simulation hard stop in IFT debug-printf builds only (no NoLog / FireSim Verilog change).
-          if (ENABLE_CF_DEBUG_PRINTF)
-            assert(!wb_uop_i.cf_fu_bitmap.getOrElse(0.U(numModules.W))(3, 1).orR,
-              "[rob] [FTQHOLD] a writeback column sets fu_bitmap bits 3..1 (reserved for sftq, dispatch column only)")
         }
       }
       val temp_uop = rob_uop(GetRowIdx(rob_idx))

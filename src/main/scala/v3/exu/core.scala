@@ -686,11 +686,20 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     pred_rename_stage.io.quiesce_flush := false.B
   }
 
-  // IFT bridge: pass privilege mode to ROB for 256-bit record assembly.
-  // RegNext matches the delay used in the commit printf (priv is the OLD privilege before any eret).
-  rob.io.ift_priv := RegNext(csr.io.status.prv)
   // [DBGFREEZE] patch 85 (b): commit records of debug-mode uops are masked and marked (rob.scala)
   rob.io.cf_dbg.foreach(_ := cf_dbg)
+  // [RECV3] SP-03 (design 2.8, 5.4): the 16-bit cycle stamp of every instruction record, free-running from reset and
+  // wrapping at 2^16.  The tile's 48-bit counter (spec SP-16) shares the reset, so tile_cyc(15,0) == ift_cyc16 every
+  // cycle.  COMMIT = the commit cycle (rob.scala commit packer), SQUASH = the capture cycle (rob.scala capture, SP-04),
+  // KILL = the cycle the lane takes the kill record (kill packer, SP-05).  IFT only: 16 FF + a 16-bit incrementer.
+  // IFT off: the constant 0 (no flop; the ROB port does not exist).
+  val ift_cyc16 = WireInit(0.U(16.W))
+  if (ENABLE_IFT) {
+    val ift_cyc16_r = RegInit(0.U(16.W))
+    ift_cyc16_r := ift_cyc16_r + 1.U
+    ift_cyc16   := ift_cyc16_r
+  }
+  rob.io.ift_cyc.foreach(_ := ift_cyc16)
   io.ifu.cf_dbg.foreach(_ := cf_dbg)   // [DBGFREEZE] (b): no fetch-time edges / domain (fetch-buffer.scala)
 
   // corefuzzing: preg_secret — per-physical-register secret-taint bit array.
@@ -1479,9 +1488,6 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   //-------------------------------------------------------------
   // Decoders
 
-  val single_step_active = cf_quiesce_core // && pipeline_drained - pipeline would not be drained when there is an instruction being executed
-  // Propagate the single-step flag: set for all uops in fetch group during single-step.
-  // IFT overhaul Phase 3, Task 3.3: it rides FetchIftInfo (dec_ift) beside the uop.
   val uop_with_step = Wire(Vec(coreWidth, new MicroOp()))
   val dec_ift       = Wire(Vec(coreWidth, new FetchIftInfo))
   
@@ -1491,7 +1497,6 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   //  decode_units(w).io.wq.uop := dec_fbundle.uops(w).bits
     uop_with_step(w) := dec_fbundle.uops(w).bits
     dec_ift(w)             := dec_fbundle.ift(w)
-    dec_ift(w).single_step := single_step_active
     // [FIFO10] step 10 (section 2, G2-D): cf_domain_id is NOT recomputed here any more.  The
     // fetch buffer already computes it from the same PC and CSRs (fetch-buffer.scala, `< end`,
     // like the frontend, the LSU secret range and every other range test); this decode copy
@@ -1517,7 +1522,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       val dec_list = fetchFlagsToList(ift.fetch_flags, ift.any_is_victim, ift.btb_sec_pc)
       val inflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
         dec_list.edges(k).valid,
-        dec_list.edges(k).op_count,
+        dec_list.edges(k).key,
         dec_list.edges(k).infl_type,
         dec_list.edges(k).is_atk,
         dec_list.edges(k).is_secret
@@ -1667,15 +1672,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   // corefuzzing: branch-domain tracking table.
   // When a branch/JALR is decoded and allocated a br_tag, record:
-  //   spec_branch_atk_table(br_tag) = 1 if that branch is in attacker domain
-  //   spec_branch_op_table(br_tag)  = cf_op_count_id of that branch
-  // This allows computing, at dispatch, whether a uop is speculated under an
-  // attacker-domain branch (cf_spec_branch_is_atk / cf_spec_branch_op_id).
+  //   spec_branch_secret_table(br_tag) = the branch's own resolved condition taint (cleared at allocation)
+  // (S3 D-S12: the attacker-branch tables spec_branch_atk_table / spec_branch_op_table left with the record fields).
   // No rollback needed: stale entries are harmless because freed tags will be
   // overwritten before they appear in any future uop's br_mask.
-  val spec_branch_atk_table    = Reg(Vec(maxBrCount, Bool()))
   val spec_branch_secret_table = Reg(Vec(maxBrCount, Bool()))
-  val spec_branch_op_table     = Reg(Vec(maxBrCount, UInt(uopIDCounterWidthCF.W)))
 
   // [DISPAR] patch 51 (B1): the write enable no longer waits for dec_fire (dis_ready ->
   // dec_stalls -> dec_fire was the tail of the 47-level path).  is_branch(w) && !is_full(w) is
@@ -1692,7 +1693,6 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   for (w <- 0 until coreWidth) {
     when (dec_brmask_logic.io.is_branch(w) && !dec_brmask_logic.io.is_full(w)) {
       val tag = dec_brmask_logic.io.br_tag(w)
-      spec_branch_atk_table(tag)    := dec_uops(w).cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U
       // FIX 1 (2026-09-03): do NOT seed this from the aggregate.  cf_secret_propagation
       // carries (a) the branch condition's own data taint, (b) BPD/BTB observability taint
       // from the fetch buffer, and (c) implicit taint the branch INHERITED from sitting in
@@ -1711,7 +1711,6 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       // (BPD sec=1 entries 2262 -> 1572).  Clearing here also prevents a reused br_tag
       // from inheriting the previous branch's secrecy.
       spec_branch_secret_table(tag) := false.B
-      spec_branch_op_table(tag)     := dec_uops(w).cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
     }
   }
   // D-BP fix: cf_secret_propagation is false at decode; re-write spec_branch_secret_table at
@@ -1893,21 +1892,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     // cf_domain_id set at decode from debug_pc vs CSR range; propagates intact through rename regs.
     dis_ift(w).speculated := dis_uops(w).br_mask =/= 0.U
 
-    // corefuzzing: determine whether any outstanding branch in br_mask is attacker-domain.
-    // Looks up spec_branch_atk_table for each set bit; takes the first (lowest br_tag) hit.
-    val br_atk_bits = VecInit((0 until maxBrCount).map(i =>
-      dis_uops(w).br_mask(i) && spec_branch_atk_table(i)))
     val br_sec_bits = VecInit((0 until maxBrCount).map(i =>
       dis_uops(w).br_mask(i) && spec_branch_secret_table(i)))
-    val any_br_atk = br_atk_bits.reduce(_ || _)
-    dis_ift(w).spec_branch_is_atk        := any_br_atk
     dis_uops(w).cf_spec_branch_is_secret.foreach(_ := br_sec_bits.reduce(_ || _))
-    // Truncated to specBranchOpIdWidthCF; software reconstructs against this uop's own
-    // cf_op_count_id.  .pad() first so the extract is legal if the table is narrower.
-    dis_ift(w).spec_branch_op_id         := Mux(
-      any_br_atk,
-      spec_branch_op_table(PriorityEncoder(br_atk_bits)).pad(specBranchOpIdWidthCF)(specBranchOpIdWidthCF-1, 0),
-      0.U)
   }
 
   // corefuzzing: Unified dispatch influencer computation.
@@ -2201,11 +2188,16 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       InfluencerCandidate(dis_valids(w) && dis_stall_was_reg(w), dis_stall_reg_head_op_count(w),  INFL_REG_PRESSURE, dis_stall_reg_head_domain(w) === 1.U || ((reg_stuck_ldatk || reg_stuck_valatk) && d_victim),  dis_stall_reg_head_is_secret(w)),
       // [FTQFULL] patch 59: the FTQ-starvation edge rides this candidate (see above); a real ROB_FULL
       // stall of the same uop has priority (its blocker is the more recent one).
+      // [RECV3] SP-07 (design 2.5): the FTQ edge has its own code INFL_FTQ_FULL (0x14; v1 ROB_FULL with srob = 0).  Still
+      // one candidate (no prefix-network growth): the code is chosen by dis_stall_was_rob(w), the flop that already
+      // chooses the key and labels (codes 0x10 / 0x14 differ in bit 2 only).  Both codes are OC-keyed.
       InfluencerCandidate(dis_valids(w) && (dis_stall_was_rob(w) || (ftq_edge && ftq_first(w))),
                           Mux(dis_stall_was_rob(w), dis_stall_rob_head_op_count(w), ftq_cap_oc),  INFL_ROB_FULL,
                           Mux(dis_stall_was_rob(w), dis_stall_rob_head_domain(w) === 1.U || rob_head_ld_atk || rob_head_val_atk,
                               ftq_cap_atk && d_victim),
-                          Mux(dis_stall_was_rob(w), dis_stall_rob_head_is_secret(w), ftq_cap_sec)),
+                          Mux(dis_stall_was_rob(w), dis_stall_rob_head_is_secret(w), ftq_cap_sec),
+                          infl_type_dyn = Some(Mux(dis_stall_was_rob(w), INFL_ROB_FULL.U(inflTypeWidthCF.W),
+                                                                         INFL_FTQ_FULL.U(inflTypeWidthCF.W)))),
       // [MEMORDATK] patch 42: is_atk also when the queue head's address is attacker-tainted and this uop is a victim
       InfluencerCandidate(dis_valids(w) && dis_stall_was_ldq(w), dis_stall_ldq_head_op_count(w),  INFL_LDQ_FULL,     dis_stall_ldq_head_domain(w) === 1.U || ldq_head_atk,  dis_stall_ldq_head_is_secret(w)),
       InfluencerCandidate(dis_valids(w) && dis_stall_was_stq(w), dis_stall_stq_head_op_count(w),  INFL_STQ_FULL,     dis_stall_stq_head_domain(w) === 1.U || stq_head_atk,  dis_stall_stq_head_is_secret(w)),
@@ -2256,7 +2248,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       pre.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)), fetchCands ++ dispCands)
 
     dis_ift(w).base           := dis_base
-    dis_ift(w).single_step    := fi.single_step
+    dis_ift(w).sftq           := fi.sftq   // [RECV3] SP-09: sftq as a field (was fu bits 3..1)
     // [ARMRES] a uop that joined the window at dispatch logs the live counter (else 0)
     dis_ift(w).atk_branch_ctr := Mux(fi.atk_branch_ctr =/= 0.U, fi.atk_branch_ctr,
                                      Mux(pre.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U, win_atk_ctr, 0.U))
@@ -2328,6 +2320,13 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     for (w <- 0 until coreWidth) {
       // [M4RECSUM] lean58: dis_uops already carries dis_sec_any; the OR is kept (idempotent) so this site reads as before
       rob.io.enq_uops(w).cf_secret_propagation.foreach(_ := dis_uops(w).cf_secret_propagation.getOrElse(false.B) || dis_sec_any(w))
+      // [RECV3] SP-09 (design 3.2 bits 0-1, 3.3 item 1): the issue queue this uop is dispatched to, on the ROB enqueue copy
+      // only (it lands in the sidecar dispatch column, as the v1 ROB bit did; the IQ / LSU / RoCC copies keep dis_uops'
+      // bitmap, 0 at dispatch in v3).  iq_type bit 0 = IQT_INT, bit 1 = IQT_MEM (IQT_MFP = 6 sets MEM).  0 FF; one AND-OR
+      // per bit on rename-register bits into the C_disp write data.
+      rob.io.enq_uops(w).cf_fu_bitmap.foreach(_ := dis_uops(w).cf_fu_bitmap.get |
+        Mux(dis_uops(w).iq_type(0), (1 << UNIT_INT_IQ).U(numModules.W), 0.U(numModules.W)) |
+        Mux(dis_uops(w).iq_type(1), (1 << UNIT_MEM_IQ).U(numModules.W), 0.U(numModules.W)))
     }
   }
   rob.io.enq_ift    := dis_ift
@@ -2373,10 +2372,6 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     // [IQHEAD] patch 49: the IQs' copy carries the chain-free seed (the slot used to zero this field on
     // load, so it had no reader; the ROB and the LSU read dis_uops(w) directly and are unchanged)
     dispatcher.io.ren_uops(w).bits.cf_attacker_influence.foreach(_ := dis_iq_atk(w))
-    // [FTQHOLD] FTQ plan T1 (option A): fu bits 3..1 carry sftq (fetch-buffer.scala [FTQHOLD]); only the ROB's dispatch
-    // column (rob.io.enq_uops = dis_uops) may hold them.  The IQ / FP copies drop them (constant mask, no logic), so no
-    // FU-side writeback can OR them into the record.  (The IQ slot already zeroes cf_fu_bitmap on load.)
-    dispatcher.io.ren_uops(w).bits.cf_fu_bitmap.foreach(_ := dis_uops(w).cf_fu_bitmap.get & ~0xE.U(numModules.W))
   }
 
   var iu_idx = 0
@@ -2885,10 +2880,6 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     io.lsu.dis_uops(w).valid := dis_fire(w)
     io.lsu.dis_valids(w)     := dis_valids(w)   // [DISPAR] patch 51 (A): pre-stall valids for the slot-parallel LDQ/STQ allocation
     io.lsu.dis_uops(w).bits  := dis_uops(w)
-    // [FTQHOLD] FTQ plan T1 (option A): the LDQ / STQ copies drop fu bits 3..1 (sftq, see the dispatcher copy above), so
-    // the load writeback and store clr_bsy bitmaps OR 0 there and the record keeps the dispatch-column value.  Constant
-    // mask: no logic; those LDQ/STQ/D$ copy bits become constant 0 (as bits 2-3 are today).
-    io.lsu.dis_uops(w).bits.cf_fu_bitmap.foreach(_ := dis_uops(w).cf_fu_bitmap.get & ~0xE.U(numModules.W))
   }
 
   // tell LSU about committing loads and stores to clear entries
@@ -3466,7 +3457,13 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
           // split across two printfs, which also opened a window for the MEMTRACE printf
           // to interleave BETWEEN them and corrupt records.  parse_ift_log.py was made
           // position-independent to follow this, not the other way round.
-          cfFmt = " CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_sec=%d spec_oc=%d pdst=%d prs1=%d prs2=%d rt1=%d rt2=%d brmask=0x%x brtag=%d abr=%d sbr=%d wsh=%d ce_repl=%d FU=0x%x INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d sftq=%d) "
+          // [RECV3] SP-05 (design 7.3): the record v3 tokens.  cyc = ift_cyc16 in the commit cycle (= the COMMIT record's
+          // cyc); fflags = the lane's FP flags (= record [118:114]); shadow_sec / shadow_atk = record [84] / [85] (v1 wsh,
+          // and its attacker twin; 0 in debug mode, [DBGFREEZE]); FU = the 15-bit unit word; sftq = the record field (SP-09);
+          // dc = the D$ footprint kind/set/way (SP-08), last, so no token lands between sstq= and alias= (ift_core
+          // _UOP_CTR_RE reads them adjacently).  Dropped: spec_atk/spec_sec/spec_oc (N-D2), ce_repl (REPL_STATE slot type,
+          // D15), INFL_FU (printf-only, no consumer; INDEX-A gap A-5).
+          cfFmt = " CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d fflags=0x%x opcount=%d cyc=%d pdst=%d prs1=%d prs2=%d rt1=%d rt2=%d brmask=0x%x brtag=%d abr=%d sbr=%d shadow_sec=%d shadow_atk=%d FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d sftq=%d dc=%d/%d/%d) "
           cfArgs = Seq[Bits](
             rob.io.commit.uops(w).cf_domain_id.getOrElse(0.U(iftTagWidth.W)),
             rob.io.commit_ift(w).speculated,
@@ -3474,50 +3471,33 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
             rob.io.commit.uops(w).cf_secret_access.getOrElse(false.B),
             com_s_prop_final,
             com_s_tx_final,
+            rob.io.commit_ift(w).fflags,
             rob.io.commit.uops(w).cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)),
-            rob.io.commit_ift(w).spec_branch_is_atk,
-            rob.io.commit.uops(w).cf_spec_branch_is_secret.getOrElse(false.B),
-            rob.io.commit_ift(w).spec_branch_op_id,
+            ift_cyc16,
             rob.io.commit.uops(w).pdst,
             rob.io.commit.uops(w).prs1,
             rob.io.commit.uops(w).prs2,
             rob.io.commit.uops(w).lrs1_rtype,
             rob.io.commit.uops(w).lrs2_rtype,
-            // [BRMASK 2026-09-08] The full speculation shadow, and this uop's own branch
-            // tag.  spec_oc names only ONE branch and picks it by PriorityEncoder over
-            // br_tag -- i.e. LOWEST TAG, not oldest, and tags wrap.  br_mask is the exact
-            // SET of branches this uop speculates under, so software can reconstruct the
-            // tag->branch binding from mask transitions: a bit APPEARING in successive
-            // uops marks where that branch was allocated; the bit CLEARING everywhere
-            // marks its resolution, after which the tag is REUSED BY A DIFFERENT BRANCH.
-            // A parser that does not treat "bit cleared from all masks" as the tag's death
-            // will attribute a shadow to a branch that retired long before -- the same
-            // slot-reuse trap the ROB op_count guards protect against.
+            // [BRMASK 2026-09-08] the full speculation shadow and this uop's own branch tag (printf only; see git history
+            // of this block for the tag-reuse note)
             rob.io.commit.uops(w).br_mask,
             rob.io.commit.uops(w).br_tag,
-            // [GHISTFIELD] GHR window counters: globalHistoryLength - value = branch
-            // retirements back to the branch that tainted the history.
+            // [GHISTFIELD] GHR window counters (record abr / sbr)
             rob.io.commit_ift(w).atk_branch_ctr,
             rob.io.commit_ift(w).sec_branch_ctr,
-            // [HW1BIT75] wsh = bridge record bit [75] (rob.scala com_wsh): the commit-time secret-window
-            // shadow test of this lane.  Printed right after sbr, where the bridge decoder puts it.
-            // Printf only (this block is COMMIT_LOG_PRINTF + ENABLE_CF_DEBUG_PRINTF + ENABLE_IFT).
-            rob.io.cf_com_win_sec(w) && !cf_dbg,   // [DBGFREEZE] patch 85: = record bit [75] (rob.scala com_wsh)
-            // [CEREPL] lean59: ce_repl = bridge record bit [254] (a CACHE_EVICTION edge of this row named the access
-            // that last advanced the set's replacement state).  Printed after wsh, where the bridge decoder puts it.
-            rob.io.commit_ift(w).ce_repl.getOrElse(false.B),
+            rob.io.cf_com_win_sec(w) && !cf_dbg,   // shadow_sec = record [84] (rob.scala com_sh_sec)
+            rob.io.cf_com_win_atk(w) && !cf_dbg,   // shadow_atk = record [85] (rob.scala com_sh_atk)
             rob.io.commit.uops(w).cf_fu_bitmap.getOrElse(0.U(numModules.W)),
-            inflBitmapFromList(rob.io.commit_ift(w).influencer_list),
             rob.io.commit_ift(w).infl_dropped,
             rob.io.commit_ift(w).cntd_deny_count,
             rob.io.commit_ift(w).stall_cycles_rob,
             rob.io.commit_ift(w).stall_cycles_stq,
             rob.io.commit_ift(w).infl_oc_aliased,
-            // [FTQHOLD] FTQ plan T2 (option A): sftq = the f4 FTQ-hold bucket carried in fu bits 3..1 of the record's
-            // fu_bitmap (fetch-buffer.scala [FTQHOLD]: bit 2 = sftq[0], bit 3 = sftq[1], bit 1 = !sftq[2]).  Printed after
-            // alias= (not between sstq= and alias=: ift_core._UOP_CTR_RE reads "sstq=N" then "alias=N" adjacently, and a token
-            // between them would silently drop alias).  Printf only; FU=0x.. stays the raw record value.
-            rob.io.commit.uops(w).cf_fu_bitmap.map(f => Cat(!f(1), f(3), f(2))).getOrElse(0.U(3.W)))
+            rob.io.commit_ift(w).sftq,
+            rob.io.commit_ift(w).dc.kind,
+            rob.io.commit_ift(w).dc.set,
+            rob.io.commit_ift(w).dc.way)
 
           // [THINUOP] Task 3.5: the single-step marker printf was commented out and its
           // cf_single_step field left the MicroOp; the empty `when` is deleted.
@@ -3563,7 +3543,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
           val comFmt = comInflFmt
           val comInflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
             rob.io.commit_ift(w).influencer_list(k).valid,
-            rob.io.commit_ift(w).influencer_list(k).op_count,
+            rob.io.commit_ift(w).influencer_list(k).key,
             rob.io.commit_ift(w).influencer_list(k).infl_type,
             rob.io.commit_ift(w).influencer_list(k).is_atk,
             rob.io.commit_ift(w).influencer_list(k).is_secret
@@ -3645,25 +3625,21 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     val kill_arb = Module(new RRArbiter(new IftKillRecord, kill_srcs.length))
     for ((a, src) <- kill_arb.io.in zip kill_srcs) { a <> src }
     val kr = kill_arb.io.out.bits
-    val kill_uop = WireInit(0.U.asTypeOf(new MicroOp))
-    kill_uop.debug_pc       := kr.pc
-    kill_uop.cf_op_count_id.foreach(_ := kr.op_count)
-    kill_uop.cf_domain_id.foreach(_ := kr.domain)
-    val kill_ift = WireInit(0.U.asTypeOf(new IftCommitInfo))
-    kill_ift.influencer_list(0).valid     := true.B
-    kill_ift.influencer_list(0).op_count  := kr.winner_op
-    kill_ift.influencer_list(0).infl_type := kr.infl_type
-    kill_ift.influencer_list(0).is_atk    := kr.winner_atk
-    kill_ift.influencer_list(0).is_secret := kr.winner_sec
-    kill_ift.cntd_deny_count := Log2Bucket(kr.deny_count)
-    // [FIFO10] step 10: the record's bit 71 (edge_atk) from every winner that denied the killed
-    // uop (was constant 0), and the winners its one-entry list replaced as the dropped count.
-    kill_ift.edge_atk        := kr.winner_atk || kr.any_atk
-    kill_ift.infl_dropped    := kr.dropped
-    // [R117SWEEP] patch 33 (r117): a secret denier (the newest winner or any replaced one) sets the
-    // kill record's s_prop summary bit, as the attacker twin sets bit 71 through edge_atk above.
-    // Was constant 0.  One OR on registered hold bits; record layout unchanged.
-    val kill_rec = uopToIFTBits(kill_uop, kill_ift, (false.B, kr.winner_sec || kr.any_sec.getOrElse(false.B), false.B, false.B), 3.U, RegNext(csr.io.status.prv).pad(3))  // [P3FIX13] priv is 3 bits in the record (zero-extended, as io.ift_priv for commit/squash)
+    // [RECV3] SP-05: the v3 KILL record (design 2.2-2.3, KILL column; IFTRecordV3.scala): an instruction record of the
+    // killed uop (pc, op_count, domain); slot 0 = the denier {key = its op_count[11:0], type, atk, sec}; dcy = the
+    // bucketed deny count; infl_dropped = the winners the slot's one-entry list replaced; atk = the denier's or any
+    // replaced winner's attacker label ([FIFO10] step 10), s_prop the secret twin ([R117SWEEP] patch 33); all else 0
+    // (dbg 0, kind 0).  cyc = ift_cyc16 now: the record is packed combinationally from kill_arb's output and registered
+    // into the lane (sq_lane_r1) in the cycle the lane takes it, so the stamp is the lane-grant cycle (design 2.8, D14),
+    // also when the lane holds it back (spec SP-17).  The v1 priv field (RegNext(csr.io.status.prv)) is gone.
+    val kill_rec = IFTRecordV3.instr(
+      IFTRecordV3.prefix(REC_KILL.U(4.W), 0.U(4.W), false.B, kr.domain, ift_cyc16, kr.op_count, kr.pc),
+      atk = kr.winner_atk || kr.any_atk, s_acc = false.B, s_prop = kr.winner_sec || kr.any_sec.getOrElse(false.B),
+      s_tx = false.B, shadow_sec = false.B, shadow_atk = false.B, spec = false.B, oc_aliased = false.B,
+      infl_dropped = kr.dropped, dcy = Log2Bucket(kr.deny_count), srob = 0.U(3.W), sstq = 0.U(3.W), sftq = 0.U(3.W),
+      dc_kind = 0.U(2.W), dc_set = 0.U(7.W), dc_way = 0.U(3.W), fflags = 0.U(5.W), unit = 0.U(numModules.W),
+      pdst = 0.U(8.W), prs1 = 0.U(8.W), prs2 = 0.U(8.W), rt1 = 0.U(2.W), rt2 = 0.U(2.W), abr = 0.U(7.W), sbr = 0.U(7.W),
+      slots = Seq(IFTRecordV3.slot(kr.winner_op, kr.infl_type, kr.winner_atk, kr.winner_sec)) ++ Seq.fill(3)(0.U(20.W)))
 
     val sq_arb = Module(new RRArbiter(UInt(256.W), 2))
     sq_arb.io.in(0) <> rob.io.ift_squash
@@ -3729,10 +3705,6 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   if (usingRoCC) {
     exe_units.rocc_unit.io.rocc.rocc         <> io.rocc
     exe_units.rocc_unit.io.rocc.dis_uops     := dis_uops
-    // [FTQHOLD] FTQ plan T2 (option A): the RoCC copy drops fu bits 3..1 like the IQ / LSU copies (core.scala
-    // dispatcher / io.lsu.dis_uops), so its writeback cannot trip the rob.scala [FTQHOLD] assert.  Constant mask.
-    for (w <- 0 until coreWidth)
-      exe_units.rocc_unit.io.rocc.dis_uops(w).cf_fu_bitmap.foreach(_ := dis_uops(w).cf_fu_bitmap.get & ~0xE.U(numModules.W))
     exe_units.rocc_unit.io.rocc.rob_head_idx := rob.io.rob_head_idx
     exe_units.rocc_unit.io.rocc.rob_pnr_idx  := rob.io.rob_pnr_idx
     exe_units.rocc_unit.io.com_exception     := rob.io.flush.valid

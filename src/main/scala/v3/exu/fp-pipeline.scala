@@ -158,7 +158,6 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
     // dis_wire.valid := io.dis_uops(w).valid
     // io.dis_uops(w).ready := dis_wire.ready
     issue_unit.io.dis_uops(w) <> io.dis_uops(w)
-    issue_unit.io.dis_uops(w).bits.cf_fu_bitmap.foreach(_ := io.dis_uops(w).bits.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << fpissqTagCF.U))
   }
 
   //-------------------------------------------------------------
@@ -367,7 +366,6 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
   // Ensure the wakeup carries the FRF writeback tag so the ROB receives
   // the tagged micro-op on writeback.
   val ll_out_bits = WireInit(ll_wbarb.io.out.bits)
-  ll_out_bits.uop.cf_fu_bitmap.foreach(_ := ll_wbarb.io.out.bits.uop.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << frfTagCF.U))
   // [G7FFLAGS] (ruling 100, G-7; functional, upstream BOOM) the ROB writes rob_fflags on
   // fflags.valid alone.  An idle arbiter presents in(1).bits = the IntToFP queue's stale
   // ram(deq_ptr) entry with fflags.valid = 1, rewriting that (possibly reused) row's flags
@@ -379,7 +377,6 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
   w_cnt = 1
   for (i <- 1 until memWidth) {
     val mem_wb = WireInit(io.ll_wports(i).bits)
-    mem_wb.uop.cf_fu_bitmap.foreach(_ := io.ll_wports(i).bits.uop.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << frfTagCF.U))
     io.wakeups(w_cnt) := io.ll_wports(i)
     io.wakeups(w_cnt).bits := mem_wb
     io.wakeups(w_cnt).bits.data := recode(io.ll_wports(i).bits.data,
@@ -392,7 +389,6 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
       val wb_uop = eu.io.fresp.bits.uop
       val wport = io.wakeups(w_cnt)
       val fpu_wb_bits = WireInit(exe_resp.bits)
-      fpu_wb_bits.uop.cf_fu_bitmap.foreach(_ := exe_resp.bits.uop.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << frfTagCF.U))
       wport.valid := exe_resp.valid && wb_uop.dst_rtype === RT_FLT
       wport.bits := fpu_wb_bits
 

@@ -127,7 +127,7 @@ class IssueSlot(val numWakeupPorts: Int, val numPendPorts: Int = 0, val pendFlt:
   // corefuzzing: per-slot ISSUE_CONTENTION accumulation registers.
   // Declared here (before out_uop assignments) so they can be referenced in out_uop.
   val cf_cntd_valid      = RegInit(false.B)
-  val cf_cntd_winner_op  = Reg(UInt(inflOpCountWidthCF.W))   // [NARROW] see micro-op.scala
+  val cf_cntd_winner_op  = Reg(UInt(inflKeyWidthCF.W))   // [NARROW] see micro-op.scala ([RECV3] 12-bit slot key)
   val cf_cntd_winner_atk = RegInit(false.B)
   val cf_cntd_winner_sec = RegInit(false.B)
   // O1: the influence type latched with the denial (ISSUE_CONTENTION or FU_BUSY)

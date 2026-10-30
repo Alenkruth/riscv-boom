@@ -132,11 +132,6 @@ class FDivSqrtUnit(implicit p: Parameters)
       r_buffer_req.uop.cf_op_count_id.foreach(_ := 0.U)
     }
     r_buffer_req.uop.cf_spec_branch_is_secret.foreach(_ := false.B)
-    // [FDIVFU] set the fpu bitmap bit (bit 22) the way the pipelined FU base does
-    // (functional-unit.scala, stage-0 newBit); FDivSqrtUnit does not extend that base, so
-    // FP divides committed without it (Phase 0 finding (d)).  Bit 12 (fpissq) is zeroed on
-    // the issue-slot path for every op and is not FP-specific; left alone.
-    r_buffer_req.uop.cf_fu_bitmap.foreach(_ := io.req.bits.uop.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << fpuTagCF.U))
     r_buffer_fin.viewAsSupertype(new tile.FPUCtrlSigs) := fdiv_decoder.io.sigs
 
     r_buffer_fin.rm := Mux(ImmGenRm(io.req.bits.uop.imm_packed) === 7.U, io.fcsr_rm, ImmGenRm(io.req.bits.uop.imm_packed))
@@ -183,7 +178,7 @@ class FDivSqrtUnit(implicit p: Parameters)
   // computing divide's operand secret, latched at the buffer -> divsqrt hand-off by
   // [FDIVTAINT] (r_divsqrt_secret, no extra flop), else the buffered request's.
   io.cf_fu_busy.valid         := !io.req.ready
-  io.cf_fu_busy.bits.op_count := cf_busy_occ.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))(inflOpCountWidthCF-1, 0)
+  io.cf_fu_busy.bits.op_count := cf_busy_occ.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))(inflKeyWidthCF-1, 0)
   io.cf_fu_busy.bits.is_atk   := cf_busy_occ.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U
   // [R124GATE] IFT off: the port default (false, functional-unit.scala) stands.
   if (ENABLE_IFT) {

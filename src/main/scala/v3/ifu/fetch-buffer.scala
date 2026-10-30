@@ -24,7 +24,7 @@ import freechips.rocketchip.util._
 
 import boom.v3.common._
 import boom.v3.exu.{BrUpdateInfo}
-import boom.v3.util.{BoolToChar, MaskUpper, Sext, SpeculativePrintf, appendModuleTag, inflBitmapFromList, fetchFlagsToList}
+import boom.v3.util.{BoolToChar, MaskUpper, Sext, SpeculativePrintf, appendModuleTag, fetchFlagsToList}
 import freechips.rocketchip.util.CoreFuzzingConstants
 // imports for corefuzzing
 
@@ -101,18 +101,6 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   val ram_ift = if (ENABLE_IFT) Reg(Vec(numEntries, new FetchIftInfo))
                 else WireInit(0.U.asTypeOf(Vec(numEntries, new FetchIftInfo)))
   ram_ift.suggestName("fb_ift_ram")
-  // [FTQHOLD] FTQ plan T1, owner T-D1 option A: sftq rides cf_fu_bitmap in its three information-free bits, fu bit 2
-  // (l0BTBTagCF, no setter) = sftq[0], fu bit 3 (l1BTBTagCF, no setter) = sftq[1], fu bit 1 (itlbTagCF, the constant 1)
-  // = !sftq[2]; sftq = 0 gives exactly the old constant (bits 3..1 = 0,0,1).  The three bits are stored HERE, per entry,
-  // already in fu form (Cat(b1, b0, !b2)), and spliced into the dequeued uop's cf_fu_bitmap below, instead of being
-  // ORed into the fill at :288: today every fill writes the same constant, so firtool folds the whole 64 x 24-bit
-  // cf_fu_bitmap RAM away (RenameStage r_uop_cf_fu_bitmap <= 24'h1F3 in lean59 e59e), and writing the bucket at the
-  // fill would make all 24 bits of every entry live (+1536 FF, measured in the t1b scratch elaboration).  Here it is
-  // 3 x 64 = 192 FF; the value each dequeued uop carries is the same as the fill form.  Write: the bucket flop
-  // (io.cf_ftq_hold3) into the entry under the same enable as `ram` (the !b2 merges into the write LUT); read: the
-  // same head_row mux as every other field, then wiring.  IFT off: None.
-  val ram_ftqh = if (ENABLE_IFT) Some(Reg(Vec(numEntries, UInt(3.W)))) else None
-  ram_ftqh.foreach(_.suggestName("fb_ftqh_ram"))
   val deq_ift_vec = Wire(Vec(numRows, Vec(coreWidth, new FetchIftInfo)))
 
   // corefuzzing: track which RAM slots actually hold valid (enqueued, not yet dequeued/cleared)
@@ -300,7 +288,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // 13 LUT, flop-sourced, ending at the fetch-buffer RAM flops.  IFT off: cf_dbg is None, fb_dbg = false.
   val fb_dbg = io.cf_dbg.getOrElse(false.B)
   for (i <- 0 until fetchWidth) {
-    in_uops(i).cf_fu_bitmap.foreach(_ := (1.U << fbTagCF.U) | (1.U << icacheTagCF.U) | (1.U << itlbTagCF.U) | (1.U << ftqTagCF.U) | (1.U << rasTagCF.U) | (1.U << bpdTagCF.U) | (1.U << btbTagCF.U))
+    in_uops(i).cf_fu_bitmap.foreach(_ := 0.U)   // [RECV3] SP-09: no fetch-side unit bits (design 3.2.1: every uop visits them)
     // Compute domain_id from PC at fetch-buffer fill time (domain is purely PC-based).
     // This ensures [FLUSH] SRC=0 entries have the correct domain when clear fires.
     val fb_in_attacker = (io.cf_attacker_start_addr =/= io.cf_attacker_end_addr) && !fb_dbg &&
@@ -372,8 +360,10 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   for (i <- 0 until fetchWidth) {
     in_ift(i).fetch_flags   := fetch_flags
     in_ift(i).any_is_victim := any_is_victim
-    in_ift(i).single_step   := false.B     // set at decode
     in_ift(i).btb_sec_pc    := io.enq.bits.btb_sec_pc.getOrElse(0.U)   // [BTBDISP] PC[13:2] for bit 7 (else bit 8)
+    // [RECV3] SP-09 (design 3.3 item 2): the FTQ-full hold bucket of this packet, as its own field (was spliced into fu bits
+    // 3..1 through fb_ftqh_ram).  It rides fb_ift_ram (+3 x 64 FF, the 192 FF fb_ftqh_ram had), then FetchIftInfo to dispatch.
+    in_ift(i).sftq          := io.cf_ftq_hold3.getOrElse(0.U(3.W))
     // [GHISTFIELD] Carry the window counters.  any_is_victim on the attacker side, matching
     // the gate the other domain-mismatch channels use: the attacker's own fetches are
     // domain=1 and must not be marked as influenced by themselves.  Explicit zero when the
@@ -451,10 +441,6 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
       when (do_enq && in_mask(i) && enq_idxs(i)(j)) {
         ram(j) := in_uops(i) // in_uops_tagged(i)
         if (ENABLE_IFT) ram_ift(j) := in_ift(i)   // [R124GATE]
-        ram_ftqh.foreach { r =>   // [FTQHOLD] fu bits 3..1 of every uop of this packet (one value per packet)
-          val b = io.cf_ftq_hold3.get
-          r(j) := Cat(b(1), b(0), !b(2))
-        }
         ram_valid(j) := true.B
         // for debugging: printing ram index for every enqueue - alex
         // printf(p"($rowsUsed, $coreWidth, enq, $j), ")
@@ -505,15 +491,6 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   val deq_valids_sub = VecInit(deq_valids.zip(sub_row_mask).map { case (v, m) => v && m })
   io.deq.bits.uops zip deq_valids_sub        map {case (d,v) => d.valid := v}
   io.deq.bits.uops zip deq_vec(head_row)      map {case (d,q) => d.bits  := q}
-  // [FTQHOLD] splice the entry's sftq fu bits 3..1 into the dequeued uop (bits 23..4 and 0 are the fill constant).
-  // Only valid entries are dequeued (deq_valids gates by ram_valid), so an unwritten entry's bits are never used.
-  ram_ftqh.foreach { r =>
-    for (w <- 0 until coreWidth) {
-      val q = deq_vec(head_row)(w).cf_fu_bitmap.get
-      val h = VecInit((0 until numRows).map(row => r(row * coreWidth + w)))(head_row)
-      io.deq.bits.uops(w).bits.cf_fu_bitmap.get := Cat(q(numModules - 1, 4), h, q(0))
-    }
-  }
   io.deq.bits.ift  := deq_ift_vec(head_row)
   io.deq.valid := deq_valids_sub.reduce(_||_)
 
@@ -617,7 +594,8 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
         // Expand influencer slots as fixed-format fields {v=,oc=,ty=} so the entire entry is
         // one printf call — no per-slot conditional printf loop needed.
         val flushInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d}"}.mkString(" ")
-        val flushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d floc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d $flushInflFmt\n"
+        val flushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d fl=%d floc=%d) FU=0x%x SRC=%d OVF=%d dcy=%d srob=%d sstq=%d alias=%d $flushInflFmt\n"
+        val flushFmtV1 = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d floc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d $flushInflFmt\n"
         for (i <- 0 until numEntries) {
           // corefuzzing: read RAM entry directly — no WireInit copy needed since we don't
           // modify the influencer list here.  fl/floc are separate fields (like spec_atk/spec_oc).
@@ -631,12 +609,12 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
           when (ram_valid(i)) {
             val inflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
               fb_list.edges(k).valid,
-              fb_list.edges(k).op_count,
+              fb_list.edges(k).key,
               fb_list.edges(k).infl_type,
               fb_list.edges(k).is_atk,
               fb_list.edges(k).is_secret
             ))
-            printf(flushFmt, (Seq[Bits](
+            if (ENABLE_IFT) printf(flushFmt, (Seq[Bits](
               Sext.apply(base_uop.debug_pc(vaddrBits-1,0), xLen),
               base_uop.debug_inst,
               base_uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)),
@@ -647,12 +625,18 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
               base_uop.cf_secret_propagation.getOrElse(false.B),
               base_uop.cf_secret_transmission.getOrElse(false.B),
               base_uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)),
-              0.U, 0.U,
               fl_cross_domain, fl_op_count,
               base_uop.cf_fu_bitmap.getOrElse(0.U(numModules.W)),
-              0.U, inflBitmapFromList(fb_list.edges),
+              0.U,
               fb_list.dropped, 0.U, 0.U, 0.U, fb_list.aliased
             ) ++ inflArgs): _*)
+            // [RECV3] SP-04: IFT off this line prints only constant-0 CF fields, but the v3 constants would change their
+            // printed widths (key 12, type 6, unit 15) and the token set, i.e. the IFT-off Verilog (RULES D3).  The IFT-off
+            // build keeps the v1 line with its v1 literal widths, byte for byte (found by the S1 stream A scratch
+            // elaboration of BaselineBoomConfig).
+            else printf(flushFmtV1, (Seq[Bits](Sext.apply(base_uop.debug_pc(vaddrBits-1,0), xLen), base_uop.debug_inst) ++
+              Seq(1, 1, 1, 1, 1, 1, 16, 1, 1, 1, 16, 24, 1, 24, 2, 1, 1, 1, 1).map(n => 0.U(n.W)) ++
+              Seq.fill(numInfluencerSlotsCF)(Seq(1, 10, 5, 1, 1).map(n => 0.U(n.W))).flatten): _*)
           }
         }
       }

@@ -197,8 +197,6 @@ class RenameStage(
 {
   val pregSz = log2Ceil(numPhysRegs)
   val rtype = if (float) RT_FLT else RT_FIX
-  // corefuzzing - setting up float/integer specific flags at compile time
-  val moduleTagCF = if (float) frfTagCF else irfTagCF
 
   //-------------------------------------------------------------
   // Helper Functions
@@ -411,8 +409,6 @@ class RenameStage(
     else       bypassed_uop := ren2_uops(w)
 
     io.ren2_uops(w) := GetNewUopAndBrMask(bypassed_uop, io.brupdate)
-    // corefuzzing: stamp irf/frf bitmap bit at rename output
-    io.ren2_uops(w).cf_fu_bitmap.foreach(_ := GetNewUopAndBrMask(bypassed_uop, io.brupdate).cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << moduleTagCF.U))
   }
 
   //-------------------------------------------------------------

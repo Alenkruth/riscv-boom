@@ -16,7 +16,7 @@ import chisel3.util._
 
 import freechips.rocketchip.rocket.Instructions._
 import freechips.rocketchip.rocket._
-import freechips.rocketchip.util.{Str, CoreFuzzingConstants}
+import freechips.rocketchip.util.{Str, CoreFuzzingConstants, PlusArg}
 import org.chipsalliance.cde.config.{Parameters}
 import freechips.rocketchip.tile.{TileKey}
 
@@ -830,7 +830,7 @@ object appendModuleTag {
  */
 object OcInRange extends CoreFuzzingConstants {
   /** True when a producer's op_count is close enough to be reconstructed exactly from
-    * the low inflOpCountWidthCF bits stored in an InfluencerEntry.
+    * the low inflKeyWidthCF (12) bits stored in an InfluencerEntry key ([RECV3]: was 10).
     *
     * Software recovers the producer as `own - ((own - stored) mod 2^W)`, which is exact
     * iff the true distance is < 2^W.  Beyond that it silently returns the WRONG producer
@@ -846,7 +846,7 @@ object OcInRange extends CoreFuzzingConstants {
     * Wrap is handled for free by UInt arithmetic.
     */
   def apply(producer: UInt, own: UInt)(implicit p: Parameters): Bool = {
-    val w = inflOpCountWidthCF
+    val w = inflKeyWidthCF
     val prod_hi = producer.pad(uopIDCounterWidthCF)(uopIDCounterWidthCF - 1, w)
     val own_hi  = own.pad(uopIDCounterWidthCF)(uopIDCounterWidthCF - 1, w)
     (prod_hi === own_hi) || (prod_hi === (own_hi - 1.U))
@@ -896,20 +896,25 @@ object Log2Bucket {
  */
 case class InfluencerCandidate(
   cond:          Bool,
-  op_count:      UInt,
+  // [RECV3] SP-06 (design 2.4): the slot key.  OC-keyed codes: the producer's op_count (any width: the low
+  // inflKeyWidthCF bits are stored, the full value feeds the oc_aliased range check); PC-keyed codes: PC[13:2];
+  // NONE-keyed codes: 0.U.  The key kind is a property of the code (CoreFuzzing.scala inflKeyKind), not a parameter.
+  key:           UInt,
   infl_type_int: Int,   // Scala compile-time constant — enables constant-folding in addInfluencerBatch
   is_atk:        Bool,
   is_secret:     Bool,
-  // [PCPROV 2026-09-15] the op_count field carries PC[11:2] (and infl_type_int already
-  // encodes PC[13:12]) -- see CoreFuzzing.scala inflPcCode.  Scala-time so the range
-  // check below constant-folds away for these candidates: a PC is not an op_count and
-  // must not set cf_infl_oc_aliased.
-  is_pc:         Boolean = false,
-  // [BTBDISP 2026-10-13, step 16] a RUNTIME type code that replaces infl_type_int in the slot
-  // and in the duplicate compare.  Used only by the BTB_STATE secret candidate, whose code is
-  // inflPcCode(INFL_BTB_STATE, PC[13:12]) chosen by two PC bits (one LUT level per code bit),
-  // so ONE candidate covers the four codes instead of four candidates in the prefix network.
-  infl_type_dyn: Option[UInt] = None)
+  // A RUNTIME type code that replaces infl_type_int in the slot and in the duplicate compare (one candidate, two codes
+  // selected by a flop; [RECV3] used by the ROB_FULL / FTQ_FULL candidate, spec SP-07).  infl_type_int still names the
+  // key kind, so both codes of a dyn candidate must have the same kind.
+  infl_type_dyn: Option[UInt] = None) {
+  // [RECV3] only OC-keyed candidates are range-checked into cf_infl_oc_aliased (a PC or a 0 key is not an op_count)
+  val ocKeyed: Boolean = InflKeyKind.isOc(infl_type_int)
+}
+
+// [RECV3] SP-06: the key kind of a code, for InfluencerCandidate (a case class cannot mix in the constants trait cheaply).
+object InflKeyKind extends CoreFuzzingConstants {
+  def isOc(code: Int): Boolean = inflKeyKind(code) == KEY_OC
+}
 
 // IFT overhaul Phase 3, Task 3.2 (D16) / Task 3.5: the batch append on an IftEdgeList.  Used where
 // the edges travel on a response (D$, STL forward) or in a side bundle (FetchIftInfo, IftDispatchInfo)
@@ -1015,14 +1020,14 @@ object addInfluencerBatchList extends CoreFuzzingConstants {
            (implicit p: Parameters): (IftEdgeList, Bool) = {
     val out    = WireInit(base)
     val n_dyn  = numInfluencerSlotsCF
-    val ocW    = inflOpCountWidthCF
+    val ocW    = inflKeyWidthCF
     val base_idx = PopCount(VecInit(base.edges.take(n_dyn).map(_.valid)))
 
     // duplicate suppression: all four fields equal (see the notes above)
     val dup_of_existing: Seq[Bool] = candidates.map { c =>
       VecInit(base.edges.take(n_dyn).map { e =>
         e.valid && e.infl_type === c.infl_type_dyn.getOrElse(c.infl_type_int.U) &&
-        e.op_count === c.op_count.pad(ocW)(ocW - 1, 0) &&
+        e.key === c.key.pad(ocW)(ocW - 1, 0) &&
         e.is_atk === c.is_atk && e.is_secret === c.is_secret
       }).asUInt.orR
     }
@@ -1044,7 +1049,7 @@ object addInfluencerBatchList extends CoreFuzzingConstants {
       val bents = (s until n_dyn).map(j => base.edges(j))
       val cents = candidates.map { c =>
         val e = Wire(new InfluencerEntry)
-        e.valid := true.B; e.op_count := c.op_count.pad(ocW)(ocW - 1, 0)
+        e.valid := true.B; e.key := c.key.pad(ocW)(ocW - 1, 0)
         e.infl_type := c.infl_type_dyn.getOrElse(c.infl_type_int.U); e.is_atk := c.is_atk; e.is_secret := c.is_secret
         e
       }
@@ -1052,10 +1057,10 @@ object addInfluencerBatchList extends CoreFuzzingConstants {
       out.edges(s)       := Mux1H(sel, bents ++ cents)
       out.edges(s).valid := sel.reduce(_ || _)
       // aliased: a written non-PC candidate whose op_count is out of reconstructable range
-      val oc_writers = (csel zip candidates).collect { case (wr, c) if !c.is_pc => wr }
-      val oc_cands   = candidates.filter(!_.is_pc)
+      val oc_writers = (csel zip candidates).collect { case (wr, c) if c.ocKeyed => wr }   // [RECV3] OC-keyed codes only
+      val oc_cands   = candidates.filter(_.ocKeyed)
       if (oc_cands.nonEmpty) {
-        val s_oc = Mux1H(oc_writers, oc_cands.map(_.op_count.pad(uopIDCounterWidthCF)))
+        val s_oc = Mux1H(oc_writers, oc_cands.map(_.key.pad(uopIDCounterWidthCF)))
         when (oc_writers.reduce(_ || _) && s_oc =/= 0.U && !OcInRange(s_oc, own_oc)) {
           out.aliased := true.B
         }
@@ -1081,20 +1086,13 @@ object addInfluencerBatchList extends CoreFuzzingConstants {
 // One definition shared by dispatch (core.scala) and the printf-only fetchFlagsToList.
 //
 // [BTBDISP 2026-10-13, step 16] bit 7 = (hit on a secret-trained BTB/uBTB entry) OR (fetch of the
-// tag a secret allocation displaced, btb.scala ift_btb_evf / faubtb.scala evf).  Its candidate is
-// PC-coded: op_count = PC[11:2] and type = inflPcCode(INFL_BTB_STATE, PC[13:12]) (31/14/15/13) of the secret
-// allocator (FetchIftInfo.btb_sec_pc).  Still one candidate (runtime type, infl_type_dyn).
+// tag a secret allocation displaced, btb.scala ift_btb_evf / faubtb.scala evf).  [RECV3] SP-07: its candidate is
+// INFL_BTB_DISPLACE (0x36, controller decision on gap B-2) with key = PC[13:2] of the secret allocator
+// (FetchIftInfo.btb_sec_pc) whole: one code (design 2.4.1; v1 used the four codes 31/14/15/13 by PC[13:12] and a 10-bit
+// key, through btbSecTypeCode, now deleted).  INFL_BTB_STATE (0x31) is left to the domain-mismatch edge (bit 5, key 0).
 // [BTBATK] DF-btbatk: bit 8 (attacker displacement record) shares that candidate: cond = bit 7 ||
 // bit 8, is_secret = bit 7, is_atk = bit 8 (one slot; a secret attacker displacement gives one
 // {atk=1, sec=1} edge with its own PC).
-object btbSecTypeCode extends CoreFuzzingConstants {
-  // pcHi 0 -> 31 (ruling 114), 1 -> 14, 2 -> 15, 3 -> 13 (retired codes, ruling 113); never 10,
-  // which the ordinary (domain-mismatch) BTB_STATE edge uses.
-  // A 4:1 select of constants on 2 bits: one LUT level per type bit.
-  def apply(pcHi: UInt): UInt =
-    VecInit(Seq(INFL_BTB_STATE_0, INFL_BTB_STATE_1, INFL_BTB_STATE_2, INFL_BTB_STATE_3)
-      .map(_.U(inflTypeWidthCF.W)))(pcHi(1, 0))
-}
 object fetchFlagCandidates extends CoreFuzzingConstants {
   def apply(f: UInt, any_is_victim: Bool, btb_sec_pc: UInt): Seq[InfluencerCandidate] = Seq(
     InfluencerCandidate(f(1), 0.U, INFL_ICACHE_STATE,      false.B,       true.B),
@@ -1107,10 +1105,9 @@ object fetchFlagCandidates extends CoreFuzzingConstants {
     // Bit 6 stays in the layout, driven 0 by the fetch buffer (no candidate, no slot).
     // [BTBATK] DF-btbatk: ONE PC-coded BTB candidate for bits 7 and 8: sec = bit 7 (secret
     // trainer hit / secret displacement record), atk = bit 8 (attacker displacement record,
-    // victim packets only).  Same codes 31/14/15/13; the parser tells the kinds apart by the
+    // victim packets only).  One code (0x36 BTB_DISPLACE, key = PC[13:2]); the parser tells the kinds apart by the
     // slot's atk/sec bits.  r117: sec sets sticky s_prop, atk sets the sticky attacker bit.
-    InfluencerCandidate(f(7) || f(8), btb_sec_pc(inflPcBitsCF-3, 0), INFL_BTB_STATE_0, f(8), f(7), is_pc = true,
-                        infl_type_dyn = Some(btbSecTypeCode(btb_sec_pc(inflPcBitsCF-1, inflPcBitsCF-2)))),
+    InfluencerCandidate(f(7) || f(8), btb_sec_pc, INFL_BTB_DISPLACE, f(8), f(7)),   // [RECV3] 0x36, key = PC[13:2]
     // [G1V2] bit 0, the I$ attacker (domain-mismatch) edge, LAST = newest: it is kept when the 4-slot
     // list overflows.  Same cond / type / is_atk as before; only its position moved.  Cost: no FF;
     // its prefix is now a popcount of the 6 earlier fetch conds (was the constant 0), shallower than
@@ -1128,49 +1125,15 @@ object fetchFlagsToList {
     addInfluencerBatchList(0.U.asTypeOf(new IftEdgeList), 0.U, fetchFlagCandidates(flags, any_is_victim, btb_sec_pc))._1
 }
 
-// corefuzzing: Compute a 24-bit INFL_FU bitmap from an influencer list.
-// Each set bit marks the pipeline module most responsible for that influence type.
-// Uses compile-time integer constants from CoreFuzzingConstants (stable, never changes).
-// Mapping: infl_type → module tag bit index (matching CoreFuzzingConstants values)
-object inflBitmapFromList {
-  // (infl_type_value → module_mask): compile-time Scala Int constants.
-  // Module bit numbers from CoreFuzzingConstants: icache=0,itlb=1,btb=4,bpd=5,ras=6,
-  // irf=9,frf=10,intissq=11,rob=14,ldq=15,stq=16,dtlb=17,dcache=18
-  private val mapping: Seq[(Int, Int)] = Seq(
-    0  -> (1 << 9),  // INFL_REG_DATAFLOW    → irf
-    1  -> (1 << 16), // INFL_STL_FORWARD     → stq
-    2  -> (1 << 11), // INFL_ISSUE_CONTENTION → intissq
-    3  -> (1 << 15), // INFL_MEM_HOL         → ldq
-    4  -> (1 << 9),  // INFL_REG_PRESSURE    → irf
-    5  -> (1 << 14), // INFL_ROB_FULL        → rob
-    6  -> (1 << 15), // INFL_LDQ_FULL        → ldq
-    7  -> (1 << 16), // INFL_STQ_FULL        → stq
-    8  -> (1 << 15), // INFL_MEM_ORDER       → ldq
-    9  -> (1 << 5),  // INFL_BPD_STATE       → bpd
-    10 -> (1 << 4),  // INFL_BTB_STATE       → btb
-    11 -> (1 << 6),  // INFL_RAS_STATE       → ras
-    12 -> (1 << 18), // INFL_CACHE_EVICTION  → dcache
-    // 13 = INFL_PIPELINE_FLUSH: represented via fl/floc fields in [FLUSH] log, not an influencer slot
-    // [BTBDISP] step 16 (ruling 113): 13/14/15 are now the BTB_STATE sec=1 PC continuations
-    // (the DTLB/ITLB/PIPELINE_FLUSH slot emitters are gone) -> btb
-    13 -> (1 << 4), 14 -> (1 << 4), 15 -> (1 << 4),      // INFL_BTB_STATE_{3,1,2}
-    31 -> (1 << 4),                                      // INFL_BTB_STATE_0 (ruling 114)
-    16 -> (1 << 0),  // INFL_ICACHE_STATE    → icache
-    17 -> (1 << 18), // INFL_MEM_DATAFLOW    → dcache (attacker store data read by victim)
-    // [PCPROV] PC[13:12] continuation codes of the two D$ types (CoreFuzzing.scala inflPcCode)
-    21 -> (1 << 18), 22 -> (1 << 18), 23 -> (1 << 18),   // INFL_CACHE_EVICTION_{1,2,3}
-    24 -> (1 << 18), 25 -> (1 << 18), 26 -> (1 << 18),   // INFL_MEM_DATAFLOW_{1,2,3}
-    // [IQFULL] step 16: an issue queue (int/fp/mem: the type does not say which)
-    28 -> ((1 << 11) | (1 << 12) | (1 << 13)),            // INFL_IQ_FULL
-  )
-  def apply(infl_list: Vec[boom.v3.common.InfluencerEntry]): UInt = {
-    val per_slot = infl_list.map { slot =>
-      val mask = MuxLookup(slot.infl_type, 0.U(24.W))(
-        mapping.map { case (ty, m) => ty.U -> m.U(24.W) })
-      Mux(slot.valid, mask, 0.U(24.W))
-    }
-    per_slot.reduce(_ | _)
-  }
+// [RECV3] SP-05: the one definition of the debug-only `+cf_state=1` plusarg (pattern of dcache.scala [REPLUPDOC]
+// cf_replupd).  It turns on the record v3 STATE / footprint debug prints: [DCFOOT] (SP-08), [MEM-*] (SP-22),
+// [FE-IC] / [FE-RAS] / [PRED-U] (SP-18/19/22), [STATE] / [EPOCH] (SP-17).  Call it with gate =
+// ENABLE_CF_DEBUG_PRINTF && ENABLE_IFT from each module whose prints read it: it instantiates one plusarg_reader in
+// that module (Verilator debug builds).  gate = false (FireSim, NoLog, oracle, IFT off) gives the constant false.
+// (Was object inflBitmapFromList, the printf-only INFL_FU table keyed on v1 codes: removed with the INFL_FU token.)
+object CfStatePlusArg {
+  def apply(gate: Boolean): Bool =
+    if (gate) PlusArg("cf_state", 0, "record v3 STATE / footprint debug prints (1 = on)", 1)(0) else false.B
 }
 
 // corefuzzing

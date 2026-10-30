@@ -108,7 +108,7 @@ object IftMerge extends CoreFuzzingConstants {
     * true); the merge overwrites every slot's valid with its hit bit anyway. */
   def ent(x: IftRawEdge)(implicit p: Parameters): InfluencerEntry = {
     val e = Wire(new InfluencerEntry)
-    e.valid := true.B; e.op_count := x.op_count; e.infl_type := x.infl_type
+    e.valid := true.B; e.key := x.key; e.infl_type := x.infl_type
     e.is_atk := x.is_atk; e.is_secret := x.is_secret
     e
   }
@@ -145,7 +145,7 @@ object IftMerge extends CoreFuzzingConstants {
     // last event (after dispatch and issue), so the mark sorts newest; ties: prio 5, before RAS.  A constant key folds
     // this group's comparators.
     val clrEntry = Wire(new InfluencerEntry)
-    clrEntry.valid := true.B; clrEntry.op_count := 0.U; clrEntry.infl_type := INFL_REG_DATAFLOW.U
+    clrEntry.valid := true.B; clrEntry.key := 0.U; clrEntry.infl_type := INFL_REG_DATAFLOW.U
     clrEntry.is_atk    := r.cl_atk && r.domain === 0.U
     clrEntry.is_secret := r.cl_sec
     val clV = clrEntry.is_atk || clrEntry.is_secret
@@ -158,11 +158,11 @@ object IftMerge extends CoreFuzzingConstants {
     // op_count-0 REG_DATAFLOW mark either way, only its bits differ.  `flat` keeps one
     // sprob entry; a third column counts as dropped like the other types (ruling 30).
     val sprobEntry = Wire(new InfluencerEntry)
-    sprobEntry.valid := true.B; sprobEntry.op_count := 0.U; sprobEntry.infl_type := INFL_REG_DATAFLOW.U
+    sprobEntry.valid := true.B; sprobEntry.key := 0.U; sprobEntry.infl_type := INFL_REG_DATAFLOW.U
     sprobEntry.is_atk    := (sp.v1 && sp.c1.is_atk)    || (sp.v2 && sp.c2.is_atk)
     sprobEntry.is_secret := (sp.v1 && sp.c1.is_secret) || (sp.v2 && sp.c2.is_secret)
     val rasEntry = Wire(new InfluencerEntry)
-    rasEntry.valid := true.B; rasEntry.op_count := 0.U; rasEntry.infl_type := INFL_RAS_STATE.U
+    rasEntry.valid := true.B; rasEntry.key := 0.U; rasEntry.infl_type := INFL_RAS_STATE.U
     rasEntry.is_atk := r.domain === 0.U; rasEntry.is_secret := false.B
     // group order on ties = today's drain priority: sprob, ic, wb, memord, ras
     // ([FIFO10] step 10: the Task 3.2 dtlb groups (prio 5) are removed, ruling 94)
@@ -229,14 +229,14 @@ object IftMerge extends CoreFuzzingConstants {
                      r.mo.map(c => c.valid && c.bits.is_atk) ++
                      Seq(clrEntry.is_atk) ++                                // [STTY0]
                      Seq(raV && r.domain === 0.U)).reduce(_ || _)
-    // [CEREPL] lean59 (owner 2026-10-23): record bit [254], the replacement-state-attributed CACHE_EVICTION flag of
-    // the row (rawRead's OR over the valid C_wb columns).  Off the merge path (a raw-row bit straight to the output).
-    out.ce_repl.foreach(_ := r.ce_repl)
-    out.speculated := disp.speculated;  out.single_step := disp.single_step
-    out.spec_branch_is_atk := disp.spec_branch_is_atk; out.spec_branch_is_secret := disp.spec_branch_is_secret
-    out.spec_branch_op_id := disp.spec_branch_op_id
+    out.speculated := disp.speculated
+    out.spec_branch_is_secret := disp.spec_branch_is_secret
     out.stall_cycles_rob := disp.stall_cycles_rob; out.stall_cycles_stq := disp.stall_cycles_stq
     out.atk_branch_ctr := disp.atk_branch_ctr;  out.sec_branch_ctr := disp.sec_branch_ctr
+    out.sftq := disp.sftq   // [RECV3] SP-09: record [101:99]
+    // [RECV3] SP-08: the NEWEST LSU-fed writeback's footprint (wb.c1 = Mux1H over >= 2 columns, so 0 when none is valid).
+    out.dc := wb.c1.dc
+    out.fflags := 0.U   // [RECV3] SP-03: no flags on a merged (squash) row; the commit readout sets the committing lane's
     (out, third =/= 0.U)
   }
 }
@@ -327,7 +327,7 @@ class RobIftBank(numRows: Int, wbPorts: Int, lsuWbPorts: Seq[Int], clrPorts: Int
         col.edges     := b.edges.edges
         col.dropped   := b.edges.dropped
         col.aliased   := b.edges.aliased
-        col.ce_repl   := b.edges.ce_repl.getOrElse(false.B)   // [CEREPL] +1 LUTRAM bit per C_wb column
+        col.dc        := b.edges.dc.get   // [RECV3] SP-08 (the sidecar exists only with IFT on)
         col.fu_bitmap := b.fu_bitmap
         col.stamp     := io.stamp
         c_wb(lsuPos(i)).write(row, col)
@@ -366,7 +366,7 @@ class RobIftBank(numRows: Int, wbPorts: Int, lsuWbPorts: Seq[Int], clrPorts: Int
     when (io.ic(i).valid) {
       val col = Wire(new IftEdgeColumn(hasDeny = true))
       col.entry.valid     := true.B
-      col.entry.op_count  := io.ic(i).bits.upd.winner_op_count.pad(inflOpCountWidthCF)(inflOpCountWidthCF-1, 0)
+      col.entry.key       := io.ic(i).bits.upd.winner_op_count.pad(inflKeyWidthCF)(inflKeyWidthCF-1, 0)
       col.entry.infl_type := io.ic(i).bits.upd.infl_type
       col.entry.is_atk    := io.ic(i).bits.upd.winner_is_atk
       col.entry.is_secret := io.ic(i).bits.upd.winner_is_sec
@@ -381,7 +381,7 @@ class RobIftBank(numRows: Int, wbPorts: Int, lsuWbPorts: Seq[Int], clrPorts: Int
     when (io.memord(i).valid) {
       val col = Wire(new IftEdgeColumn(hasDeny = false))
       col.entry.valid     := true.B
-      col.entry.op_count  := io.memord(i).bits.upd.prod_op_count
+      col.entry.key       := io.memord(i).bits.upd.prod_op_count
       col.entry.infl_type := io.memord(i).bits.upd.infl_type.getOrElse(INFL_MEM_ORDER.U)   // [RDEDGE] patch 80
       col.entry.is_atk    := io.memord(i).bits.upd.is_atk
       col.entry.is_secret := io.memord(i).bits.upd.is_secret
@@ -397,10 +397,7 @@ class RobIftBank(numRows: Int, wbPorts: Int, lsuWbPorts: Seq[Int], clrPorts: Int
     val info = e.info
     val d = Wire(new IftDispColumn)
     d.speculated            := info.speculated
-    d.single_step           := info.single_step
-    d.spec_branch_is_atk    := info.spec_branch_is_atk
     d.spec_branch_is_secret := e.spec_branch_is_secret      // ruling 74: from the uop
-    d.spec_branch_op_id     := info.spec_branch_op_id
     d.stall_cycles_rob      := info.stall_cycles_rob
     d.stall_cycles_stq      := info.stall_cycles_stq
     d.atk_branch_ctr        := info.atk_branch_ctr
@@ -408,9 +405,10 @@ class RobIftBank(numRows: Int, wbPorts: Int, lsuWbPorts: Seq[Int], clrPorts: Int
     d.base_list             := info.base.edges
     d.base_dropped          := info.base.dropped
     d.oc_aliased            := info.base.aliased
-    d.fu_bitmap             := e.fu_bitmap | (1.U << robTagCF.U)
+    d.fu_bitmap             := e.fu_bitmap   // [RECV3] SP-09: no ROB bit (constant 1 in v1); INT_IQ / MEM_IQ arrive in e.fu_bitmap
     d.alloc_stamp           := io.stamp
     d.ras_xdom              := e.ras_xdom            // [RASEVERY]
+    d.sftq                  := info.sftq             // [RECV3] SP-09
     c_disp.write(io.enq.bits.row, d)
     c_oc.foreach(_.write(io.enq.bits.row, e.oc))
     allValids.foreach(v => v(io.enq.bits.row) := false.B)
@@ -424,7 +422,7 @@ class RobIftBank(numRows: Int, wbPorts: Int, lsuWbPorts: Seq[Int], clrPorts: Int
   // ---------------------------------------------------------------- raw read (Task 2.10d)
   def toRaw(c: IftEdgeColumn, hasDeny: Boolean): IftRawEdge = {
     val x = Wire(new IftRawEdge(hasDeny))
-    x.op_count := c.entry.op_count; x.infl_type := c.entry.infl_type
+    x.key := c.entry.key; x.infl_type := c.entry.infl_type
     x.is_atk   := c.entry.is_atk;   x.is_secret := c.entry.is_secret
     if (hasDeny) x.deny_bucket.get := c.deny_bucket.get
     x.stamp    := c.stamp
@@ -456,11 +454,9 @@ class RobIftBank(numRows: Int, wbPorts: Int, lsuWbPorts: Seq[Int], clrPorts: Int
       r.wb(k).bits.edges   := wbCols(k).edges
       r.wb(k).bits.dropped := wbCols(k).dropped
       r.wb(k).bits.aliased := wbCols(k).aliased
+      r.wb(k).bits.dc      := wbCols(k).dc
       r.wb(k).bits.stamp   := wbCols(k).stamp
     }
-    // [CEREPL] lean59: OR over the valid C_wb columns (every one, merged or older/dropped, like edge_atk); the raw row
-    // (and the squash raw FIFO entry) grows by 1 bit.  Levels: the existing async v/c reads -> one 8-input AND/OR.
-    r.ce_repl := wbCols.zip(v_wb).map { case (c, v) => v(row) && c.ce_repl }.reduce(_ || _)
     // [STTY0] bundle61: the store operand labels of every valid C_clr column (a store clears busy once; the OR also
     // covers a re-issued store).  Levels: the existing async clr reads -> one 6-input AND/OR per bit.
     r.cl_atk := clrCols.zip(v_clr).map { case (c, v) => v(row) && c.is_atk    }.reduce(_ || _)

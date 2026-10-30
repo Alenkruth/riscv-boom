@@ -34,10 +34,7 @@ class IftCommitInfo(implicit p: Parameters) extends BoomBundle with CoreFuzzingC
   //  [HW1BIT75] (owner R-b, 2026-10-20) the bit is the commit-time secret-window shadow bit,
   //  passed to uopToIFTBits by the ROB commit packer as an argument (rob.scala com_wsh), not
   //  held here: it is computed at commit and is never stored per ROB row.)
-  val single_step           = Bool()
-  val spec_branch_is_atk    = Bool()
   val spec_branch_is_secret = Bool()
-  val spec_branch_op_id     = UInt(specBranchOpIdWidthCF.W)
   val stall_cycles_rob      = UInt(3.W)
   val stall_cycles_stq      = UInt(3.W)
   val atk_branch_ctr        = UInt(7.W)
@@ -48,20 +45,17 @@ class IftCommitInfo(implicit p: Parameters) extends BoomBundle with CoreFuzzingC
   val infl_oc_aliased       = Bool()
   val cntd_deny_count       = UInt(3.W)
   val edge_atk              = Bool()      // [FIFO10] OR of is_atk over EVERY edge that reached the row (stored or dropped)
-  // [CEREPL] lean59 (owner 2026-10-23, RULES C "Replacement state": "keep it in cache eviction with a bit"): record bit
-  // [254].  1 = a CACHE_EVICTION (ty 12/21-23) edge that reached this row (stored or dropped, like edge_atk) named the
-  // access that last advanced the set's replacement state (ift_repl_sec / ift_repl_atk, or the LFSR taint under random
-  // replacement), not the evicting access itself.  dcache.scala [CEREPL] has the exact condition.  None IFT off.
-  val ce_repl               = if (ENABLE_IFT) Some(Bool()) else None
+  val sftq                  = UInt(3.W)   // [RECV3] SP-09: the row's FTQ-full hold bucket (C_disp), record [101:99]
+  val dc                    = new IftDcFoot   // [RECV3] SP-08: the newest LSU-fed writeback's D$ footprint (record [113:102])
+  // [RECV3] SP-03: the committing uop's FP exception flags (record [118:114], design 2.3 "fflags", owner D4 "capture
+  // it").  Set by the ROB commit readout (rob_head_fflags); 0 from IftMerge (SQUASH records carry 0) and on KILL.
+  val fflags                = UInt(freechips.rocketchip.tile.FPConstants.FLAGS_SZ.W)
 }
 
 /** Written once at enqueue (D-column). */
 class IftDispColumn(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
   val speculated            = Bool()
-  val single_step           = Bool()
-  val spec_branch_is_atk    = Bool()
   val spec_branch_is_secret = Bool()
-  val spec_branch_op_id     = UInt(specBranchOpIdWidthCF.W)
   val stall_cycles_rob      = UInt(3.W)
   val stall_cycles_stq      = UInt(3.W)
   val atk_branch_ctr        = UInt(7.W)
@@ -75,6 +69,7 @@ class IftDispColumn(implicit p: Parameters) extends BoomBundle with CoreFuzzingC
   // slot pushed by the other domain, or a victim ret that popped a stale slot).  IftMerge raises
   // the RAS edge from it on every such ret, committed or squashed (147 -> 148 bits).
   val ras_xdom              = Bool()
+  val sftq                  = UInt(3.W)   // [RECV3] SP-09: record [101:99] (+3 LUTRAM bits per C_disp row)
 }
 
 /** One LSU-fed writeback port's contribution. */
@@ -82,7 +77,7 @@ class IftWbColumn(implicit p: Parameters) extends BoomBundle with CoreFuzzingCon
   val edges     = Vec(numInfluencerSlotsCF, new InfluencerEntry)
   val dropped   = UInt(2.W)
   val aliased   = Bool()
-  val ce_repl   = Bool()      // [CEREPL] the response's IftEdgeList.ce_repl (the sidecar exists only with IFT on)
+  val dc        = new IftDcFoot   // [RECV3] SP-08: the response's D$ footprint (+12 LUTRAM bits per C_wb column, owner D5)
   val fu_bitmap = UInt(numModules.W)
   val stamp     = UInt(IftStamp.W.W)
 }
@@ -172,13 +167,14 @@ class IftWbEdgeColumn(implicit p: Parameters) extends BoomBundle with CoreFuzzin
   val edges   = Vec(numInfluencerSlotsCF, new InfluencerEntry)
   val dropped = UInt(2.W)
   val aliased = Bool()
+  val dc      = new IftDcFoot   // [RECV3] SP-08 (raw squash row: +12 bits per wb column)
   val stamp   = UInt(IftStamp.W.W)
 }
 
 /** An ic or memord word without entry.valid.  The column's own valid bit says whether it
   * exists; the merge overwrites every slot's valid with its hit bit. */
 class IftRawEdge(val hasDeny: Boolean)(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
-  val op_count    = UInt(inflOpCountWidthCF.W)
+  val key         = UInt(inflKeyWidthCF.W)
   val infl_type   = UInt(inflTypeWidthCF.W)
   val is_atk      = Bool()
   val is_secret   = Bool()
@@ -203,8 +199,6 @@ class IftRawRow(val nSprob: Int, val nIc: Int, val nWb: Int, val nMemord: Int)(i
   // [FIFO10] step 10: saturating sum of the valid C_ic columns' `dropped` (replaced contention
   // winners), formed in rawRead so the raw row grows by 2 bits, not 7 x 2
   val ic_dropped = UInt(2.W)
-  // [CEREPL] OR of ce_repl over the valid C_wb columns, formed in rawRead (raw row + 1 bit, not nWb)
-  val ce_repl    = Bool()
   // [STTY0] bundle61: OR of the store operand labels over the valid C_clr columns, formed in rawRead (raw row + 2 bits,
   // not 3 x (2 + stamp)): the store's REG_DATAFLOW (ty0) edge in IftMerge.  Squash raw entry 1168 -> 1170 bits, still
   // 17 RAMB36 (512 x 72) per bank.
@@ -212,10 +206,11 @@ class IftRawRow(val nSprob: Int, val nIc: Int, val nWb: Int, val nMemord: Int)(i
   val cl_sec     = Bool()
 }
 
-/** Record fields that do not come from the merge, taken at capture.  116 bits. */
+/** Record fields that do not come from the merge, taken at capture.  [RECV3] SP-04: 97 bits (v1 116: - inst 32, - priv 3,
+  * + stamp 16; cause renamed kind).  The SQUASH record (IftSquashPack) takes pc, op_count, pregs, rtypes, the four sticky
+  * flags, the capture stamp and the kind from here, and its domain from the raw row. */
 class IftSqSide(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
-  val pc         = UInt(32.W)                            // debug_pc(31, 0), record [36:5]
-  val inst       = UInt(32.W)                            // debug_inst, record [68:37]
+  val pc         = UInt(32.W)                            // debug_pc(31, 0), record [79:48]
   val op_count   = UInt(uopIDCounterWidthCF.W)
   val pdst       = UInt(maxPregSz.W)
   val prs1       = UInt(maxPregSz.W)
@@ -226,12 +221,13 @@ class IftSqSide(implicit p: Parameters) extends BoomBundle with CoreFuzzingConst
   val s_prop     = Bool()
   val s_tx       = Bool()
   val atk        = Bool()
-  val priv       = UInt(3.W)                             // io.ift_priv at capture
-  val cause      = Bool()                                // D2b: 0 branch kill (SRC=3), 1 rollback (SRC=4)
+  val stamp      = UInt(16.W)                            // [RECV3] io.ift_cyc in the capture cycle: the record's cyc (design 2.8)
+  val kind       = Bool()                                // D2b / design 2.6: 0 branch kill (SRC=3), 1 rollback (SRC=4)
 }
 
-/** One raw squash FIFO entry: 1,017 + 116 = 1,133 bits ([RASEVERY]: was 1,149; still 16 RAMB36 of 72) (Task 3.2: + 2 x 19 DTLB; Task 3.9: - 1;
-  * step 10: + 2 ic_dropped, - 2 x 19 DTLB; step 11: the FIFO is 512 deep = 16 RAMB36 (512 x 72) per bank, was 32 as 1K x 36). */
+/** One raw squash FIFO entry (raw row + side).  [RECV3] after the whole V1 series: side 97 b; raw row 1,185 b (12-bit key and
+  * 6-bit type, SP-06; D$ footprint per C_wb column, SP-08; 15-bit unit word + sftq, SP-09; -10 b C_disp, SP-09 3.13) = 1,272 bits, 18 RAMB36 (512 x 72)
+  * per bank (v1: 1,170 bits, 17).  The IftSquashMerge println prints the elaborated width.  INDEX-A (stream A) gap A-2. */
 class IftSqEntry(val nSprob: Int, val nIc: Int, val nWb: Int, val nMemord: Int)(implicit p: Parameters)
     extends BoomBundle {
   val raw  = new IftRawRow(nSprob, nIc, nWb, nMemord)
@@ -270,33 +266,40 @@ class FetchIftInfo(implicit p: Parameters) extends BoomBundle with CoreFuzzingCo
   val any_is_victim  = Bool()
   val atk_branch_ctr = UInt(7.W)
   val sec_branch_ctr = UInt(7.W)
-  val single_step    = Bool()
   val btb_sec_pc     = UInt(inflPcBitsCF.W)
+  val sftq           = UInt(3.W)   // [RECV3] SP-09: FTQ-full f4 hold bucket of the packet (fetch-buffer.scala ram_ift)
 }
 
+/** [RECV3] SP-08 (design 2.3, 6.1.1): the D$ footprint of a load's answer.  kind 0 none (no D$ data: forwarded, killed in
+  * s1/s2, not executed, store), 1 array hit by the load's own access, 2 answered through the MSHR file (line-buffer drain
+  * of a cacheable miss, or a late secondary's t_replay), 3 uncached / IOMSHR.  set / way: the line read (kinds 1, 2; 0 for
+  * 0 and 3).  A descriptor only: whether the access changed the replacement state is the STATE record's R group. */
+class IftDcFoot extends Bundle {
+  val kind = UInt(2.W)
+  val set  = UInt(7.W)
+  val way  = UInt(3.W)
+}
 /** Influencer edges travelling on a memory response (D16) and on the ROB writeback port. */
 class IftEdgeList(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
   val edges   = Vec(numInfluencerSlotsCF, new InfluencerEntry)
   val dropped = UInt(2.W)
   val aliased = Bool()
-  // [CEREPL] lean59: this list carries a CACHE_EVICTION edge attributed through the set's replacement state (record
-  // bit [254], IftCommitInfo.ce_repl).  Set only by the D$ (dcache.scala [CEREPL]); every other list builds on a zero
-  // base or copies a D$ response list whole, so it is 0 there.  None IFT off.
-  val ce_repl = if (ENABLE_IFT) Some(Bool()) else None
+  // [RECV3] SP-08: the D$ footprint of the response this list rides on (set by the D$ / MSHR file only: every other list
+  // builds on a zero base or copies a D$ response list whole, so it is 0 there, e.g. kind 0 on a forwarded load).  None IFT
+  // off.  (Takes the place of the v1 ce_repl flag, removed by SP-06.)
+  val dc      = if (ENABLE_IFT) Some(new IftDcFoot) else None
 }
 
 /** What dispatch hands the ROB for the dispatch column (replaces the uop fields).
   * Ruling 74: cf_spec_branch_is_secret stays in MicroOp, so it is not carried here. */
 class IftDispatchInfo(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
   val speculated            = Bool()
-  val single_step           = Bool()
-  val spec_branch_is_atk    = Bool()
-  val spec_branch_op_id     = UInt(specBranchOpIdWidthCF.W)
   val stall_cycles_rob      = UInt(3.W)
   val stall_cycles_stq      = UInt(3.W)
   val atk_branch_ctr        = UInt(7.W)
   val sec_branch_ctr        = UInt(7.W)
   val base                  = new IftEdgeList
+  val sftq                  = UInt(3.W)   // [RECV3] SP-09: from FetchIftInfo.sftq (core.scala dispatch)
 }
 
 /** Kill-time contention record from an issue slot (D18).  72 bits, +1 for [R117SWEEP] any_sec. */
@@ -304,7 +307,7 @@ class IftKillRecord(implicit p: Parameters) extends BoomBundle with CoreFuzzingC
   val op_count    = UInt(uopIDCounterWidthCF.W)
   val pc          = UInt(32.W)
   val domain      = UInt(1.W)
-  val winner_op   = UInt(inflOpCountWidthCF.W)
+  val winner_op   = UInt(inflKeyWidthCF.W)
   val infl_type   = UInt(inflTypeWidthCF.W)
   val winner_atk  = Bool()
   val winner_sec  = Bool()
@@ -322,7 +325,7 @@ class IftKillRecord(implicit p: Parameters) extends BoomBundle with CoreFuzzingC
   *  cf_src_secret load from in_uop.bits.cf_secret_propagation sees it.) */
 class IssueCntdCarry(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
   val valid       = Bool()
-  val winner_op   = UInt(inflOpCountWidthCF.W)
+  val winner_op   = UInt(inflKeyWidthCF.W)
   val winner_atk  = Bool()
   val winner_sec  = Bool()
   val infl_type   = UInt(inflTypeWidthCF.W)

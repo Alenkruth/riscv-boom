@@ -42,16 +42,6 @@ class IssueUnitCollapsing(
   //   case 2.U => memissqTagCF
   //   case 1.U => intissqTagCF
   // }
-  val moduleTagCF = if (params.iqType == BigInt(4)) {
-    // FP issue queue tag
-    fpissqTagCF
-  } else if (params.iqType == BigInt(2)) {
-    // MEM issue queue tag
-    memissqTagCF
-  } else {
-    // INT issue queue tag
-    intissqTagCF
-  }
 
   //-------------------------------------------------------------
   // Figure out how much to shift entries by
@@ -111,8 +101,6 @@ class IssueUnitCollapsing(
           issue_slots(i).in_uop.valid := will_be_valid(i+j)
           issue_slots(i).in_uop.bits  := uops(i+j)
           issue_slots(i).in_cntd      := cntds(i+j)
-          // corefuzzing: stamp issue-queue bitmap bit when uop enters slot
-          issue_slots(i).in_uop.bits.cf_fu_bitmap.foreach(_ := uops(i+j).cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << moduleTagCF.U))
         }
       }
     }
@@ -208,7 +196,7 @@ class IssueUnitCollapsing(
     // [NARROW 2026-09-10] truncate explicitly to the contention field's width; the
       // ty=2 edge discarded these bits anyway (rob.scala:715), so cutting here keeps
       // it visible instead of relying on an implicit Chisel width truncation.
-      val winner_op     = io.iss_uops(w).cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))(inflOpCountWidthCF-1, 0)
+      val winner_op     = io.iss_uops(w).cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))(inflKeyWidthCF-1, 0)
     // [WINATK] patch 66 (V10, owner 2026-10-19 16:3x; P6 full occupant bit): the winner is attacker when it is
     // attacker-owned OR attacker-influenced (io.iss_uops(w).cf_attacker_influence = the slot's dispatch seed
     // (window, packet tag, dispatch edges) || its wakeup operand taint cf_src_atk), as FU_BUSY ([I3BUSYATK])
@@ -264,7 +252,7 @@ class IssueUnitCollapsing(
                            no_port_available && io.cf_fu_busy.valid && needs_busy_fu
       when (fu_busy_denial && !already_denied(i)) {
         issue_slots(i).cf_contend_in.valid                := true.B
-        issue_slots(i).cf_contend_in.bits.winner_op_count := io.cf_fu_busy.bits.op_count(inflOpCountWidthCF-1, 0)
+        issue_slots(i).cf_contend_in.bits.winner_op_count := io.cf_fu_busy.bits.op_count(inflKeyWidthCF-1, 0)
         issue_slots(i).cf_contend_in.bits.winner_is_atk   := io.cf_fu_busy.bits.is_atk
         issue_slots(i).cf_contend_in.bits.winner_is_sec   := io.cf_fu_busy.bits.is_sec
         issue_slots(i).cf_contend_in.bits.infl_type       := INFL_FU_BUSY.U

@@ -824,6 +824,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   replay_req(0).cf_res_atk.foreach(_ := mshrs.io.replay.bits.cf_res_atk.getOrElse(false.B))   // [ATKEVICT]
   replay_req(0).cf_res_esec.foreach(_ := mshrs.io.replay.bits.cf_res_esec.getOrElse(false.B))
   replay_req(0).cf_res_repl.foreach(_ := mshrs.io.replay.bits.cf_res_repl.getOrElse(false.B))   // [CEREPL]
+  replay_req(0).cf_res_nack.foreach(_ := mshrs.io.replay.bits.cf_res_nack.getOrElse(false.B))   // [RECV3] 3.D
   mshrs.io.replay.ready    := metaReadArb.io.in(0).ready && dataReadArb.io.in(0).ready
   // Tag read for MSHR replays
   metaReadArb.io.in(0).valid              := mshrs.io.replay.valid
@@ -851,6 +852,7 @@ mshr_read_req(0).cf_res_v.foreach(_ := false.B)
 mshr_read_req(0).cf_res_atk.foreach(_ := false.B)   // [ATKEVICT]
 mshr_read_req(0).cf_res_esec.foreach(_ := false.B)
 mshr_read_req(0).cf_res_repl.foreach(_ := false.B)   // [CEREPL]
+mshr_read_req(0).cf_res_nack.foreach(_ := false.B)
 metaReadArb.io.in(3).valid       := mshrs.io.meta_read.valid
 metaReadArb.io.in(3).bits.req(0) := mshrs.io.meta_read.bits
 metaReadArb.io.in(3).bits.req(0).idx := mshrs.io.meta_read.bits.idx & dcache_set_mask(idxBits-1, 0)
@@ -874,6 +876,7 @@ wb_req(0).cf_res_v.foreach(_ := false.B)
 wb_req(0).cf_res_atk.foreach(_ := false.B)   // [ATKEVICT]
 wb_req(0).cf_res_esec.foreach(_ := false.B)
 wb_req(0).cf_res_repl.foreach(_ := false.B)   // [CEREPL]
+wb_req(0).cf_res_nack.foreach(_ := false.B)
 // Tag read for write-back
 metaReadArb.io.in(2).valid        := wb.io.meta_read.valid
 metaReadArb.io.in(2).bits.req(0)  := wb.io.meta_read.bits
@@ -903,6 +906,7 @@ prober_req(0).cf_res_v.foreach(_ := false.B)
 prober_req(0).cf_res_atk.foreach(_ := false.B)   // [ATKEVICT]
 prober_req(0).cf_res_esec.foreach(_ := false.B)
 prober_req(0).cf_res_repl.foreach(_ := false.B)   // [CEREPL]
+prober_req(0).cf_res_nack.foreach(_ := false.B)
 // Tag read for prober
 metaReadArb.io.in(1).valid       := prober.io.meta_read.valid
 metaReadArb.io.in(1).bits.req(0) := prober.io.meta_read.bits
@@ -1041,14 +1045,14 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // Cost: 2 x (10 + 2) FF + 1 FF, ~6 LUT.  Levels: flop-to-flop beside the lrsc registers; the SC response gets one
   // more candidate in its edge batch (below).  IFT off: not elaborated.
   val cf_lrsc_v   = if (ENABLE_IFT) RegInit(false.B) else WireInit(false.B)
-  val cf_lrsc_oc  = if (ENABLE_IFT) Reg(UInt(inflOpCountWidthCF.W)) else WireInit(0.U(inflOpCountWidthCF.W))
+  val cf_lrsc_oc  = if (ENABLE_IFT) Reg(UInt(inflKeyWidthCF.W)) else WireInit(0.U(inflKeyWidthCF.W))
   val cf_lrsc_atk = if (ENABLE_IFT) Reg(Bool()) else WireInit(false.B)
   val cf_lrsc_sec = if (ENABLE_IFT) Reg(Bool()) else WireInit(false.B)
   if (ENABLE_IFT) {
-    val lr_oc  = s2_req(0).uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)).pad(inflOpCountWidthCF)(inflOpCountWidthCF - 1, 0)
+    val lr_oc  = s2_req(0).uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)).pad(inflKeyWidthCF)(inflKeyWidthCF - 1, 0)
     val lr_sec = s2_req(0).cf_addr_sec.getOrElse(false.B)
     val lr_atk = s2_req(0).cf_addr_atk.getOrElse(false.B) || s2_req(0).uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U
-    val q_oc   = Reg(UInt(inflOpCountWidthCF.W))
+    val q_oc   = Reg(UInt(inflKeyWidthCF.W))
     val q_sec  = Reg(Bool())
     val q_atk  = Reg(Bool())
     when (s2_valid(0) && s2_type === t_lsu && s2_req(0).uop.mem_cmd === M_XLR) { q_oc := lr_oc; q_sec := lr_sec; q_atk := lr_atk }
@@ -1450,6 +1454,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     // [CEREPL] lean59: the eviction-filter edge (its PC wins, cf_res_pc above) carries the entry's r bit; a nack edge
     // (s2_req.cf_res_*, LSU-driven) never is replacement-state.  One AND on the s2 evf register: 0 levels.
     mshrs.io.req(w).bits.cf_res_repl.foreach(_ := s2_evf_hit(w) && s2_evf_r(w))
+    mshrs.io.req(w).bits.cf_res_nack.foreach(_ := !s2_evf_hit(w) && (s2_req(w).cf_res_v.getOrElse(false.B) || cf_nk_atk))   // [RECV3] 3.D: the PC (cf_res_pc above) is the LSU nack edge's
     // value taint (owner extension of C): the loaded value carries attacker taint when the
     // eviction's allocating access was attacker-domain (d).  Rides on the primary's uop flag;
     // the MSHR applies it to every response it drains (mshrs.scala cf_rp_vatk).
@@ -1996,13 +2001,12 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // [STDW] patch 60: the stored-since-fill mask (IFT only; constant 0 IFT off)
   def iftStMask(e: UInt)  : UInt = if (ENABLE_IFT) e(iftStoreBits - 1, iftStoreBits - CF_SUBLINE) else 0.U(CF_SUBLINE.W)
   def iftStAt(e: UInt, addr: UInt): Bool = (iftStMask(e) & cfSubOH(addr)).orR
-  // [PCPROV] one candidate per PC[13:12] value: infl_type_int must stay a Scala constant
-  // (the batch constant-folds on it), so the 2 high bits select among 4 static codes.
-  def pcCandidates(fire: Bool, pc12: UInt, base: Int, is_atk: Bool, is_secret: Bool): Seq[InfluencerCandidate] =
-    (0 until 4).map { hi =>
-      InfluencerCandidate(fire && pc12(inflPcBitsCF-1, inflPcBitsCF-2) === hi.U,
-                          pc12(inflPcBitsCF-3, 0), inflPcCode(base, hi), is_atk, is_secret, is_pc = true)
-    }
+  // [RECV3] SP-07 (design 2.4.1): a PC-keyed D$ edge is ONE candidate: key = PC[13:2] whole, one code per type (v1 folded
+  // PC[13:12] into four codes per type, so every edge was four candidates).  A Seq so the call sites still concatenate.
+  def pcCandidates(fire: Bool, pc12: UInt, code: Int, is_atk: Bool, is_secret: Bool): Seq[InfluencerCandidate] = {
+    require(inflKeyKind(code) == KEY_PC, "[RECV3] pcCandidates takes PC-keyed codes only")
+    Seq(InfluencerCandidate(fire, pc12(inflPcBitsCF - 1, 0), code, is_atk, is_secret))
+  }
   // per-access accessors: test only the doubleword this access touches
   def iftSecretAt(e: UInt, addr: UInt): Bool = (iftSecMask(e) & cfSubOH(addr)).orR
   def iftAtkAt(e: UInt, addr: UInt)   : Bool = (iftAtkMask(e) & cfSubOH(addr)).orR
@@ -2248,7 +2252,6 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     }
 
     val uop_resp_base = WireInit(s2_req(w).uop)
-    uop_resp_base.cf_fu_bitmap.foreach(_ := s2_req(w).uop.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << dcacheTagCF.U))
 
     val uop_resp_final = WireInit(uop_resp_base)
     // [WINMEM] step 21: on the response cf_opnd_* means "the memory word read was window-marked"
@@ -2355,8 +2358,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       val res_atk     = s2_req(w).cf_res_atk.getOrElse(false.B)
       val res_sec     = res_line || !res_atk || s2_req(w).cf_res_esec.getOrElse(false.B)
 
-      // [PCPROV] 3 candidates -> 12: each D$ edge is one of four static type codes
-      // selected by the producer PC[13:12]; exactly one of each group of 4 can fire.
+      // [RECV3] SP-07: one candidate per edge (key = the producer PC[13:2]; v1 used four codes per edge).
       // Task 3.2 (D16): built on a ZERO base into the response's edge list (at most 3 fire,
       // so nothing drops; PC candidates never set aliased).  The LSU promotes
       // cf_attacker_influence from these edges (respEdgeAtk); Task 3.9 removed the copy of
@@ -2369,17 +2371,23 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
                      INFL_CACHE_EVICTION, true.B, evict_fire && iftFillSecMask(s2_fill_entry).orR) ++
         pcCandidates(memdf_fire,  iftPc(s2_store_entry),    INFL_MEM_DATAFLOW,   true.B,  s2_dw_edge) ++   // [WLEDGE] [F9DW]
         pcCandidates(memsec_fire, iftPc(s2_store_entry),    INFL_MEM_DATAFLOW,   false.B, true.B) ++
-        pcCandidates(res_fire,    res_pc,                   INFL_CACHE_EVICTION, res_atk, res_sec) ++   // [RESID]
+        // [RECV3] SP-07 + 3.D (design 2.5): the residency candidate by what its PC names.  CACHE_EVICTION: the line's own
+        // secret-address mark (res_line) or an MSHR replay's eviction-record edge; REPL_STATE (0x35): a replay edge whose
+        // eviction record named the replacement-state advancer (v1 CACHE_EVICTION + bit [254]); DC_NACK (0x23): the LSU's
+        // nack edge, on an LSU-request hit or carried by the MSHR (cf_res_nack, 3.D).  Exclusive (REPL_STATE needs an
+        // eviction-filter edge, cf_res_nack needs none): at most one fires; with evict / memdf|memsec / LRSC at most 3.
+        pcCandidates(res_fire && (res_line || (cf_rp_load && !s2_req(w).cf_res_repl.getOrElse(false.B) &&
+                                                 !s2_req(w).cf_res_nack.getOrElse(false.B))),
+                     res_pc, INFL_CACHE_EVICTION, res_atk, res_sec) ++   // [RESID]
+        pcCandidates(res_fire && !res_line && cf_rp_load && s2_req(w).cf_res_repl.getOrElse(false.B),
+                     res_pc, INFL_REPL_STATE, res_atk, res_sec) ++
+        pcCandidates(res_fire && !res_line && (cf_lsu_hit || (cf_rp_load && s2_req(w).cf_res_nack.getOrElse(false.B))),
+                     res_pc, INFL_DC_NACK, res_atk, res_sec) ++
         // [RDEDGE] patch 80: an SC (lane 0) served while the reservation's LR label is set.  At most 3 D$ edges fire
         // for an SC (evict, res, this; memdf/memsec are loads only), so nothing drops.
         (if (ENABLE_IFT && w == 0) Seq(InfluencerCandidate(s2_sc && cf_lrsc_v, cf_lrsc_oc, INFL_LRSC, cf_lrsc_atk, cf_lrsc_sec))
          else Seq()))   // Scala-gated: IFT off the batch keeps its three candidate groups
       cache_resp(w).bits.edges := resp_edges
-      // [CEREPL] lean59: a replay load's MSHR edge (res_fire through s2_req.cf_res_v; the LSU's nack edge has
-      // cf_res_repl = 0) that names the replacement-state advancer.  A secret-resident line's own mark (res_line)
-      // takes the PC first and is not replacement-state.  The other D$ edges (evict_fire / ratk_fire: fill and
-      // residency marks; memdf / memsec; LRSC) never are.  Record bit [254] via the ROB sidecar (rob-ift-sidecar.scala).
-      cache_resp(w).bits.edges.ce_repl.foreach(_ := res_fire && !res_line && s2_req(w).cf_res_repl.getOrElse(false.B))
       // Set summary flags so writeback paths can skip scanning cf_influencer_list.
       // (memdf_fire sets cf_mem_dataflow_atk: [F9FLAT] below.)
       // [FIFO10] step 10 (R-STICKY): the secret-dataflow summary is set for EVERY load that reads a
@@ -2465,6 +2473,17 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     cache_resp(w).bits.cf_res_atk.foreach(_ := false.B)   // [ATKEVICT]
     cache_resp(w).bits.cf_res_esec.foreach(_ := false.B)
     cache_resp(w).bits.cf_res_repl.foreach(_ := false.B)   // [CEREPL] edges already built above
+    // [RECV3] SP-08 (design 6.1.1): the footprint of a hit (kind 1, t_lsu) or of a late secondary's replay (kind 2, t_replay;
+    // replays always hit, dcache :1017): the masked s2 index and the hit way.  Only hit lanes reach the LSU (s2_resp_hit,
+    // [RESPSEL]); a store-only-miss ack carries it too but nothing reads a store ack's edges.  Levels: the 8:3 encoder on the
+    // s2 tag-match register (1 LUT level) runs beside the deeper Mux1H(s2_tag_match_way) of the edge entries into the same
+    // endpoint (the ROB C_wb write): the approved +1 site (08 section 8.2 d), not a new worst path.
+    cache_resp(w).bits.edges.dc.foreach { d =>
+      d.kind := Mux(s2_type === t_replay, 2.U(2.W), 1.U(2.W))
+      d.set  := s2_set_cf.pad(7)
+      d.way  := OHToUInt(s2_tag_match_way(w)(nWays - 1, 0)).pad(3)
+    }
+    cache_resp(w).bits.cf_res_nack.foreach(_ := false.B)
   }
 
   // [FILLINIT 2026-09-07] A refill MUST clear this line's store-metadata.
@@ -2710,27 +2729,31 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // accidental splice from HEAD reintroduced it.
 
   val uncache_resp = Wire(Valid(new BoomDCacheResp))
-  // corefuzzing: stamp dcacheTagCF into MSHR (miss) responses and mark secret_transmission
   uncache_resp.bits                     := mshrs.io.resp.bits
-  uncache_resp.bits.uop.cf_fu_bitmap.foreach(_ := mshrs.io.resp.bits.uop.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << dcacheTagCF.U))
   // Task 3.2 (D16): a miss/uncached response carries no D$ edge.  Zeroed here (after the bulk
   // copy) so the MSHR resp arbiter and respq copies of the field are unread and pruned.
   // [RESID] step 15 (residue audit rows 1b/3/5): ...except the residency/eviction edge the MSHR
   // attaches to a line-buffer (miss) response.  Built here once, on a zero base (folds).
+  // [RECV3] SP-07 + 3.D: CACHE_EVICTION, REPL_STATE (0x35) when the MSHR's eviction record named the replacement-state
+  // advancer (cf_rp_res_repl), or DC_NACK (0x23) when the MSHR edge's PC is the nack edge's (cf_rp_res_nack).  Exclusive.
+  val cf_unc_rv   = mshrs.io.resp.bits.cf_res_v.getOrElse(false.B)
+  val cf_unc_repl = mshrs.io.resp.bits.cf_res_repl.getOrElse(false.B)
+  val cf_unc_nack = mshrs.io.resp.bits.cf_res_nack.getOrElse(false.B)
+  val cf_unc_ratk = mshrs.io.resp.bits.cf_res_atk.getOrElse(false.B)                                     // [ATKEVICT]
+  val cf_unc_rsec = !cf_unc_ratk || mshrs.io.resp.bits.cf_res_esec.getOrElse(false.B)
+  val cf_unc_rpc  = mshrs.io.resp.bits.cf_res_pc.getOrElse(0.U(inflPcBitsCF.W))
   val (cf_unc_edges, _) = addInfluencerBatchList(0.U.asTypeOf(new IftEdgeList), mshrs.io.resp.bits.uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)),
-    pcCandidates(mshrs.io.resp.bits.cf_res_v.getOrElse(false.B), mshrs.io.resp.bits.cf_res_pc.getOrElse(0.U), INFL_CACHE_EVICTION,
-                 mshrs.io.resp.bits.cf_res_atk.getOrElse(false.B),                                     // [ATKEVICT]
-                 !mshrs.io.resp.bits.cf_res_atk.getOrElse(false.B) || mshrs.io.resp.bits.cf_res_esec.getOrElse(false.B)))
+    pcCandidates(cf_unc_rv && !cf_unc_repl && !cf_unc_nack, cf_unc_rpc, INFL_CACHE_EVICTION, cf_unc_ratk, cf_unc_rsec) ++
+    pcCandidates(cf_unc_rv &&  cf_unc_repl,                 cf_unc_rpc, INFL_REPL_STATE,     cf_unc_ratk, cf_unc_rsec) ++
+    pcCandidates(cf_unc_rv &&  cf_unc_nack,                 cf_unc_rpc, INFL_DC_NACK,        cf_unc_ratk, cf_unc_rsec))
   uncache_resp.bits.edges               := cf_unc_edges
-  // [CEREPL] lean59: the line-buffer (miss) response's CACHE_EVICTION edge names the replacement-state advancer
-  // (mshrs.scala cf_rp_res_repl, already gated with the edge's eviction-record source).
-  uncache_resp.bits.edges.ce_repl.foreach(_ := mshrs.io.resp.bits.cf_res_v.getOrElse(false.B) &&
-                                                mshrs.io.resp.bits.cf_res_repl.getOrElse(false.B))
+  uncache_resp.bits.edges.dc.foreach(_ := mshrs.io.resp.bits.edges.dc.get)   // [RECV3] SP-08: kind 2 (MSHR) or 3 (IOMSHR)
   uncache_resp.bits.cf_res_v.foreach(_ := false.B)
   uncache_resp.bits.cf_res_pc.foreach(_ := 0.U)
   uncache_resp.bits.cf_res_atk.foreach(_ := false.B)
   uncache_resp.bits.cf_res_esec.foreach(_ := false.B)
   uncache_resp.bits.cf_res_repl.foreach(_ := false.B)
+  uncache_resp.bits.cf_res_nack.foreach(_ := false.B)
   // s_tx is NOT set at MSHR completion: cache miss fill is not a transmission event.
   uncache_resp.valid    := mshrs.io.resp.valid
   mshrs.io.resp.ready := !(cache_resp.map(_.valid).reduce(_&&_)) // We can backpressure the MSHRs, but not cache hits
@@ -2790,6 +2813,8 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     assert(!(io.lsu.nack(w).valid && s2_type =/= t_lsu))
   }
 
+  // [RECV3] SP-08: the [DCFOOT] FT-3 oracle print moved to lsu.scala (FIX-04): here the response uop of an MSHR replay
+  // (kind 2) is the rpq copy, whose cf_op_count_id mshrs.scala zeroes at rpq enqueue, so the line printed oc=0.
   // Store/amo hits
   val s3_req   = RegNext(s2_req(0))
   val s3_valid = RegNext(s2_valid(0) && s2_hit(0) && isWrite(s2_req(0).uop.mem_cmd) &&
@@ -2895,7 +2920,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
                              s2_req(j).uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U ||
                              s2_req(j).uop.cf_attacker_influence.getOrElse(false.B)).foldLeft(false.B)(_ || _)
     v(w).valid    := s2_nack_data(w) && s2_type === t_lsu && (sec || atk)
-    v(w).bits.oc  := s2_req(0).uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)).pad(inflOpCountWidthCF)(inflOpCountWidthCF - 1, 0)
+    v(w).bits.oc  := s2_req(0).uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)).pad(inflKeyWidthCF)(inflKeyWidthCF - 1, 0)
     v(w).bits.atk := atk
     v(w).bits.sec := sec
   })
