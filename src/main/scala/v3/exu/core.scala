@@ -1907,10 +1907,23 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // combinational loops that would arise from reading dis_uops(w) after writing it.
   val dis_stall_was_rob = (0 until coreWidth).map(w =>
     RegNext(dis_valids(w) && !dis_fire(w) && !rob.io.ready))
+  // [STALLLANE] F5 (owner 2026-10-26, RULES C "Stall-edge fixes"; task-reports/regpressure-check-20261026.md):
+  // LDQ_FULL / STQ_FULL (and REG_PRESSURE below) tag EVERY lane blocked behind the stalling lane, as ROB_FULL /
+  // IQ_FULL (global ready) already do.  A lane's own term is unchanged (the [DISPAR] fire-based *_full_obs);
+  // an OLDER lane j < w contributes its own dispatch hazard term exactly as dis_hazards reads it
+  // (dis_valids(j) && *_full(j) && uses_*(j): if it holds, lane j cannot fire, so lane w is blocked behind it).
+  // Levels: the older-lane OR (cfStallOlder) has no dis_fire term: ren2 FFs / the LSU's pre-fire count select,
+  // in parallel with dis_fire; the RegNext D LUT gains one input (valid, !fire, own obs, own uses, older OR:
+  // 5 <= 6), so 0 added levels on dis_fire and on every path from it.  0 FF; (coreWidth-1) small LUTs per queue.
+  // IFT off: the older term is constant false (the RegNexts and their D logic are exactly as before).
+  def cfStallOlder(t: Int => Bool, w: Int): Bool =
+    if (ENABLE_IFT && w > 0) (0 until w).map(j => dis_valids(j) && t(j)).reduce(_||_) else false.B
   val dis_stall_was_ldq = (0 until coreWidth).map(w =>
-    RegNext(dis_valids(w) && !dis_fire(w) && io.lsu.ldq_full_obs(w) && dis_uops(w).uses_ldq))
+    RegNext(dis_valids(w) && !dis_fire(w) && (io.lsu.ldq_full_obs(w) && dis_uops(w).uses_ldq ||
+                                              cfStallOlder(j => io.lsu.ldq_full(j) && dis_uops(j).uses_ldq, w))))
   val dis_stall_was_stq = (0 until coreWidth).map(w =>
-    RegNext(dis_valids(w) && !dis_fire(w) && io.lsu.stq_full_obs(w) && dis_uops(w).uses_stq))
+    RegNext(dis_valids(w) && !dis_fire(w) && (io.lsu.stq_full_obs(w) && dis_uops(w).uses_stq ||
+                                              cfStallOlder(j => io.lsu.stq_full(j) && dis_uops(j).uses_stq, w))))
   // C5: capture whether the blocking queue head was secret-dependent at stall time.
   // Used to propagate s_prop to the stalled instruction.
   // corefuzzing: dispatch-stall DURATION for the two dominant structural stalls.
@@ -1964,8 +1977,13 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val dis_stall_stq_head_domain    = (0 until coreWidth).map(w => stallCap(io.lsu.stq_head_domain,    dis_stall_stq_en(w)))
   val dis_stall_stq_head_is_secret = (0 until coreWidth).map(w => stallCap(io.lsu.stq_head_is_secret, dis_stall_stq_en(w)))
   // REG_PRESSURE: stall due to physical register freelist exhausted (INT or FP rename)
+  // [STALLLANE] F5: every lane blocked behind a freelist-stalled OLDER lane gets the edge too (a rd=x0 / store /
+  // branch lane, or a lane whose own pre-selected preg was valid, had none).  ren_stalls(j) is the dis_hazards
+  // term (rename FFs + 1-2 LUT), shallower than dis_fire; same level argument and IFT-off rule as LDQ/STQ above.
+  // reg_stuck_en's OR over lanes is unchanged: a younger lane is set only when an older valid lane j with
+  // ren_stalls(j) did not fire, and that lane's own bit is set in the same cycle.
   val dis_stall_was_reg = (0 until coreWidth).map(w =>
-    RegNext(dis_valids(w) && !dis_fire(w) && ren_stalls(w)))
+    RegNext(dis_valids(w) && !dis_fire(w) && (ren_stalls(w) || cfStallOlder(j => ren_stalls(j), w))))
   // [MEMORDATK] 42b: the ROB head (cycle t-2) was a load that was not committing; read only by the
   // ROB_FULL / REG_PRESSURE is_atk term below (rob_head_ld_atk).  IFT off: constant 0, no flop.
   val rob_ld_head_q = if (ENABLE_IFT) RegNext(rob.io.com_load_is_at_rob_head, false.B) else false.B
@@ -1985,14 +2003,33 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // 42b load term), CE = 1 LUT over 5 FFs; the candidate reads FFs exactly as before (is_atk LUT
   // input count unchanged).  ~21 FF.  IFT off: constant 0, no flop (stallCap convention).
   val rob_nocom_q = if (ENABLE_IFT) RegNext(!rob.io.commit.valids.reduce(_||_), false.B) else false.B
-  val reg_stuck_en = rob_nocom_q || !dis_stall_was_reg.reduce(_||_)
+  // [REGREL] F2/F3 (owner 2026-10-26, RULES C "Stall-edge fixes"; task-reports/regpressure-check-20261026.md
+  // section 3): during a REG stall the capture now takes the stuck head on its RELEASE, i.e. on the first commit
+  // after a no-commit cycle (at cycle k: commit at k-1, none at k-2), not on every no-commit cycle.
+  //   F2: the head's labels are read as of its COMMIT cycle (headReg at k = head(k-1)), so the s_prop / atk the
+  //       head receives in its own writeback cycle (rob.scala cf_s_prop_rob_upd, sprob atk, writeback sticky_atk:
+  //       written at w, commit at w+1) are included, as ROB_FULL sees them.  The old rule kept comb(w) of the
+  //       head (its last no-commit cycle), before that write (e.g. `ld secret; div` head: sec=0).
+  //   F3: a younger head that is still busy one cycle after the blocker commits (a dependent op) is no longer
+  //       captured on the c+1 no-commit cycle, so a c+3 freelist relief still names the blocker, not that op.
+  // The 42b load term moves to rob_ld_head_q (= com_load_is_at_rob_head one cycle earlier: head is a load and
+  // nothing commits at k-2): the same row, which did not commit at k-2 and is the row that commits at k-1
+  // (the head moves only on commit).  ldq_head_atk (headReg) at k is the LDQ head of k-1 = that load (the LDQ
+  // head advances after its commit).
+  // Levels / cost: +1 FF (rob_nocom_q2, D = the existing rob_nocom_q FF).  CE = 1 LUT over 6 FF (rob_nocom_q,
+  // rob_nocom_q2, the coreWidth=4 dis_stall_was_reg FFs), still one LUT6; the D inputs are existing FFs / the
+  // existing rob_ld_head_q FF AND headReg'd ldq_head_atk (one 2-input AND, was the same AND on
+  // com_load_is_at_rob_head).  Not on dis_fire (capture registers feed only the candidate's data legs).
+  // IFT off: rob_nocom_q / rob_nocom_q2 are constant false and stuckCap is constant 0 (no flop), as before.
+  val rob_nocom_q2 = if (ENABLE_IFT) RegNext(rob_nocom_q, false.B) else false.B
+  val reg_stuck_en = (!rob_nocom_q && rob_nocom_q2) || !dis_stall_was_reg.reduce(_||_)
   def stuckCap[T <: Data](x: T): T =
     if (ENABLE_IFT) RegEnable(x, 0.U.asTypeOf(x), reg_stuck_en) else 0.U.asTypeOf(x)
   val reg_stuck_oc     = stuckCap(rob.io.rob_head_op_count)
   val reg_stuck_dom    = stuckCap(rob.io.rob_head_domain)
   val reg_stuck_sec    = stuckCap(rob.io.rob_head_is_secret)
   val reg_stuck_valatk = stuckCap(rob.io.rob_head_valatk.getOrElse(false.B))
-  val reg_stuck_ldatk  = stuckCap(rob.io.com_load_is_at_rob_head && io.lsu.ldq_head_atk.getOrElse(false.B))
+  val reg_stuck_ldatk  = stuckCap(rob_ld_head_q && io.lsu.ldq_head_atk.getOrElse(false.B))   // [REGREL] k-2 load term
   val dis_stall_reg_head_op_count  = (0 until coreWidth).map(w => reg_stuck_oc)
   val dis_stall_reg_head_domain    = (0 until coreWidth).map(w => reg_stuck_dom)
   val dis_stall_reg_head_is_secret = (0 until coreWidth).map(w => reg_stuck_sec)
@@ -2144,7 +2181,15 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
                       (io.lsu.stq_head_domain =/= dis_uops(w).cf_domain_id.getOrElse(0.U(iftTagWidth.W)) || io.lsu.stq_head_is_secret || stq_head_atk)
     val dis_hol_any   = dis_hol_ldq || dis_hol_stq
     val hol_head_op   = Mux(dis_hol_ldq, io.lsu.ldq_head_op_count,      io.lsu.stq_head_op_count)
-    val hol_is_atk    = Mux(dis_hol_ldq, io.lsu.ldq_head_domain === 1.U || ldq_head_atk, io.lsu.stq_head_domain === 1.U || stq_head_atk)
+    // [VICGATE] F1 (owner 2026-10-26, RULES C "Stall-edge fixes"): the attacker-DOMAIN term of the stall edges
+    // (REG_PRESSURE, ROB_FULL, LDQ_FULL, STQ_FULL, MEM_HOL) is gated to VICTIM consumers, as IQ_FULL / FTQ_FULL and
+    // the record terms of the same edges already are: an attacker-domain consumer takes no atk=1 slot from them
+    // (its own record / domain carries the attacker label; its register taint is domain-seeded, regfile.scala).
+    // ldq_head_atk / stq_head_atk already carry d_victim, so (dom || x_atk) && d_victim = the same is_atk LUT
+    // (d_victim was already one of its inputs): 0 FF, 0 LUT, 0 levels; is_atk feeds only the prefix network's
+    // register endpoints (never dis_fire).  IFT off: d_victim is constant true (cf_domain_id absent), so the
+    // expression is unchanged.  RECORD CHANGE (fewer atk=1 slots / sticky atk on attacker-domain records).
+    val hol_is_atk    = Mux(dis_hol_ldq, io.lsu.ldq_head_domain === 1.U || ldq_head_atk, io.lsu.stq_head_domain === 1.U || stq_head_atk) && d_victim
     val hol_is_secret = Mux(dis_hol_ldq, io.lsu.ldq_head_is_secret,      io.lsu.stq_head_is_secret)
 
     // Task 3.3: the base list is built here in one batch on a zero base: the 8 fetch
@@ -2189,7 +2234,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     // ftq_taint_compactor RegNext and the sys_pc2epc RegNext.
     val dispCands0 = Seq(
       // [REGSTUCK] 52d: the is_atk terms come from the same stuck-head capture (d_victim stays live).
-      InfluencerCandidate(dis_valids(w) && dis_stall_was_reg(w), dis_stall_reg_head_op_count(w),  INFL_REG_PRESSURE, dis_stall_reg_head_domain(w) === 1.U || ((reg_stuck_ldatk || reg_stuck_valatk) && d_victim),  dis_stall_reg_head_is_secret(w)),
+      // [VICGATE] F1: the domain term is gated to victim consumers with the rest (see hol_is_atk above).
+      InfluencerCandidate(dis_valids(w) && dis_stall_was_reg(w), dis_stall_reg_head_op_count(w),  INFL_REG_PRESSURE, (dis_stall_reg_head_domain(w) === 1.U || reg_stuck_ldatk || reg_stuck_valatk) && d_victim,  dis_stall_reg_head_is_secret(w)),
       // [FTQFULL] patch 59: the FTQ-starvation edge rides this candidate (see above); a real ROB_FULL
       // stall of the same uop has priority (its blocker is the more recent one).
       // [RECV3] SP-07 (design 2.5): the FTQ edge has its own code INFL_FTQ_FULL (0x14; v1 ROB_FULL with srob = 0).  Still
@@ -2197,14 +2243,15 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       // chooses the key and labels (codes 0x10 / 0x14 differ in bit 2 only).  Both codes are OC-keyed.
       InfluencerCandidate(dis_valids(w) && (dis_stall_was_rob(w) || (ftq_edge && ftq_first(w))),
                           Mux(dis_stall_was_rob(w), dis_stall_rob_head_op_count(w), ftq_cap_oc),  INFL_ROB_FULL,
-                          Mux(dis_stall_was_rob(w), dis_stall_rob_head_domain(w) === 1.U || rob_head_ld_atk || rob_head_val_atk,
+                          Mux(dis_stall_was_rob(w), (dis_stall_rob_head_domain(w) === 1.U || rob_head_ld_atk || rob_head_val_atk) && d_victim,   // [VICGATE] F1
                               ftq_cap_atk && d_victim),
                           Mux(dis_stall_was_rob(w), dis_stall_rob_head_is_secret(w), ftq_cap_sec),
                           infl_type_dyn = Some(Mux(dis_stall_was_rob(w), INFL_ROB_FULL.U(inflTypeWidthCF.W),
                                                                          INFL_FTQ_FULL.U(inflTypeWidthCF.W)))),
       // [MEMORDATK] patch 42: is_atk also when the queue head's address is attacker-tainted and this uop is a victim
-      InfluencerCandidate(dis_valids(w) && dis_stall_was_ldq(w), dis_stall_ldq_head_op_count(w),  INFL_LDQ_FULL,     dis_stall_ldq_head_domain(w) === 1.U || ldq_head_atk,  dis_stall_ldq_head_is_secret(w)),
-      InfluencerCandidate(dis_valids(w) && dis_stall_was_stq(w), dis_stall_stq_head_op_count(w),  INFL_STQ_FULL,     dis_stall_stq_head_domain(w) === 1.U || stq_head_atk,  dis_stall_stq_head_is_secret(w)),
+      // [VICGATE] F1: domain term gated to victim consumers (ldq_head_atk / stq_head_atk already are).
+      InfluencerCandidate(dis_valids(w) && dis_stall_was_ldq(w), dis_stall_ldq_head_op_count(w),  INFL_LDQ_FULL,     (dis_stall_ldq_head_domain(w) === 1.U || ldq_head_atk) && d_victim,  dis_stall_ldq_head_is_secret(w)),
+      InfluencerCandidate(dis_valids(w) && dis_stall_was_stq(w), dis_stall_stq_head_op_count(w),  INFL_STQ_FULL,     (dis_stall_stq_head_domain(w) === 1.U || stq_head_atk) && d_victim,  dis_stall_stq_head_is_secret(w)),
       // [IQHEAD] patch 49 (r175): fires on every IQ-refusal end and names the refusing IQ's stalling
       // occupant (oc); is_atk when that op is attacker-domain or attacker-influenced and this uop is
       // a victim (R-STICKY promotes it), is_secret from that op's secret state (r117: sticky s_prop).

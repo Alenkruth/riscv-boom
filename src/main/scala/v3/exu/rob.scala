@@ -730,7 +730,20 @@ class Rob(
         // candidate), so the old base-list OR is redundant and is removed (r91): 0 LUT here.
         sticky_s_prop(rob_tail) := io.enq_uops(w).cf_secret_propagation.getOrElse(false.B)
         sticky_s_tx(rob_tail)   := io.enq_uops(w).cf_secret_transmission.getOrElse(false.B)
-        sticky_atk(rob_tail)    := io.enq_uops(w).cf_attacker_influence.getOrElse(false.B)
+        // [RASSTICKY] F4 (owner 2026-10-26, RULES C "Stall-edge fixes", sticky-bit-only variant;
+        // task-reports/regpressure-check-20261026.md F4): a VICTIM (domain 0) ret whose popped RAS slot was
+        // cross-domain or stale (cf_ras_pred_xdom) carries the RAS_STATE atk=1 edge at readout (sidecar rasEntry /
+        // edge_atk: is_atk = row domain 0); D1 "every edge with atk=1 sets its sticky attacker bit" now holds for
+        // it, so the stall edges that name such a ret (REG_PRESSURE / ROB_FULL / FTQ_FULL via rob_head_valatk /
+        // rob_head_full_atk, and the flush/squash readouts) see atk=1 like the ret's own record.  Sticky (record)
+        // bit ONLY: cf_attacker_influence, the IQ seed and every value-taint path are untouched (a pop+push jalr's
+        // link register is not attacker-tagged by this).  The ret's own record atk is unchanged (sticky ||
+        // edge_atk already had it).  Cost: 0 FF; two more inputs (ras_xdom, domain bit: enqueue-uop fields from the
+        // ren2 registers) on the OR into the sticky_atk write data, a register endpoint behind the existing write
+        // enable: 0 levels on dis_fire (the enable is unchanged).  IFT off: this block is not elaborated.
+        sticky_atk(rob_tail)    := io.enq_uops(w).cf_attacker_influence.getOrElse(false.B) ||
+                                   (io.enq_uops(w).cf_ras_pred_xdom.getOrElse(false.B) &&
+                                    io.enq_uops(w).cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U)
       }
       rob_exception(rob_tail) := io.enq_uops(w).exception
       rob_predicated(rob_tail)   := false.B
