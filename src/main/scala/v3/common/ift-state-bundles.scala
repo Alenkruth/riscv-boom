@@ -34,8 +34,8 @@ class IftRGroup extends Bundle {
 
 /** M: D$ tag/coherence write (metaWriteArb output).  [84:66], 19 b. */
 class IftMGroup extends Bundle {
-  val dom  = Bool()        // [84]    written domain (MSHR writes; 0 for prober/walker)
-  val sec  = Bool()        // [83]    written secret mark (MSHR writes; 0 for prober/walker)
+  val dom  = Bool()        // [84]    written domain OR attacker-address line mark (MSHR writes; 0 prober/walker) [MFLAGS]
+  val sec  = Bool()        // [83]    s_acc refill OR secret-residency line mark (MSHR writes; 0 prober/walker) [MFLAGS]
   val coh  = UInt(2.W)     // [82:81] written coherence state
   val mshr = UInt(3.W)     // [80:78] writing MSHR (src 0, 1), else 0
   val way  = UInt(3.W)     // [77:75] written way (src 3 walker: 0, it writes every way)

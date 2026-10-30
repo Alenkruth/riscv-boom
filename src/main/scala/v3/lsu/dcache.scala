@@ -1801,8 +1801,17 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     stw.m.way      := Mux(stMwc === 2.U, 0.U, OHToUInt(metaWriteArb.io.out.bits.way_en))
     stw.m.mshr     := Mux(stMsh, mshrs.io.cf_st_mw_chosen.get, 0.U)
     stw.m.coh      := metaWriteArb.io.out.bits.data.coh.state
-    stw.m.sec      := stMsh && mshrs.io.cf_meta_write_fill.bits.secret
-    stw.m.dom      := stMsh && mshrs.io.cf_meta_write_fill.bits.domain(0)
+    // [MFLAGS] owner 2026-10-28 ("Fix both flags"): sec / dom also carry the LINE marks this MSHR's write gives the
+    // line, the same bits ift_res_meta takes at this write ([RESID] fill-set slot 1, below; RULES A.3 one tag kind):
+    // addr_sec = req.cf_addr_sec || cf_sec_asec (a secret-derived-address or s_acc/s_prop READ primary [FILLSEC], or
+    // any merged secondary at a secret-derived address, mshrs.scala [RESID]); addr_atk = its attacker twin [ATKRES].
+    // Before: sec = the read primary's s_acc only ([SACCU]), dom = the filling domain only, so the line a secret-
+    // derived-address load fills (the F+R / spectreRSB probe line) showed sec=0.  (.secret is a subset of addr_sec,
+    // dcache [FILLSEC]; kept so the field never depends on that fold.)  Levels: both are existing nMSHRs:1 Mux1H
+    // outputs of MSHR flops (already feeding ift_res_meta); the OR joins the stMsh AND in one LUT (4 inputs) before
+    // the tap flop: 0 added levels on the select path, 0 FF.  IFT off: io.cf_state is None, nothing here elaborates.
+    stw.m.sec      := stMsh && (mshrs.io.cf_meta_write_fill.bits.secret || mshrs.io.cf_meta_write_fill.bits.addr_sec)
+    stw.m.dom      := stMsh && (mshrs.io.cf_meta_write_fill.bits.domain(0) || mshrs.io.cf_meta_write_fill.bits.addr_atk)
     // ---- L: replacement conf 3 only: an MSHR-file fire advanced the LFSR (replacer.miss) with no allocation
     //      (secondary merge, MMIO).  The same terms as cf_lfsr_fire / cf_lfsr_set / cf_lfsr_aset (re-stated here:
     //      those vals live inside an `if (ENABLE_IFT)` scope; firtool merges the duplicates).
