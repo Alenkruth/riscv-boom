@@ -85,8 +85,13 @@ class ICacheBundle(val outer: ICache) extends BoomBundle()(outer.p)
 
   // corefuzzing: domain of s1 fetch PC (1=attacker, 0=victim), for domain mismatch detection
   val s1_domain_id = Input(Bool())
+  // [M3ATKWIN] lean58: the attacker window is open (registered in the frontend); ORed into the FILL domain only
+  val cf_s1_fill_atk = if (ENABLE_IFT) Some(Input(Bool())) else None
   // corefuzzing: whether s1 fetch PC is in the secret range (for secret mismatch detection)
   val s1_is_secret  = Input(Bool())
+  // [ICFILL] runtime enable of the debug fill print (0xbc0 bit 4, cf_debug_rob_enable, as [D4RAS]); the port exists
+  // only in debug-printf IFT builds (enableCfDebugPrintf && enableIFT), so other configs keep their Verilog.
+  val cf_dbg_print  = if (ENABLE_CF_DEBUG_PRINTF && ENABLE_IFT) Some(Input(Bool())) else None
 
   // corefuzzing: ICache set/way reconfiguration indices (from icacheCSRCF at 0xbcb)
   val cf_icache_set_conf = Input(UInt(2.W))  // index into icacheSetOptions = Seq(64, 32, 16, 8)
@@ -178,7 +183,12 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val refill_paddr = RegEnable(io.s1_paddr, s1_valid && !(refill_valid || s2_miss))
   val refill_tag = refill_paddr(tagBits+untagBits-1, minUntagBits)
   // Mask refill set index to active sets so refills stay within active region
-  val refill_idx = refill_paddr(untagBits-1,blockOffBits) & icache_set_mask
+  // [ICVBW] (DF-icache-vb-width, owner 2026-10-22 "stage with G1 V2"): truncate to idxBits like s0_set_idx_masked.
+  // icache_set_mask is 7 bits wide (the option literal 64 needs 7 bits), so the untruncated `&` made refill_idx 7 bits
+  // and Cat(repl_way, refill_idx) below indexed vb_array at way*128+set: ways 4-7 landed past bit 511 and never became
+  // valid (8-way I$ ran as 4-way).  The value is unchanged (bit 6 of the mask is constant 0); only the width is fixed,
+  // so tag_array / ift_tag_meta / data-array addresses and the [ICFILL] set= field are unchanged.  0 logic levels.
+  val refill_idx = (refill_paddr(untagBits-1,blockOffBits) & icache_set_mask)(idxBits-1, 0)
   val refill_one_beat = tl_out.d.fire && edge_out.hasData(tl_out.d.bits)
 
   io.req.ready := !refill_one_beat
@@ -235,7 +245,8 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   }
 
   // corefuzzing: write ift_tag_meta on refill_done (same cycle as tag_array write, one way mask)
-  val refill_domain_reg = RegEnable(io.s1_domain_id, s1_valid && !(refill_valid || s2_miss))
+  val refill_domain_reg = RegEnable(if (ENABLE_IFT) io.s1_domain_id || io.cf_s1_fill_atk.get else io.s1_domain_id,   // [M3ATKWIN]
+                                    s1_valid && !(refill_valid || s2_miss))
   val refill_secret_reg = RegEnable(io.s1_is_secret,  s1_valid && !(refill_valid || s2_miss))
   if (ENABLE_IFT) {
     when (refill_done) {
@@ -243,6 +254,22 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
         Seq.tabulate(nWays)(repl_way === _.U))
       ift_tag_meta_secret.write(refill_idx, VecInit(Seq.fill(nWays)(refill_secret_reg)),
         Seq.tabulate(nWays)(repl_way === _.U))
+    }
+  }
+
+  // [ICFILL] debug print (owner 2026-10-22, "Stage [ICFILL] print"; r17 follow-up): one line per I$ refill, in the
+  // cycle the line is written (refill_done): set, way, the fill's domain and secret mark exactly as written into
+  // ift_tag_meta / ift_tag_meta_secret, the line address and whether the fill is dropped (invalidated: fence.i during
+  // the refill, the valid bit is not set).  Measurement only: reads existing nodes, no logic change.  Compile-time
+  // enableCfDebugPrintf && enableIFT (the port above), runtime 0xbc0 bit 4 like [D4RAS]; its own cycle counter
+  // (debug builds only, as d4_cyc).  Format:
+  //   [ICFILL] c=<cycle> set=<set> way=<way> dom=<0|1> sec=<0|1> pa=0x<line address> inv=<0|1>
+  io.cf_dbg_print.foreach { en =>
+    val icf_cyc = RegInit(0.U(40.W))
+    icf_cyc := icf_cyc + 1.U
+    when (en && refill_done) {
+      printf("[ICFILL] c=%d set=%d way=%d dom=%d sec=%d pa=0x%x inv=%d\n", icf_cyc, refill_idx, repl_way,
+        refill_domain_reg, refill_secret_reg, (refill_paddr >> blockOffBits) << blockOffBits, invalidated)
     }
   }
 
@@ -256,7 +283,8 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val s1_bankid = Wire(Bool())
 
   for (i <- 0 until nWays) {
-    val s1_idx = io.s1_paddr(untagBits-1,blockOffBits) & icache_set_mask
+    // [ICVBW] truncated to idxBits so Cat(i.U, s1_idx) is way*nSets+set, matching the vb_array write above.
+    val s1_idx = (io.s1_paddr(untagBits-1,blockOffBits) & icache_set_mask)(idxBits-1, 0)
     val s1_tag = io.s1_paddr(tagBits+untagBits-1, minUntagBits)
     val s1_vb = vb_array(Cat(i.U, s1_idx))
     val tag = tag_rdata(i)

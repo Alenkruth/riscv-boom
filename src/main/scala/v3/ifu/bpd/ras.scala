@@ -39,6 +39,10 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
     val write_domain = Input(Bool())
     // corefuzzing: set false at push; true retroactively via late_write_secret when call is confirmed secret
     val write_secret = Input(Bool())
+    // [B60RAS] bundle60 (C): the slot was pushed while the ATTACKER window was open (07g M3 window label), kept apart
+    // from the pusher's domain (write_domain / read_domain) so both rules hold.  IFT only.
+    val write_watk = if (ENABLE_IFT) Some(Input(Bool())) else None
+    val read_watk  = if (ENABLE_IFT) Some(Output(Bool())) else None
 
     // corefuzzing: late update ports — fired from FTQ when a secret instruction commits from
     // a call-containing fetch packet, marking the pushed RAS slot as secret.
@@ -75,9 +79,16 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
   io.read_domain := (if (ENABLE_IFT) Mux(RegNext(io.write_valid && io.write_idx === io.read_idx),
     RegNext(io.write_domain),
     RegNext(ras_domain(io.read_idx))) else false.B)
-  io.read_secret := (if (ENABLE_IFT) Mux(RegNext(io.write_valid && io.write_idx === io.read_idx),
-    RegNext(io.write_secret),
-    RegNext(ras_secret(io.read_idx))) else false.B)
+  // [RASLBL] DF-ras-repair-label: a top repair (write_push false) ORs the restored label into the
+  // slot (below), so the forwarded value is the written bit OR the slot's current bit (read_idx ===
+  // write_idx in that cycle, so the existing read flop holds it).  One more flop (the push bit) and
+  // one more input on the existing output LUT: same level count after the flops.
+  io.read_secret := (if (ENABLE_IFT) {
+    val rsec_q = RegNext(ras_secret(io.read_idx))
+    Mux(RegNext(io.write_valid && io.write_idx === io.read_idx),
+      RegNext(io.write_secret) || (RegNext(!io.write_push) && rsec_q),
+      rsec_q)
+  } else false.B)
 
   when (io.write_valid) {
     ras(io.write_idx)        := io.write_addr
@@ -88,9 +99,35 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
   // produce constant false (RegInit value), and FIRRTL DCE removes both shadow
   // register arrays along with their forwarding muxes.
   if (ENABLE_IFT) {
+    // [B60RAS] per-entry attacker-window label (true = pushed while the attacker window was open).  Declared only with
+    // ENABLE_IFT so IFT-off Verilog is unchanged (an unused register still takes a _RANDOM init slot).
+    val ras_watk = RegInit(VecInit(Seq.fill(nRasEntries)(false.B)))
     when (io.write_valid) {
       ras_domain(io.write_idx) := io.write_domain
-      ras_secret(io.write_idx) := io.write_secret  // reset to false; late_write_secret marks true later
+      // [B60RAS] the window label is written like the domain: a push writes the push-time window bit, the FTQ top
+      // repair restores the label saved beside ras_top (frontend.scala).  Same write select as ras_domain (0 levels
+      // on it); data = one more f3 / FTQ bit.  Cost: nRasEntries FF + 1 LUT each.
+      ras_watk(io.write_idx)   := io.write_watk.get
+    }
+    // [B60RAS] read side, forwarded on a same-cycle write exactly like read_domain (one read flop, one forward flop)
+    io.read_watk.get := Mux(RegNext(io.write_valid && io.write_idx === io.read_idx),
+      RegNext(io.write_watk.get),
+      RegNext(ras_watk(io.read_idx)))
+    // [RASLBL] DF-ras-repair-label: a push (write_push) replaces the slot's secret bit (window bit;
+    // late_write_secret marks true later).  The FTQ top repair (write_push false) restores the slot to
+    // the content its packet read at f3, with the labels read beside it (frontend.scala, FTQ
+    // ras_top_dom / ras_top_sec): the domain is written as saved (exact: a domain changes only at a
+    // push), the secret bit is saved OR current.  RULES.md A ("kept until overwritten"): a repair is
+    // not an overwrite by new content, so a mark the slot got after the capture (late_write_secret /
+    // [WINFTQ] / [WINFTQPOST] on the call that pushed it) stays; if a wrong-path push did overwrite
+    // the slot, the saved bit brings back the restored content's tag (the OR may keep the wrong-path
+    // push's window bit: over-taint only).  Per slot: the same write select (write_valid && idx === i,
+    // what the dynamic-index write generated); the data gains !write_push && q: one more input on the
+    // slot's existing D LUT, 0 added levels.
+    for (i <- 0 until nRasEntries) {
+      when (io.write_valid && io.write_idx === i.U) {
+        ras_secret(i) := io.write_secret || (!io.write_push && ras_secret(i))
+      }
     }
 
     // corefuzzing: late update — mark a slot secret when the associated call instruction is confirmed secret
@@ -110,10 +147,11 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
     // ALL entries stale (the stack is circular: every slot lies below the pointer), a call push
     // clears the entry it writes (the top repair does not: it restores old content), and the
     // read-side flag rides beside read_domain.  frontend.scala turns a stale read by a victim
-    // ret into cf_ras_pred_xdom, so the ROB raises INFL_RAS_STATE atk=1 only if that ret
-    // MISPREDICTS (doc 67 Part B gate): a balanced callback (attacker ret into its victim caller)
-    // marks the victim's lower frames stale, but their rets predict correctly and stay silent.
-    // Wrong-path attacker moves also mark (over-taint, mispredict-gated the same way).
+    // ret into cf_ras_pred_xdom, and the ROB raises INFL_RAS_STATE atk=1 on that ret.
+    // [RASEVERY] owner 2026-10-21 ("edge every stale pop too"): no mispredict gate any more, so
+    // a balanced callback (attacker ret into its victim caller), which marks the victim's lower
+    // frames stale, now edges their (correctly predicted) rets as well; wrong-path attacker
+    // moves also mark (over-taint, accepted).
     // Cost: nRasEntries FF + 1 LUT each, a nRasEntries:1 mux and 1 FF on the read side.
     // Levels: the bulk-set enable is the f3 push/pop condition AND the f3 attacker bit (+1 LUT
     // beside ras.io.write_valid, into FFs); the read flag is a register like read_domain.
@@ -129,6 +167,7 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
         ras_domain(i) := false.B
         ras_secret(i) := false.B
         ras_stale(i)  := false.B
+        ras_watk(i)   := false.B   // [B60RAS]
       }
     }
     // the entry's value after this cycle's updates, registered like read_domain

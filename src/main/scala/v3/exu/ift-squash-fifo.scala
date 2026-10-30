@@ -147,7 +147,7 @@ class IftSquashMerge(nBanks: Int, nSprob: Int, nIc: Int, nWb: Int, nMemord: Int,
       val fl_is_secret    = !cause && d.fl_sec
       val fl_op_count     = Mux(cause, 0.U, d.fl_oc)
       val inflFmt = (0 until numInfluencerSlotsCF).map(k => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d}").mkString(" ")
-      val fmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d fl_sec=%d floc=%d FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d pdst=%d prs1=%d prs2=%d rt1=%d rt2=%d brmask=0x%x brtag=%d abr=%d sbr=%d) $inflFmt\n"
+      val fmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d fl_sec=%d floc=%d FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d sftq=%d pdst=%d prs1=%d prs2=%d rt1=%d rt2=%d brmask=0x%x brtag=%d abr=%d sbr=%d ce_repl=%d) $inflFmt\n"
       val inflArgs = (0 until numInfluencerSlotsCF).flatMap(k => Seq[Bits](
         info.influencer_list(k).valid, info.influencer_list(k).op_count, info.influencer_list(k).infl_type,
         info.influencer_list(k).is_atk, info.influencer_list(k).is_secret))
@@ -159,8 +159,10 @@ class IftSquashMerge(nBanks: Int, nSprob: Int, nIc: Int, nWb: Int, nMemord: Int,
         fl_cross_domain, fl_is_secret, fl_op_count,
         info.fu_bitmap, Mux(cause, 4.U, 3.U), inflBitmapFromList(info.influencer_list), info.infl_dropped,
         info.cntd_deny_count, info.stall_cycles_rob, info.stall_cycles_stq, info.infl_oc_aliased,
+        Cat(!info.fu_bitmap(1), info.fu_bitmap(3), info.fu_bitmap(2)),   // [FTQHOLD] sftq from fu bits 3..1 (printf only)
         u.pdst, u.prs1, u.prs2, u.lrs1_rtype, u.lrs2_rtype, d.br_mask, d.br_tag,
-        info.atk_branch_ctr, info.sec_branch_ctr) ++ inflArgs): _*)
+        info.atk_branch_ctr, info.sec_branch_ctr,
+        info.ce_repl.getOrElse(false.B)) ++ inflArgs): _*)   // [CEREPL] lean59: record bit [254]
     }
     d.old_rec.foreach { o =>
       assert(!m_valid || rec === o, "[rob] 4b squash record differs from the capture-time record (Task 2.10d shadow)")

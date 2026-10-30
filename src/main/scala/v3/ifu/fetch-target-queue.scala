@@ -73,6 +73,12 @@ class FTQBundle(implicit p: Parameters) extends BoomBundle
   // [FTQATK] patch 47 (r173 (5)): a CFI of this packet resolved with an attacker-tainted condition
   // or target (brinfos cond_atk); ORed into the domain sent with the predictor update
   val cf_fetch_atk = if (ENABLE_IFT) Some(Bool()) else None
+  // [RASLBL] DF-ras-repair-label: the domain and secret labels of the RAS slot ras_top was read
+  // from (FetchBundle.ras_top_dom/sec, f3), restored with ras_top by the top repair
+  val ras_top_dom = if (ENABLE_IFT) Some(Bool()) else None
+  val ras_top_sec = if (ENABLE_IFT) Some(Bool()) else None
+  // [B60RAS] bundle60 (C): the slot's attacker-window label (ras.io.read_watk), restored with ras_top like ras_top_dom
+  val ras_top_watk = if (ENABLE_IFT) Some(Bool()) else None
 
   // // Metadata for the branch predictor
   // val bpd_meta = Vec(nBanks, UInt(bpdMaxMetaLength.W))
@@ -158,6 +164,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val cf_win_ftq_rs  = if (ENABLE_IFT) Some(Input(Valid(UInt(idx_sz.W)))) else None
   // [WINFTQPOST] patch 38: the secret window is open (core winCtr counter != 0), for the enqueue tag
   val cf_win_sec_open = if (ENABLE_IFT) Some(Input(Bool())) else None
+  // [M3ATKWIN] lean58 (Fable audit M3; RULES A U8 "symmetric", reading 1): the attacker window is open (core winCtr != 0)
+  val cf_win_atk_open = if (ENABLE_IFT) Some(Input(Bool())) else None
   val cf_ras_win_upd = if (ENABLE_IFT) Some(Output(Valid(UInt(log2Ceil(nRasEntries).W)))) else None
   // [FTQATK] patch 47: one port per brinfos lane (core.scala), valid = a br/jalr resolved with
   // cond_atk; bits = its ftq_idx.  Direct ports, no compactor (brinfos is already a register).
@@ -168,6 +176,10 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     val ras_update = Output(Bool())
     val ras_update_idx = Output(UInt(log2Ceil(nRasEntries).W))
     val ras_update_pc  = Output(UInt(vaddrBitsExtended.W))
+    // [RASLBL] the repaired slot's saved labels (registered like ras_update_pc; read only with ras_update)
+    val ras_update_dom = if (ENABLE_IFT) Some(Output(Bool())) else None
+    val ras_update_sec = if (ENABLE_IFT) Some(Output(Bool())) else None
+    val ras_update_watk = if (ENABLE_IFT) Some(Output(Bool())) else None   // [B60RAS]
 
     // [F-RAS-3b] (22c2, review B1) active RAS size = frontend cf_ras_active (rasOptionsVec(cf_ras_idx)),
     // the SAME wire the frontend uses at F1/F2/F3, so the FTQ's stored ghist.ras_idx advances in the
@@ -250,7 +262,14 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     // any existing path.  Cost: about 1 LUT per entry (the constant-0 data input becomes a signal).
     if (ENABLE_IFT) {
       new_entry.cf_fetch_secret.get := io.cf_win_sec_open.get || io.enq.bits.ghist_secret.getOrElse(false.B)
-      new_entry.cf_fetch_atk.get    := false.B   // [FTQATK] set only at resolution (below)
+      // [M3ATKWIN] lean58 (Fable audit M3; RULES A U8 "symmetric", reading 1): a packet enqueued while the ATTACKER window is open trains the predictors
+      // with the attacker label (bpdupdate cf_domain_id |= cf_fetch_atk), the twin of cf_fetch_secret above.  It is
+      // also still set at resolution by an attacker-steered CFI ([FTQATK]).  0 added levels (a data input of the
+      // entry's existing write mux), about 1 LUT per entry.  RECORD CHANGE.
+      new_entry.cf_fetch_atk.get    := io.cf_win_atk_open.get || io.enq.bits.ghist_atk.getOrElse(false.B)
+      new_entry.ras_top_dom.get     := io.enq.bits.ras_top_dom.get   // [RASLBL] beside ras_top
+      new_entry.ras_top_sec.get     := io.enq.bits.ras_top_sec.get
+      new_entry.ras_top_watk.get    := io.enq.bits.ras_top_watk.get   // [B60RAS]
     }
 
     val new_ghist = Mux(io.enq.bits.ghist.current_saw_branch_not_taken,
@@ -439,11 +458,48 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     bpd_ptr := WrapInc(bpd_ptr, cf_ftq_active)
   }
 
+  // [SINKFACTS86] patch 86 (all-sinks study Q1/Q2/Q5/Q6, owner 2026-10-20): debug printfs ONLY.  Gate = the
+  // IftSquashMerge printf gate (rob.scala iftSqDbgOn): IFT on, CF debug printfs on, no IFT bridge.  IFT off,
+  // CoreFuzzingDMINoLogConfig and every FireSim (bridge) build elaborate nothing here.  cyc = d4_cyc_q, a
+  // counter from reset (the dcache [SMWR]/[RFB] cyc and the predictor [*W] cyc count from the same reset).
+  //  [Q2MP]  every brupdate.b2.mispredict cycle: rv = the same-cycle FTQ redirect (Q2 premise: always 1, so the
+  //          mispredict/repair walk arm above, RegNext(b2.mispredict) && !RegNext(redirect.valid), never fires),
+  //          ridx = redirect ftq idx, midx = the mispredicted branch's ftq idx (they differ only when the ROB
+  //          flush arm of core.scala owns the redirect).
+  //  [Q2ARM] the walk armed (bpd_update_mispredict / bpd_update_repair): expected never (then the loop
+  //          predictor, whose only allocating input is is_mispredict_update, stays empty: Q1).
+  //  [BPDU]  every predictor update leaving the FTQ (the Q5 update rate; the join key for the [BIMW] / [BTBW] /
+  //          [UBTBW] / [TAGEW] writes, which follow 1-2 cycles later in the banks).
+  if (ENABLE_IFT && ENABLE_CF_DEBUG_PRINTF && !ENABLE_IFT_BRIDGE) {
+    when (io.brupdate.b2.mispredict) {
+      printf("[Q2MP] cyc=%d rv=%d ridx=%d midx=%d\n", d4_cyc_q, io.redirect.valid, io.redirect.bits,
+        io.brupdate.b2.uop.ftq_idx)
+    }
+    when (bpd_update_mispredict || bpd_update_repair) {
+      printf("[Q2ARM] cyc=%d mp=%d rp=%d ridx=%d eidx=%d\n", d4_cyc_q, bpd_update_mispredict, bpd_update_repair,
+        bpd_repair_idx, bpd_end_idx)
+    }
+    when (io.bpdupdate.valid) {
+      printf("[BPDU] cyc=%d pc=0x%x brm=0x%x cv=%d ci=%d tk=%d mp=%d br=%d jal=%d mpu=%d rpu=%d dom=%d sec=%d\n",
+        d4_cyc_q, io.bpdupdate.bits.pc, io.bpdupdate.bits.br_mask, io.bpdupdate.bits.cfi_idx.valid,
+        io.bpdupdate.bits.cfi_idx.bits, io.bpdupdate.bits.cfi_taken, io.bpdupdate.bits.cfi_mispredicted,
+        io.bpdupdate.bits.cfi_is_br, io.bpdupdate.bits.cfi_is_jal, io.bpdupdate.bits.is_mispredict_update,
+        io.bpdupdate.bits.is_repair_update, io.bpdupdate.bits.cf_domain_id.getOrElse(0.U(1.W)),
+        io.bpdupdate.bits.cf_is_secret.getOrElse(false.B))
+    }
+  }
+
   io.enq.ready := RegNext(!full || do_commit_update)
 
   val redirect_idx = io.redirect.bits
   val redirect_entry = ram(redirect_idx)
   val redirect_new_entry = WireInit(redirect_entry)
+  // [RASLBL] DF-ras-repair-label: the labels saved beside ras_top, from the same redirect_entry read
+  // (32:1 mux per bit -> flop, parallel to the ras_update_pc path; no valid gate needed, the frontend
+  // reads them only with ras_update).  2 x (about 11 LUT + 1 FF).
+  io.ras_update_dom.foreach(_ := RegNext(redirect_entry.ras_top_dom.get))
+  io.ras_update_sec.foreach(_ := RegNext(redirect_entry.ras_top_sec.get))
+  io.ras_update_watk.foreach(_ := RegNext(redirect_entry.ras_top_watk.get))   // [B60RAS] same read, +1 (11 LUT + 1 FF)
 
   when (io.redirect.valid) {
     enq_ptr    := WrapInc(io.redirect.bits, cf_ftq_active)
@@ -501,6 +557,17 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
       // land between the read and this write-back).
       ram(RegNext(io.redirect.bits)).cf_fetch_atk.get :=
         RegNext(redirect_new_entry.cf_fetch_atk.get) || ram(RegNext(io.redirect.bits)).cf_fetch_atk.get
+      // [RASLBL] the write-back would rewrite the saved RAS labels with the value read a cycle earlier
+      // (equal: only the enqueue writes them, and enq_ptr has moved past this entry).  Keep them, so
+      // their per-entry flops load only at enqueue (CE = the existing enqueue decode, D = the shared
+      // enqueue data): no write mux per bit and no flop for RegNext(redirect_new_entry) of these bits.
+      for (e <- 0 until num_entries) {
+        when (RegNext(io.redirect.bits) === e.U) {
+          ram(e).ras_top_dom.get := ram(e).ras_top_dom.get
+          ram(e).ras_top_sec.get := ram(e).ras_top_sec.get
+          ram(e).ras_top_watk.get := ram(e).ras_top_watk.get   // [B60RAS]
+        }
+      }
     }
   }
 

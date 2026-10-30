@@ -41,6 +41,11 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     // [R124GATE3] patch 28 (B51): IFT-only, absent without ENABLE_IFT (same position when present).
     val domain = if (ENABLE_IFT) Some(UInt(1.W)) else None
     val secret = if (ENABLE_IFT) Some(Bool()) else None
+    // [LOOPRESET] lean58 A6 (gap inventory 2026-10-23, ledger 1023): set by the first update that writes the entry
+    // (update_mispredict), cleared by the reset sweep.  A reset entry (tag 0, domain 0) has never been written, so
+    // its domain is no one's state; without this bit an attacker fetch with pc[17:8] = 0 raised an empty ty9 edge.
+    // IFT-only (None without ENABLE_IFT, so the stock entry is unchanged).  nSets x 1 FF per column.
+    val written = if (ENABLE_IFT) Some(Bool()) else None
   }
 
   class LoopBranchPredictorColumn extends Module {
@@ -90,7 +95,11 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     // O4: qualified on the column's OWN tag match -- the same condition the prediction
     // path uses below -- so a mismatch is reported only when the prediction genuinely
     // came from this entry.
-    io.f3_domain_mismatch := (f3_entry.tag === f3_tag) && (f3_entry.domain.getOrElse(0.U(1.W)) =/= io.f3_req_domain)
+    // [LOOPRESET] the domain label is raised only by an entry an update has written (one more input on the flag LUT,
+    // a flop: 0 levels).  The secret label needs no gate: a never-written entry has secret = 0 from the reset sweep.
+    io.f3_domain_mismatch := (if (ENABLE_IFT) (f3_entry.tag === f3_tag) && f3_entry.written.get &&
+                                              (f3_entry.domain.get =/= io.f3_req_domain)
+                              else (f3_entry.tag === f3_tag) && (f3_entry.domain.getOrElse(0.U(1.W)) =/= io.f3_req_domain))
     io.f3_secret_mismatch := (f3_entry.tag === f3_tag) && f3_entry.secret.getOrElse(false.B)
 
     io.f3_pred := io.f3_pred_in
@@ -192,6 +201,7 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       val cf_no_owner = !tag_match && (entry.conf === 7.U || (entry.conf =/= 0.U && entry.age =/= 0.U))
       wentry.domain.foreach(_ := Mux(cf_no_owner, entry.domain.getOrElse(0.U(1.W)), io.update_domain))
       wentry.secret.foreach(_ := io.update_secret)
+      wentry.written.foreach(_ := true.B)   // [LOOPRESET]
       entries(io.update_idx) := wentry
     } .elsewhen (io.update_repair && !doing_reset) {
       when (tag_match && !(f4_fire && io.update_idx === f4_idx)) {
@@ -204,6 +214,33 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       entries(reset_idx) := (0.U).asTypeOf(new LoopEntry)
    }
 
+    // [SINKFACTS86] patch 86 (all-sinks study Q1): is the loop predictor inert?  Debug printf builds only (the
+    // IftSquashMerge gate: IFT on, CF debug printfs on, no IFT bridge; IFT off / NoLog / FireSim elaborate nothing).
+    //  [LOOPU]    an update_mispredict / update_repair reached this column (the ONLY inputs that write tag, conf or
+    //             p_cnt): expected never, because the FTQ never arms the mispredict/repair walk (Q2, [Q2ARM]).
+    //  [LOOPV]    the count of entries with conf =/= 0 or tag =/= 0 changed (allocation or loss); nage = entries
+    //             with age =/= 0 (the f4 path ages tag-0 entries only).  One line right after the 16-cycle reset
+    //             sweep is expected (its RegNext compare sees the last uncleared entry); any line with nconf > 0 or
+    //             ntag > 0 means the predictor is not inert.
+    //  [LOOPFLIP] the column overrode the TAGE direction (needs conf = 7): expected never.
+    if (ENABLE_IFT && ENABLE_CF_DEBUG_PRINTF && !ENABLE_IFT_BRIDGE) {
+      val cf_sf_cyc = RegInit(0.U(40.W))
+      cf_sf_cyc := cf_sf_cyc + 1.U
+      val cf_nconf = PopCount(entries.map(_.conf =/= 0.U))
+      val cf_ntag  = PopCount(entries.map(_.tag =/= 0.U))
+      val cf_nage  = PopCount(entries.map(_.age =/= 0.U))
+      when (!doing_reset && (cf_nconf =/= RegNext(cf_nconf) || cf_ntag =/= RegNext(cf_ntag))) {
+        printf("[LOOPV] cyc=%d nconf=%d ntag=%d nage=%d\n", cf_sf_cyc, cf_nconf, cf_ntag, cf_nage)
+      }
+      when (!doing_reset && (io.update_mispredict || io.update_repair)) {
+        printf("[LOOPU] cyc=%d mp=%d rp=%d idx=0x%x tagm=%d conf=%d\n", cf_sf_cyc, io.update_mispredict,
+          io.update_repair, io.update_idx, tag_match, entry.conf)
+      }
+      when (io.f3_pred =/= io.f3_pred_in) {
+        printf("[LOOPFLIP] cyc=%d tag=0x%x\n", cf_sf_cyc, f3_tag)
+      }
+    }
+
   }
 
 
@@ -215,7 +252,11 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val update_meta = s1_update.bits.meta.asTypeOf(Vec(bankWidth, new LoopMeta))
   // O4: the loop predictor is a direction predictor, so it reports as BPD state.
   // composer.scala ORs f3_bpd_*_mismatch across banks -- no new influencer type needed.
-  io.f3_bpd_domain_mismatch := columns.map(_.io.f3_domain_mismatch).reduce(_||_)
+  // [ATKDMMASK] lean58 A5 (gap inventory 2026-10-23): the attacker-side twin of [BPDMASK]: a slot below the fetch
+  // PC, or a bank whose request is not valid, is not part of the packet; its domain label raises no edge either.
+  io.f3_bpd_domain_mismatch := (if (ENABLE_IFT) (0 until bankWidth).map(w =>
+    columns(w).io.f3_domain_mismatch && s3_mask(w) && s3_valid).reduce(_||_)
+    else columns.map(_.io.f3_domain_mismatch).reduce(_||_))   // IFT off: unchanged Verilog
   // [BPDMASK] r170 A (DF-dt-sprop): a slot below the fetch PC, or a bank whose request is not
   // valid, is not part of the packet; its secret label raises no edge.
   io.f3_bpd_secret_mismatch := (0 until bankWidth).map(w =>
@@ -246,6 +287,21 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     columns(w).io.update_meta            := update_meta(w)
 
     f3_meta(w) := columns(w).io.f3_meta
+  }
+
+  // [SINKFACTS86] patch 86 (all-sinks study Q1, the IFT side of "inert"): a FIRED f3 packet for which a loop
+  // column reports a domain mismatch.  With no allocation, every entry keeps its reset value (tag 0, domain 0),
+  // so this can only be an attacker-domain fetch whose packet index has tag bits idx[13:4] = 0 (pc[17:8] = 0)
+  // matching a never-written entry: io.f3_bpd_domain_mismatch then raises fetch flag 3 (INFL_BPD_STATE,
+  // is_atk = any_is_victim) with no state behind it.  dm = per-column mask, idx = s3_idx (pc >> 4), fdom = the
+  // f3 fetch domain.  Same gate as the column printfs.
+  if (ENABLE_IFT && ENABLE_CF_DEBUG_PRINTF && !ENABLE_IFT_BRIDGE) {
+    val cf_sf_cyc = RegInit(0.U(40.W))
+    cf_sf_cyc := cf_sf_cyc + 1.U
+    val cf_dm = VecInit(columns.map(_.io.f3_domain_mismatch)).asUInt
+    when (s3_valid && io.f3_fire && cf_dm =/= 0.U) {
+      printf("[LOOPDM] cyc=%d idx=0x%x dm=0x%x fdom=%d\n", cf_sf_cyc, s3_idx, cf_dm, columns(0).io.f3_req_domain)
+    }
   }
 
   io.f3_meta := f3_meta.asUInt

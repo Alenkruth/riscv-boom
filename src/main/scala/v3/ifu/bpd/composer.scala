@@ -43,6 +43,7 @@ class ComposedBranchPredictorBank(implicit p: Parameters) extends BranchPredicto
 
     // corefuzzing: wire domain to each component
     c.io.f0_domain_id := io.f0_domain_id
+    c.io.f1_domain_id.foreach(_ := io.f1_domain_id.get)   // [F4S1RNG] lean58
 
   }
   require(meta_sz < bpdMaxMetaLength)

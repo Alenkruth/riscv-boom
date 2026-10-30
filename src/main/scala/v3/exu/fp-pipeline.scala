@@ -287,8 +287,8 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
   fregfile.io.cf_wclr := io.cf_wclr
   val fll_wport0 = RegNext(WritePort(ll_wbarb.io.out, fpregSz, fLen+1, RT_FLT, io.wsh_sec, io.wsh_atk))
   fregfile.io.write_ports(0) := fll_wport0
-  fregfile.io.write_ports(0).bits.wsec := fll_wport0.bits.wsec && wep_same_sec
-  fregfile.io.write_ports(0).bits.watk := fll_wport0.bits.watk && wep_same_atk
+  fregfile.io.write_ports(0).bits.wsec := false.B   // [ONETAG] r205: the secret tag rides `secret` (WritePort)
+  fregfile.io.write_ports(0).bits.watk := false.B   // [ONETAGATK] r205 U8: the attacker tag rides taint_atk (WritePort)
   // [R124GATE2] patch 27 (r124/B51): IFT off the regfile has no taint memory; zero the data-taint
   // bits so the fll_wport0 secret/taint_atk flops have no reader (IFT-on: nothing emitted).
   if (!ENABLE_IFT) {
@@ -305,8 +305,8 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
   for (i <- 1 until memWidth) {
     val fll_wport = RegNext(WritePort(io.ll_wports(i), fpregSz, fLen+1, RT_FLT, io.wsh_sec, io.wsh_atk))
     fregfile.io.write_ports(w_cnt) := fll_wport
-    fregfile.io.write_ports(w_cnt).bits.wsec := fll_wport.bits.wsec && wep_same_sec   // [WINEXP]
-    fregfile.io.write_ports(w_cnt).bits.watk := fll_wport.bits.watk && wep_same_atk
+    fregfile.io.write_ports(w_cnt).bits.wsec := false.B   // [ONETAG]
+    fregfile.io.write_ports(w_cnt).bits.watk := false.B   // [ONETAGATK]
     if (!ENABLE_IFT) {   // [R124GATE2] as for fll_wport0
       fregfile.io.write_ports(w_cnt).bits.secret    := false.B
       fregfile.io.write_ports(w_cnt).bits.taint_atk := false.B
@@ -320,13 +320,11 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
       fregfile.io.write_ports(w_cnt).valid     := eu.io.fresp.valid && eu.io.fresp.bits.uop.rf_wen
       fregfile.io.write_ports(w_cnt).bits.addr := eu.io.fresp.bits.uop.pdst
       fregfile.io.write_ports(w_cnt).bits.data := eu.io.fresp.bits.data
-      fregfile.io.write_ports(w_cnt).bits.secret := eu.io.fresp.bits.secret
-      // [IMPLWIN] window taint of the result
-      // [WINEXP] step 21: live only while the uop's dispatch epoch is current
-      fregfile.io.write_ports(w_cnt).bits.wsec := io.wsh_sec.res(eu.io.fresp.bits.uop.cf_win_sec.getOrElse(false.B) || eu.io.fresp.bits.uop.cf_opnd_wsec.getOrElse(false.B),
-                                                                 eu.io.fresp.bits.uop.cf_wep_sec.getOrElse(0.U(2.W)), eu.io.fresp.bits.uop.rob_idx)   // [WINSHADOW]
-      fregfile.io.write_ports(w_cnt).bits.watk := io.wsh_atk.res(eu.io.fresp.bits.uop.cf_win_atk.getOrElse(false.B) || eu.io.fresp.bits.uop.cf_opnd_watk.getOrElse(false.B),
-                                                                 eu.io.fresp.bits.uop.cf_wep_atk.getOrElse(0.U(2.W)), eu.io.fresp.bits.uop.rob_idx)
+      // [ONETAG] r205: the one secret tag (regfile.scala WritePort rule); no window kind
+      fregfile.io.write_ports(w_cnt).bits.secret := eu.io.fresp.bits.secret || eu.io.fresp.bits.uop.cf_secret_access.getOrElse(false.B) ||
+                                                    eu.io.fresp.bits.uop.cf_secret_propagation.getOrElse(false.B) || io.wsh_sec.in(eu.io.fresp.bits.uop.rob_idx)
+      fregfile.io.write_ports(w_cnt).bits.wsec := false.B
+      fregfile.io.write_ports(w_cnt).bits.watk := false.B   // [ONETAGATK] r205 U8 (merged into taint_atk below)
       // [FPTAINT 2026-09-08] Was OWNERSHIP ONLY -- it dropped fresp.bits.taint_atk, so any
       // attacker- or secret-derived value passing through an FP register lost its taint.
       // The LSU computes fresp.bits.taint_atk correctly (lsu.scala:2009, including the
@@ -334,7 +332,9 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
       // Mirrors the integer path at core.scala:1977.  Note the SECRET line above already
       // takes the propagated value -- only the attacker side was broken.
       fregfile.io.write_ports(w_cnt).bits.taint_atk := eu.io.fresp.bits.taint_atk ||
-                                                      (eu.io.fresp.bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U)
+                                                      (eu.io.fresp.bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U) ||
+                                                      eu.io.fresp.bits.uop.cf_attacker_influence.getOrElse(false.B) ||   // [ONETAGATK]
+                                                      io.wsh_atk.in(eu.io.fresp.bits.uop.rob_idx)
       eu.io.fresp.ready                        := true.B
       when (eu.io.fresp.valid) {
         assert(eu.io.fresp.ready, "No backpressuring the FPU")

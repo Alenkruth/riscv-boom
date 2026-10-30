@@ -210,7 +210,10 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
     val cf_btb_quiesce    = Input(Bool())
 
     // corefuzzing: fetch domain tracking for BPD/BTB domain mismatch detection
-    val f0_domain_id           = Input(UInt(1.W))   // domain of current fetch (f0 stage)
+    val f0_domain_id           = Input(UInt(1.W))   // domain of current fetch (f0 stage); IFT off only (unused IFT on)
+    // [F4S1RNG] lean58 timing F4: IFT on, the fetch domain arrives at s1, computed by the frontend from s1_vpc and a
+    // registered copy of the range CSRs (frontend.scala) instead of from s0_vpc.  None IFT off.
+    val f1_domain_id           = if (ENABLE_IFT) Some(Input(UInt(1.W))) else None
     val f3_bpd_domain_mismatch = Output(Bool())     // TAGE entry last updated by different domain
     val f3_btb_domain_mismatch = Output(Bool())     // BTB entry last updated by different domain
     // corefuzzing: secret shadow mismatch — predictor entry was trained by secret instruction
@@ -264,7 +267,10 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
   val s1_update_valid = RegNext(s0_update_valid)
 
   // corefuzzing: fetch domain piped one cycle (f0→s1) for use in domain shadow comparisons
-  val s1_domain = if (ENABLE_IFT) RegNext(io.f0_domain_id) else 0.U   // [R124GATE3] patch 28: IFT-only flop
+  // [F4S1RNG] lean58 timing F4: IFT on, the s1 domain is the frontend's s1 compare (io.f1_domain_id), equal every
+  // cycle to the old per-bank RegNext(io.f0_domain_id) (proof in frontend.scala [F4S1RNG]); the per-component f0->s1
+  // flops are gone.  IFT off: constant 0 as before.
+  val s1_domain = if (ENABLE_IFT) io.f1_domain_id.get else 0.U   // [R124GATE3] patch 28
 
 }
 
@@ -300,7 +306,8 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     val cf_btb_quiesce    = Input(Bool())
 
     // corefuzzing: domain of the fetch request for BPD/BTB domain shadow comparisons
-    val f0_req_domain_id = Input(UInt(1.W))
+    val f0_req_domain_id = Input(UInt(1.W))   // IFT off only (IFT on: tied 0 by the frontend, unused)
+    val f1_req_domain_id = if (ENABLE_IFT) Some(Input(UInt(1.W))) else None   // [F4S1RNG] lean58: the s1 fetch domain
   })
 
   var total_memsize = 0
@@ -585,6 +592,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
   // corefuzzing: wire domain to all banked predictors and aggregate mismatch at f3
   for (i <- 0 until nBanks) {
     banked_predictors(i).io.f0_domain_id              := io.f0_req_domain_id
+    banked_predictors(i).io.f1_domain_id.foreach(_ := io.f1_req_domain_id.get)   // [F4S1RNG]
     banked_predictors(i).io.update.bits.cf_domain_id.foreach(_ := io.update.bits.cf_domain_id.getOrElse(0.U(1.W)))
     banked_predictors(i).io.update.bits.cf_is_secret.foreach(_ := io.update.bits.cf_is_secret.getOrElse(false.B))
   }

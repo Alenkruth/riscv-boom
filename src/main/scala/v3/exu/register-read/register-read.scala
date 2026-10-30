@@ -52,6 +52,9 @@ class RegisterRead(
   rtype: UInt = RT_FIX
 )(implicit p: Parameters) extends BoomModule
 {
+  // [DBGFREEZE] patch 85: debug-mode taint mask and the x8 / x9 taint carry (core.scala dvP / dvA / dvL).  The ports
+  // exist on the INT instance only (the FP register-read is unchanged: debug code does not write FP registers).
+  val cfDbgPorts = ENABLE_IFT && rtype.litValue == RT_FIX.litValue
   val io = IO(new Bundle {
     // issued micro-ops
     val iss_valids = Input(Vec(issueWidth, Bool()))
@@ -69,6 +72,15 @@ class RegisterRead(
 
     val kill   = Input(Bool())
     val brupdate = Input(new BrUpdateInfo())
+
+    // [DBGFREEZE] patch 85: cf_dbg = the hart is in debug mode; cf_dbg_preg / cf_dbg_vt = the preg holding the
+    // program's x8 / x9 (valid while it is still mapped) and its carried taint {watk, wsec, atk, sec};
+    // cf_dbg_cap = the regfile taint read by this cycle's operand reads of those pregs (core.scala ORs it into
+    // the carried taint while the hart is in debug mode).
+    val cf_dbg      = if (cfDbgPorts) Some(Input(Bool())) else None
+    val cf_dbg_preg = if (cfDbgPorts) Some(Input(Vec(2, Valid(UInt(maxPregSz.W))))) else None
+    val cf_dbg_vt   = if (cfDbgPorts) Some(Input(Vec(2, UInt(4.W)))) else None
+    val cf_dbg_cap  = if (cfDbgPorts) Some(Output(Vec(2, UInt(4.W)))) else None
   })
 
   val rrd_valids       = Wire(Vec(issueWidth, Bool()))
@@ -140,6 +152,16 @@ class RegisterRead(
   val rrd_rs2_win = WireInit(VecInit(Seq.fill(issueWidth)(0.U(2.W))))
   val rrd_rs3_win = WireInit(VecInit(Seq.fill(issueWidth)(0.U(2.W))))
   rrd_pred_data := DontCare
+  // [DBGFREEZE] patch 85 (c) [DBGVT]: per operand, which carried preg it reads ({x9, x8} match) and the carried
+  // taint it gets.  The match is two 8-bit compares of the rrd uop's prs (a flop) against two flops, in parallel
+  // with the regfile read; it is shared by the debug-mode capture and the program-mode apply.
+  val dbg_rr     = io.cf_dbg.getOrElse(false.B)
+  val rrd_rs1_vm = WireInit(VecInit(Seq.fill(issueWidth)(0.U(2.W))))
+  val rrd_rs2_vm = WireInit(VecInit(Seq.fill(issueWidth)(0.U(2.W))))
+  def dbgMatch(prs: UInt, isP0: Bool): UInt =
+    if (cfDbgPorts) VecInit(io.cf_dbg_preg.get.map(d => d.valid && d.bits === prs && !isP0)).asUInt else 0.U(2.W)
+  def dbgVt(m: UInt): UInt =
+    if (cfDbgPorts) Mux(m(0), io.cf_dbg_vt.get(0), 0.U(4.W)) | Mux(m(1), io.cf_dbg_vt.get(1), 0.U(4.W)) else 0.U(4.W)
 
   io.prf_read_ports := DontCare
 
@@ -176,9 +198,13 @@ class RegisterRead(
     if (numReadPorts > 2) rrd_rs3_data(w) := Mux(rs3_is_p0, 0.U, io.rf_read_ports(idx+2).data)
     if (numReadPorts > 2) rrd_rs3_secret(w) := io.rf_read_ports(idx+2).secret && !rs3_is_p0
     if (numReadPorts > 2) rrd_rs3_atk(w)    := io.rf_read_ports(idx+2).taint_atk && !rs3_is_p0
-    if (numReadPorts > 0) rrd_rs1_win(w) := Mux(rs1_is_p0, 0.U, Cat(io.rf_read_ports(idx+0).watk, io.rf_read_ports(idx+0).wsec))
-    if (numReadPorts > 1) rrd_rs2_win(w) := Mux(rs2_is_p0, 0.U, Cat(io.rf_read_ports(idx+1).watk, io.rf_read_ports(idx+1).wsec))
-    if (numReadPorts > 2) rrd_rs3_win(w) := Mux(rs3_is_p0, 0.U, Cat(io.rf_read_ports(idx+2).watk, io.rf_read_ports(idx+2).wsec))
+    // [ONETAG] r205: the secret half of the window kind is gone (the regfile's `secret` carries it); only watk.
+    // [ONETAGATK] r205 U8: no window kind left on either side (the regfile's secret / taint_atk carry both tags)
+    if (numReadPorts > 0) rrd_rs1_win(w) := 0.U
+    if (numReadPorts > 1) rrd_rs2_win(w) := 0.U
+    if (numReadPorts > 2) rrd_rs3_win(w) := 0.U
+    if (numReadPorts > 0) rrd_rs1_vm(w) := dbgMatch(rrd_uops(w).prs1, rs1_is_p0)   // [DBGVT]
+    if (numReadPorts > 1) rrd_rs2_vm(w) := dbgMatch(rrd_uops(w).prs2, rs2_is_p0)
 
     if (enableSFBOpt) rrd_pred_data(w) := Mux(RegNext(io.iss_uops(w).is_sfb_shadow), io.prf_read_ports(w).data, false.B)
 
@@ -251,8 +277,9 @@ class RegisterRead(
       rs2_atk_cases ++= Array((bypass.valid && (prs2 === bypass.bits.uop.pdst) && bypass.bits.uop.rf_wen
         && bypass.bits.uop.dst_rtype === RT_FIX && lrs2_rtype === RT_FIX && (prs2 =/= 0.U), bypass.bits.taint_atk))
       // [IMPLWIN] the producer's result window taint rides its uop on the bypass
-      val byp_win = Cat(bypass.bits.uop.cf_win_atk.getOrElse(false.B) || bypass.bits.uop.cf_opnd_watk.getOrElse(false.B),
-                        bypass.bits.uop.cf_win_sec.getOrElse(false.B) || bypass.bits.uop.cf_opnd_wsec.getOrElse(false.B))
+      // [ONETAG] r205: secret half 0; the bypass `secret` already carries the producer's merged tag (core.scala)
+      // [ONETAGATK] r205 U8: both halves 0; the bypass taint_atk carries the producer's merged tag (core.scala)
+      val byp_win = 0.U(2.W)
       rs1_win_cases ++= Array((bypass.valid && (prs1 === bypass.bits.uop.pdst) && bypass.bits.uop.rf_wen
         && bypass.bits.uop.dst_rtype === RT_FIX && lrs1_rtype === RT_FIX && (prs1 =/= 0.U), byp_win))
       rs2_win_cases ++= Array((bypass.valid && (prs2 === bypass.bits.uop.pdst) && bypass.bits.uop.rf_wen
@@ -267,12 +294,40 @@ class RegisterRead(
 
     if (numReadPorts > 0) bypassed_rs1_data(w)  := MuxCase(rrd_rs1_data(w), rs1_cases)
     if (numReadPorts > 1) bypassed_rs2_data(w)  := MuxCase(rrd_rs2_data(w), rs2_cases)
-    if (numReadPorts > 0) bypassed_rs1_secret(w) := MuxCase(rrd_rs1_secret(w), rs1_secret_cases)
-    if (numReadPorts > 1) bypassed_rs2_secret(w) := MuxCase(rrd_rs2_secret(w), rs2_secret_cases)
-    if (numReadPorts > 0) bypassed_rs1_atk(w) := MuxCase(rrd_rs1_atk(w), rs1_atk_cases)
-    if (numReadPorts > 1) bypassed_rs2_atk(w) := MuxCase(rrd_rs2_atk(w), rs2_atk_cases)
-    if (numReadPorts > 0) bypassed_rs1_win(w) := MuxCase(rrd_rs1_win(w), rs1_win_cases)
-    if (numReadPorts > 1) bypassed_rs2_win(w) := MuxCase(rrd_rs2_win(w), rs2_win_cases)
+    // [DBGFREEZE] patch 85 (c) [DBGVT]: OR in the carried x8 / x9 taint.  The carried preg's producer finished
+    // before the halt (or is the debug restore, done before dret), so no bypass ever matches it.
+    // [F3DBGVT] lean58 timing F3 (timing-audit-20261023 sections 5-6): the OR now sits on the MuxCase DEFAULT (the
+    // regfile-read leg, flop + regfile read), not after the MuxCase.  The old comment's "0 levels" was wrong for the
+    // tag bit: the OR was the last LUT of the lean57 worst path (LSU writeback -> regfile write-port bypass ->
+    // MuxCase -> OR -> exe_reg_rs1_secret).  Exact: MuxCase(d || v, cases) == MuxCase(d, cases) || v whenever no
+    // case is selected (the default leg is taken) or v = 0; the two differ only if a bypass case matches while the
+    // carried taint v is non-zero, which the invariant above excludes: dvL(k) clears when an x(8+k) writer commits,
+    // before the freed preg can be reallocated, renamed and bypassed, so a bypass hit names a younger preg.  Debug
+    // printf builds (Verilator; never FireSim/oracle builds, RULES D3) assert the invariant on every valid rrd uop.
+    // Levels: -1 on the bypass leg of the tag bits; the default leg gains the OR (flop-sourced, off the late path).
+    val vt1 = dbgVt(rrd_rs1_vm(w))
+    val vt2 = dbgVt(rrd_rs2_vm(w))
+    if (cfDbgPorts) {   // IFT on, integer register-read
+      if (numReadPorts > 0) bypassed_rs1_secret(w) := MuxCase(rrd_rs1_secret(w) || vt1(0), rs1_secret_cases)
+      if (numReadPorts > 1) bypassed_rs2_secret(w) := MuxCase(rrd_rs2_secret(w) || vt2(0), rs2_secret_cases)
+      if (numReadPorts > 0) bypassed_rs1_atk(w) := MuxCase(rrd_rs1_atk(w) || vt1(1), rs1_atk_cases)
+      if (numReadPorts > 1) bypassed_rs2_atk(w) := MuxCase(rrd_rs2_atk(w) || vt2(1), rs2_atk_cases)
+      if (numReadPorts > 0) bypassed_rs1_win(w) := MuxCase(rrd_rs1_win(w) | vt1(3, 2), rs1_win_cases)
+      if (numReadPorts > 1) bypassed_rs2_win(w) := MuxCase(rrd_rs2_win(w) | vt2(3, 2), rs2_win_cases)
+    } else {            // no carried taint (vt = 0): the pre-lean58 expressions, unchanged Verilog
+      if (numReadPorts > 0) bypassed_rs1_secret(w) := MuxCase(rrd_rs1_secret(w), rs1_secret_cases) || vt1(0)
+      if (numReadPorts > 1) bypassed_rs2_secret(w) := MuxCase(rrd_rs2_secret(w), rs2_secret_cases) || vt2(0)
+      if (numReadPorts > 0) bypassed_rs1_atk(w) := MuxCase(rrd_rs1_atk(w), rs1_atk_cases) || vt1(1)
+      if (numReadPorts > 1) bypassed_rs2_atk(w) := MuxCase(rrd_rs2_atk(w), rs2_atk_cases) || vt2(1)
+      if (numReadPorts > 0) bypassed_rs1_win(w) := MuxCase(rrd_rs1_win(w), rs1_win_cases) | vt1(3, 2)
+      if (numReadPorts > 1) bypassed_rs2_win(w) := MuxCase(rrd_rs2_win(w), rs2_win_cases) | vt2(3, 2)
+    }
+    if (cfDbgPorts && ENABLE_CF_DEBUG_PRINTF && !ENABLE_IFT_BRIDGE) {
+      val hit1 = rs1_secret_cases.map(_._1).reduce(_ || _)
+      val hit2 = rs2_secret_cases.map(_._1).reduce(_ || _)
+      if (numReadPorts > 0) assert(!(rrd_valids(w) && hit1 && vt1 =/= 0.U), "[F3DBGVT] bypass hit on a carried x8/x9 preg (rs1)")
+      if (numReadPorts > 1) assert(!(rrd_valids(w) && hit2 && vt2 =/= 0.U), "[F3DBGVT] bypass hit on a carried x8/x9 preg (rs2)")
+    }
     if (enableSFBOpt)     bypassed_pred_data(w) := MuxCase(rrd_pred_data(w), pred_cases)
   }
 
@@ -290,9 +345,12 @@ class RegisterRead(
     // corefuzzing: an operand carries taint only if the instruction actually READS
     // that operand from THIS register file.  Without these guards a stale prs index
     // leaks another register's taint (see the rtype note on the class parameters).
-    val rs1_reads_reg = rrd_uops(w).lrs1_rtype === rtype
-    val rs2_reads_reg = rrd_uops(w).lrs2_rtype === rtype
-    val rs3_reads_reg = rrd_uops(w).frs3_en
+    // [DBGFREEZE] patch 85 (b): a debug-mode uop reads no operand taint (data or window): no s_prop / atk, no
+    // cond_secret / cond_atk (window arm, FTQ secret / atk mark, br_atk mask), no STQ address / data taint, a clean
+    // result.  The guards gate TAINT only (data is untouched).  One more input on the existing guard LUTs.
+    val rs1_reads_reg = rrd_uops(w).lrs1_rtype === rtype && !dbg_rr
+    val rs2_reads_reg = rrd_uops(w).lrs2_rtype === rtype && !dbg_rr
+    val rs3_reads_reg = rrd_uops(w).frs3_en && !dbg_rr
     // [WINMEM] step 21 (owner r139, F2; replaces step 20's [MEMCOLLAPSE] / r136): memory keeps
     // the WINDOW kind.  Store operand data taint (rs*_secret/atk -> STQ addr_is_* / data_is_*)
     // is DATA-only again (-1 OR level); a store's window taint reaches the STQ through the uop
@@ -345,10 +403,10 @@ class RegisterRead(
       // on this register input; it feeds the window bits only, not the data path.
       val st_awin = if (numReadPorts > 0) Mux(rs1_reads_reg, bypassed_rs1_win(w), 0.U) else 0.U(2.W)
       val st_dwin = if (numReadPorts > 1) Mux(rs2_reads_reg, bypassed_rs2_win(w), 0.U) else 0.U(2.W)
-      exe_reg_uops(w).cf_opnd_wsec.foreach(_ := Mux(st_coll, st_awin(0), opnd_win(0)))
-      exe_reg_uops(w).cf_opnd_watk.foreach(_ := Mux(st_coll, st_awin(1), opnd_win(1)))
-      exe_reg_uops(w).cf_dwin_sec.foreach(_ := st_coll && st_dwin(0))
-      exe_reg_uops(w).cf_dwin_atk.foreach(_ := st_coll && st_dwin(1))
+      exe_reg_uops(w).cf_opnd_wsec.foreach(_ := false.B)   // [ONETAG] r205: no secret window kind
+      exe_reg_uops(w).cf_opnd_watk.foreach(_ := false.B)   // [ONETAGATK] r205 U8: no attacker window kind
+      exe_reg_uops(w).cf_dwin_sec.foreach(_ := false.B)    // [ONETAG] r205
+      exe_reg_uops(w).cf_dwin_atk.foreach(_ := false.B)    // [ONETAGATK] r205 U8
       when (opnd_win(0)) { exe_reg_uops(w).cf_secret_propagation.foreach(_ := true.B) }
       when (opnd_win(1)) { exe_reg_uops(w).cf_attacker_influence.foreach(_ := true.B) }
     if (enableSFBOpt)     exe_reg_pred_data(w) := bypassed_pred_data(w)
@@ -356,6 +414,21 @@ class RegisterRead(
   }
   // TODO add assert to detect bypass conflicts on non-bypassable things
   // TODO add assert that checks bypassing to verify there isn't something it hits rs3
+
+  // [DBGFREEZE] patch 85 (c): debug-mode capture of the program's x8 / x9 taint: the regfile taint (p0-masked, before
+  // bypass: the carried preg is never bypassed) of every valid operand read of a carried preg.  core.scala uses it
+  // only while the hart is in debug mode.  2 x 4 bits, each an OR over the operands: about 40 LUT.
+  if (cfDbgPorts) {
+    for (k <- 0 until 2) {
+      io.cf_dbg_cap.get(k) := (0 until issueWidth).flatMap { w =>
+        val n = numReadPortsArray(w)
+        (if (n > 0) Seq(Mux(rrd_valids(w) && rrd_uops(w).lrs1_rtype === rtype && rrd_rs1_vm(w)(k),
+                            Cat(rrd_rs1_win(w), rrd_rs1_atk(w), rrd_rs1_secret(w)), 0.U(4.W))) else Nil) ++
+        (if (n > 1) Seq(Mux(rrd_valids(w) && rrd_uops(w).lrs2_rtype === rtype && rrd_rs2_vm(w)(k),
+                            Cat(rrd_rs2_win(w), rrd_rs2_atk(w), rrd_rs2_secret(w)), 0.U(4.W))) else Nil)
+      }.foldLeft(0.U(4.W))(_ | _)
+    }
+  }
 
   //-------------------------------------------------------------
   // set outputs to execute pipelines

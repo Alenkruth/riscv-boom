@@ -141,6 +141,8 @@ class RobIo(
   // corefuzzing: cf_secret_transmission for stores, from LSU
   val lsu_clr_bsy_cf_stx    = Input(Vec(memWidth + 1, Bool()))
   val lsu_clr_bsy_cf_sprop  = Input(Vec(memWidth + 1, Bool()))
+  // [M7STATK] bundle61: the store's data / address attacker taint (lsu.scala cfStAtk), the twin of cf_sprop.  IFT only.
+  val lsu_clr_bsy_cf_atk    = if (ENABLE_IFT) Some(Input(Vec(memWidth + 1, Bool()))) else None
 
   // Port for unmarking loads/stores as speculation hazards..
   val lsu_clr_unsafe   = Input(Vec(memWidth, Valid(UInt(robAddrSz.W))))
@@ -211,6 +213,10 @@ class RobIo(
   // [MEMORD 2026-09-08] ty=8 MEM_ORDER edge from the LSU's order_fail sites.  See
   // CF_MemOrdUpdate in micro-op.scala for why the LDQ-resident edge cannot survive.
   val cf_lsu_memord_upd = Input(Vec(memWidth, Valid(new CF_MemOrdUpdate)))
+  // [RDEDGE] patch 80: the LSU's reader-side edge port (INFL_STL_PARTIAL, INFL_DC_BANKCONF), one registered
+  // update per cycle, op_count-guarded like MEM_ORDER.  It is sidecar memord port memWidth (one more C_memord
+  // column, merged with the MEM_ORDER columns by the same newest-two rule).  IFT only.
+  val cf_lsu_rdedge_upd = if (ENABLE_IFT) Some(Input(Valid(new CF_MemOrdUpdate))) else None
   // ([FIFO10] step 10, owner ruling 94: the Task 3.2 cf_lsu_dtlb_upd INFL_DTLB_STATE port is
   //  removed with the DTLB domain/secret shadows; paging is off, it could never fire.)
 
@@ -224,6 +230,11 @@ class RobIo(
   val cf_wsh_sec       = Input(new WinShadowInfo)
   val cf_wsh_atk       = Input(new WinShadowInfo)
   val cf_com_win_sec   = Output(Vec(coreWidth, Bool()))
+  // [ONETAG] r205: per retire lane, the committing record is secret (s_acc || s_prop || shadow; 0 in debug mode):
+  // the regfile late-secret set (core.scala)
+  val cf_com_sec       = if (ENABLE_IFT) Some(Output(Vec(coreWidth, Bool()))) else None
+  // [ONETAGATK] r205 U8: per retire lane, the committing record has atk (sticky atk || attacker shadow; 0 in debug)
+  val cf_com_atk       = if (ENABLE_IFT) Some(Output(Vec(coreWidth, Bool()))) else None
   val cf_com_win_atk   = Output(Vec(coreWidth, Bool()))
 
   // corefuzzing changes
@@ -240,6 +251,9 @@ class RobIo(
   // Driven unconditionally (zero when ENABLE_IFT_BRIDGE=false in BoomCoreParams).
   // core.scala gates them behind ENABLE_IFT_BRIDGE before forwarding to tile IO.
   val ift_priv            = Input(UInt(3.W))               // current privilege mode (from csr.io.status.prv)
+  // [DBGFREEZE] patch 85 (b): the hart is in debug mode (core.scala cf_dbg).  A commit record then has no labels and
+  // priv[2] = 1.  IFT only.
+  val cf_dbg              = if (ENABLE_IFT) Some(Input(Bool())) else None
   val ift_commit_valids   = Output(Vec(retireWidth, Bool())) // arch_valids
   val ift_commit_records  = Output(Vec(retireWidth, UInt(256.W)))
   // [THINUOP] Task 3.5: the IFT record fields that left the MicroOp, per retire slot, for the
@@ -459,7 +473,7 @@ class Rob(
   val lsuWbPorts  = Seq(0, 1) ++ (if (usingFPU) Seq(numWakeupPorts - 3, numWakeupPorts - 2) else Nil)
   val iftNSprob   = numWakeupPorts                               // the sidecar's sprobPorts
   val iftNIc      = io.cf_issue_contention_upd.length
-  val iftNMo      = memWidth
+  val iftNMo      = memWidth + 1   // [RDEDGE] patch 80: + the reader-edge port's column
   // Task 2.10d (review F7, ruling 63 Q2): the squash path's printf copies (IftSqDbg memories,
   // [FLUSH], [SQREC], [SQDROP], [SQRAW]) and the Verilator-only bit-exact shadow check of the
   // 4b record exist only in printf builds without the IFT bridge.  No FireSim bridge build
@@ -581,7 +595,7 @@ class Rob(
     // corefuzzing [SIDECAR] (IFT overhaul Phase 2, Task 2.2): IFT state for this bank moves
     // into a per-bank LUTRAM sidecar (RobIftBank, spec 5.1; D3, D15, D17, D19).  Once
     // Tasks 2.3/2.4 route the update ports and the readout, rob_uop keeps only op_count,
-    // domain and ras_pred_xdom; everything else lives in the sidecar columns or in the four
+    // domain ([RASEVERY]: ras_pred_xdom moved to C_disp); everything else lives in the sidecar columns or in the four
     // sticky bits below (same-cycle readers: shadow broadcast, head status, squash gate).
     // Task 2.3 routed every update port into the columns / sticky bits and deleted the
     // drains; Task 2.4 made the commit path read the sidecar (io.commit.uops(w).cf_* is
@@ -591,20 +605,20 @@ class Rob(
     // and deleted the old pending tables (sprob/ic/wb) with their last readers.  Task 2.6
     // moved the squash record and the [FLUSH] printf to the sidecar squash readout (tail-order
     // drain + rollback walk) and zeroes the rob_uop.cf_* copy at enqueue: rob_uop.cf_* is read
-    // only for op_count, domain and ras_pred_xdom (spec 5.1.1) when ENABLE_IFT.
+    // only for op_count and domain (spec 5.1.1; [RASEVERY] ras_pred_xdom is in C_disp) when ENABLE_IFT.
     // LSU-fed writeback ports: `lsuWbPorts` above the bank loop (Task 2.10d).
     // One op_count guard read port per guarded update port, in guardOk call order
     // (s_acc, br_atk_self, memord, s_tx, sprob); the require after the last call checks it.
     // ([FIFO10] step 10: the 2 DTLB guard ports are gone, 21 -> 19.)
     val sidecarGuardPorts = io.cf_lsu_s_acc_upd.length + io.cf_br_atk_self.length +
-                            io.cf_lsu_memord_upd.length +
+                            io.cf_lsu_memord_upd.length + io.cf_lsu_rdedge_upd.size +   // [RDEDGE] patch 80
                             io.cf_lsu_s_tx_upd.length + io.cf_s_prop_rob_upd.length
     // Rule 6.1/5: every new element is under ENABLE_IFT.  With IFT off the sidecar is not
     // elaborated and the readout fields below read as zero, so BaselineBoomConfig's Verilog
     // is unchanged (checked in Task 2.11).  Written as a Module inside `if (ENABLE_IFT)`
     // with its IO exposed through a wire so the rest of this file reads one name:
     val sidecar_io = Wire(new RobIftBankIO(numRobRows, numWakeupPorts, memWidth + 1, numWakeupPorts,
-                                           io.cf_issue_contention_upd.length, memWidth,
+                                           io.cf_issue_contention_upd.length, iftNMo,   // [RDEDGE] patch 80
                                            guardPorts = sidecarGuardPorts, lsuWbCount = lsuWbPorts.length))
     // Ruling 29 (Task 2.1 review; Phase 0 Bug 3): no DontCare on this wire.  Every field
     // gets an explicit zero/false default here; the real drivers follow (last connect wins).
@@ -617,8 +631,6 @@ class Rob(
     sidecar_io.sprob.foreach  { x => x.valid := false.B; x.bits := 0.U.asTypeOf(x.bits) }
     sidecar_io.ic.foreach     { x => x.valid := false.B; x.bits := 0.U.asTypeOf(x.bits) }
     sidecar_io.memord.foreach { x => x.valid := false.B; x.bits := 0.U.asTypeOf(x.bits) }
-    sidecar_io.ras.valid    := false.B
-    sidecar_io.ras.bits     := 0.U
     sidecar_io.guard_row.foreach(_ := 0.U)
     sidecar_io.guard_oc.foreach(_ := 0.U)
     sidecar_io.commit       := 0.U.asTypeOf(sidecar_io.commit)
@@ -631,7 +643,7 @@ class Rob(
     sidecar_io.sq_third     := false.B
     if (ENABLE_IFT) {
       val m = Module(new RobIftBank(numRobRows, numWakeupPorts, lsuWbPorts, memWidth + 1,
-                                    numWakeupPorts, io.cf_issue_contention_upd.length, memWidth,
+                                    numWakeupPorts, io.cf_issue_contention_upd.length, iftNMo,   // [RDEDGE] patch 80
                                     guardPorts = sidecarGuardPorts))
       m.io <> sidecar_io
     }
@@ -684,8 +696,9 @@ class Rob(
       // [SIDECAR] Task 2.2: dispatch writes the sidecar's dispatch column and the four
       // sticky bits.  Task 2.6 (ruling 38 amendment 1, deferred from Task 2.2): with the
       // [FLUSH] printf and the squash record now read from the sidecar squash readout, no
-      // rob_uop.cf_* reader is left except cf_op_count_id, cf_domain_id and cf_ras_pred_xdom
-      // (spec 5.1.1), so the row's copy of every other cf_* field is zeroed here and the
+      // rob_uop.cf_* reader is left except cf_op_count_id and cf_domain_id
+      // (spec 5.1.1; [RASEVERY]: cf_ras_pred_xdom now goes to C_disp below and is zeroed
+      // here), so the row's copy of every other cf_* field is zeroed here and the
       // flops fold away.  Under ENABLE_IFT only (ruling 5): with IFT off the sidecar does not
       // exist and the commit uop still carries the rob_uop copy, as before Phase 2.
       if (ENABLE_IFT) {
@@ -697,12 +710,14 @@ class Rob(
         rob_uop(rob_tail).cf_mem_dataflow_atk.foreach(_ := false.B)
         rob_uop(rob_tail).cf_mem_sec_dataflow.foreach(_ := false.B)
         rob_uop(rob_tail).cf_spec_branch_is_secret.foreach(_ := false.B)
+        rob_uop(rob_tail).cf_ras_pred_xdom.foreach(_ := false.B)   // [RASEVERY] read from C_disp
       }
       sidecar.io.enq.valid    := true.B
       sidecar.io.enq.bits.row  := rob_tail
       sidecar.io.enq.bits.oc   := io.enq_uops(w).cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
       sidecar.io.enq.bits.fu_bitmap := io.enq_uops(w).cf_fu_bitmap.getOrElse(0.U(numModules.W))
       sidecar.io.enq.bits.spec_branch_is_secret := io.enq_uops(w).cf_spec_branch_is_secret.getOrElse(false.B)
+      sidecar.io.enq.bits.ras_xdom := io.enq_uops(w).cf_ras_pred_xdom.getOrElse(false.B)   // [RASEVERY] -> C_disp
       sidecar.io.enq.bits.info := io.enq_ift(w)
       if (ENABLE_IFT) {
         sticky_s_acc(rob_tail)  := io.enq_uops(w).cf_secret_access.getOrElse(false.B)
@@ -781,8 +796,17 @@ class Rob(
           sidecar.io.clr(ci).valid          := true.B
           sidecar.io.clr(ci).bits.row       := cidx
           sidecar.io.clr(ci).bits.fu_bitmap := cf_bmap
+          // [STTY0] bundle61: the store's operand labels for its REG_DATAFLOW (ty0) edge (rob-ift-sidecar.scala IftMerge)
+          sidecar.io.clr(ci).bits.is_secret := cf_sprop
+          sidecar.io.clr(ci).bits.is_atk    := io.lsu_clr_bsy_cf_atk.get(ci)
+          // [FTQHOLD] as the writeback-column assert: the store clr_bsy column never carries sftq bits.
+          if (ENABLE_CF_DEBUG_PRINTF)
+            assert(!cf_bmap(3, 1).orR, "[rob] [FTQHOLD] a store clr_bsy column sets fu_bitmap bits 3..1 (reserved for sftq)")
           when (cf_stx)   { sticky_s_tx(cidx)   := true.B }
           when (cf_sprop) { sticky_s_prop(cidx) := true.B }
+          // [M7STATK] bundle61: the attacker twin (RULES A reading 4 / U8): one more set term on the row's sticky
+          // attacker bit, beside the existing ones (FF -> FF set path, +1 level at most on that short path).
+          when (io.lsu_clr_bsy_cf_atk.get(ci)) { sticky_atk(cidx) := true.B }
         }
         assert (rob_val(cidx) === true.B, "[rob] store writing back to invalid entry.")
         assert (rob_bsy(cidx) === true.B, "[rob] store writing back to a not-busy entry.")
@@ -848,7 +872,9 @@ class Rob(
       }
       // [MEMORD] the INFL_MEM_ORDER edge of the squashed load goes to this port's C_memord
       // column so it lands on the squash record.  Same bank-match + op_count guard.
-      for ((upd, mi) <- io.cf_lsu_memord_upd.zipWithIndex) {
+      // [RDEDGE] patch 80: the reader-edge port is handled exactly like a MEM_ORDER port (its own column, the same
+      // guard, the same R-STICKY sticky_atk / sticky_s_prop writes: +1 term on each per-row OR, still 2 levels [inf]).
+      for ((upd, mi) <- (io.cf_lsu_memord_upd ++ io.cf_lsu_rdedge_upd.toSeq).zipWithIndex) {
         val midx = GetRowIdx(upd.bits.rob_idx)
         val ok   = guardOk(midx, upd.bits.op_count_id)
         when (upd.valid && MatchBank(GetBankIdx(upd.bits.rob_idx)) && ok) {
@@ -868,18 +894,14 @@ class Rob(
           when (upd.bits.is_secret) { sticky_s_prop(midx) := true.B }
         }
       }
-      // [RASGATE doc 67 Part B] RAS cross-domain edge, MISPREDICT-GATED: raise
-      // INFL_RAS_STATE only when a ret whose RAS-predicted top was cross-domain
-      // (cf_ras_pred_xdom, set in fetch-buffer) actually mispredicts -- a real ret2spec.
-      // The entry (op_count 0, is_atk = the ret was fetched in the victim domain) is
-      // built at readout from the row's domain; only the arrival stamp is stored (C_ras).
-      when (io.brupdate.b2.mispredict && MatchBank(GetBankIdx(io.brupdate.b2.uop.rob_idx))) {
-        val ras_ridx = GetRowIdx(io.brupdate.b2.uop.rob_idx)
-        when (rob_val(ras_ridx) && rob_uop(ras_ridx).cf_ras_pred_xdom.getOrElse(false.B)) {
-          sidecar.io.ras.valid := true.B
-          sidecar.io.ras.bits  := ras_ridx
-        }
-      }
+      // [RASEVERY] owner 2026-10-21 (RULES.md A, "RAS edge"): the [RASGATE] (doc 67 Part B)
+      // b2.mispredict port is removed.  b2.mispredict for a JALR also fires on !next_val /
+      // cfi_idx mismatch with a CORRECT target (functional-unit.scala), so the gated edge was
+      // frontend-timing dependent.  Every ret with cf_ras_pred_xdom (cross-domain slot, or a
+      // victim ret on a stale slot) now carries INFL_RAS_STATE from its dispatch column
+      // (C_disp.ras_xdom, rob-ift-sidecar.scala IftMerge), committed or squashed, mispredicted
+      // or not.  The entry (op_count 0, is_atk = the ret was fetched in the victim domain) is
+      // still built at readout from the row's domain.
       // Gap 1 fix (DOC:23): direct s_tx update from LSU TLB stage -- a live preg_secret
       // check found a secret-tainted source address.  Same op_count_id guard.
       for (upd <- io.cf_lsu_s_tx_upd) {
@@ -1023,7 +1045,27 @@ class Rob(
       // [SIDECAR] reconstruct the record fields from the sidecar + sticky flags
       sidecar.io.commit.row    := com_idx
       sidecar.io.commit.domain := rob_uop(com_idx).cf_domain_id.getOrElse(0.U(iftTagWidth.W))
-      com_ift    := sidecar.io.commit_out
+      // [DBGFREEZE] patch 85 (b): a uop committing in debug mode (debug ROM, abstract command, program buffer) gets
+      // a record with no labels: no sticky flag, no influencer slot, no dropped/aliased count, no spec-branch flag.
+      // The sources are already clean (core.scala [DBGFREEZE]); this mask also covers the writeback-time labels of
+      // a debug load that read program memory (memory taint, STL forward, MEM_DATAFLOW / REG_DATAFLOW edges), which
+      // have no state behind them.  The same masked values feed the commit printf (io.commit.uops / commit_ift)
+      // and the bridge record, which is also marked priv[2] = 1 below.  Exact: while cf_dbg = 1 only debug-mode uops
+      // commit.  Cost: about 15 AND per lane on readout terms that end at the record flops (merged into the existing
+      // ORs where there is one); 0 levels on the regfile set ports (cf_com_win_* untouched: the window shadow is
+      // invalid in debug mode, its range dies on the entry flush and nothing arms).
+      val cdbg   = io.cf_dbg.get
+      val com_ci = WireInit(sidecar.io.commit_out)
+      when (cdbg) {
+        com_ci.influencer_list.foreach(_.valid := false.B)
+        com_ci.infl_dropped          := 0.U
+        com_ci.infl_oc_aliased       := false.B
+        com_ci.edge_atk              := false.B
+        com_ci.ce_repl.foreach(_ := false.B)   // [CEREPL] record bit [254]: no label in debug mode
+        com_ci.spec_branch_is_atk    := false.B
+        com_ci.spec_branch_is_secret := false.B
+      }
+      com_ift    := com_ci
       // [WINSHADOW] step 20: a committing entry in the window shadow range is in the window
       // [WINAGE] Phase 4 Task 4.3c (gate review C3, the ROB commit instance): the test no longer
       // reads the committing uop's rob_idx out of the rob_uop readout (com_idx mux -> 64:1 row
@@ -1052,9 +1094,12 @@ class Rob(
       val win_atk = io.cf_wsh_atk.inAge(cage) && rob_uop(com_idx).cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U
       io.cf_com_win_sec(w) := win_sec
       io.cf_com_win_atk(w) := win_atk
-      com_sticky := Cat(sticky_atk(com_idx) || win_atk, sticky_s_tx(com_idx),
-                        sticky_s_prop(com_idx) || win_sec, sticky_s_acc(com_idx))
-      applyIft(io.commit.uops(w), com_idx, sidecar.io.commit_out)
+      com_sticky := Mux(cdbg, 0.U, Cat(sticky_atk(com_idx) || win_atk, sticky_s_tx(com_idx),
+                                       sticky_s_prop(com_idx) || win_sec, sticky_s_acc(com_idx)))   // [DBGFREEZE]
+      io.cf_com_sec.get(w) := com_sticky(0) || com_sticky(1)   // [ONETAG] the record's s_acc || s_prop (|| win_sec), debug-masked
+      io.cf_com_atk.get(w) := com_sticky(3)                    // [ONETAGATK] the record's atk (|| win_atk), debug-masked
+      IftApply(io.commit.uops(w), sticky_s_acc(com_idx) && !cdbg, sticky_s_prop(com_idx) && !cdbg,
+               sticky_s_tx(com_idx) && !cdbg, sticky_atk(com_idx) && !cdbg, com_ci)   // [DBGFREEZE] (was applyIft)
       when (win_sec) { io.commit.uops(w).cf_secret_propagation.foreach(_ := true.B) }
       when (win_atk) { io.commit.uops(w).cf_attacker_influence.foreach(_ := true.B) }
       // [WINMEM] step 21 (owner r139, F2): a committing STORE in the shadow range is a window
@@ -1171,7 +1216,7 @@ class Rob(
       // set a pending bit in the same cycle.
       ift_sq_ptrrst_bank(w) := Mux(ift_rob_ptr_reset, PopCount(ift_squash_pending) - drain_emit.asUInt, 0.U)
       // Review Focus 3: a MEM_ORDER edge must land before the rollback walk reads its row
-      val memord_hits_rbk_row = io.cf_lsu_memord_upd.map(u => u.valid && MatchBank(GetBankIdx(u.bits.rob_idx)) &&
+      val memord_hits_rbk_row = (io.cf_lsu_memord_upd ++ io.cf_lsu_rdedge_upd.toSeq).map(u => u.valid && MatchBank(GetBankIdx(u.bits.rob_idx)) &&
                                                                GetRowIdx(u.bits.rob_idx) === com_idx).reduce(_ || _)
       assert(!(rbk_emit && memord_hits_rbk_row), "[rob] MEM_ORDER edge arrived in the rollback cycle of its row")
       // [FLUSH] printf (Task 2.10d, ruling 63 Q3): printed by IftSquashMerge from the shipped
@@ -1286,7 +1331,7 @@ class Rob(
             val fl_op_count = Mux(io.cf_mispredict_uop.valid,
               io.cf_mispredict_uop.bits.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)), 0.U)
             val robFlushInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d}"}.mkString(" ")
-            val robFlushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d fl_sec=%d floc=%d FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d pdst=%d prs1=%d prs2=%d rt1=%d rt2=%d brmask=0x%x brtag=%d abr=%d sbr=%d) $robFlushInflFmt\n"
+            val robFlushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d fl_sec=%d floc=%d FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d sftq=%d pdst=%d prs1=%d prs2=%d rt1=%d rt2=%d brmask=0x%x brtag=%d abr=%d sbr=%d) $robFlushInflFmt\n"
             // [THINUOP] Task 3.5: this IFT-off printf used to read the removed MicroOp IFT fields,
             // which are constant zero in an IFT-off build (only the fetch buffer ever wrote them,
             // with zeros), so it prints the same zeros from a zero IftCommitInfo.
@@ -1304,7 +1349,7 @@ class Rob(
               fu.cf_secret_access.getOrElse(false.B), fu.cf_secret_propagation.getOrElse(false.B), fu.cf_secret_transmission.getOrElse(false.B),
               fu.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)), fu_ift.spec_branch_is_atk, fu_ift.spec_branch_op_id,
               fl_cross_domain, fl_is_secret, fl_op_count,
-              fu.cf_fu_bitmap.getOrElse(0.U(numModules.W)), Mux(rbk_kill_i, 4.U, 3.U), inflBitmapFromList(fu_ift.influencer_list), fu_ift.infl_dropped, fu_ift.cntd_deny_count, fu_ift.stall_cycles_rob, fu_ift.stall_cycles_stq, fu_ift.infl_oc_aliased, fu.pdst, fu.prs1, fu.prs2, fu.lrs1_rtype, fu.lrs2_rtype,
+              fu.cf_fu_bitmap.getOrElse(0.U(numModules.W)), Mux(rbk_kill_i, 4.U, 3.U), inflBitmapFromList(fu_ift.influencer_list), fu_ift.infl_dropped, fu_ift.cntd_deny_count, fu_ift.stall_cycles_rob, fu_ift.stall_cycles_stq, fu_ift.infl_oc_aliased, 0.U /* [FTQHOLD] sftq: IFT off */, fu.pdst, fu.prs1, fu.prs2, fu.lrs1_rtype, fu.lrs2_rtype,
               // [BRMASK 2026-09-08] full speculation shadow + own tag; see core.scala
               br_mask, rob_uop(i).br_tag,
               fu_ift.atk_branch_ctr, fu_ift.sec_branch_ctr   // [GHISTFIELD]
@@ -1373,7 +1418,15 @@ class Rob(
     // Cost: 0 FF, 0 LUT (input swap); levels: the sidecar readout (2 LUT after the async row read) instead
     // of the sticky 64:1 read, into the same AND/OR -> cf_ff_atk flop: at most +1 on a flop-ending path.
     // IFT off: sidecar_io.commit_valatk is the constant-false default and the domain term is gated.
-    rob_head_ffatk(w)    := sidecar.io.commit_valatk ||
+    // [L15FFREC] lean59 (Fable audit 2026-10-23 L15; RULES A U8 "symmetric" with reading 2, C131u): the attacker
+    // label now also takes the retiring op's attacker RECORD (sticky_atk), as the secret label takes its record
+    // (rob_head_ffsec = sticky s_acc || s_prop): patch 63's value-only narrowing pre-dates the 10-20 one-tag
+    // reading, under which a record-tagged op's result carries the tag (registers already do: regfile WritePort
+    // takes uop.cf_attacker_influence).  Value taint and domain stay (a superset).  sticky_atk(rob_head) is the
+    // read rob_head_fatk_b already makes (firtool shares it): 0 FF, one more OR input; levels: max(sticky 64:1
+    // read, sidecar readout) + 0..1 into the same AND/OR -> cf_ff_atk flop.  IFT off: sticky_atk is the
+    // constant-false wire (stickyVec), so the Verilog is unchanged.  RECORD CHANGE (more attacker fflags taint).
+    rob_head_ffatk(w)    := sidecar.io.commit_valatk || sticky_atk(rob_head) ||
                             (ENABLE_IFT.B && rob_uop(rob_head).cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U)
     rob_head_uses_stq(w) := rob_uop(rob_head).uses_stq
     rob_head_uses_ldq(w) := rob_uop(rob_head).uses_ldq
@@ -1392,7 +1445,12 @@ class Rob(
     // write port or path into the ROB (r98).  sp_atk is value taint (taint_atk / window operand
     // taint of a domain-0 register write, not a line-borne load value), never a sticky summary, so
     // the stalled consumers' sticky atk can never feed it back (no chain, the r168a principle).
-    if (ENABLE_IFT && w == 0) rob_head_valatk_bank0 := sidecar.io.commit_valatk && rob_state =/= s_rollback
+    // [RECEDGE] r205 (RULES.md A reading 4, "Record summary for both"): the ROB-head attacker label for REG_PRESSURE /
+    // ROB_FULL is the head's attacker RECORD (sticky_atk, the read rob_head_fatk_b already makes) as well as its
+    // value taint, so the stalled uops chain like the secret side (rob_head_is_secret = s_acc || s_prop).  The
+    // fflags label (rob_head_ffatk) kept value taint here; lean59 [L15FFREC] adds the record to it as well.
+    // One OR on an existing read into the existing headReg flop: 0 added levels, 0 FF.
+    if (ENABLE_IFT && w == 0) rob_head_valatk_bank0 := (sidecar.io.commit_valatk && rob_state =/= s_rollback) || sticky_atk(rob_head)
     // [ROBHEAD] patch 58: per bank (bank 0 = the existing wires above)
     if (w == 0) {
       rob_head_oc_b(w)  := rob_head_oc_bank0
@@ -1403,7 +1461,7 @@ class Rob(
       rob_head_oc_b(w)  := io.commit.uops(w).cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
       rob_head_dom_b(w) := rob_uop(rob_head).cf_domain_id.getOrElse(0.U(iftTagWidth.W))
       rob_head_sec_b(w) := rob_head_ffsec(w)   // = sticky_s_acc(rob_head) || sticky_s_prop(rob_head)
-      if (ENABLE_IFT) rob_head_valatk_b(w) := sidecar.io.commit_valatk && rob_state =/= s_rollback
+      if (ENABLE_IFT) rob_head_valatk_b(w) := (sidecar.io.commit_valatk && rob_state =/= s_rollback) || sticky_atk(rob_head)   // [RECEDGE]
     }
     // [FTQFULL] patch 59: the bank's FULL head status.  Every term is an EXISTING read of this bank's head
     // entry: sticky_atk / the domain and rob_head_ffsec on the rob_head row (the [FFTAINT] reads: sticky atk,
@@ -1433,8 +1491,27 @@ class Rob(
     // logs).  Record-identical: each record is the same bits one cycle later, with its valid.
     // The squash lane gets the matching extra cycle in core.scala ([RECREG] there), so the
     // commit/squash order on the bridge token stream is unchanged.  Cost: retireWidth x 257 FF.
+    // [HW1BIT75] (owner ruling R-b, 2026-10-20; readerless-bridge-study.md HW1) record bit [75] := this
+    // lane's commit-time secret-window shadow bit, the win_sec above (= io.cf_com_win_sec(w), the inAge
+    // test whose only record effect so far was the OR into s_prop, bit [73]).  It tells the host that
+    // the record sat in the WINSHADOW range at commit, i.e. its s_prop is (at least) control-dependent,
+    // which a shadow member otherwise shows as a bare s_prop with no explaining slot and sbr = 0.
+    // Squash / kill records keep 0 (their packers use the default).  An invalid lane may carry a 1:
+    // it is event_type 0 and the driver drops it (D2a), as for every other field of that lane.
+    // Cost: the RECREG bit [75] of each lane (RegNext below) was constant 0 and is pruned; it becomes
+    // live: +1 FF per lane, 0 LUT (win_sec drives the flop D directly; bit [73] already gets
+    // win_sec through one OR).  Levels: win_sec -> D is one LUT shorter than the existing
+    // win_sec -> com_sticky(1) -> bit [73] -> D leg, so 0 added.  IFT off: the literal false.B, so
+    // the record (and the Verilog) is exactly as before.
+    // [DBGFREEZE] patch 85 (b): a debug-mode commit record also carries bit [75] = 0 (the shadow range is invalid in
+    // debug mode, its range dies on the entry flush and nothing arms; the AND makes the mask explicit, 1 LUT input).
+    val com_wsh = if (ENABLE_IFT) io.cf_com_win_sec(w) && !io.cf_dbg.get else false.B
+    // [DBGFREEZE] patch 85 (b): priv[2] = 1 marks a commit record of a debug-mode uop (the trace port's convention,
+    // core.scala io.trace priv = {debug, prv}).  Squash records keep priv[2] = 0: their drain can lag the halt, so
+    // the parser classifies them by PC (the Debug Module range 0x0-0xfff), see p4-85-author.md.
+    val com_priv = if (ENABLE_IFT) Cat(io.cf_dbg.get, io.ift_priv(1, 0)) else io.ift_priv
     val com_rec = uopToIFTBits(io.commit.uops(w), com_ift,
-      (com_sticky(0), com_sticky(1), com_sticky(2), com_sticky(3)), com_evt, io.ift_priv)
+      (com_sticky(0), com_sticky(1), com_sticky(2), com_sticky(3)), com_evt, com_priv, com_wsh)
     if (ENABLE_IFT) {
       io.ift_commit_valids(w)  := RegNext(io.commit.arch_valids(w), false.B)
       io.ift_commit_records(w) := RegNext(com_rec, 0.U)
@@ -1507,6 +1584,12 @@ class Rob(
           sidecar.io.wb(i).bits.row       := rob_row
           sidecar.io.wb(i).bits.edges     := io.wb_resps(i).bits.edges
           sidecar.io.wb(i).bits.fu_bitmap := wb_uop_i.cf_fu_bitmap.getOrElse(0.U(numModules.W))
+          // [FTQHOLD] FTQ plan T2 Step 1 (option A): fu bits 3..1 carry sftq and are written only by the dispatch column
+          // (core.scala masks the IQ / LSU copies).  A writeback column with any of them set would OR a wrong sftq into the
+          // record.  Simulation hard stop in IFT debug-printf builds only (no NoLog / FireSim Verilog change).
+          if (ENABLE_CF_DEBUG_PRINTF)
+            assert(!wb_uop_i.cf_fu_bitmap.getOrElse(0.U(numModules.W))(3, 1).orR,
+              "[rob] [FTQHOLD] a writeback column sets fu_bitmap bits 3..1 (reserved for sftq, dispatch column only)")
         }
       }
       val temp_uop = rob_uop(GetRowIdx(rob_idx))
@@ -1525,8 +1608,8 @@ class Rob(
 
     // [SCFWD] patch 40b (D17 sweep, phase4/patches/p4-40b-review.md): the commit readout is an
     // asynchronous read of columns written at the clock edge, so a column or sticky write in its
-    // row's commit cycle would be lost.  Only C_ras can do that (b2 vs a head-ready ret) and it
-    // is forwarded into the commit merge ([RASBYP], rob-ift-sidecar.scala).  For every other
+    // row's commit cycle would be lost.  Only C_ras could do that (b2 vs a head-ready ret, forwarded
+    // by [RASBYP]); [RASEVERY] removed C_ras (the RAS edge is written at dispatch).  For every other
     // port the write precedes the commit by at least one edge (proof per port in the report);
     // these checks make a later change that breaks it a hard stop.  Verilator printf builds
     // only (iftSqShadow: ENABLE_CF_DEBUG_PRINTF and no bridge), like the squash shadow check:

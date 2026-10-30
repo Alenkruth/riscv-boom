@@ -339,6 +339,22 @@ abstract class PipelinedFunctionalUnit(
     // [SEEDFIX] see the note at r_atk_alu.
     r_atk(0)    := io.req.bits.rs1_taint_atk || io.req.bits.rs2_taint_atk || io.req.bits.rs3_taint_atk ||  // [G3RS3ATK]
                    (io.req.bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U)
+    // [JALRSTX] F1 (owner 2026-10-22, "Do all the fixes"; r17 analysis): a jalr (ret included) whose TARGET register
+    // (rs1) carries the secret tag is an s_tx sink, the fetch-side twin of U3 (a load at a secret-derived address).
+    // Set when the jalr executes, on the resolving uop, so the ROB's existing writeback OR (rob.scala wb_resps ->
+    // sticky_s_tx) marks the row before any later kill: the commit record, the [FLUSH]/squash record of a killed
+    // (wrong-path) jalr and the bridge record all carry it.  rs1_secret is the register-read flop (data tag, the same
+    // bit as brinfo.cond_secret that arms [JALRWIN], core.scala).  Jump unit only (the only unit that executes a
+    // jalr); issue-slot.scala zeroes the incoming bit, so this bit was a constant 0 here before.
+    // Cost: +1 FF (this r_uops(0) bit, folded before), 1 LUT on two flops, +0 levels; in the ROB the jump unit's
+    // writeback port now drives its term of the sticky_s_tx set (it was constant 0).
+    // Not covered (no edge, as for [JALRWIN] the arm/no-arm differs only in the first case): a jalr whose older
+    // mispredicting branch resolves in the same cycle it executes (the kill drops its writeback; [JALRWIN] still
+    // arms from brinfos), and a jalr killed before it issues (its rs1 tag is never read).
+    if (isJmpUnit) {
+      r_uops(0).cf_secret_transmission.foreach(_ := io.req.bits.uop.cf_secret_transmission.getOrElse(false.B) ||
+                                                    (io.req.bits.uop.is_jalr && io.req.bits.rs1_secret))
+    }
     }
 
     // IFT LUT optimization: zero cf_* fields not read by the FU pipeline or by
@@ -958,7 +974,9 @@ abstract class IterativeFunctionalUnit(dataWidth: Int)(implicit p: Parameters)
   // [I3BUSYATK] (ruling 100, I-3) the occupant's attacker flag is its result attacker taint
   // (operand taint OR ownership, held in r_atk for the whole latency), not ownership alone:
   // a victim divide on attacker-chosen operands has attacker-chosen latency.  r_atk is a flop.
-  io.cf_fu_busy.bits.is_atk   := r_atk
+  // [RECEDGE] r205 (reading 4, "Record summary for both"): plus the occupant's attacker record summary (r_uop flop),
+  // the twin of is_sec's s_acc || s_prop below.  One LUT input, 0 levels.
+  io.cf_fu_busy.bits.is_atk   := r_atk || r_uop.cf_attacker_influence.getOrElse(false.B)
   // [R124GATE] IFT off: the port default (false) stands.
   if (ENABLE_IFT) io.cf_fu_busy.bits.is_sec := r_secret || r_uop.cf_secret_access.getOrElse(false.B) || r_uop.cf_secret_propagation.getOrElse(false.B)
 

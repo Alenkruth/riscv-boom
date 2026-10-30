@@ -53,7 +53,7 @@ import midas.targetutils.AutoCounterCoverModuleAnnotation
 import chisel3.experimental.annotate
 
 import boom.v3.common._
-import boom.v3.exu.{BrUpdateInfo, Exception, FuncUnitResp, CommitSignals, ExeUnitResp, SpecLdWakeup}
+import boom.v3.exu.{BrUpdateInfo, Exception, FuncUnitResp, CommitSignals, ExeUnitResp, SpecLdWakeup, WinShadowInfo}
 
 // fore corefuzzing - SpeculativePRintf and Sext
 import boom.v3.util.{BoolToChar, AgePriorityEncoder, IsKilledByBranch, GetNewBrMask, WrapInc, IsOlder, UpdateBrMask, SpeculativePrintf}
@@ -96,6 +96,9 @@ class BoomDCacheReq(implicit p: Parameters) extends BoomBundle()(p)
   // sec = cf_res_esec}; when 0 it is {atk=0, sec=1} as in step 15.  D$-internal; LSU drives 0.
   val cf_res_atk  = if (ENABLE_IFT) Some(Bool()) else None
   val cf_res_esec = if (ENABLE_IFT) Some(Bool()) else None
+  // [CEREPL] lean59: the edge's PC (cf_res_pc, from the D$ eviction record) names the access that last advanced the
+  // set's replacement state, not the evicting access (dcache.scala [CEREPL]).  D$-internal; LSU drives 0.
+  val cf_res_repl = if (ENABLE_IFT) Some(Bool()) else None
 }
 
 class BoomDCacheResp(implicit p: Parameters) extends BoomBundle()(p)
@@ -111,6 +114,7 @@ class BoomDCacheResp(implicit p: Parameters) extends BoomBundle()(p)
   val cf_res_pc = if (ENABLE_IFT) Some(UInt(inflPcBitsCF.W)) else None
   val cf_res_atk  = if (ENABLE_IFT) Some(Bool()) else None   // [ATKEVICT] step 17, as in BoomDCacheReq
   val cf_res_esec = if (ENABLE_IFT) Some(Bool()) else None
+  val cf_res_repl = if (ENABLE_IFT) Some(Bool()) else None   // [CEREPL] as in BoomDCacheReq
   // IFT overhaul Task 3.2 (D16): the D$ edges of this response (CACHE_EVICTION,
   // MEM_DATAFLOW), built on a zero base.  Zero on every MSHR/uncached response.
   val edges = new IftEdgeList
@@ -143,6 +147,10 @@ with CoreFuzzingConstants
   val cf_nack_mshr = if (ENABLE_IFT) Some(Flipped(Vec(memWidth, Bool()))) else None
   // [NACKCONF] patch 68 (V12): lane w's CONFLICTING MSHR(s) hold an attacker-influenced request (mshrs.scala)
   val cf_nack_aatk = if (ENABLE_IFT) Some(Flipped(Vec(memWidth, Bool()))) else None
+  // [NACKCONFSEC] lean58 (M8): lane w's CONFLICTING MSHR(s) hold a secret-address / secret-fill request (mshrs.scala)
+  val cf_nack_asec = if (ENABLE_IFT) Some(Flipped(Vec(memWidth, Bool()))) else None
+  // [RDEDGE] patch 80: lane w's nack was a data-array bank conflict with a TAGGED older lane (dcache.scala)
+  val cf_bank_nack = if (ENABLE_IFT) Some(Flipped(Vec(memWidth, Valid(new CF_BankNack)))) else None
 
   val brupdate     = Output(new BrUpdateInfo)
   val exception    = Output(Bool())
@@ -195,9 +203,18 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   val no_pending_mem  = Output(Bool()) // No outstanding memory requests
   // Pulse to reset LSQ pointers to 0 on quiesce drain (queues are empty at this point)
   val cf_lsq_quiesce_reset = Input(Bool())
-  // [LSQWCLR] patch 64 (V7): the attacker window CLOSED this cycle (core win_atk_close, the pulse that
-  // flash-clears the register files' watk).  IFT only.
-  val cf_wclr_atk = if (ENABLE_IFT) Some(Input(Bool())) else None
+  // [ONETAGATK] r205 U8: the patch-64 close pulse (cf_wclr_atk) is removed; the attacker window shadow range is the
+  // twin of cf_wsh_sec below (attacker shadow loads mark the lines they fill).
+  val cf_wsh_atk  = if (ENABLE_IFT) Some(Input(new WinShadowInfo)) else None
+  // [FILLSEC] r205 (RULES.md A reading 3): the secret window shadow range (core.scala wsh_sec), so a load dispatched
+  // before the arming branch resolved but issued after it is an s_prop load for its D$ fill.
+  val cf_wsh_sec  = if (ENABLE_IFT) Some(Input(new WinShadowInfo)) else None
+  // [F1WSH] lean58 timing F1 (timing-audit-20261023 section 6): per lane, the window-shadow membership of the uop on
+  // io.core.exe(w).iresp (cf_wsh_sec / cf_wsh_atk .in(rob_idx)), computed per response candidate (D$ load, AMO,
+  // store-to-load forward) and selected by the same when-branches as the iresp uop, so the core's memory write ports
+  // no longer run in() (two 8-bit IsOlder carry chains) AFTER the late LSU response select.  Exact: see lsu.scala.
+  val cf_resp_wsec = if (ENABLE_IFT) Some(Output(Vec(memWidth, Bool()))) else None
+  val cf_resp_watk = if (ENABLE_IFT) Some(Output(Vec(memWidth, Bool()))) else None
 
   val ldq_full    = Output(Vec(coreWidth, Bool()))
   val stq_full    = Output(Vec(coreWidth, Bool()))
@@ -245,6 +262,8 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   val cf_secret_ftq_updates = Output(Vec(memWidth, Valid(UInt(log2Ceil(ftqSz).W))))
   // [MEMORD 2026-09-08] ty=8 MEM_ORDER edge -> ROB, so it survives the order-fail flush.
   val cf_memord_upd = Output(Vec(memWidth, Valid(new CF_MemOrdUpdate)))
+  // [RDEDGE] patch 80: reader-side edges (INFL_STL_PARTIAL, INFL_DC_BANKCONF) -> ROB, one registered update per cycle
+  val cf_rdedge_upd = if (ENABLE_IFT) Some(Output(Valid(new CF_MemOrdUpdate))) else None
   // Task 3.2 (D14): INFL_DTLB_STATE edge from the TLB stage straight to the ROB row
   // corefuzzing: direct ROB s_acc update at TLB stage — sets cf_secret_access in the ROB entry
   // immediately when the effective address is found to be in the secret range, without waiting
@@ -283,6 +302,9 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   // s_prop=0 while every other chain member was tagged.  clr_bsy is the path stores DO
   // use, so carry it there (mirrors clr_bsy_cf_stx).
   val clr_bsy_cf_sprop  = Output(Vec(memWidth + 1, Bool()))
+  // [M7STATK] bundle61: the attacker twin of the store s_prop carried on clr_bsy (cfStAtk: data or address operand
+  // attacker taint).  IFT only.
+  val clr_bsy_cf_atk    = if (ENABLE_IFT) Some(Output(Vec(memWidth + 1, Bool()))) else None
 
   // Speculatively safe load (barring memory ordering failure)
   val clr_unsafe      = Output(Vec(memWidth, Valid(UInt(robAddrSz.W))))
@@ -341,6 +363,8 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   // corefuzzing: secret address range from CSRs for cf_secret_access detection
   val cf_secret_start_addr = Input(UInt(coreMaxAddrBits.W))
   val cf_secret_end_addr   = Input(UInt(coreMaxAddrBits.W))
+  // [DBGFREEZE] patch 85 (b): the hart is in debug mode (core.scala cf_dbg, a flop); no s_acc then.  IFT only.
+  val cf_dbg               = if (ENABLE_IFT) Some(Input(Bool())) else None
 }
 
 class LSUIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
@@ -412,14 +436,16 @@ class STQEntry(implicit p: Parameters) extends BoomBundle()(p)
   // the D$ store metadata and give a forwarded load window taint; a reload never re-arms.
   // Stamped with the store's dispatch epoch (uop.cf_wep_*).  4 FF per entry.
   // [R124GATE2] patch 27 (r124/B51): None without ENABLE_IFT (writers foreach, readers getOrElse).
-  val addr_is_wsec        = if (ENABLE_IFT) Some(Bool()) else None
-  val addr_is_watk        = if (ENABLE_IFT) Some(Bool()) else None
-  val data_is_wsec        = if (ENABLE_IFT) Some(Bool()) else None
-  val data_is_watk        = if (ENABLE_IFT) Some(Bool()) else None
-  // corefuzzing: was this store's ADDRESS inside the secret range?  Recorded at TLB
-  // time so the s_tx decision can be made later, at clr_bsy, when the DATA is known.
-  // [R124GATE] patch 26 (ruling 124): None without ENABLE_IFT (s_tx bookkeeping only).
-  val addr_in_secret      = if (ENABLE_IFT) Some(Bool()) else None
+  // [ONETAG] r205 (RULES.md A reading 2, one secret tag): the secret window kinds are removed (2 FF per STQ entry).
+  // A window-derived operand is already secret DATA (the regfile's one tag), so addr_is_secret / data_is_secret
+  // carry it; the store's membership / record goes to its D$ doubleword through the commit-time record bit below.
+  val addr_is_wsec: Option[Bool] = None
+  val addr_is_watk: Option[Bool] = None   // [ONETAGATK] r205 U8: no attacker window kind (-1 FF per STQ entry)
+  val data_is_wsec: Option[Bool] = None
+  val data_is_watk: Option[Bool] = None   // [ONETAGATK] (-1 FF per STQ entry)
+  // [SACCU] owner 2026-10-21 (RULES.md A, one s_acc definition): addr_in_secret (1 FF per entry) is retired.
+  // "Was this store's ADDRESS inside the secret range" is now the entry uop's cf_secret_access, which the
+  // TLB stage sets from is_secret_lsq for every LSQ op (plain stores included); its readers moved to that bit.
   // [MEMORDATK] patch 42: the store's DISPATCH-time attacker summary (dis_uops.cf_attacker_influence:
   // attacker packet / fetch edge, dispatch edge, attacker-window membership).  The entry uop's own
   // cf_attacker_influence stays zeroed (Change 8: the commit request and the AMO response read it).
@@ -618,7 +644,13 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       //   cf_fu_bitmap (set above, merged at TLB+commit).  Task 3.2: the influencer list,
       //   cf_infl_dropped and cf_infl_oc_aliased are zeroed too (below).
       // rob_uop holds the dispatch-time IFT state independently.
-      ldq(ld_enq_idx).bits.uop.cf_attacker_influence.foreach(_ := false.B)
+      // [ATKSEED] r205-10b (t206, 2026-10-20): cf_attacker_influence is now PRESERVED (the dispatch record value,
+      // window membership and promotions included: the same io.core.dis_uops bit the STQ keeps as cf_dis_atk), the
+      // twin of cf_secret_propagation.  Readers that assumed it: the load response uop (ldq_base_cf -> the r205-8
+      // [ONETAGATK] writeback tag of the load's result), cfLdAtk on the wakeup / retry D$ request (fill marks) and
+      // the r205-5 [RECEDGE] LDQ head attacker bit.  Before this they read constant 0 here.  Cost: 1 FF per LDQ entry
+      // (numLdqEntries) and its bit on the existing entry read muxes.  Levels: the D input is the same dispatch bit
+      // the STQ's cf_dis_atk flop takes: 0 added.
       ldq(ld_enq_idx).bits.uop.cf_spec_branch_is_secret.foreach(_ := false.B)
       // Task 3.2 (D16): nothing in the LSU reads a uop list any more (the D$ and STL edges
       // travel on the response, MEM_ORDER and DTLB go to the ROB as messages), so the LDQ
@@ -664,7 +696,6 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       stq(st_enq_idx).bits.addr_is_watk.foreach(_ := false.B)
       stq(st_enq_idx).bits.data_is_wsec.foreach(_ := false.B)
       stq(st_enq_idx).bits.data_is_watk.foreach(_ := false.B)
-      stq(st_enq_idx).bits.addr_in_secret.foreach(_ := false.B)
       stq(st_enq_idx).bits.cf_dis_atk.foreach(_ := io.core.dis_uops(w).bits.cf_attacker_influence.getOrElse(false.B))   // [MEMORDATK]
       stq(st_enq_idx).bits.data.valid := false.B
       stq(st_enq_idx).bits.committed  := false.B
@@ -704,17 +735,23 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   io.core.stq_head_domain    := headReg(Mux(stq(stq_head).valid, stq(stq_head).bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)), 0.U))
   io.core.ldq_head_is_secret := headReg(Mux(ldq(ldq_head).valid,
     ldq(ldq_head).bits.uop.cf_secret_access.getOrElse(false.B) || ldq(ldq_head).bits.uop.cf_secret_propagation.getOrElse(false.B), false.B))
-  // [STSACC] patch 52: the store's s_acc is its entry's addr_in_secret (registered at the TLB
-  // stage, cleared at enqueue), not uop.cf_secret_access (set for AMOs only; see is_secret_lsq).
-  // For an STQ entry uop.cf_secret_access implies addr_in_secret, so this is a superset: a
-  // one-bit entry-mux input swapped for another, 0 added levels.
+  // [STSACC] patch 52 / [SACCU] 2026-10-21: the store's s_acc is its entry uop's cf_secret_access, now set at the
+  // TLB stage for every in-range LSQ op (was the separate addr_in_secret; same value, same entry mux, 0 levels).
   io.core.stq_head_is_secret := headReg(Mux(stq(stq_head).valid,
-    stq(stq_head).bits.addr_in_secret.getOrElse(false.B) || stq(stq_head).bits.uop.cf_secret_propagation.getOrElse(false.B), false.B))
+    stq(stq_head).bits.uop.cf_secret_access.getOrElse(false.B) || stq(stq_head).bits.uop.cf_secret_propagation.getOrElse(false.B), false.B))
   // [MEMORDATK] patch 42: address attacker taint of the heads (2 FF; the same entry mux as the bits above)
+  // [RECEDGE] r205 (RULES.md A reading 4; owner option "Record summary for both"): the attacker head label is the
+  // head's attacker RECORD summary known here (the entry uop's cf_attacker_influence: dispatch seed, window,
+  // promotions; the STQ's dispatch summary cf_dis_atk) as well as its address taint, exactly as the secret head
+  // bit uses the record s_acc || s_prop: a uop stalled behind it gets atk, and so do the uops stalled behind that
+  // one (chains, as on the secret side).  Two more leaves on the same head-entry mux, into the existing headReg
+  // flop: 0 added levels, 0 FF.
   io.core.ldq_head_atk.foreach(_ := headReg(ldq(ldq_head).valid &&
-    (ldq(ldq_head).bits.addr_is_atk.getOrElse(false.B) || ldq(ldq_head).bits.uop.cf_opnd_watk.getOrElse(false.B))))
+    (ldq(ldq_head).bits.addr_is_atk.getOrElse(false.B) || ldq(ldq_head).bits.uop.cf_opnd_watk.getOrElse(false.B) ||
+     ldq(ldq_head).bits.uop.cf_attacker_influence.getOrElse(false.B))))
   io.core.stq_head_atk.foreach(_ := headReg(stq(stq_head).valid &&
-    (stq(stq_head).bits.addr_is_atk.getOrElse(false.B) || stq(stq_head).bits.addr_is_watk.getOrElse(false.B))))
+    (stq(stq_head).bits.addr_is_atk.getOrElse(false.B) || stq(stq_head).bits.addr_is_watk.getOrElse(false.B) ||
+     stq(stq_head).bits.cf_dis_atk.getOrElse(false.B) || stq(stq_head).bits.uop.cf_attacker_influence.getOrElse(false.B))))
   io.core.ldq_head_valid     := headReg(ldq(ldq_head).valid)
   io.core.stq_head_valid     := headReg(stq(stq_head).valid)
   // [HOLFIX] `succeeded` = the D$ has acked; until then the head holds the line.
@@ -1118,10 +1155,21 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // corefuzzing: uop copies with dtlbTagCF bit set and cf_secret_access detected via physical address
   // Two-stage wire pattern avoids combinational cycle: Stage 1 = base mods, Stage 2 = influencer.
   val exe_tlb_uop_cf = Wire(Vec(memWidth, new MicroOp()))
-  // corefuzzing: `in_secret` is computed inside the TLB-stage loop below, but the STQ
-  // address write lives in a LATER, separate for(w) block.  Export it per-way so the
-  // store can record whether its ADDRESS landed in the secret range (Case A).
-  val exe_tlb_in_secret = Wire(Vec(memWidth, Bool()))
+  // [FILLSEC] r205 (RULES.md A reading 3: "a line filled by a secret or s_prop load becomes secret"): a LOAD's D$
+  // request carries its s_prop as known at issue (dispatch-time window membership, fetch-state / stall edges,
+  // operand taint) OR window-shadow membership (dispatched before the arming branch resolved, in the range now).
+  // The D$ reads it only for loads, to mark the line its MSHR FILLS (dcache.scala [FILLSEC]); the D$ response
+  // brings it back to the writeback, where the regfile tag already takes the same terms (regfile.scala [ONETAG]).
+  // Levels: rob_idx flop -> 2 x 8-bit IsOlder -> OR -> the D$ s1 request flop (off the address / index path).
+  // Residual (under-taint, OPEN O6): a shadow load that reached the D$ BEFORE its branch resolved fills unmarked.
+  def cfLdSprop(u: MicroOp): Bool = u.cf_secret_propagation.getOrElse(false.B) ||
+                                    io.core.cf_wsh_sec.map(_.in(u.rob_idx)).getOrElse(false.B)
+  // [ONETAGATK] r205 U8: the attacker twin: a load's D$ request carries its attacker record known at issue OR attacker
+  // shadow membership; the D$ marks the line its MSHR fills (dcache.scala [ONETAGATK]).
+  def cfLdAtk(u: MicroOp): Bool = u.cf_attacker_influence.getOrElse(false.B) ||
+                                  io.core.cf_wsh_atk.map(_.in(u.rob_idx)).getOrElse(false.B)
+  // [SACCU] 2026-10-21: exe_tlb_in_secret (the per-way export for addr_in_secret) is retired; the STQ entry
+  // takes the in-range fact through exe_tlb_uop_cf(w).cf_secret_access (is_secret_lsq) like every other LSQ op.
   // [WAKESEC] is_secret_load exported per way for the load-hit speculative wakeup.
   val exe_tlb_secret_load = Wire(Vec(memWidth, Bool()))
   // [RESID] step 15: the address operand's own taint per way, for the D$ request (cf_addr_sec).
@@ -1131,7 +1179,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     // Stage 1: bitmap + secret_access, based on exe_tlb_uop (register-backed, no feedback)
     val uop_tlb_base = WireInit(exe_tlb_uop(w))
     uop_tlb_base.cf_fu_bitmap.foreach(_ := exe_tlb_uop(w).cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << dtlbTagCF.U))
-    val secret_range_valid = io.core.cf_secret_end_addr =/= io.core.cf_secret_start_addr
+    // [DBGFREEZE] patch 85 (b): a debug-mode access (fesvr reading or writing program memory through the program
+    // buffer) is never a secret access: no s_acc, no FTQ secret mark, no secret D$ / MSHR / DTLB mark, no STQ
+    // addr_in_secret.  One input on the range-valid LUT (CSR flops): 0 levels on the TLB-stage compare.
+    val secret_range_valid = io.core.cf_secret_end_addr =/= io.core.cf_secret_start_addr && !io.core.cf_dbg.getOrElse(false.B)
     // Use virtual address for secret-range check: CSRs hold virtual addresses, and on a TLB miss
     // exe_tlb_paddr has invalid page-frame bits (0 from resp.paddr on miss), so physical comparison
     // would always be false for speculative loads that never committed a TLB fill.
@@ -1150,7 +1201,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     // [STSACC] patch 52 (owner 10-17; RULES A "s_acc = an access whose address lies in the
     // secret range ... on every LSQ access"): the s_acc SUMMARY is every LSQ op whose address is
     // in the range, stores included (a store there is a secret access, never s_tx by itself).
-    // Only the ROB message below takes it.  is_secret_rd stays on the uop bit (LDQ/STQ copies)
+    // (Superseded for the uop bit by [SACCU] below.)  Only the ROB message below takes it.  is_secret_rd stays on the uop bit (LDQ/STQ copies)
     // and on the FTQ mark: the STQ uop's cf_secret_access is also the D$ store-meta value mark
     // (dcache st_sec), the MSHR refill line mark (cf_req_secret) and the STL-forward value
     // secret, so setting it for a clean store would make that store mark lines and hand out
@@ -1159,12 +1210,39 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     // registered addr_in_secret instead.  uses_stq replaces is_amo (an AMO has uses_stq=1):
     // same AND/OR shape, same exe_tlb_uop mux arrival, 0 added levels.  sfence (uses_ldq =
     // uses_stq = 0) and hella (NullMicroOp) stay excluded, as before.
+    // [STADDR] patch 73 (owner 2026-10-19): "never s_tx by itself" above is about an address IN the secret range.
+    // A store whose address is secret-DERIVED (addr_is_secret) is now s_tx, decided at clr_bsy (cfStTx below).
     val is_secret_lsq  = in_secret && (exe_tlb_uop(w).uses_ldq || exe_tlb_uop(w).uses_stq)
     exe_tlb_secret_load(w) := is_secret_load
-    uop_tlb_base.cf_secret_access.foreach(_ := exe_tlb_uop(w).cf_secret_access.getOrElse(false.B) || is_secret_rd)
+    // [SACCU] owner 2026-10-21 (RULES.md A "s_acc / cf_secret_access": the uop bit and the record s_acc are ONE
+    // definition; every LSQ access (load, store, AMO) whose address is in the secret range sets both).  The uop
+    // bit now takes is_secret_lsq, the same wire as the ROB message below (was is_secret_rd).  It differs only for
+    // a plain store (uses_stq && !is_amo); loads and AMOs are unchanged.  What the patch-52 note above guarded:
+    //   - D$ store-meta (dcache st_sec = s_prop || s_acc): no change, the commit request's s_prop already carries
+    //     the store's record s_acc through cf_win_sec (r205 S-a, below); U1/O4 "a store tags its doubleword".
+    //   - MSHR refill line mark / op_count adoption (cf_req_secret): gated with isRead in mshrs.scala [SACCU], so
+    //     a plain in-range store that misses still marks only its own doubleword (at its rpq replay), never the
+    //     whole filled line.
+    //   - STL forward (stl_store_is_secret): the forwarding load overlaps the store, so it is in range itself and
+    //     its value was already secret (fwd_sacc); the change is the STL_FORWARD edge sec label (U2: the store's
+    //     record summary labels the edge).
+    // The FTQ mark below stays on is_secret_rd (loads/AMOs).  Levels: one LUT input swapped (is_amo -> uses_stq,
+    // the ROB-message term already built from the same exe_tlb_uop flops): 0 added levels, 0 FF.
+    uop_tlb_base.cf_secret_access.foreach(_ := exe_tlb_uop(w).cf_secret_access.getOrElse(false.B) || is_secret_lsq)
     // corefuzzing: TLB-stage FTQ update — mark this fetch packet as secret as soon as s_acc is known.
     // Fires speculatively (even for squashed memory ops) to capture transient secret access flows.
-    io.core.cf_secret_ftq_updates(w).valid := exe_tlb_valid(w) && is_secret_rd
+    // [L12FTQLIVE] lean59 (Fable audit 2026-10-23 L12): the mark is sent only for a uop that is still LIVE this cycle
+    // (not killed by this cycle's branch mispredict mask, no flush), the same kill terms as the mem_xcpt_valids
+    // above.  Then every FTQ mark names the entry of a live, uncommitted uop, which the FTQ cannot have
+    // re-enqueued (an entry is re-enqueued only after a redirect beyond it, which kills every uop in it, or after
+    // it retired), so neither the FTQ bit nor the RAS late mark (cf_ras_secret_upd) can land on another packet,
+    // independent of the frontend refetch latency.  "Speculatively" still holds for wrong-path ops that are not
+    // yet known dead (unchanged); only the kill cycle's mark is dropped.  Levels: the kill reduce (brupdate
+    // replica flops, 2-3 LUT) is shallower than the 40-bit in_secret compares it joins at the final AND: 0 added
+    // levels on the exe_tlb -> FTQ ram path.  Cost: ~1 LUT per lane (the kill terms are already built above;
+    // firtool shares them).  IFT off: the port is unread (frontend IFT-only), so nothing changes.  RECORD CHANGE.
+    io.core.cf_secret_ftq_updates(w).valid := exe_tlb_valid(w) && is_secret_rd &&
+                                              !io.core.exception && !IsKilledByBranch(io.core.brupdate, exe_tlb_uop(w))
     io.core.cf_secret_ftq_updates(w).bits  := exe_tlb_uop(w).ftq_idx
     // Direct ROB update: set s_acc immediately when address lands in secret range.
     // op_count_id is included to guard against ROB slot reuse: if this TLB-stage
@@ -1173,8 +1251,14 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     // [FIFO10] step 10 (R-STICKY): a LOAD's issue-path attacker / s_prop flags ride the same
     // message, so a load squashed before writeback keeps them (stores excluded: a committed store
     // never takes its address taint into these bits either, clr_bsy carries only its data taint).
-    val tlb_ld_atk   = exe_tlb_uop(w).uses_ldq && exe_tlb_uop(w).cf_attacker_influence.getOrElse(false.B)
-    val tlb_ld_sprop = exe_tlb_uop(w).uses_ldq && exe_tlb_uop(w).cf_secret_propagation.getOrElse(false.B)
+    // [M7STATK] bundle61 (parity with [M7STSP] below): the uses_ldq gate is dropped, so a STORE's issue-time attacker
+    // summary rides this message too and a store killed before clr_bsy keeps it in its squash record.  (Comment above
+    // "stores excluded" is superseded: the store's data / address attacker taint now also reaches the ROB at clr_bsy,
+    // [M7STATK] cfStAtk.)  One LUT input less: 0 levels.  RECORD CHANGE.
+    val tlb_ld_atk   = exe_tlb_uop(w).cf_attacker_influence.getOrElse(false.B)
+    // [M7STSP] lean58: the s_prop flag rides this message for stores too (the uses_ldq gate is dropped), so a store
+    // killed before clr_bsy keeps its issue-time s_prop in its squash record, as a load does.  RECORD CHANGE.
+    val tlb_ld_sprop = exe_tlb_uop(w).cf_secret_propagation.getOrElse(false.B)
     // [STSACC] patch 52: is_secret_lsq (was is_secret_rd) on valid and s_acc; ROB side unchanged.
     io.core.cf_s_acc_rob_upd(w).valid               := exe_tlb_valid(w) && (is_secret_lsq || tlb_ld_atk || tlb_ld_sprop)
     io.core.cf_s_acc_rob_upd(w).bits.rob_idx        := exe_tlb_uop(w).rob_idx
@@ -1199,7 +1283,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     val data_reg_secret  = exe_tlb_uop(w).cf_secret_propagation.getOrElse(false.B) || prs1_live_secret || prs2_live_secret
     // s_tx Case A: store carrying secret-dependent data to a non-secret memory address.
     //   The secret escapes to attacker-accessible memory (anything outside the secret range).
-    exe_tlb_in_secret(w) := in_secret
+    // [SACCU] (exe_tlb_in_secret retired: the STQ entry takes in_secret through its uop cf_secret_access)
     // s_tx Case B: load where the effective address is derived from secret-propagated data
     //   AND the address is outside the secret range (attacker-accessible memory).
     //   The secret controls which non-secret memory location is accessed, leaking it via address
@@ -1353,6 +1437,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     dmem_req(w).bits.cf_res_v.foreach(_ := false.B)
     dmem_req(w).bits.cf_res_atk.foreach(_ := false.B)   // [ATKEVICT] D$-internal
     dmem_req(w).bits.cf_res_esec.foreach(_ := false.B)
+    dmem_req(w).bits.cf_res_repl.foreach(_ := false.B)   // [CEREPL] D$-internal (a nack edge is never replacement-state)
     dmem_req(w).bits.cf_res_pc.foreach(_ := 0.U)
 
     io.dmem.s1_kill(w) := false.B
@@ -1362,6 +1447,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w)
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
       dmem_req(w).bits.uop   := exe_tlb_uop_cf(w) // corefuzzing: use IFT-tagged uop
+      dmem_req(w).bits.uop.cf_secret_propagation.foreach(_ := cfLdSprop(exe_tlb_uop_cf(w)))   // [FILLSEC]
+      dmem_req(w).bits.uop.cf_attacker_influence.foreach(_ := cfLdAtk(exe_tlb_uop_cf(w)))      // [ONETAGATK]
       dmem_req(w).bits.cf_addr_sec.foreach(_ := exe_tlb_addr_sec(w))   // [RESID]
       dmem_req(w).bits.cf_addr_atk.foreach(_ := exe_tlb_addr_atk(w))   // [ATKRES]
 
@@ -1372,6 +1459,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w)
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
       dmem_req(w).bits.uop   := exe_tlb_uop_cf(w) // corefuzzing: use IFT-tagged uop
+      dmem_req(w).bits.uop.cf_secret_propagation.foreach(_ := cfLdSprop(exe_tlb_uop_cf(w)))   // [FILLSEC]
+      dmem_req(w).bits.uop.cf_attacker_influence.foreach(_ := cfLdAtk(exe_tlb_uop_cf(w)))      // [ONETAGATK]
       dmem_req(w).bits.cf_addr_sec.foreach(_ := exe_tlb_addr_sec(w))   // [RESID]
       dmem_req(w).bits.cf_addr_atk.foreach(_ := exe_tlb_addr_atk(w))   // [ATKRES]
       dmem_req(w).bits.cf_res_v.foreach(_ := ldq_retry_e.bits.cf_nack_res_v.getOrElse(false.B) ||
@@ -1405,7 +1494,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       // attacker-influenced for a value the attacker never wrote.
       // data_is_atk is captured at STD arrival from the store DATA operand's own taint,
       // which is exactly "is this line's content attacker-derived".
-      dmem_req(w).bits.uop.cf_attacker_influence.foreach(_ := stq_commit_e.bits.data_is_atk.getOrElse(false.B))
+      // [ONETAGATK] r205 U8 (the attacker twin of S-a, OPEN O4): the stored doubleword's attacker tag = data taint OR the
+      // store's commit-time attacker RECORD (kept in the STQ uop's cf_win_atk at commit, below).
+      dmem_req(w).bits.uop.cf_attacker_influence.foreach(_ := stq_commit_e.bits.data_is_atk.getOrElse(false.B) ||
+                                                    stq_commit_e.bits.uop.cf_win_atk.getOrElse(false.B))
       // [STDSEC] step 15 (residue audit row 1c): the line's secret DW bit must carry the STORED
       // VALUE's secret taint only, exactly like the attacker bit above.  The uop's aggregate
       // s_prop includes the ADDRESS operand (register-read ORs rs1), so a clean store to a
@@ -1413,7 +1505,13 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       // MEM_DATAFLOW sec edge.  The address residue is now marked separately ([RESID]).
       // dcache st_sec = s_prop || s_acc; nothing else reads s_prop on a store request (the
       // MSHR fill secret is s_acc only; the LSU never takes s_prop from a D$ response uop).
-      dmem_req(w).bits.uop.cf_secret_propagation.foreach(_ := stq_commit_e.bits.data_is_secret.getOrElse(false.B))
+      // [ONETAG] r205 (option S-a, OPEN O4 in p4-r205-author.md): the stored doubleword gets the ONE secret tag
+      // when the stored VALUE is secret OR the store is a secret / s_prop instruction (its commit-time record,
+      // kept in the STQ uop's cf_win_sec at commit, below): the memory twin of "a register written by an s_prop
+      // instruction carries the secret tag".  This replaces the window-kind DW mark (address, data or
+      // membership, epoch-gated).  One OR on an existing entry read, 0 levels.
+      dmem_req(w).bits.uop.cf_secret_propagation.foreach(_ := stq_commit_e.bits.data_is_secret.getOrElse(false.B) ||
+                                                    stq_commit_e.bits.uop.cf_win_sec.getOrElse(false.B))
       dmem_req(w).bits.cf_addr_sec.foreach(_ := stq_commit_e.bits.addr_is_secret.getOrElse(false.B))   // [RESID]
       dmem_req(w).bits.cf_addr_atk.foreach(_ := stq_commit_e.bits.addr_is_atk.getOrElse(false.B))   // [ATKRES]
       // [WLSEC] step 17 (owner answer Q5): a store of SECRET DATA to a NON-secret address (the
@@ -1422,15 +1520,13 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       // rpq keeps (so a store that misses applies it at its replay).  The D$ response uop of a
       // store/AMO is not read for s_tx (the STQ entry is), so the override is local.
       dmem_req(w).bits.uop.cf_secret_transmission.foreach(_ := stq_commit_e.bits.data_is_secret.getOrElse(false.B) &&
-                                                     !stq_commit_e.bits.addr_in_secret.getOrElse(false.B))
+                                                     !stq_commit_e.bits.uop.cf_secret_access.getOrElse(false.B))   // [SACCU]
       // [WINMEM] step 21 (owner r139, F2): the store's WINDOW taint (address, data or
       // membership, incl. the commit-time shadow) rides the request uop's cf_opnd_* to the D$,
       // which marks the stored doubleword window-kind with the uop's epoch (cf_wep_*).  The rpq
       // keeps both for a store that misses.  One 3-input OR per kind.
-      dmem_req(w).bits.uop.cf_opnd_wsec.foreach(_ := stq_commit_e.bits.addr_is_wsec.getOrElse(false.B) || stq_commit_e.bits.data_is_wsec.getOrElse(false.B) ||
-                                           stq_commit_e.bits.uop.cf_win_sec.getOrElse(false.B))
-      dmem_req(w).bits.uop.cf_opnd_watk.foreach(_ := stq_commit_e.bits.addr_is_watk.getOrElse(false.B) || stq_commit_e.bits.data_is_watk.getOrElse(false.B) ||
-                                           stq_commit_e.bits.uop.cf_win_atk.getOrElse(false.B))
+      dmem_req(w).bits.uop.cf_opnd_wsec.foreach(_ := false.B)   // [ONETAG] r205: no secret window kind
+      dmem_req(w).bits.uop.cf_opnd_watk.foreach(_ := false.B)   // [ONETAGATK] r205 U8: no attacker window kind
 
       stq_execute_head                     := Mux(dmem_req_fire(w),
                                                 WrapInc(stq_execute_head, cf_stq_active),
@@ -1442,6 +1538,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       dmem_req(w).valid      := true.B
       dmem_req(w).bits.addr  := ldq_wakeup_e.bits.addr.bits
       dmem_req(w).bits.uop   := ldq_wakeup_e.bits.uop
+      dmem_req(w).bits.uop.cf_secret_propagation.foreach(_ := cfLdSprop(ldq_wakeup_e.bits.uop))   // [FILLSEC]
+      dmem_req(w).bits.uop.cf_attacker_influence.foreach(_ := cfLdAtk(ldq_wakeup_e.bits.uop))      // [ONETAGATK]
       dmem_req(w).bits.cf_addr_sec.foreach(_ := ldq_wakeup_e.bits.addr_is_secret.getOrElse(false.B))   // [RESID]
       dmem_req(w).bits.cf_addr_atk.foreach(_ := ldq_wakeup_e.bits.addr_is_atk.getOrElse(false.B))   // [ATKRES]
       dmem_req(w).bits.cf_res_v.foreach(_ := ldq_wakeup_e.bits.cf_nack_res_v.getOrElse(false.B) ||
@@ -1510,8 +1608,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         ldq(ldq_idx).bits.addr_is_atk.foreach(_ := exe_req(w).bits.taint_atk)
         // [IMPLWIN] step 20: a window-tainted ADDRESS selects a window-tainted value (the
         // window twin of [SECDEST]); the load's result window taint reads its LDQ uop.
-        ldq(ldq_idx).bits.uop.cf_opnd_wsec.foreach(_ := exe_req(w).bits.uop.cf_opnd_wsec.getOrElse(false.B))
-        ldq(ldq_idx).bits.uop.cf_opnd_watk.foreach(_ := exe_req(w).bits.uop.cf_opnd_watk.getOrElse(false.B))
+        ldq(ldq_idx).bits.uop.cf_opnd_wsec.foreach(_ := false.B)   // [ONETAG] r205: no secret window kind
+        ldq(ldq_idx).bits.uop.cf_opnd_watk.foreach(_ := false.B)   // [ONETAGATK] r205 U8
       }
       ldq(ldq_idx).bits.addr_is_uncacheable := exe_tlb_uncacheable(w) && !exe_tlb_miss(w)
       // corefuzzing: write IFT flags computed in TLB stage back to LDQ entry.
@@ -1554,7 +1652,6 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         stq(stq_idx).bits.addr_is_wsec.foreach(_ := exe_req(w).bits.uop.cf_opnd_wsec.getOrElse(false.B))
         stq(stq_idx).bits.addr_is_watk.foreach(_ := exe_req(w).bits.uop.cf_opnd_watk.getOrElse(false.B))
       }
-      stq(stq_idx).bits.addr_in_secret.foreach(_ := exe_tlb_in_secret(w))
       // corefuzzing: write IFT flags computed in TLB stage into STQ so clr_bsy carries them to ROB
       // same omission on the store path (see the LDQ note above)
       stq(stq_idx).bits.uop.cf_secret_propagation.foreach(_ :=
@@ -1784,7 +1881,35 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // [WINMEM] step 21 (owner r139, F2): the store's s_prop / s_tx RECORD counts window-tainted
   // DATA as before (step 20 reached it through the collapsed data_is_secret); only the memory
   // marks keep the kinds apart.  One OR on each existing entry read.
-  def cfStDataSec(e: STQEntry): Bool = e.data_is_secret.getOrElse(false.B) || e.data_is_wsec.getOrElse(false.B)
+  // [ONETAG] r205: one tag; window-derived data is already in data_is_secret.  The store s_tx rule stays the DATA rule
+  // (secret data to a non-secret address, or a secret-derived address): a store that is s_prop only does not
+  // become s_tx (OPEN O4).  With one tag the window address now counts as a secret address ([STADDR] term).
+  def cfStDataSec(e: STQEntry): Bool = e.data_is_secret.getOrElse(false.B)
+  // [STADDR] patch 73 (owner approval 2026-10-19; SINKS.md S3, the dead-end sink "secret-indexed store"): a store
+  // whose ADDRESS is secret-derived (addr_is_secret: the AGU rs1 DATA taint, written at sta/stad incoming) is a
+  // transmission even with clean data: its D$ fill / replacement update / dirty bit / Acquire are chosen by the
+  // secret and outlive the store whether or not any later instruction reads them (the load Case B twin).  No
+  // range gate (r118 Q3, as [NORANGE]).  [ONETAG] r205: there is no separate window taint of the address any more;
+  // a window-derived address register carries the one secret tag, so addr_is_secret covers it.
+  // Decided at clr_bsy like Case A, so a squashed store that never reached clr_bsy is not marked (a store writes
+  // the D$ only after commit).  Replaces r117's "the store itself is not s_tx" (RULES A l.18-19).
+  // Levels: addr_is_secret is an STQ entry flop read through the same stq_idx select as the s_acc uop bit; the
+  // final term gains one LUT input ((a || b) && !c || d, 4 inputs), ends at clr_bsy_cf_stx_r: 0 added levels.
+  // IFT off: addr_is_secret is None (false), the term folds to the old one.
+  def cfStAddrTx(e: STQEntry): Bool = e.addr_is_secret.getOrElse(false.B)
+  def cfStTx(e: STQEntry): Bool = (cfStDataSec(e) && !e.uop.cf_secret_access.getOrElse(false.B)) || cfStAddrTx(e)   // [SACCU]
+  // [M7STSP] lean58 (Fable audit M7; spec s_prop, load/store symmetry): a store's s_prop record takes its ADDRESS
+  // operand too (addr_is_secret, the [STADDR] bit), as a load's does: a store whose address register is secret is
+  // s_tx ([STADDR]) and now also s_prop.  Used by every clr_bsy s_prop site.  One OR input: 0 levels.  RECORD CHANGE.
+  def cfStSprop(e: STQEntry): Bool = cfStDataSec(e) || cfStAddrTx(e)
+  // [M7STATK] bundle61 (owner 2026-10-24 13:2x via the controller; RULES A reading 4 / U8 symmetric, C M7 line): the
+  // attacker twin of [M7STSP].  A store's attacker record takes its DATA operand (data_is_atk, written at STD) and its
+  // ADDRESS operand (addr_is_atk, written at the TLB stage) attacker taint, as a load's record does; before, a store
+  // whose data / address register was attacker-tainted committed with atk=0 while the load forwarded from it got ty1
+  // atk=1 from the same STQ entry (t75 0x80001594 sd a5).  Carried on clr_bsy like s_prop (clr_bsy_cf_atk) and set
+  // into the row's sticky attacker bit at the ROB.  Levels: two STQ entry flops through the same stq_idx select as
+  // the s_prop bits, into a new flop: 0 added levels on existing paths.
+  def cfStAtk(e: STQEntry): Bool = e.data_is_atk.getOrElse(false.B) || e.addr_is_atk.getOrElse(false.B)
 
   // Task 1: Clr ROB busy bit
   val clr_bsy_valid    = RegInit(widthMap(w => false.B))
@@ -1795,6 +1920,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // corefuzzing: carry cf_secret_transmission from STQ uop to ROB
   val clr_bsy_cf_stx_r = RegInit(widthMap(w => false.B))
   val clr_bsy_cf_sprop_r = RegInit(widthMap(w => false.B))
+  val clr_bsy_cf_atk_r   = if (ENABLE_IFT) Some(RegInit(widthMap(w => false.B))) else None   // [M7STATK]
 
   for (w <- 0 until memWidth) {
     clr_bsy_valid      (w) := false.B
@@ -1803,6 +1929,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     clr_bsy_cf_bmap    (w) := 0.U
     clr_bsy_cf_stx_r   (w) := false.B
     clr_bsy_cf_sprop_r (w) := false.B
+    clr_bsy_cf_atk_r.foreach(_(w) := false.B)   // [M7STATK]
 
 
     when (fired_stad_incoming(w)) {
@@ -1821,9 +1948,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       // store inside a tainted region as a transmission (e.g. `sd s0,40(sp)`, x507,
       // spilling a provably CLEAN s0).  A transmission is secret DATA reaching a
       // non-secret address -- both facts now live in the entry.
-      clr_bsy_cf_sprop_r (w) := cfStDataSec(stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits)   // [WINMEM]
-      clr_bsy_cf_stx_r   (w) := cfStDataSec(stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits) &&
-                               !stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.addr_in_secret.getOrElse(false.B)
+      clr_bsy_cf_sprop_r (w) := cfStSprop(stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits)   // [WINMEM] [M7STSP]
+      clr_bsy_cf_atk_r.foreach(_(w) := cfStAtk(stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits))   // [M7STATK]
+      clr_bsy_cf_stx_r   (w) := cfStTx(stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits)   // Case A || [STADDR]
     } .elsewhen (fired_sta_incoming(w)) {
       clr_bsy_valid      (w) := mem_stq_incoming_e(w).valid            &&
                                 mem_stq_incoming_e(w).bits.data.valid  &&
@@ -1840,9 +1967,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       // store inside a tainted region as a transmission (e.g. `sd s0,40(sp)`, x507,
       // spilling a provably CLEAN s0).  A transmission is secret DATA reaching a
       // non-secret address -- both facts now live in the entry.
-      clr_bsy_cf_sprop_r (w) := cfStDataSec(stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits)   // [WINMEM]
-      clr_bsy_cf_stx_r   (w) := cfStDataSec(stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits) &&
-                               !stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.addr_in_secret.getOrElse(false.B)
+      clr_bsy_cf_sprop_r (w) := cfStSprop(stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits)   // [WINMEM] [M7STSP]
+      clr_bsy_cf_atk_r.foreach(_(w) := cfStAtk(stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits))   // [M7STATK]
+      clr_bsy_cf_stx_r   (w) := cfStTx(stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits)   // Case A || [STADDR]
     } .elsewhen (fired_std_incoming(w)) {
       clr_bsy_valid      (w) := mem_stq_incoming_e(w).valid                 &&
                                 mem_stq_incoming_e(w).bits.addr.valid       &&
@@ -1859,9 +1986,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       // store inside a tainted region as a transmission (e.g. `sd s0,40(sp)`, x507,
       // spilling a provably CLEAN s0).  A transmission is secret DATA reaching a
       // non-secret address -- both facts now live in the entry.
-      clr_bsy_cf_sprop_r (w) := cfStDataSec(stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits)   // [WINMEM]
-      clr_bsy_cf_stx_r   (w) := cfStDataSec(stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits) &&
-                               !stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits.addr_in_secret.getOrElse(false.B)
+      clr_bsy_cf_sprop_r (w) := cfStSprop(stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits)   // [WINMEM] [M7STSP]
+      clr_bsy_cf_atk_r.foreach(_(w) := cfStAtk(stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits))   // [M7STATK]
+      clr_bsy_cf_stx_r   (w) := cfStTx(stq(mem_stq_incoming_e(w).bits.uop.stq_idx).bits)   // Case A || [STADDR]
     } .elsewhen (fired_sfence(w)) {
       clr_bsy_valid      (w) := (w == 0).B // SFence proceeds down all paths, only allow one to clr the rob
       clr_bsy_rob_idx    (w) := mem_incoming_uop(w).rob_idx
@@ -1869,6 +1996,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       clr_bsy_cf_bmap    (w) := mem_incoming_uop(w).cf_fu_bitmap.getOrElse(0.U(numModules.W))
       clr_bsy_cf_stx_r   (w) := false.B
     clr_bsy_cf_sprop_r (w) := false.B
+      clr_bsy_cf_atk_r.foreach(_(w) := false.B)   // [M7STATK]
     } .elsewhen (fired_sta_retry(w)) {
       clr_bsy_valid      (w) := mem_stq_retry_e.valid            &&
                                 mem_stq_retry_e.bits.data.valid  &&
@@ -1878,8 +2006,16 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       clr_bsy_rob_idx    (w) := mem_stq_retry_e.bits.uop.rob_idx
       clr_bsy_brmask     (w) := GetNewBrMask(io.core.brupdate, mem_stq_retry_e.bits.uop)
       clr_bsy_cf_bmap    (w) := stq(mem_stq_retry_e.bits.uop.stq_idx).bits.uop.cf_fu_bitmap.getOrElse(0.U(numModules.W))
-      clr_bsy_cf_stx_r   (w) := stq(mem_stq_retry_e.bits.uop.stq_idx).bits.uop.cf_secret_transmission.getOrElse(false.B)
-      clr_bsy_cf_sprop_r (w) := cfStDataSec(stq(mem_stq_retry_e.bits.uop.stq_idx).bits)   // [WINMEM]
+      // [FPSTX] patch 81 (p4-73-author.md flagged item 8; owner approval 2026-10-19): Case A as on the three incoming
+      // paths (cfStTx: secret data to a non-secret address, || [STADDR]).  This path read the uop's s_tx bit, which
+      // is set only for AMOs (and AMOs never take clr_bsy here), so a store whose address RETRIED (TLB miss) after
+      // its data landed lost its secret-data s_tx.  The entry's data bits are written at STD, before this path can
+      // fire (it requires data.valid).  The uop bit stays ORed (nothing dropped).  Same entry select, one more LUT
+      // input: 0 added levels.
+      clr_bsy_cf_stx_r   (w) := stq(mem_stq_retry_e.bits.uop.stq_idx).bits.uop.cf_secret_transmission.getOrElse(false.B) ||
+                               cfStTx(stq(mem_stq_retry_e.bits.uop.stq_idx).bits)   // Case A || [STADDR] ([FPSTX])
+      clr_bsy_cf_sprop_r (w) := cfStSprop(stq(mem_stq_retry_e.bits.uop.stq_idx).bits)   // [WINMEM] [M7STSP]
+      clr_bsy_cf_atk_r.foreach(_(w) := cfStAtk(stq(mem_stq_retry_e.bits.uop.stq_idx).bits))   // [M7STATK]
     }
 
     io.core.clr_bsy(w).valid          := clr_bsy_valid(w) &&
@@ -1890,6 +2026,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     io.core.clr_bsy_cf_stx(w)        := clr_bsy_cf_stx_r(w)
  // [PROBE-STRIPPED 2026-09-10] A1CLR -- A1 is CLOSED; probe retired.
     io.core.clr_bsy_cf_sprop(w)      := clr_bsy_cf_sprop_r(w)
+    io.core.clr_bsy_cf_atk.foreach(_(w) := clr_bsy_cf_atk_r.get(w))   // [M7STATK]
     // // [A1PROBE] downstream half: does the store's secret flag ever leave the LSU?
     // if (ENABLE_CF_DEBUG_PRINTF) {
       // when (io.core.clr_bsy(w).valid && io.core.cf_debug_lsu_enable) {
@@ -1905,12 +2042,14 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val stdf_clr_bsy_cf_bmap  = Reg(UInt(numModules.W))
   val stdf_clr_bsy_cf_stx   = RegInit(false.B)
   val stdf_clr_bsy_cf_sprop = RegInit(false.B)
+  val stdf_clr_bsy_cf_atk   = if (ENABLE_IFT) Some(RegInit(false.B)) else None   // [M7STATK]
   stdf_clr_bsy_valid    := false.B
   stdf_clr_bsy_rob_idx  := 0.U
   stdf_clr_bsy_brmask   := 0.U
   stdf_clr_bsy_cf_bmap  := 0.U
   stdf_clr_bsy_cf_stx   := false.B
   stdf_clr_bsy_cf_sprop := false.B
+  stdf_clr_bsy_cf_atk.foreach(_ := false.B)
   when (fired_stdf_incoming) {
     val s_idx = mem_stdf_uop.stq_idx
     stdf_clr_bsy_valid   := stq(s_idx).valid                 &&
@@ -1921,8 +2060,15 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     stdf_clr_bsy_rob_idx := mem_stdf_uop.rob_idx
     stdf_clr_bsy_brmask  := GetNewBrMask(io.core.brupdate, mem_stdf_uop)
     stdf_clr_bsy_cf_bmap := stq(s_idx).bits.uop.cf_fu_bitmap.getOrElse(0.U(numModules.W))
-    stdf_clr_bsy_cf_stx  := stq(s_idx).bits.uop.cf_secret_transmission.getOrElse(false.B)
-    stdf_clr_bsy_cf_sprop := cfStDataSec(stq(s_idx).bits)   // [WINMEM]
+    // [FPSTX] patch 81: Case A here too.  An FP store whose DATA arrives after its address clears busy on this path
+    // (the STA path needs data.valid), and it read only the uop's s_tx bit (AMOs only), so an FP store of SECRET data
+    // to a non-secret address was s_tx only when its data came first (t108 m153 / m154 order dependence).  The FP
+    // data bit (data_is_secret) is written at fp_stdata.fire, one cycle before fired_stdf_incoming
+    // reads the entry.  0 added levels (as above).
+    stdf_clr_bsy_cf_stx  := stq(s_idx).bits.uop.cf_secret_transmission.getOrElse(false.B) ||
+                            cfStTx(stq(s_idx).bits)   // Case A || [STADDR] ([FPSTX])
+    stdf_clr_bsy_cf_sprop := cfStSprop(stq(s_idx).bits)   // [WINMEM] [M7STSP]
+    stdf_clr_bsy_cf_atk.foreach(_ := cfStAtk(stq(s_idx).bits))   // [M7STATK]
   }
 
 
@@ -1934,6 +2080,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   io.core.clr_bsy_cf_bitmap(memWidth)       := stdf_clr_bsy_cf_bmap
   io.core.clr_bsy_cf_stx(memWidth)         := stdf_clr_bsy_cf_stx
   io.core.clr_bsy_cf_sprop(memWidth)       := stdf_clr_bsy_cf_sprop
+  io.core.clr_bsy_cf_atk.foreach(_(memWidth) := stdf_clr_bsy_cf_atk.get)   // [M7STATK]
 
 
 
@@ -1985,6 +2132,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   for (w <- 0 until memWidth) {
     io.core.cf_memord_upd(w).valid := false.B
     io.core.cf_memord_upd(w).bits  := DontCare
+    io.core.cf_memord_upd(w).bits.infl_type.foreach(_ := INFL_MEM_ORDER.U)   // [RDEDGE] patch 80 (the sites never set it)
   }
   // [MEMORDATK] patch 42 (DF-memord-atk, r116/r117 destination rule for attacker influence): the
   // order-fail producer is attacker-influenced when it is attacker-domain OR its address/data is
@@ -2000,9 +2148,26 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val stq_atk_infl = VecInit(stq.map(e => e.bits.cf_dis_atk.getOrElse(false.B) ||
                                           e.bits.addr_is_atk.getOrElse(false.B)  || e.bits.data_is_atk.getOrElse(false.B) ||
                                           e.bits.addr_is_watk.getOrElse(false.B) || e.bits.data_is_watk.getOrElse(false.B)))
-  val ldq_atk_infl = VecInit(ldq.map(e => e.bits.addr_is_atk.getOrElse(false.B) || e.bits.uop.cf_opnd_watk.getOrElse(false.B)))
+  // [U2MO] variant for RULES.md E/U2 = YES (record summary also for MEM_ORDER): the searcher's attacker record summary
+  // (one leaf, same entry mux, 0 levels).  The store side already carries cf_dis_atk (its dispatch summary); the
+  // 10-19 "drop cf_dis_atk" question in U2 is not touched here.
+  val ldq_atk_infl = VecInit(ldq.map(e => e.bits.addr_is_atk.getOrElse(false.B) || e.bits.uop.cf_opnd_watk.getOrElse(false.B) ||
+                                          e.bits.uop.cf_attacker_influence.getOrElse(false.B)))
   val st_atk_sel   = widthMap(w => stq_atk_infl(lcam_stq_idx(w)))   // one entry mux per way, shared by every LDQ entry
   val ld_atk_sel   = widthMap(w => ldq_atk_infl(lcam_ldq_idx(w)))
+  // [L9LDSEC] lean58 (Fable audit L9; RULES A U2): the LD-LD MEM_ORDER searcher's SECRET label from its live LDQ
+  // entry (written at the TLB stage, like ld_atk_sel), not from lcam_uop (the pre-write snapshot): s_acc || s_prop,
+  // or a secret-derived address (such a load is s_prop by RULES D1 l.16).  One entry mux per way: 0 levels on the
+  // order-fail path (it feeds only the memord message).  RECORD CHANGE.
+  val ldq_sec_infl = VecInit(ldq.map(e => e.bits.uop.cf_secret_access.getOrElse(false.B) ||
+                                          e.bits.uop.cf_secret_propagation.getOrElse(false.B) ||
+                                          e.bits.addr_is_secret.getOrElse(false.B)))
+  val ld_sec_sel   = widthMap(w => ldq_sec_infl(lcam_ldq_idx(w)))
+  // [B60LDB] bundle60 (B): per way, the OLDER LDQ entries that blocked this load search (the LD-LD branch below: an
+  // older load to the same DW that has not executed or was nacked kills the searcher and clears can_forward).  Read
+  // only by the [RDEDGE] STL_PARTIAL edge (names that load as the producer).  A copy of the kill term into new
+  // wires: 0 levels on the kill / can_forward path.  IFT off: None (not elaborated).
+  val cf_ld_blk = if (ENABLE_IFT) Some(WireInit(widthMap(w => VecInit((0 until numLdqEntries).map(x => false.B))))) else None
   val failed_loads     = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B))) // Loads which we will report as failures (throws a mini-exception)
   val nacking_loads    = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B))) // Loads which are being nacked by dcache in the next stage
 
@@ -2065,11 +2230,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           val st_atk_infl = st_atk_sel(w)
           when (stq(lcam_stq_idx(w)).bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= l_bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) ||
                 stq(lcam_stq_idx(w)).bits.uop.cf_secret_propagation.getOrElse(false.B) ||
-                stq(lcam_stq_idx(w)).bits.addr_in_secret.getOrElse(false.B) || st_atk_infl) {   // [STSACC] patch 52
+                stq(lcam_stq_idx(w)).bits.uop.cf_secret_access.getOrElse(false.B) || st_atk_infl) {   // [STSACC] patch 52, [SACCU]
             val stq_infl_uop = stq(lcam_stq_idx(w)).bits.uop
-            // [STSACC] patch 52: the store's s_acc = addr_in_secret (written at its TLB stage, one
+            // [STSACC] patch 52 / [SACCU]: the store's s_acc = its uop cf_secret_access (written at its TLB stage, one
             // cycle before this search reads it); same entry mux as the bit it replaces, 0 levels.
-            val stq_infl_sacc = stq(lcam_stq_idx(w)).bits.addr_in_secret.getOrElse(false.B)
+            val stq_infl_sacc = stq(lcam_stq_idx(w)).bits.uop.cf_secret_access.getOrElse(false.B)
             // [MEMORD] The edge goes to the ROB entry, where it lands on the squashed load's
             // [FLUSH] record.  Task 3.2: the LDQ-copy addInfluencer is gone (its result was
             // destroyed by the order-fail flush anyway, doc 53 B1; spec 5.2.2).
@@ -2099,8 +2264,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
             // TLB stage; the lcam_uop copy is the pre-write snapshot with the attacker bit zeroed)
             val ld_atk_infl = ld_atk_sel(w)
             when (lcam_uop(w).cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= l_bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) ||
-                  lcam_uop(w).cf_secret_propagation.getOrElse(false.B) ||
-                  lcam_uop(w).cf_secret_access.getOrElse(false.B) || ld_atk_infl) {
+                  ld_sec_sel(w) || ld_atk_infl) {   // [L9LDSEC] (was lcam_uop's s_prop || s_acc)
               // [MEMORD] same routing as site 1 (Task 3.2: LDQ-copy addInfluencer removed).  This site additionally
               // requires l_bits.observed, set by a release search (do_release_search: the D$ releases the line, e.g.
               // a dirty-victim writeback on an ordinary eviction), so it IS reachable in a single-core sim: t48 hits
@@ -2110,7 +2274,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
               io.core.cf_memord_upd(w).bits.op_count_id  := l_bits.uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
               io.core.cf_memord_upd(w).bits.prod_op_count := lcam_uop(w).cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
               io.core.cf_memord_upd(w).bits.is_atk       := lcam_uop(w).cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U || ld_atk_infl   // [MEMORDATK]
-              io.core.cf_memord_upd(w).bits.is_secret    := lcam_uop(w).cf_secret_access.getOrElse(false.B) || lcam_uop(w).cf_secret_propagation.getOrElse(false.B)
+              io.core.cf_memord_upd(w).bits.is_secret    := ld_sec_sel(w)   // [L9LDSEC]
             }
           }
         } .elsewhen (lcam_ldq_idx(w) =/= i.U) {
@@ -2121,6 +2285,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
             s1_set_execute(lcam_ldq_idx(w))    := false.B
             io.dmem.s1_kill(w)                 := RegNext(dmem_req_fire(w))
             can_forward(w)                     := false.B
+            cf_ld_blk.foreach(_(w)(i)          := true.B)   // [B60LDB]
           }
         }
       }
@@ -2203,6 +2368,219 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     }
   }
 
+
+  // [RDEDGE] patch 80 (CLEAN.md section 6 "reader-side gaps"; SPEC-P1 classes 20 / 21; owner approval 2026-10-19):
+  // two reader-side edges the record had no class for, both TIMING edges (no value taint), both keyed by the
+  // producer's op_count and emitted only when the producer is tagged (its own label, CLEAN.md R2: not gated on the
+  // reader's domain):
+  //   STL_PARTIAL (v1 code 29): a load search found an older store that overlaps it but cannot forward (partial byte
+  //     overlap, a fence / AMO, or an uncacheable full overlap: the three ldst_addr_matches cases that are not a
+  //     forward), so the load is killed (s1_kill) and replayed until the store drains: its latency is a function of
+  //     that store's ADDRESS.  Tag = OR over the matching stores of the producer RECORD summary ([F21REC] below;
+  //     was the address label only); key = the youngest matching store (forwarding_idx).  It fires on every
+  //     replaying search (one column entry per row, rewritten).  [B60LDB] a search that an OLDER pending load to
+  //     the same DW blocked (can_forward cleared by the LD-LD branch) names that load instead (below).
+  //   DC_BANKCONF (v1 code 30): the D$ nacked the load because an older lane read the same data-array bank at
+  //     another row (dcache.scala cf_bank_nack, the label and op_count of that lane's access).  Loads only (a store
+  //     nack is retried after commit, when its ROB row is gone).
+  // Transport: a dedicated op_count-guarded ROB port (rob.scala cf_lsu_rdedge_upd, sidecar C_memord column
+  // memWidth), NOT the MEM_ORDER ports, so no existing port gains a mux.  [B61LDQ] bundle61 (replaces bundle60's
+  // per-source holding registers, [B60ARB]): each event is staged one cycle, then held PER LOAD in a pending entry
+  // beside its LDQ entry; one edge per cycle goes to the port, oldest load first; the port is driven from flops.
+  // Debug-only [RDELOST] / [RDELATE] count edges whose load left the LDQ before the edge reached the ROB.  Details
+  // at [B61LDQ] below.  Levels: every term is a new endpoint (stage / pending / port registers); the label ORs run
+  // beside the existing match / nack logic and feed only them.  IFT off: not elaborated.
+  if (ENABLE_IFT) {
+    def rdeUpd(v: Bool, u: MicroOp, oc: UInt, atk: Bool, sec: Bool, ty: Int): Valid[CF_MemOrdUpdate] = {
+      val r = Wire(Valid(new CF_MemOrdUpdate))
+      r.valid              := v
+      r.bits.rob_idx       := u.rob_idx
+      r.bits.op_count_id   := u.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
+      r.bits.prod_op_count := oc.pad(inflOpCountWidthCF)(inflOpCountWidthCF - 1, 0)
+      r.bits.is_atk        := atk
+      r.bits.is_secret     := sec
+      r.bits.infl_type.get := ty.U(inflTypeWidthCF.W)
+      r
+    }
+    // [F21REC] Fable review 2026-10-23 F2-1, owner answer "Use the producer record" (RULES.md C): the STL_PARTIAL
+    // labels are the matching STQ entry's RECORD summary as known at the search, exactly like STL_FORWARD after 07f
+    // M6 ([M6STLATK]) and the STQ-head labels ([RECEDGE]); address taint alone is not enough.  Per entry:
+    //   sec = s_acc (uop.cf_secret_access, [SACCU]) || s_prop (uop.cf_secret_propagation: dispatch summary, the
+    //         TLB-stage issue s_prop and the STD data taint) || addr_is_secret (part of the store's s_prop record,
+    //         [M7STSP] cfStSprop) || uop.cf_win_sec (the commit-time record s_acc || s_prop, written at commit:
+    //         a committed store still waiting to drain carries its FINAL record, incl. retroactive s_prop)
+    //   atk = cf_dis_atk (dispatch attacker summary: attacker packet / edges / window) || uop.cf_attacker_influence
+    //         (as [M6STLATK]) || addr_is_atk (ownership-seeded for attacker-domain stores, N3) || data_is_atk (the
+    //         data operand's attacker taint, as the MEM_ORDER stq_atk_infl) || uop.cf_win_atk (commit-time record)
+    // A fence / AMO in the STQ takes its own record the same way.  The fire condition (sec || atk) follows the new
+    // labels: a store whose record is tagged but whose address is clean now produces the edge.  The old address
+    // leaves stay as members of the record (superset: no edge of the old design is lost).
+    // Levels: each label is a 4/5-input OR of STQ entry flops (one LUT, off the ldst_addr_matches path); the
+    // m(i) & lab(i) AND-OR tree keeps its shape, so the match -> holding-register path gains 0 levels.
+    // Cost [inf]: ~2 x 40 LUT (one per entry per label), 0 FF.  IFT off: inside if (ENABLE_IFT), not elaborated.
+    val stq_lab_sec = VecInit(stq.map(e => e.bits.uop.cf_secret_access.get || e.bits.uop.cf_secret_propagation.get ||
+                                           e.bits.addr_is_secret.get || e.bits.uop.cf_win_sec.get)).asUInt
+    val stq_lab_atk = VecInit(stq.map(e => e.bits.cf_dis_atk.get || e.bits.uop.cf_attacker_influence.get ||
+                                           e.bits.addr_is_atk.get || e.bits.data_is_atk.get ||
+                                           e.bits.uop.cf_win_atk.get)).asUInt
+    // [B60LDB] bundle60 (B), owner 2026-10-24 (FINDINGS-open-rebase59 item 1b: "keep the edge but name the older
+    // load as producer", its record summary for the labels as RULES.md C F2-1 "producer record"): an OLDER load to
+    // the same DW that is still pending (not executed, or nacked) kills the searcher and clears can_forward, so a
+    // fully overlapping store that could forward falls into the partial branch and set ldst_addr_matches: the edge
+    // fired naming that store although the delay is the LD-LD order.  For a search with such a blocker
+    // (cf_ld_blk) the edge names the older load:
+    //   sec = OR over the blockers of ldq_sec_infl (s_acc || s_prop || secret-derived address, [L9LDSEC])
+    //   atk = OR over the blockers of ldq_atk_infl (attacker address || operand window || attacker record, [U2MO];
+    //         the same LDQ record labels as the [RECEDGE] LDQ head)
+    //   key = the op_count of one TAGGED blocker (lowest LDQ index among the tagged blockers: each blocker alone
+    //         keeps the searcher from completing, so any tagged one is a true producer).
+    // The store record ([F21REC]) labels the edge only when no older load blocks.  A store that ALSO blocks (a real
+    // partial overlap) is named by the next replay after the older load executes (that search has no blocker); if it
+    // drained first it did not delay the load.  The fire condition keeps the store match (m.orR): no new trigger.
+    // Levels: cf_ld_blk(i) is a copy of the LD-LD kill term, which also feeds can_forward and so arrives before the
+    // store-side match / forwarding_idx terms; the three 2:1 selects add 1 LUT after the store-side AND-OR / oc mux,
+    // into the [B61LDQ] stage register (a new endpoint, D input only).  Cost [inf] per way: 40-bit one-hot priority
+    // over the tagged blockers (~45 LUT, the per-entry AND folds into it), 10-bit 40:1 AND-OR of the LDQ op_count
+    // (~140 LUT), 2 x 40-bit label OR (~28 LUT), 12 select LUT; 0 FF.
+    val ld_lab_sec = ldq_sec_infl.asUInt
+    val ld_lab_atk = ldq_atk_infl.asUInt
+    val stp = (0 until memWidth).map { w =>
+      val m    = ldst_addr_matches(w).asUInt
+      val lb   = cf_ld_blk.get(w).asUInt
+      val lbs  = lb & ld_lab_sec
+      val lba  = lb & ld_lab_atk
+      val lsel = PriorityEncoderOH(lbs | lba)
+      val l_oc = Mux1H(lsel, ldq.map(_.bits.uop.cf_op_count_id.get(inflOpCountWidthCF - 1, 0)))
+      val blk  = lb.orR
+      val sec  = Mux(blk, lbs.orR, (m & stq_lab_sec).orR)
+      val atk  = Mux(blk, lba.orR, (m & stq_lab_atk).orR)
+      val oc   = Mux(blk, l_oc, stq(forwarding_idx(w)).bits.uop.cf_op_count_id.get(inflOpCountWidthCF - 1, 0))
+      rdeUpd(do_ld_search(w) && m.orR && !mem_forward_valid(w) && (sec || atk) &&
+             !IsKilledByBranch(io.core.brupdate, lcam_uop(w)) && !io.core.exception && !RegNext(io.core.exception),
+             lcam_uop(w), oc, atk, sec, INFL_STL_PARTIAL)
+    }
+    val dcb = (0 until memWidth).map { w =>
+      val n = io.dmem.cf_bank_nack.get(w)
+      rdeUpd(io.dmem.nack(w).valid && !io.dmem.nack(w).bits.is_hella && io.dmem.nack(w).bits.uop.uses_ldq && n.valid &&
+             !IsKilledByBranch(io.core.brupdate, io.dmem.nack(w).bits.uop) && !io.core.exception,
+             io.dmem.nack(w).bits.uop, n.bits.oc, n.bits.atk, n.bits.sec, INFL_DC_BANKCONF)
+    }
+    // [B60ARB] the DC_BANKCONF sources exist only with a banked D$: with numDCacheBanks = 1 the data array is
+    // BoomDuplicatedDataArray, whose nacks are constant false (dcache.scala), so their stage registers / type bits would be
+    // dead flops that firtool cannot fold (a valid register that only clears itself).  Same edges, no dead state.
+    val dcbOn = boomParams.numDCacheBanks > 1
+    val src  = (if (dcbOn) dcb else Nil) ++ stp
+    // the LDQ index of each source's load (both edge kinds land on a load: dcb requires uses_ldq, stp is a load search)
+    val srcLdq = (if (dcbOn) (0 until memWidth).map(w => io.dmem.nack(w).bits.uop.ldq_idx) else Nil) ++
+                 (0 until memWidth).map(w => lcam_ldq_idx(w))
+    // [B61LDQ] bundle61, owner 2026-10-24 12:0x ("Back to author, rebuild"; bundle60 left [RDELOST] nlive = 9 on t50,
+    // 26 on ift_all, every one k = 1).  Root cause in bundle60's [B60ARB]: one holding register per SOURCE (lane).  A
+    // loop with several loads to one DW (t50 0x80001c4c-0x80001c80: four lw -20(s0) and a sw -20(s0) per iteration,
+    // more than one iteration in flight) has those loads replaying on both lanes, so a lane sees a DIFFERENT row on
+    // consecutive searches: the per-source de-dup never matches, lane 0 is "urgent" every cycle and wins the port
+    // every cycle (fixed priority), lane 1's waiting edge starves, and when lane 1 then gets its next event both are
+    // urgent and k = 0 wins: lane 1's held edge is replaced.  t50 [RDELOST] 1: row oc 25188 (lw 0x80001c68), ty29
+    // naming the older lw oc 25171; its commit record carries no ty29 at all.  Two sources sharing one port per cycle
+    // cannot be lossless while one lane alone fills the port; the loss is structural, not a priority detail.
+    // Fix: hold the pending edge PER LOAD (per LDQ entry) instead of per lane, and send the OLDEST pending load first:
+    //   stage   : stg(k) := src(k) every cycle, as bundle60 (the source cone ends in this D input: 0 levels).  Only the
+    //             LDQ index, producer op_count and labels are kept (the row and op_count are read from the LDQ entry).
+    //   table   : per LDQ entry {pend, prod op_count, sec, atk (, bank-conflict type bit with a banked D$)}.  A staged
+    //             event writes ITS load's entry: pend := 1, producer := the new one; labels := the new labels, ORed
+    //             with the entry's if it still holds an unsent edge (sticky: no label is dropped; the column keeps
+    //             one entry per row anyway, newest producer).  Two rows never share an entry, so no event of one load
+    //             can replace another load's edge.
+    //   grant   : the oldest pending entry whose load is valid, in LDQ age order from ldq_head (AgePriorityEncoder).
+    //             The load at the LDQ head is the next load to commit, so the edge most at risk is always sent first; a
+    //             younger load cannot commit while an older one is pending.  pend := 0 on grant (a new event in the
+    //             same cycle re-sets it with the new content).  A load that leaves the LDQ (commit, branch kill,
+    //             exception flush) cannot be granted (ldq.valid), and its pend is cleared the next cycle, before the
+    //             entry can be reallocated (a freed entry is enqueued one cycle later at the earliest).
+    //   port    : registered (out); rob_idx / op_count_id from the granted LDQ entry's uop (the same load).
+    // Residual (counted, debug): an edge that reaches the ROB in or after its row's commit cycle (the commit record
+    // reads the sidecar column asynchronously in that cycle).  Timing: event t, table t+2, port t+3, column visible
+    // t+4; the load was killed by the event and must replay, return data and write back before it commits (>= t+5).
+    // Levels: stage D input as bundle60 (0).  Table: flop (stg) -> LDQ-index decode (1) -> per-entry D mux (1).  Grant:
+    // flop (pend, ldq.valid) -> age priority (~4) -> 40:1 read (3) -> out D; all flop-to-flop new endpoints, the ROB
+    // port input starts at a flop.  No existing path changes.
+    // Cost [inf]: table 40 x 13 = 520 FF (+40 with a banked D$); stage 2 x 19 = 38 FF; port 37 FF (bundle60: 140 FF of
+    // stage / holding / port, removed); LUT: ~520 table D, ~100 age priority, ~500 port read (36 bits x 40:1), ~20 misc.
+    // No stall, nack, replay or queue: one entry per existing LDQ entry (the per-LDQ precedent: [NACKRES] {v, pc}).
+    val stg_v   = src.map(s => RegNext(s.valid, false.B))
+    val stg     = src.map(s => RegNext(s.bits))
+    val stg_ldq = srcLdq.map(i => RegNext(i))
+    val isBank  = (0 until src.length).map(k => dcbOn && k < memWidth)   // src order: dcb lanes first when banked
+    val pend    = RegInit(VecInit(Seq.fill(numLdqEntries)(false.B)))
+    val p_oc    = Reg(Vec(numLdqEntries, UInt(inflOpCountWidthCF.W)))
+    val p_sec   = Reg(Vec(numLdqEntries, Bool()))
+    val p_atk   = Reg(Vec(numLdqEntries, Bool()))
+    val p_bank  = if (dcbOn) Some(Reg(Vec(numLdqEntries, Bool()))) else None
+    val elig    = (0 until numLdqEntries).map(i => pend(i) && ldq(i).valid)
+    val gv      = elig.reduce(_ || _)
+    val gidx    = AgePriorityEncoder(elig, ldq_head)
+    for (i <- 0 until numLdqEntries) {
+      val hits = (0 until src.length).map(k => stg_v(k) && stg_ldq(k) === i.U)
+      val gnti = gv && gidx === i.U
+      val keep = pend(i) && !gnti   // an unsent edge of this load: merge its labels
+      when (hits.reduce(_ || _)) {
+        pend(i)  := true.B
+        p_oc(i)  := PriorityMux(hits.reverse, stg.reverse.map(_.prod_op_count))   // the later source wins
+        p_sec(i) := hits.zip(stg).map { case (h, s) => h && s.is_secret }.reduce(_ || _) || (keep && p_sec(i))
+        p_atk(i) := hits.zip(stg).map { case (h, s) => h && s.is_atk    }.reduce(_ || _) || (keep && p_atk(i))
+        p_bank.foreach(b => b(i) := PriorityMux(hits.reverse, isBank.reverse.map(_.B)))
+      } .elsewhen (gnti || !ldq(i).valid) {
+        pend(i)  := false.B
+      }
+    }
+    val out = RegInit(0.U.asTypeOf(Valid(new CF_MemOrdUpdate)))
+    out.valid              := gv
+    out.bits.rob_idx       := ldq(gidx).bits.uop.rob_idx
+    out.bits.op_count_id   := ldq(gidx).bits.uop.cf_op_count_id.get
+    out.bits.prod_op_count := p_oc(gidx)
+    out.bits.is_atk        := p_atk(gidx)
+    out.bits.is_secret     := p_sec(gidx)
+    out.bits.infl_type.get := (if (dcbOn) Mux(p_bank.get(gidx), INFL_DC_BANKCONF.U(inflTypeWidthCF.W), INFL_STL_PARTIAL.U(inflTypeWidthCF.W))
+                               else INFL_STL_PARTIAL.U(inflTypeWidthCF.W))
+    io.core.cf_rdedge_upd.get := out
+    // Debug only (ENABLE_CF_DEBUG_PRINTF; no FPGA flops).  Observed one cycle late, from registered copies:
+    //   [RDELOST] a load left the LDQ in cycle c while its entry was pending (incl. granted in c: the port register
+    //   reaches the ROB after the commit).  live=1: it left by COMMIT (not killed / flushed) = a lost edge of a live
+    //   row; live=0: dead row.  n = all, nlive = live.  Requirement: nlive = 0.
+    //   [RDELATE] the port register carried an edge in the cycle its load committed (reaches the column too late for
+    //   that commit record; counted in nlive as well).
+    if (ENABLE_CF_DEBUG_PRINTF) {
+      val killed = (0 until numLdqEntries).map(i => IsKilledByBranch(io.core.brupdate, ldq(i).bits.uop) || io.core.exception)
+      val pv_r   = RegNext(VecInit(elig))
+      val kil_r  = RegNext(VecInit(killed))
+      val vld_r  = RegNext(VecInit(ldq.map(_.valid)))
+      val left   = (0 until numLdqEntries).map(i => vld_r(i) && !ldq(i).valid)   // left the LDQ in the previous cycle
+      val lost   = (0 until numLdqEntries).map(i => left(i) && pv_r(i))
+      val lostLv = (0 until numLdqEntries).map(i => lost(i) && !kil_r(i))
+      val oidx   = RegNext(gidx)                                                   // the entry the port carries now
+      val o_v_r  = RegNext(out.valid, false.B)                                     // the port carried an edge last cycle,
+      val o_i_r  = RegNext(oidx)                                                   // for this entry,
+      val late   = o_v_r && VecInit(left)(o_i_r) && !kil_r(o_i_r)                  // and that load committed last cycle
+      val cf_rde_lost  = RegInit(0.U(16.W))
+      val cf_rde_llive = RegInit(0.U(16.W))
+      val cf_rde_late  = RegInit(0.U(16.W))
+      val nl  = cf_rde_lost  + PopCount(lost)
+      val nll = cf_rde_llive + PopCount(lostLv) + late.asUInt
+      cf_rde_lost  := nl
+      cf_rde_llive := nll
+      for (i <- 0 until numLdqEntries) {
+        when (lost(i)) {
+          printf("[RDELOST] n=%d nlive=%d ldq=%d rob=%d oc=%d prod=%d sec=%d atk=%d live=%d\n",
+                 nl, nll, i.U, ldq(i).bits.uop.rob_idx, ldq(i).bits.uop.cf_op_count_id.get, p_oc(i), p_sec(i), p_atk(i),
+                 lostLv(i))
+        }
+      }
+      when (late) {
+        cf_rde_late := cf_rde_late + 1.U
+        printf("[RDELATE] n=%d nlive=%d rob=%d oc=%d prod=%d\n", cf_rde_late + 1.U, nll, RegNext(out.bits.rob_idx),
+               RegNext(out.bits.op_count_id), RegNext(out.bits.prod_op_count))
+      }
+    }
+  }
 
   // Task 3: Clr unsafe bit in ROB for succesful translations
   //         Delay this a cycle to avoid going ahead of the exception broadcast
@@ -2311,6 +2689,21 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     // Task 3.2: zero edges by default (never DontCare, Phase 0 Bug 3)
     io.core.exe(w).iresp.bits.edges := 0.U.asTypeOf(new IftEdgeList)
     io.core.exe(w).fresp.bits.edges := 0.U.asTypeOf(new IftEdgeList)
+    io.core.cf_resp_wsec.foreach(_(w) := false.B)   // [F1WSH] no response: the write port is not valid
+    io.core.cf_resp_watk.foreach(_(w) := false.B)
+  }
+  // [F1WSH] lean58 timing F1: the window-shadow test of a response candidate's uop, assigned in the SAME when-branch
+  // as io.core.exe(w).iresp.bits.uop (below), on the SAME uop.  Chisel last-connect gives both signals the same
+  // branch selection, so in every cycle cf_resp_w*(w) === cf_wsh_*.in(io.core.exe(w).iresp.bits.uop.rob_idx) whenever
+  // the iresp uop is a branch's uop (every cycle iresp.valid can be 1); outside the branches iresp.valid = 0 and the
+  // write port is not valid.  cf_wsh_* is the core's wsh_* wire (core.scala), the same value WritePort used.
+  // Levels: in() now runs on each candidate's own rob_idx (D$: the ldq_idx-muxed LDQ uop of an s2 register index;
+  // AMO: the stq_idx-muxed STQ uop; forward: the wb_forward_ldq_idx-muxed LDQ uop), in parallel with the select
+  // logic, and the late select (wb_forward_valid / dmem_resp_fired, fan-out 343/292 in lean57) now picks one bit.
+  // Cost: 3 candidates x 2 kinds x one in() per lane (~10 LUT each) = ~120 LUT for memWidth 2; the core drops 4.
+  def cfRespWin(w: Int, u: MicroOp): Unit = {
+    io.core.cf_resp_wsec.foreach(_(w) := io.core.cf_wsh_sec.get.in(u.rob_idx))
+    io.core.cf_resp_watk.foreach(_(w) := io.core.cf_wsh_atk.get.in(u.rob_idx))
   }
 
   val dmem_resp_fired = WireInit(widthMap(w => false.B))
@@ -2330,8 +2723,20 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.executed  := false.B
         nacking_loads(io.dmem.nack(w).bits.uop.ldq_idx) := true.B
         // [NACKRES] step 16: nacked while a secret-address miss holds an MSHR -> tag the load
+        // [NACKSECQ] lean58 A7 (DF-nack-secqual, ledger 752; RULES D1 "MSHR/WB nack"): only a nack whose CAUSE is
+        // the MSHR/WB side (MSHR full / same set / no free way, victim line, same-set writeback) is that edge, as on
+        // the attacker side since patch 44: a probe or data-bank-conflict nack taken while some secret MSHR is live
+        // no longer raises a secret nack edge (secret over-taint removed).  cf_nack_mshr is a register-only term
+        // (dcache.scala, 0 levels); one more input on the existing write-enable LUT.  A nack with an MSHR cause AND
+        // a probe/bank cause in the same cycle records nothing (the attacker side's existing under-taint corner).
+        // [NACKCONFSEC] lean58 (Fable audit M8, owner 2026-10-23): ...and only when the CONFLICTING MSHR holds the
+        // secret request (patch 68's attacker rule, now both sides): an unrelated probe nacked on full MSHRs or
+        // another set while the victim's secret miss is live no longer gets a secret register.  The PC is still
+        // cf_asec_busy.bits (the lowest live secret MSHR's), which names the conflicting one whenever only one
+        // secret MSHR is live (residual: several live secret MSHRs may name another one).  RECORD CHANGE.
         if (ENABLE_IFT) {
-          when (io.dmem.cf_asec_busy.valid) {
+          val nk_sec = io.dmem.cf_nack_asec.get(w) && io.dmem.cf_nack_mshr.get(w)
+          when (nk_sec) {
             ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.cf_nack_res_v.foreach(_ := true.B)
             ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.cf_nack_res_pc.foreach(_ := io.dmem.cf_asec_busy.bits)
           }
@@ -2347,7 +2752,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
             ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.cf_nack_res_atk.foreach(_ := true.B)
           }
           for (i <- 0 until numLdqEntries) {
-            when (nk_atk && !io.dmem.cf_asec_busy.valid && io.dmem.nack(w).bits.uop.ldq_idx === i.U &&
+            when (nk_atk && !nk_sec && io.dmem.nack(w).bits.uop.ldq_idx === i.U &&   // [NACKCONFSEC] (was !cf_asec_busy.valid)
                   !ldq(i).bits.cf_nack_res_v.get) {
               ldq(i).bits.cf_nack_res_pc.foreach(_ := io.dmem.cf_asec_busy.bits)
             }
@@ -2379,7 +2784,22 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         val ldq_base_cf = ldq(ldq_idx).bits.uop
         val resp_cf     = io.dmem.resp(w).bits.uop
         val merged_base_cf = WireInit(ldq_base_cf)
-        merged_base_cf.cf_fu_bitmap.foreach(_ := ldq_base_cf.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | resp_cf.cf_fu_bitmap.getOrElse(0.U(numModules.W)))
+        // [F7FUBMAP] lean58 timing F7 (timing-audit-20261023 section 6): the LSU sets dcacheTagCF itself and no longer
+        // reads the D$ response's 24-bit cf_fu_bitmap, so the copies the D$ carries for it (s1/s2 request registers,
+        // the 8 x 16 rpq entries in LUTRAM, the MSHR req registers, the response bus) lose their only reader and are
+        // trimmed by synthesis, in the MSHR block that is the lean57 local-congestion hotspot.
+        // Bit-identical (records unchanged): the D$ response bitmap is (request uop bitmap) | dcacheTagCF (dcache.scala
+        // uop_resp_base on a hit / replay, uncache_resp for the MSHR path; no other D$ or MSHR site touches the field),
+        // and every LSU load request's uop bitmap is a subset of this LDQ entry's bitmap by the time it responds:
+        //   load incoming / retry: the request uop is exe_tlb_uop_cf(w), and the same cycle ORs exe_tlb_uop_cf(w)'s
+        //     bitmap into ldq(ldq_idx) (the will_fire_load_incoming || will_fire_load_retry block, same ldq_idx);
+        //   load wakeup: the request uop IS the LDQ entry's uop;
+        //   MSHR replay: the rpq holds a copy of one of the above;
+        // and an LDQ entry's bitmap only grows (written at enqueue and by that OR, nowhere else).  Hence
+        // ldq | (req | dcacheBit) == ldq | dcacheBit.  This relies on the D$ answering only the live load its ldq_idx
+        // names (BOOM's own invariant: killed loads are dropped in s1/s2 and in the rpq), the same invariant every
+        // other field of this merge already relies on.  IFT off: the field is None.
+        merged_base_cf.cf_fu_bitmap.foreach(_ := ldq_base_cf.cf_fu_bitmap.getOrElse(0.U(numModules.W)) | (1.U << dcacheTagCF.U))
         merged_base_cf.cf_secret_access.foreach(_ := ldq_base_cf.cf_secret_access.getOrElse(false.B) || resp_cf.cf_secret_access.getOrElse(false.B))
         merged_base_cf.cf_secret_transmission.foreach(_ := ldq_base_cf.cf_secret_transmission.getOrElse(false.B) || resp_cf.cf_secret_transmission.getOrElse(false.B))
         // [MERGEFIX 2026-09-07] VALIDATED. merged_base_cf = WireInit(ldq_base_cf), so any
@@ -2404,8 +2824,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         // response uop's cf_opnd_* from the store metadata, epoch-matched to this load) returns
         // WINDOW taint: the core writes it to the register's wsec/watk (epoch-checked) and gives
         // the s_prop update; it never reaches `secret`, so it never re-arms the window.
-        merged_base_cf.cf_opnd_wsec.foreach(_ := ldq_base_cf.cf_opnd_wsec.getOrElse(false.B) || resp_cf.cf_opnd_wsec.getOrElse(false.B))
-        merged_base_cf.cf_opnd_watk.foreach(_ := ldq_base_cf.cf_opnd_watk.getOrElse(false.B) || resp_cf.cf_opnd_watk.getOrElse(false.B))
+        merged_base_cf.cf_opnd_wsec.foreach(_ := false.B)   // [ONETAG] r205: no secret window kind
+        merged_base_cf.cf_opnd_watk.foreach(_ := false.B)   // [ONETAGATK] r205 U8
         // Task 3.2 (D16): the D$ edges ride on the response; promote attacker influence on
         // an attacker edge exactly as the old list merge did.
         when (respEdgeAtk(io.dmem.resp(w).bits.edges)) { merged_base_cf.cf_attacker_influence.foreach(_ := true.B) }
@@ -2415,6 +2835,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         io.core.exe(w).fresp.bits.edges := io.dmem.resp(w).bits.edges
 
         io.core.exe(w).iresp.bits.uop  := dmem_resp_uop_cf
+        cfRespWin(w, dmem_resp_uop_cf)   // [F1WSH]
         io.core.exe(w).fresp.bits.uop  := dmem_resp_uop_cf
         io.core.exe(w).iresp.valid     := send_iresp
         io.core.exe(w).iresp.bits.data := io.dmem.resp(w).bits.data
@@ -2480,13 +2901,14 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           // for the uop, one AND, one OR.
           val amo_e = stq(io.dmem.resp(w).bits.uop.stq_idx).bits
           amo_base_cf.cf_secret_transmission.foreach(_ := amo_e.uop.cf_secret_transmission.getOrElse(false.B) ||
-                                                (cfStDataSec(amo_e) && !amo_e.addr_in_secret.getOrElse(false.B)))   // [WINMEM]
+                                                (cfStDataSec(amo_e) && !amo_e.uop.cf_secret_access.getOrElse(false.B)))   // [WINMEM] [SACCU]
           // [WINMEM] step 21: the AMO's old value is window-tainted when its address operand was
           // (the load half; the data operand does not select the returned value) or the D$
           // word it read was window-marked (response cf_opnd_*); membership is the uop's cf_win_*.
-          amo_base_cf.cf_opnd_wsec.foreach(_ := amo_e.addr_is_wsec.getOrElse(false.B) || io.dmem.resp(w).bits.uop.cf_opnd_wsec.getOrElse(false.B))
-          amo_base_cf.cf_opnd_watk.foreach(_ := amo_e.addr_is_watk.getOrElse(false.B) || io.dmem.resp(w).bits.uop.cf_opnd_watk.getOrElse(false.B))
+          amo_base_cf.cf_opnd_wsec.foreach(_ := false.B)   // [ONETAG] r205
+          amo_base_cf.cf_opnd_watk.foreach(_ := false.B)   // [ONETAGATK]
           io.core.exe(w).iresp.bits.uop   := amo_base_cf
+          cfRespWin(w, amo_base_cf)   // [F1WSH]
           io.core.exe(w).iresp.bits.edges := io.dmem.resp(w).bits.edges
           io.core.exe(w).iresp.bits.data := io.dmem.resp(w).bits.data
             // AMO path: the response uop is the STQ entry, so the taint is that
@@ -2572,8 +2994,17 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       // load's own s_tx are unchanged (TLB-stage address rule).  r139 (edge only) governs the store-DATA
       // whole-line mark, not this.  Cost: one 1-bit entry mux by wb_forward_stq_idx beside the
       // data_is_secret one + one OR input; 0 levels (the OR folds into the consumers' LUTs).
+      // [ONETAG] r205: the window-kind forward (stl_wsec, same-epoch compare) is gone; a window-derived store data or
+      // address is already data_is_secret / addr_is_secret (the one tag).  Whether the forwarded value / STL_FORWARD
+      // label also takes the store's record s_prop is RULES.md E/U2 (+ OPEN O4): staged as r205-u2b-stl-record.diff.
+      // [U2STL] variant for RULES.md E/U2 = YES for STL_FORWARD (and OPEN O4 S-a): the forwarded value and the
+      // STL_FORWARD sec label also take the store's record s_prop known now (dispatch-time membership / edges,
+      // operand taint), as its D$ doubleword does at commit.  One leaf on the same entry mux: 0 levels.
+      // [SACCU] 2026-10-21: stl_infl_uop.cf_secret_access is now set for a plain in-range store too (one s_acc
+      // definition), so an STL_FORWARD from such a store carries sec = 1 (U2: the record summary labels the edge).
+      // The forwarded value was already secret through the load's own fwd_sacc below; no new logic.
       val stl_store_is_secret = stl_infl_uop.cf_secret_access.getOrElse(false.B) || stq_e.bits.data_is_secret.getOrElse(false.B) ||
-                                stq_e.bits.addr_is_secret.getOrElse(false.B)
+                                stq_e.bits.addr_is_secret.getOrElse(false.B) || stl_infl_uop.cf_secret_propagation.getOrElse(false.B)
       // ATTACKER: forwarding hands the loaded register the store's VALUE, so it also
       // hands over that value's attacker taint.  data_is_atk, not the uop's domain --
       // an attacker-written value forwarded into victim code is influence, not ownership.
@@ -2582,13 +3013,19 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       // ATTACKER-tainted address hands a VICTIM load attacker value taint and an atk edge; and the load's
       // own attacker address taints its value, as on the D$ response path (iresp taint_atk above).
       val stl_fwd_victim      = forward_uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U
-      val stl_atk_v           = (stl_store_is_atk || stq_e.bits.addr_is_atk.getOrElse(false.B)) && stl_fwd_victim
+      // [M6STLATK] lean58 (Fable audit M6; RULES A U2 "all edges", U8 symmetric): the store's attacker RECORD (its
+      // dispatch summary cf_dis_atk and the uop's attacker bit, as the STQ head and the store's D$ DW at commit
+      // use it) joins the forwarded value and both STL_FORWARD labels, the twin of stl_store_is_secret's
+      // cf_secret_propagation leaf.  One leaf on the same forward-entry mux: 0 levels.  RECORD CHANGE.
+      val stl_store_atk_rec   = stq_e.bits.cf_dis_atk.getOrElse(false.B) || stl_infl_uop.cf_attacker_influence.getOrElse(false.B)
+      val stl_atk_v           = (stl_store_is_atk || stq_e.bits.addr_is_atk.getOrElse(false.B) || stl_store_atk_rec) && stl_fwd_victim
       // [STLDOM] patch 67 (V11, owner 2026-10-19 16:3x): ...and the store's attacker DOMAIN, as the D$ store-meta
       // write marks atkMask with (domain || data_is_atk) (dcache.scala st_atk).  An attacker store of x0 or of a
       // victim-written register forwarded a clean value and then committed a tainted doubleword.  P1: ownership
       // seeds the value the attacker writes.  The domain comes through the same forward-entry select as
       // data_is_atk (parallel): +1 OR input, 0 levels.  IFT off: cf_domain_id is None (constant 0).
       val stl_val_atk         = stl_store_is_atk || stl_infl_uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U ||
+                                stl_store_atk_rec ||   // [M6STLATK]
                                 (stq_e.bits.addr_is_atk.getOrElse(false.B) && stl_fwd_victim) ||
                                 ldq(f_idx).bits.addr_is_atk.getOrElse(false.B)
       // Task 3.2 (D16): the two STL_FORWARD edges are built on a zero base and travel on the
@@ -2597,7 +3034,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       // Exactly one can fire (the domain tests are complements).
       val (stl_edges, stl_atk) = addInfluencerBatchList(0.U.asTypeOf(new IftEdgeList), forward_uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)), Seq(
         InfluencerCandidate(data_ready && live && (forward_uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= stl_infl_uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W))),
-                            stl_infl_uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)), INFL_STL_FORWARD, stl_infl_uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U, stl_store_is_secret),
+                            stl_infl_uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)), INFL_STL_FORWARD,
+                            stl_infl_uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U || stl_store_atk_rec, stl_store_is_secret),   // [M6STLATK]
         // [MEMORDATK] same-domain: also an attacker-influenced (data or address) store forwarding to a victim
         // load, is_atk = that term, is_secret = the store's secret (was the constants {0, 1}).
         InfluencerCandidate(data_ready && live && (stl_store_is_secret || stl_atk_v) && (forward_uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === stl_infl_uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W))),
@@ -2611,18 +3049,18 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       // window epoch (a store is older than its load, so a later epoch means the window closed
       // in between).  The core makes it register window taint + s_prop; never `secret`.
       // One 2-bit compare + 4-input OR beside the existing data-taint terms.
-      val stl_wsec = stq_e.bits.addr_is_wsec.getOrElse(false.B) || stq_e.bits.data_is_wsec.getOrElse(false.B) || stl_infl_uop.cf_win_sec.getOrElse(false.B)
-      val stl_watk = stq_e.bits.addr_is_watk.getOrElse(false.B) || stq_e.bits.data_is_watk.getOrElse(false.B) || stl_infl_uop.cf_win_atk.getOrElse(false.B)
-      fwd_uop_cf.cf_opnd_wsec.foreach(_ := forward_uop.cf_opnd_wsec.getOrElse(false.B) ||
-                                 (stl_wsec && stl_infl_uop.cf_wep_sec.getOrElse(0.U(2.W)) === forward_uop.cf_wep_sec.getOrElse(0.U(2.W))))
-      fwd_uop_cf.cf_opnd_watk.foreach(_ := forward_uop.cf_opnd_watk.getOrElse(false.B) ||
-                                 (stl_watk && stl_infl_uop.cf_wep_atk.getOrElse(0.U(2.W)) === forward_uop.cf_wep_atk.getOrElse(0.U(2.W))))
+      fwd_uop_cf.cf_opnd_wsec.foreach(_ := false.B)   // [ONETAG] r205
+      // [ONETAGATK] r205 U8: the attacker window-kind forward (stl_watk, same-epoch compare) is gone; a window-derived
+      // store value is already data_is_atk / addr_is_atk.  The store's attacker RECORD on the forwarded value is the
+      // attacker side of U2 (u2b covers the secret side only).
+      fwd_uop_cf.cf_opnd_watk.foreach(_ := false.B)
       io.core.exe(w).iresp.bits.edges := stl_edges
       io.core.exe(w).fresp.bits.edges := stl_edges
 
       io.core.exe(w).iresp.valid := (fwd_uop_cf.dst_rtype === RT_FIX) && data_ready && live
       io.core.exe(w).fresp.valid := (fwd_uop_cf.dst_rtype === RT_FLT) && data_ready && live
       io.core.exe(w).iresp.bits.uop  := fwd_uop_cf
+      cfRespWin(w, fwd_uop_cf)   // [F1WSH]
       io.core.exe(w).fresp.bits.uop  := fwd_uop_cf
       io.core.exe(w).iresp.bits.data := loadgen.data
       // [SECDEST] step 17 A(1): a forwarded load at a secret-derived address also returns a
@@ -2635,8 +3073,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       // response path tags it (dmem_resp_uop_cf.cf_secret_access in iresp/fresp.secret above).
       // Missing, the register was written clean and its consumers (ridl: the sb of the
       // attacker's ld of ift_secret) lost s_tx.  The LOAD's bit, not the store's: patch 52
-      // leaves the STQ uop's cf_secret_access clear for a clean store (it is the line/value
-      // mark).  The s_prop of the load itself needs nothing here: the core's writeback s_prop
+      // left the STQ uop's cf_secret_access clear for a clean store ([SACCU] 2026-10-21 now sets it
+      // for an in-range store, which stl_store_is_secret above already reads).  The s_prop of the load itself needs nothing here: the core's writeback s_prop
       // update already fires on wb_uop.cf_secret_access (core.scala is_secret_wb), as on the
       // D$ path, so the sticky s_prop below stays store-taint only.
       // Cost: one more leaf (the same ldq(f_idx) register mux as fwd_asec) on the existing
@@ -2778,8 +3216,14 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       stq(idx).bits.committed := true.B
       // [WINMEM] step 21: a store committing in the window shadow (rob.scala sets the commit
       // uop's cf_win_* from the [WINSHADOW] range) is a window member for its D$ write
-      stq(idx).bits.uop.cf_win_sec.foreach(_ := stq(idx).bits.uop.cf_win_sec.getOrElse(false.B) || io.core.commit.uops(w).cf_win_sec.getOrElse(false.B))
-      stq(idx).bits.uop.cf_win_atk.foreach(_ := stq(idx).bits.uop.cf_win_atk.getOrElse(false.B) || io.core.commit.uops(w).cf_win_atk.getOrElse(false.B))
+      // [ONETAG] r205: the STQ uop's cf_win_sec now holds the store's commit-time RECORD secret (s_acc || s_prop,
+      // which includes the commit-time window shadow; debug-masked by rob.scala), read only by the D$ write request
+      // above (S-a).  The store writes the D$ only after commit, so the bit is final when it is read.
+      stq(idx).bits.uop.cf_win_sec.foreach(_ := io.core.commit.uops(w).cf_secret_propagation.getOrElse(false.B) ||
+                                                io.core.commit.uops(w).cf_secret_access.getOrElse(false.B))
+      // [ONETAGATK] r205 U8: the STQ uop's cf_win_atk now holds the store's commit-time attacker RECORD (sticky atk ||
+      // attacker shadow, debug-masked), read only by the D$ write request above.
+      stq(idx).bits.uop.cf_win_atk.foreach(_ := io.core.commit.uops(w).cf_attacker_influence.getOrElse(false.B))
     } .elsewhen (commit_load) {
       assert (ldq(idx).valid, "[lsu] trying to commit an un-allocated load entry.")
       assert ((ldq(idx).bits.executed || ldq(idx).bits.forward_std_val) && ldq(idx).bits.succeeded ,
@@ -3048,31 +3492,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   io.core.no_pending_mem := (if (ENABLE_RECONF) io.core.queues_empty && hella_state === h_ready && !io.hellacache.req.valid
                              else io.core.queues_empty && !io.dmem.req.valid)
 
-  // [LSQWCLR] patch 64 (V7, owner 2026-10-19 16:3x; claude-artifacts/20-attacker-taint-lifecycle.md V7): the
-  // ATTACKER-window bits of the LDQ / STQ entries expire with the window, as the register files' watk does
-  // ([WINCLR] patch 35 C flash clear on win_atk_close).  Before: ldq.uop.cf_opnd_watk, stq.addr_is_watk /
-  // data_is_watk and stq.uop.cf_win_atk kept 1 for the entry's life, so ldq_head_atk / stq_head_atk (MEM_HOL,
-  // LDQ_FULL, STQ_FULL) and ldq/stq_atk_infl (MEM_ORDER) stayed is_atk after the close.  Every uop in flight
-  // at a close is younger than the closing branches (outside the window), so clearing every entry is exact;
-  // the D$ window marks (epoch-stamped) and the STL forward (epoch compare) see the same verdict.  The clear
-  // is the close REGISTERED (one FF, so the core -> LSU route starts at a flop) and is the LAST connection
-  // (it wins over a write in the same cycle: such a write is from a uop already outside the window, or it
-  // is the write of the close cycle itself).  Cost: 1 FF + a synchronous-clear term on 40 + 3 x 40 = 160
-  // FF bits (the FDRE R pin when the clear is the highest priority, else 1 LUT each), 0 levels on every
-  // reader.  IFT off: the port and the clear are not elaborated.
-  if (ENABLE_IFT) {
-    val cf_wclr_atk_q = RegNext(io.core.cf_wclr_atk.get, false.B)
-    when (cf_wclr_atk_q) {
-      for (i <- 0 until numLdqEntries) {
-        ldq(i).bits.uop.cf_opnd_watk.foreach(_ := false.B)
-      }
-      for (i <- 0 until numStqEntries) {
-        stq(i).bits.addr_is_watk.foreach(_ := false.B)
-        stq(i).bits.data_is_watk.foreach(_ := false.B)
-        stq(i).bits.uop.cf_win_atk.foreach(_ := false.B)
-      }
-    }
-  }
+  // [ONETAGATK] r205 U8 (owner 2026-10-20: the attacker side is symmetric, no flash clear at close): the patch-64
+  // LSQ close clear of the attacker window bits is removed with those bits (-1 FF, -160 FF-bit clear terms).
 }
 
 /**

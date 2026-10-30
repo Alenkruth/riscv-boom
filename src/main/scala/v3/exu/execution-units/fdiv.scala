@@ -193,7 +193,8 @@ class FDivSqrtUnit(implicit p: Parameters)
     // that OR for the computing op; the buffered op's operand bits are flops: one LUT, 0 levels added.
     io.cf_fu_busy.bits.is_atk := Mux(r_divsqrt_val, r_divsqrt_atk,
                                      r_buffer_req.rs1_taint_atk || r_buffer_req.rs2_taint_atk) ||
-                                 cf_busy_occ.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U
+                                 cf_busy_occ.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U ||
+                                 cf_busy_occ.cf_attacker_influence.getOrElse(false.B)   // [RECEDGE] r205 record summary
     io.cf_fu_busy.bits.is_sec := Mux(r_divsqrt_val, r_divsqrt_secret,
                                      r_buffer_req.rs1_secret || r_buffer_req.rs2_secret) ||
                                  cf_busy_occ.cf_secret_access.getOrElse(false.B) || cf_busy_occ.cf_secret_propagation.getOrElse(false.B)

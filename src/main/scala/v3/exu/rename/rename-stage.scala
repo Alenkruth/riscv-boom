@@ -323,6 +323,9 @@ class RenameStage(
   maptable.io.ren_br_tags := ren2_br_tags
   maptable.io.brupdate      := io.brupdate
   maptable.io.rollback    := io.rollback 
+  // [DBGFREEZE] patch 85 (c): x8 / x9 mappings for core.scala (INT stage only)
+  val cf_map89 = if (ENABLE_IFT && !float) Some(IO(Output(Vec(2, UInt(pregSz.W))))) else None
+  cf_map89.foreach(_ := maptable.cf_map89.get)
 
   // Maptable outputs.
   for ((uop, w) <- ren1_uops.zipWithIndex) {

@@ -111,6 +111,19 @@ class WithoutCfDebugPrintf extends Config((site, here, up) => {
   }
 })
 
+/* Turns ON the D$/MSHR shadow-state printfs ([RFB], [SMWR], [SMDROP], [RMDROP], [D1STARVE],
+ * dcache.scala) used only by the host oracle's D$ cross-check (dcheck.py, via oracle/vlog.py).
+ * Off by default (enableCfCacheShadowPrintf = false); needs enableCfDebugPrintf (the default).
+ * Scala `if`, so no logic when off. */
+class WithCfCacheShadowPrintf extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      enableCfCacheShadowPrintf = true
+    )))
+    case other => other
+  }
+})
+
 /* Disables the LSU memory-access trace printf ("MT ..." lines, MEMTRACE_PRINTF /
  * enableMemtracePrintf, lsu.scala:1991). That dump is a SEPARATE gate from the CF-debug
  * printfs and is on by default, so a commit-log config must also apply this to emit only

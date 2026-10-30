@@ -83,8 +83,10 @@ class BIMBranchPredictorBank(params: BoomBIMParams = BoomBIMParams())(implicit p
   // Qualified on a valid, post-reset prediction: BIM has no tags, so without this
   // every read of an idle entry would report a mismatch.
   val s2_bim_live = s2_valid && !doing_reset
+  // [ATKDMMASK] lean58 A5 (gap inventory 2026-10-23): the attacker-side twin of [BPDMASK]: a slot below the fetch
+  // PC, or a bank whose request is not valid, is not part of the packet; its domain label raises no edge either.
   io.f3_bpd_domain_mismatch := (if (ENABLE_IFT) RegNext(s2_bim_live &&
-    (0 until bankWidth).map(w => s2_req_rdomain(w) =/= s2_fetch_domain).reduce(_||_)) else false.B)   // [R124GATE3]
+    (0 until bankWidth).map(w => (s2_req_rdomain(w) =/= s2_fetch_domain) && s2_mask(w)).reduce(_||_)) else false.B)   // [R124GATE3]
   // [BPDMASK] r170 A (DF-dt-sprop): a slot below the fetch PC, or a bank whose request is not
   // valid, is not part of the packet; its secret label raises no edge.
   io.f3_bpd_secret_mismatch := (if (ENABLE_IFT) RegNext(s2_bim_live &&
@@ -159,6 +161,25 @@ class BIMBranchPredictorBank(params: BoomBIMParams = BoomBIMParams())(implicit p
       wrbypass(wrbypass_enq_idx)      := s1_update_wdata
       wrbypass_idxs(wrbypass_enq_idx) := s1_update_index
       wrbypass_enq_idx := WrapInc(wrbypass_enq_idx, nWrBypassEntries)
+    }
+  }
+
+  // [SINKFACTS86] patch 86 (all-sinks study Q6): every BIM commit write, debug printf builds only (the
+  // IftSquashMerge gate: IFT on, CF debug printfs on, no IFT bridge; IFT off / NoLog / FireSim elaborate nothing).
+  // pc = the bank-aligned update pc (bank = pc[3]); idx = the row; wm = slot write mask; meta = the FETCH-time
+  // counters the update carries; byp / bypv = the 2-entry row write bypass hit and that row; per written slot the
+  // old value is bypv when byp = 1, else meta (bim.scala old_bim_value); new = the written counters (unwritten
+  // slots printed 0).  The host replays these writes to get the TRUE row before each write: used =/= true is a
+  // fetch-vs-update interleaving event, i.e. exactly where a commit-order model (models.py BIM) diverges.
+  // cyc: a debug-only 40-bit counter from reset (same reset as the FTQ d4_cyc_q and dcache cf_d1_cyc).
+  if (ENABLE_IFT && ENABLE_CF_DEBUG_PRINTF && !ENABLE_IFT_BRIDGE) {
+    val cf_sf_cyc = RegInit(0.U(40.W))
+    cf_sf_cyc := cf_sf_cyc + 1.U
+    when (!doing_reset && s1_update.valid && s1_update.bits.is_commit_update && s1_update_wmask.reduce(_||_)) {
+      printf("[BIMW] cyc=%d pc=0x%x idx=0x%x wm=0x%x meta=0x%x byp=%d bypv=0x%x new=0x%x\n", cf_sf_cyc,
+        s1_update.bits.pc, s1_update_index(log2Ceil(nSets)-1, 0), s1_update_wmask.asUInt, s1_update_meta.bims.asUInt,
+        wrbypass_hit, wrbypass(wrbypass_hit_idx).asUInt,
+        VecInit((0 until bankWidth).map(w => Mux(s1_update_wmask(w), s1_update_wdata(w), 0.U(2.W)))).asUInt)
     }
   }
 

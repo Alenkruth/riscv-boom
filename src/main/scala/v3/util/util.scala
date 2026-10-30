@@ -1070,8 +1070,14 @@ object addInfluencerBatchList extends CoreFuzzingConstants {
 }
 
 // IFT overhaul Phase 3, Task 3.3: the 8 fetch-side candidates ([FIFO10]: was 10, ITLB removed), rebuilt from the
-// FetchIftInfo.fetch_flags bits (bit order: FetchIftInfo in ift-bundles.scala).  The order
-// below is the old fetch-buffer batch order, so the base list keeps today's slot order.
+// FetchIftInfo.fetch_flags bits (bit order: FetchIftInfo in ift-bundles.scala).  The candidate
+// order below is NOT the bit order: [G1V2] (owner 2026-10-22, G1 variant V2) moved the I$ attacker
+// edge (bit 0, ty16 is_atk) from first to LAST, after the BTB candidates, so it is the newest fetch
+// edge and survives a full list (addInfluencerBatchList keeps the newest; slot 0 is the oldest).
+// Everything else keeps the old fetch-buffer batch order (I$ secret edge, bit 1, stays first).
+// Order (candidate index -> bit): 0 b1 I$ sec, 1 b2 RAS, 2 b3 BPD atk, 3 b4 BPD sec, 4 b5 BTB ty10,
+// 5 b7|b8 BTB PC-coded, 6 b0 I$ atk.  No reader depends on this order beyond slot placement
+// (dis_sec_any / promotedAtk are ORs; IftMerge orders the base group by slot).
 // One definition shared by dispatch (core.scala) and the printf-only fetchFlagsToList.
 //
 // [BTBDISP 2026-10-13, step 16] bit 7 = (hit on a secret-trained BTB/uBTB entry) OR (fetch of the
@@ -1091,19 +1097,25 @@ object btbSecTypeCode extends CoreFuzzingConstants {
 }
 object fetchFlagCandidates extends CoreFuzzingConstants {
   def apply(f: UInt, any_is_victim: Bool, btb_sec_pc: UInt): Seq[InfluencerCandidate] = Seq(
-    InfluencerCandidate(f(0), 0.U, INFL_ICACHE_STATE,      any_is_victim, false.B),
     InfluencerCandidate(f(1), 0.U, INFL_ICACHE_STATE,      false.B,       true.B),
     InfluencerCandidate(f(2), 0.U, INFL_RAS_STATE,         false.B,       true.B),
     InfluencerCandidate(f(3), 0.U, INFL_BPD_STATE,         any_is_victim, false.B),
     InfluencerCandidate(f(4), 0.U, INFL_BPD_STATE,         false.B,       true.B),
     InfluencerCandidate(f(5), 0.U, INFL_BTB_STATE,         any_is_victim, false.B),
-    InfluencerCandidate(f(6), 0.U, INFL_BTB_TARGET_INJECT, any_is_victim, false.B),
+    // [TY27RM 2026-10-22, owner order] f(6) (BTB_TARGET_INJECT, ty27) is removed: the BTB edge is
+    // ty10 BTB_STATE (entry installed by the other domain) and its secret/displacement codes.
+    // Bit 6 stays in the layout, driven 0 by the fetch buffer (no candidate, no slot).
     // [BTBATK] DF-btbatk: ONE PC-coded BTB candidate for bits 7 and 8: sec = bit 7 (secret
     // trainer hit / secret displacement record), atk = bit 8 (attacker displacement record,
     // victim packets only).  Same codes 31/14/15/13; the parser tells the kinds apart by the
     // slot's atk/sec bits.  r117: sec sets sticky s_prop, atk sets the sticky attacker bit.
     InfluencerCandidate(f(7) || f(8), btb_sec_pc(inflPcBitsCF-3, 0), INFL_BTB_STATE_0, f(8), f(7), is_pc = true,
-                        infl_type_dyn = Some(btbSecTypeCode(btb_sec_pc(inflPcBitsCF-1, inflPcBitsCF-2)))))
+                        infl_type_dyn = Some(btbSecTypeCode(btb_sec_pc(inflPcBitsCF-1, inflPcBitsCF-2)))),
+    // [G1V2] bit 0, the I$ attacker (domain-mismatch) edge, LAST = newest: it is kept when the 4-slot
+    // list overflows.  Same cond / type / is_atk as before; only its position moved.  Cost: no FF;
+    // its prefix is now a popcount of the 6 earlier fetch conds (was the constant 0), shallower than
+    // the dispatch candidates' prefixes already in the same network; outputs are registers only.
+    InfluencerCandidate(f(0), 0.U, INFL_ICACHE_STATE,      any_is_victim, false.B))
     // [FIFO10] step 10 (ruling 94): the two ITLB_STATE candidates (bits 8/9) are removed.
 }
 

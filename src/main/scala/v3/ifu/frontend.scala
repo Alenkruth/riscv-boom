@@ -291,7 +291,7 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
   val ras_domain_mismatch    = if (ENABLE_IFT) Some(Bool()) else None  // RAS return addr pushed by different domain
   val bpd_domain_mismatch    = if (ENABLE_IFT) Some(Bool()) else None  // TAGE entry last updated by different domain
   val btb_domain_mismatch    = if (ENABLE_IFT) Some(Bool()) else None  // BTB entry last written by different domain
-  val btb_target_xdom        = if (ENABLE_IFT) Some(Bool()) else None  // BTB-predicted JALR target is cross-domain (branch-target-injection)
+  // [TY27RM 2026-10-22] btb_target_xdom removed (ty27 BTB_TARGET_INJECT retired; the BTB edge is btb_domain_mismatch, ty10)
   val cf_fetch_domain        = if (ENABLE_IFT) Some(UInt(1.W)) else None // domain of this fetch packet (for FTQ/bpdupdate)
   // corefuzzing: secret shadow mismatch — predictor entry was trained by secret instruction
   val bpd_secret_mismatch    = if (ENABLE_IFT) Some(Bool()) else None
@@ -313,6 +313,12 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
   val ghist_atk_ctr          = if (ENABLE_IFT) Some(UInt(7.W)) else None
   // corefuzzing: RAS pop was from a slot pushed by a secret call (retroactively tagged)
   val ras_pop_secret         = if (ENABLE_IFT) Some(Bool()) else None
+  // [RASLBL] DF-ras-repair-label: domain and secret labels of the slot ras_top was read from (the same
+  // registered RAS read, ras.io.read_domain / read_secret), saved in the FTQ for the top repair
+  val ras_top_dom            = if (ENABLE_IFT) Some(Bool()) else None
+  val ras_top_sec            = if (ENABLE_IFT) Some(Bool()) else None
+  // [B60RAS] bundle60 (C): the slot's attacker-window label (ras.io.read_watk), saved for the top repair
+  val ras_top_watk           = if (ENABLE_IFT) Some(Bool()) else None
 }
 
 
@@ -415,6 +421,9 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   // The FTQ's retire-time counters are no longer read.
   val cf_win_sec_ctr = Output(UInt(7.W))
   val cf_win_atk_ctr = Output(UInt(7.W))
+  // [DBGFREEZE] patch 85 (b): the hart is in debug mode (core.scala cf_dbg, a flop): the fetch buffer gives the
+  // packets it enqueues no fetch-time label (edges, s_prop / atk, domain).  IFT only.
+  val cf_dbg = if (ENABLE_IFT) Some(Output(Bool())) else None
   // [WINFTQ] patch 29b (owner r160): the FTQ index of the oldest secret-window arming branch
   // that resolved (registered); the FTQ tags every entry younger than it (fetch-target-queue.scala).
   val cf_win_ftq_rs = if (ENABLE_IFT) Some(Output(Valid(UInt(log2Ceil(ftqSz).W)))) else None
@@ -526,10 +535,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   bpd.io.f0_req.bits.pc    := s0_vpc
   bpd.io.f0_req.bits.ghist := s0_ghist
   // corefuzzing: compute s0 domain for BPD domain shadow tracking
-  bpd.io.f0_req_domain_id := Mux(
+  // [F4S1RNG] lean58: IFT on, the BPD gets the s1 domain (bpd.io.f1_req_domain_id, below); this port is tied 0.
+  bpd.io.f0_req_domain_id := (if (ENABLE_IFT) 0.U else Mux(
     (io.cpu.cf_attacker_start_addr =/= 0.U) &&
     (s0_vpc >= io.cpu.cf_attacker_start_addr) &&
-    (s0_vpc < io.cpu.cf_attacker_end_addr), 1.U, 0.U)
+    (s0_vpc < io.cpu.cf_attacker_end_addr), 1.U, 0.U))
 
   // Value from reconfigure CSR - AK
   // for the fuzzycore.
@@ -570,15 +580,55 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   icache.io.s1_kill  := tlb.io.resp.miss || f1_clear
 
   // corefuzzing: compute fetch domain (attacker=1, victim=0) based on s0_vpc vs CSR range
+  // [F4S1RNG] lean58 timing F4 (timing-audit-20261023 section 2.5): IFT on, the three fetch-PC range tests (attacker
+  // range for the BPD and for the I$, secret range for the I$) no longer hang on s0_vpc, the frontend's next-PC select
+  // (the stock critical net; lean54's worst family).  They are computed in s1 from s1_vpc = RegNext(s0_vpc) and from
+  // a registered copy of the range CSRs and of their enable terms (cf_rng_q).  Exact: every consumer took the s0
+  // result through an unconditional RegNext (s1_fetch_domain, s1_fetch_is_secret, and each predictor bank's s1_domain
+  // = RegNext(io.f0_domain_id)), and for any combinational f, RegNext(f(s0_vpc, csr)) = f(RegNext(s0_vpc),
+  // RegNext(csr)) in every cycle after the first: no reliance on the CSR-write flush (a fetch in flight across a
+  // range-CSR write computes exactly what it did before).  The f3 range compare (f3_imemresp.pc) and the fetch
+  // buffer keep the live CSRs.  Cost: 4 x vaddrBitsExtended + 2 FF (the CSR copies sit on the frontend side of the
+  // SLR2-SLR3 crossing); the compares move from s0_vpc's fan-out to s1 cones that end at the f2 flops / I$ s1 logic
+  // (parallel with the SRAM read and tag compare).  IFT off: the s0 form below is unchanged.
+  val cf_rng_q = if (ENABLE_IFT) Some(RegNext(VecInit(io.cpu.cf_attacker_start_addr, io.cpu.cf_attacker_end_addr,
+                                                      io.cpu.cf_secret_start_addr,   io.cpu.cf_secret_end_addr))) else None
+  val cf_rng_en_q = if (ENABLE_IFT) Some(RegNext(VecInit(io.cpu.cf_attacker_start_addr =/= 0.U,
+                                                         io.cpu.cf_secret_start_addr =/= io.cpu.cf_secret_end_addr))) else None
+  val s1_vpc_atk = cf_rng_q.map(q => cf_rng_en_q.get(0) && (s1_vpc >= q(0)) && (s1_vpc < q(1))).getOrElse(false.B)
+  val s1_vpc_sec = cf_rng_q.map(q => cf_rng_en_q.get(1) && (s1_vpc >= q(2)) && (s1_vpc < q(3))).getOrElse(false.B)
+  bpd.io.f1_req_domain_id.foreach(_ := s1_vpc_atk)
+  // The s0 forms are kept for IFT off (unchanged Verilog); IFT on they have no reader and are removed.
   val s0_fetch_is_attacker = (io.cpu.cf_attacker_start_addr =/= 0.U) &&
     (s0_vpc >= io.cpu.cf_attacker_start_addr) && (s0_vpc < io.cpu.cf_attacker_end_addr)
-  // [R124GATE3] patch 28 (B51): IFT-only flop (feeds only the ICache domain-mismatch compare).
-  val s1_fetch_domain = if (ENABLE_IFT) RegNext(s0_fetch_is_attacker) else false.B
+  // [R124GATE3] patch 28 (B51): IFT-only (feeds only the ICache domain-mismatch compare).
+  val s1_fetch_domain = if (ENABLE_IFT) s1_vpc_atk else false.B   // [F4S1RNG] (was RegNext(s0_fetch_is_attacker))
   // corefuzzing: compute fetch secret flag based on s0_vpc vs secret CSR range
   val s0_fetch_is_secret = (io.cpu.cf_secret_start_addr =/= io.cpu.cf_secret_end_addr) &&
     (s0_vpc >= io.cpu.cf_secret_start_addr) && (s0_vpc < io.cpu.cf_secret_end_addr)
-  val s1_fetch_is_secret = RegNext(s0_fetch_is_secret)
-  icache.io.s1_domain_id := s1_fetch_domain
+  val s1_fetch_is_secret = if (ENABLE_IFT) s1_vpc_sec else RegNext(s0_fetch_is_secret)   // [F4S1RNG]
+  // [ICREDIR] F3 (owner 2026-10-22, FINAL: "a fetch redirected by an attacker-domain CFI is attacker-influenced"):
+  // for the I$ domain compare and the fill domain, a fetch packet that is the TARGET of a control transfer made by
+  // an attacker-domain CFI counts as attacker even when its PC is victim/neutral code (r17: the attacker's scan jalr
+  // probing victim-range stubs never mismatched, icache.scala s1_domain_mismatch).  s0_redir_atk follows s0_vpc's
+  // own select (same when-blocks below): core mispredict redirect -> the redirecting uop's domain (brupdate.b2, a
+  // register, the same uop the core redirects for); f1/f2/f3 predicted-taken redirect -> the PC-range domain of the
+  // predicting packet; f2 replay -> the replayed packet's bit; sequential fetch, sfence and ROB flushes -> 0.  Only
+  // the target packet is marked (the next sequential packet is back to its PC domain); the fetch buffer's packet
+  // domain (cf_domain_id, the ty16 is_atk = any_is_victim gate) is unchanged.
+  // Cost: +3 FF (s1/s2 bit, s2 PC domain), ~4 LUT on the s0 select (parallel to s0_vpc, flop or BPD-select data,
+  // +0 levels on s0_vpc), +1 OR input on the I$ s1 domain compare (flop-sourced, absorbed: +0 levels expected,
+  // <= +1 bound).  IFT off: constant 0, no flops.
+  val s0_redir_atk    = WireInit(false.B)
+  val s1_redir_atk    = if (ENABLE_IFT) RegNext(s0_redir_atk, false.B) else false.B
+  val s2_redir_atk    = if (ENABLE_IFT) RegNext(s1_redir_atk, false.B) else false.B
+  val s2_fetch_domain = if (ENABLE_IFT) RegNext(s1_fetch_domain, false.B) else false.B
+  icache.io.s1_domain_id := s1_fetch_domain || s1_redir_atk
+  // [M3ATKWIN] lean58 (Fable audit M3; RULES A U8 "symmetric", reading 1): a line FILLED while the attacker window is open takes the attacker fill
+  // domain (the twin of the secret window term on s1_is_secret, registered the same way).  Fill side only: the
+  // fetch's own domain for the I$ mismatch compare is unchanged (a domain compare, unlike the secret flag, would
+  // flag every window fetch of a victim line).  RECORD CHANGE.
+  icache.io.cf_s1_fill_atk.foreach(_ := RegNext(io.cpu.cf_win_atk_ctr =/= 0.U, false.B))
   // [ICSEC] step 15: icache.io.s1_is_secret is driven below, after `ftq` is in Scala scope.
 
   // [FIFO10] step 10 (owner ruling 94: machine mode, paging off): the ITLB domain/secret shadow
@@ -616,6 +666,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_vpc       := f1_predicted_target
     s0_ghist     := f1_predicted_ghist
     s0_is_replay := false.B
+    s0_redir_atk := f1_do_redirect && s1_fetch_domain   // [ICREDIR]
   }
 
   // --------------------------------------------------------
@@ -672,6 +723,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_valid := (!s2_tlb_resp.ae.inst && !s2_tlb_resp.pf.inst) || s2_is_replay || s2_tlb_miss
     s0_vpc   := s2_vpc
     s0_is_replay := s2_valid && icache.io.resp.valid
+    s0_redir_atk := s2_redir_atk   // [ICREDIR] a replay keeps its packet's bit
     // When this is not a replay (it queried the BPDs, we should use f3 resp in the replaying s1)
     s0_s1_use_f3_bpd_resp := !s2_is_replay
     s0_ghist := s2_ghist
@@ -688,6 +740,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       s0_valid     := !((s2_tlb_resp.ae.inst || s2_tlb_resp.pf.inst) && !s2_is_replay)
       s0_vpc       := f2_predicted_target
       s0_is_replay := false.B
+      s0_redir_atk := f2_do_redirect && s2_fetch_domain   // [ICREDIR]
       s0_ghist     := f2_predicted_ghist
       s2_fsrc      := BSRC_2
       s0_tsrc      := BSRC_2
@@ -975,6 +1028,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_fetch_bundle.cfi_idx.bits  := PriorityEncoder(f3_redirects)
 
   f3_fetch_bundle.ras_top := ras.io.read_addr
+  // [RASLBL] the labels read beside ras_top (RAS read flops, 0 logic); +2 FF in the f4 queue
+  f3_fetch_bundle.ras_top_dom.foreach(_ := ras.io.read_domain)
+  f3_fetch_bundle.ras_top_sec.foreach(_ := ras.io.read_secret)
+  f3_fetch_bundle.ras_top_watk.foreach(_ := ras.io.read_watk.get)   // [B60RAS] RAS read flop, +1 FF per f4 entry
 
   // corefuzzing: compute fetch domain at f3 for RAS/ICache mismatch detection
   val f3_fetch_is_attacker = (io.cpu.cf_attacker_start_addr =/= 0.U) &&
@@ -984,11 +1041,23 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_fetch_bundle.icache_secret_mismatch.foreach(_ := f3_imemresp.icache_secret_mismatch.getOrElse(false.B))
   // RAS domain mismatch: ret pops an addr pushed by a different domain
   // [RASPTR] patch 29 (F-RAS-1): or a VICTIM ret pops an entry written before the latest
-  // attacker pointer move (ras.scala read_stale).  Same field, so the same mispredict-gated ROB
-  // edge (INFL_RAS_STATE, is_atk = the ret is domain 0).  One more input on the same LUT.
+  // attacker pointer move (ras.scala read_stale).  Same field, so the same ROB edge
+  // (INFL_RAS_STATE, is_atk = the ret is domain 0).  One more input on the same LUT.
+  // [RASEVERY] owner 2026-10-21: both halves raise the edge on EVERY such ret (no mispredict
+  // gate); the ROB takes it from the dispatch column (rob-ift-sidecar.scala IftMerge).
+  // [B60RAS] bundle60 (C), owner 2026-10-24 (FINDINGS-open-rebase59 item 4, "separate push-domain bit per RAS entry so
+  // both rules hold"): read_domain is again the PUSHER's domain only (RULES.md C RAS-edge rule: a pusher-domain
+  // mismatch edges both ways), and the 07g M3 attacker-window label rides its own bit read_watk: a VICTIM ret popping
+  // a slot pushed while the attacker window was open gets the edge (as with the one-bit 07g M3 design).  Before, one
+  // bit held "attacker push OR window", so an ATTACKER ret popping a victim slot pushed inside the window saw no
+  // mismatch and lost RAS_STATE (t91 m92 2/8, m93 2/16).  Victim rets: identical to before (dom || watk).  Attacker
+  // rets: edge iff the pusher was the victim (window label not involved: the attacker window labels attacker
+  // influence, which an attacker ret does not receive from its own window).  Levels: one more flop input on the
+  // existing mismatch LUT (ret, cfi valid, f3 domain, read_domain, read_stale, read_watk): 0 added levels.
   f3_fetch_bundle.ras_domain_mismatch.foreach(_ := (
     f3_fetch_bundle.cfi_is_ret && f3_fetch_bundle.cfi_idx.valid &&
-    ((ras.io.read_domain =/= f3_fetch_is_attacker) || (!f3_fetch_is_attacker && ras.io.read_stale))
+    ((ras.io.read_domain =/= f3_fetch_is_attacker) ||
+     (!f3_fetch_is_attacker && (ras.io.read_stale || ras.io.read_watk.getOrElse(false.B))))
   ))
   // corefuzzing: RAS pop secret — the popped slot was retroactively marked secret
   // (pushed by a call from a secret fetch packet). Gated to actual returns only.
@@ -999,22 +1068,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // corefuzzing: BPD/BTB domain and secret mismatches from the prediction response
   f3_fetch_bundle.bpd_domain_mismatch.foreach(_ := f3_bpd_resp.io.deq.bits.bpd_domain_mismatch.getOrElse(false.B))
   f3_fetch_bundle.btb_domain_mismatch.foreach(_ := f3_bpd_resp.io.deq.bits.btb_domain_mismatch.getOrElse(false.B))
-  // corefuzzing: BTB TARGET-domain edge (branch-target-injection, doc 67 Part A).
-  // btb_domain_mismatch tracks the INSTALLER's domain; the BTI attack rides the
-  // branch->TARGET jump instead. Here: a BTB-predicted JALR whose predicted target is in
-  // a different domain than the fetch. cf_attacker_start/end are the same range used for
-  // f3_fetch_is_attacker. Meaningful (attack) occurrences are SQUASHED (spec=1): a benign
-  // cross-domain indirect call commits; a poisoned mispredicted one appears as [FLUSH].
-  val f3_btb_pred_target = f3_targs(f3_fetch_bundle.cfi_idx.bits)
-  val f3_btb_target_is_attacker = (io.cpu.cf_attacker_start_addr =/= 0.U) &&
-    (f3_btb_pred_target >= io.cpu.cf_attacker_start_addr) &&
-    (f3_btb_pred_target <  io.cpu.cf_attacker_end_addr)
-  f3_fetch_bundle.btb_target_xdom.foreach(_ := (
-    f3_fetch_bundle.cfi_idx.valid &&
-    (f3_fetch_bundle.cfi_type === CFI_JALR) &&
-    !f3_fetch_bundle.cfi_is_ret &&   // exclude returns (jalr x0) -- those are RAS co-location, not BTI
-    (f3_btb_target_is_attacker =/= f3_fetch_is_attacker)
-  ))
+  // [TY27RM 2026-10-22, owner order] the BTB TARGET-domain edge (btb_target_xdom, ty27, doc 67 Part A) is
+  // removed with its two f3 range compares on f3_btb_pred_target: the BTB edge is btb_domain_mismatch (ty10).
   f3_fetch_bundle.bpd_secret_mismatch.foreach(_ := f3_bpd_resp.io.deq.bits.bpd_secret_mismatch.getOrElse(false.B))
   f3_fetch_bundle.btb_secret_mismatch.foreach(_ := f3_bpd_resp.io.deq.bits.btb_secret_mismatch.getOrElse(false.B))
   if (ENABLE_IFT) {   // [R124GATE] the fields exist only with ENABLE_IFT
@@ -1054,14 +1109,20 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U)
   ras.io.write_idx    := WrapInc(f3_fetch_bundle.ghist.ras_idx, cf_ras_active)
   // corefuzzing: record domain of the call that pushes to RAS
+  // [M3ATKWIN] lean58 (Fable audit M3; RULES A U8 "symmetric", reading 1): ...or a call pushed while the attacker window is open (the twin of
+  // write_secret below): a victim ret that later pops it gets the cross-domain RAS edge.  RECORD CHANGE.
+  // [B60RAS] bundle60 (C): the window half moved to its own bit (write_watk); write_domain is the pusher's domain only
+  // (the IFT-off expression, unchanged).  Levels: write_domain data loses one input; write_watk = the shared 7-bit
+  // zero detect of the window counter, the same term the one-bit design ORed in: 0 added levels.
   ras.io.write_domain := f3_fetch_is_attacker
+  ras.io.write_watk.foreach(_ := io.cpu.cf_win_atk_ctr =/= 0.U)
   // corefuzzing: secret not yet known at push time; retroactively updated via late_write_secret
   ras.io.write_secret := false.B
   // [WINFTQPOST] patch 38: a call pushed while the secret window is open is a window member, so the
   // slot it pushes is window-secret at once (same f3 bit as ghist_secret; the late ports above only
   // cover tagged FTQ entries, which a jalr call with a clean target and no window operand never
-  // was, and a JAL only through [RASJAL] a few cycles after dispatch).  The top repair below keeps
-  // false (it restores content).  Levels: core winCtr register -> 7-bit zero detect (shared) ->
+  // was, and a JAL only through [RASJAL] a few cycles after dispatch).  The top repair below writes
+  // the label saved in the FTQ ([RASLBL]).  Levels: core winCtr register -> 7-bit zero detect (shared) ->
   // ras_secret D data and the read-forward flop; the RAS write select is unchanged.  Cost: about
   // 1 LUT per RAS slot plus the forward flop (previously a constant).
   if (ENABLE_IFT) { ras.io.write_secret := io.cpu.cf_win_sec_ctr =/= 0.U }
@@ -1115,6 +1176,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       s0_valid     := !(f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if)
       s0_vpc       := f3_predicted_target
       s0_is_replay := false.B
+      s0_redir_atk := f3_fetch_bundle.cfi_idx.valid && f3_fetch_is_attacker   // [ICREDIR] taken CFI at f3
       s0_ghist     := f3_predicted_ghist
       s0_tsrc      := BSRC_3
 
@@ -1164,10 +1226,15 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // [ICSEC] step 15 (residue audit row 18): the I$ line secret bit was "fetch PC inside the
   // secret DATA range", which code practically never is, so a line fetched only because of
   // secret-dependent control flow was recorded clean.  The fetch is now also secret while the
-  // committed secret-branch window (the GHR counter, armed by a secret branch packet) is open.
-  // Registered (1 FF) to keep the FTQ counter compare off the I$ s1 path.  The same bit gates
-  // the reader-side mismatch: a fetch inside the window does not flag itself.  Wrong-path
-  // fetches before the branch commits stay unmarked (secretness is not known at fetch).
+  // secret window (io.cpu.cf_win_sec_ctr, core.scala [ARMRES]) is open.
+  // [COMMENTFIX 2026-10-22] (was: "the committed secret-branch window ... armed by a secret branch packet" and
+  // "wrong-path fetches before the branch commits stay unmarked"; both outdated, comment only): the window ARMS
+  // when a secret-conditioned branch, or a jalr whose target register is secret ([JALRWIN]), RESOLVES, wrong-path
+  // ones included, and decays per committed GHR shift.  So a fetch made after the arming resolve (e.g. the
+  // redirect of that jalr's own mispredict) is marked even if it is wrong-path; a fetch made before the resolve
+  // is not (secretness is not known yet at fetch).
+  // Registered (1 FF) to keep the core counter compare off the I$ s1 path.  The same bit gates
+  // the reader-side mismatch: a fetch inside the window does not flag itself.
   // [R124GATE] patch 26: the window-term flop exists only with ENABLE_IFT.
   icache.io.s1_is_secret := (if (ENABLE_IFT) s1_fetch_is_secret || RegNext(io.cpu.cf_win_sec_ctr =/= 0.U, false.B)
                              else s1_fetch_is_secret)
@@ -1185,6 +1252,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // [WINFTQ] patch 29b: the window range's calls (FTQ queue, one per cycle), same slot rule
   ftq.io.cf_win_ftq_rs.foreach(_ := io.cpu.cf_win_ftq_rs.get)
   ftq.io.cf_win_sec_open.foreach(_ := io.cpu.cf_win_sec_ctr =/= 0.U)   // [WINFTQPOST] patch 38
+  ftq.io.cf_win_atk_open.foreach(_ := io.cpu.cf_win_atk_ctr =/= 0.U)   // [M3ATKWIN] lean58
   ftq.io.cf_atk_ftq_updates.foreach(_ := io.cpu.cf_atk_ftq_updates.get)   // [FTQATK] patch 47
   ras.io.late_write_win.foreach { l =>
     l.valid := ftq.io.cf_ras_win_upd.get.valid
@@ -1198,12 +1266,14 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   fb.io.cf_debug_rob_enable      := io.cpu.cf_debug_rob_enable
   fb.io.cf_attacker_start_addr   := io.cpu.cf_attacker_start_addr
   fb.io.cf_attacker_end_addr     := io.cpu.cf_attacker_end_addr
+  fb.io.cf_dbg.foreach(_ := io.cpu.cf_dbg.getOrElse(false.B))   // [DBGFREEZE] patch 85 (b)
   ftq.io.cf_debug_ftq_enable   := io.cpu.cf_debug_frontend_enable
   ftq.io.cf_ftq_idx            := io.cpu.cf_ftq_idx
   // [F-RAS-3b] same wire as the F1/F2/F3 ghist updates and the RAS write index: no skew.
   ftq.io.cf_ras_active.foreach(_ := cf_ras_active)
   ftq.io.cf_ftq_quiesce_reset  := io.cpu.cf_ftq_quiesce_reset
   icache.io.cf_icache_set_conf := io.cpu.cf_icache_set_conf
+  icache.io.cf_dbg_print.foreach(_ := io.cpu.cf_debug_rob_enable)   // [ICFILL] debug print enable (0xbc0 bit 4)
   icache.io.cf_icache_way_conf := io.cpu.cf_icache_way_conf
 
   // When we mispredict, we need to repair
@@ -1260,6 +1330,25 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   fb.io.enq.valid := f4.io.deq.valid && ftq.io.enq.ready && !f4_delay
   fb.io.enq.bits  := f4.io.deq.bits
   fb.io.enq.bits.ftq_idx := ftq.io.enq_idx
+  // [FTQHOLD] FTQ plan T1: f4 FTQ-hold counter.  Counts the cycles the packet now in f4 waits with !ftq.io.enq.ready
+  // (only the FTQ term: a fetch-buffer-full or f4_delay hold neither counts nor clears), saturating at 63 like
+  // dis_stall_rob_cycles (core.scala).  Cleared when f4 is empty or its packet leaves (f4.io.deq.fire): the plan's
+  // ".elsewhen (fire)" plus the empty case, so a held packet dropped by f4_clear cannot hand its count to the next
+  // packet (f4 is empty the cycle after a clear).  At fire ftq.io.enq.ready = 1, so the count is complete.  The bucket
+  // is its own register (f4_hold_b3 = Log2Bucket of the count's next value) and goes to the fetch buffer as an input
+  // port (fb.io.cf_ftq_hold3), so FetchBundle, the f4 queue and the FTQ are unchanged and the fb leg is a flop.
+  // Levels: the hold term is 1 LUT on two flops (f4 full flag, the FTQ's RegNext ready); the clear is f4.io.deq.fire
+  // + 1 LUT into the new flops, the depth of the f4 queue's own full-flag update (a new leaf; no existing path gains
+  // a level).  No stall / ready / valid change.  9 FF, about 12 LUT.  IFT off: not elaborated.
+  if (ENABLE_IFT) {
+    val f4_hold_cnt = RegInit(0.U(6.W))
+    val f4_hold_b3  = RegInit(0.U(3.W))
+    val f4_hold_clr = !f4.io.deq.valid || f4.io.deq.fire
+    val f4_hold_run = Mux(!ftq.io.enq.ready && f4_hold_cnt =/= 63.U, f4_hold_cnt + 1.U, f4_hold_cnt)   // flops only
+    f4_hold_cnt := Mux(f4_hold_clr, 0.U, f4_hold_run)
+    f4_hold_b3  := Mux(f4_hold_clr, 0.U, Log2Bucket(f4_hold_run))
+    fb.io.cf_ftq_hold3.get := f4_hold_b3
+  }
   fb.io.enq.bits.sfbs    := Mux(f4_sfb_valid, UIntToOH(f4_sfb_idx), 0.U(fetchWidth.W)).asBools
   fb.io.enq.bits.shadowed_mask := (
     Mux(f4_sfb_valid, f4_sfb_mask(fetchWidth-1,0), 0.U(fetchWidth.W)) |
@@ -1287,7 +1376,16 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   when (ftq.io.ras_update && enableRasTopRepair.B) {
     ras.io.write_valid := true.B
     ras.io.write_push  := false.B   // [RASPTR] a repair restores content, it does not refresh
-    ras.io.write_secret := false.B  // [WINFTQPOST] patch 38: unchanged for the repair
+    // [RASLBL] DF-ras-repair-label: restore the labels the FTQ saved with ras_top (the slot's domain
+    // and secret bit at the packet's f3 read) instead of this cycle's f3 packet domain and false;
+    // ras.scala ORs the secret bit into the slot's current one (a later mark is kept).  IFT off:
+    // unchanged (write_secret false; write_domain unread).  Levels: the write_domain / write_secret
+    // data gain a 2:1 select by the repair (an FTQ flop) beside the f3 domain compare / window zero
+    // detect: at most +1 LUT on those data paths (absorbable into the per-slot D LUT), select
+    // (write_valid / write_idx) unchanged.
+    ras.io.write_secret := (if (ENABLE_IFT) ftq.io.ras_update_sec.get else false.B)
+    if (ENABLE_IFT) { ras.io.write_domain := ftq.io.ras_update_dom.get }
+    if (ENABLE_IFT) { ras.io.write_watk.get := ftq.io.ras_update_watk.get }   // [B60RAS] restored as saved, like the domain
     ras.io.write_idx   := ftq.io.ras_update_idx
     ras.io.write_addr  := ftq.io.ras_update_pc
   }
@@ -1393,6 +1491,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_vpc       := io.cpu.sfence.bits.addr
     s0_is_replay := false.B
     s0_is_sfence := true.B
+    s0_redir_atk := false.B   // [ICREDIR]
 
   }.elsewhen (io.cpu.redirect_flush) {
     fb.io.clear := true.B
@@ -1410,6 +1509,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     // ROB flush-on-commit redirects (redirect_flush_is_mispredict=false) always update s0_vpc.
     s0_vpc       := Mux(io.cpu.redirect_flush_is_mispredict && !io.cpu.allow_fetch,
                         s1_vpc, io.cpu.redirect_pc)
+    // [ICREDIR] a mispredict redirect is made by brupdate.b2's uop (core.scala); a ROB flush redirect is not a CFI: 0
+    s0_redir_atk := Mux(io.cpu.redirect_flush_is_mispredict && !io.cpu.allow_fetch, s1_redir_atk,
+                        io.cpu.redirect_flush_is_mispredict &&
+                        io.cpu.brupdate.b2.uop.cf_domain_id.getOrElse(0.U) =/= 0.U)
     s0_ghist     := io.cpu.redirect_ghist
     s0_tsrc      := BSRC_C
     s0_is_replay := false.B

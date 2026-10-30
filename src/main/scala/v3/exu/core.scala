@@ -364,12 +364,35 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // [IMPLWIN] step 20 (rulings 132/134/135/136/137): the sticky cf_ctrl_secret_ctx is REMOVED.
   // The decaying window that shadows the GHR (winCtr, [ARMRES] below the brinfos loop) is the
   // only control-flow scope: armed when a DATA-secret branch RESOLVES, aged by retiring
-  // conditional branches younger than it.  Its members get s_prop / atk and a WINDOW-tainted
+  // conditional branches younger than it (one per committed GHR shift, [GHRWIN] 62 / [GHRWIN2] 71).
+  // Its members get s_prop / atk and a WINDOW-tainted
   // result register (uop.cf_win_*; regfile wsec/watk), a register-taint kind separate from
   // the data taint, which never re-arms the window.  Disarm holds it closed ([WINDISARM]).
   // [R124GATE] patch 26 (r151): a flop only with ENABLE_IFT; IFT off the secret window is disarmed.
   val cf_sec_disarm_c = if (ENABLE_IFT) RegNext(custom_csrs.cf_secret_start_addr === custom_csrs.cf_secret_end_addr, true.B)
                         else true.B
+
+  // [DBGFREEZE] patch 85 (owner 2026-10-20: "how would a DMI halt end in a secret window? just make sure that does
+  // not happen"; p4-85-author.md).  Debug-mode execution (debug ROM, abstract commands, program buffer: fesvr halts
+  // the hart for every tohost poll, fesvr/dtm.cc read_chunk) is invisible to IFT:
+  //   (a) its uops never arm, decay or join the secret / attacker windows: the window counters are frozen (decay
+  //       gated in the shared GHR-shift chain cf_ghr_shift_q, patch 71) and every reader sees them closed
+  //       (win_*_ctr below, also the frontend export);
+  //   (b) they take no label at the sources: no operand taint (register-read), no fetch-time edges / domain
+  //       (fetch-buffer.scala), no s_acc (lsu.scala), no dispatch-stall edges / C5 (dispatch loop), so nothing they
+  //       train (FTQ secret/atk bit -> BPD/BTB/RAS, I$, D$ fill / store meta, STQ head bits) is secret or attacker;
+  //       their commit records are masked and marked priv[2] = 1 (rob.scala);
+  //   (c) the program's taint state survives the halt: window counter, epochs, regfile marks (nothing closes), the
+  //       fflags taint (frozen below), and the taint of x8/x9, the only registers the debug ROM / Rocket DM abstract
+  //       commands / fesvr / OpenOCD overwrite and restore (dvP/dvA/dvL below, register-read [DBGVT]).
+  // Bracket: debug entry is an exception (full flush) and dret is unique + flush_on_commit, so while cf_dbg = 1
+  // every uop from fetch to commit is a debug-mode uop.  cf_dbg is reg_debug one flop later (placement); it rises
+  // at exception + 3, before the first debug-ROM fetch reaches the fetch buffer (+5), and falls at dret's CSR
+  // execution + 2, before dret commits' flush lets a program uop dispatch.  Stores committed before entry drain
+  // with their own (STQ) labels, and debug stores that drain after dret carry the clean labels made here, so no
+  // time-based gate sits on the D$ write.  IFT off: constant false, everything below folds.
+  val cf_dbg   = if (ENABLE_IFT) RegNext(csr.io.status.debug, false.B) else false.B
+  val cf_dbg_q = if (ENABLE_IFT) RegNext(cf_dbg, false.B) else false.B
 
 
   // for the fuzzycore project - AK
@@ -411,6 +434,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
                                                    rob.io.ift_third_drop_cnt, satAdd16(rob.io.ift_squash_ovf_cnt, kill_ovf_cnt)))
   // corefuzzing: wire secret address CSRs into LSU for cf_secret_access detection
   io.lsu.cf_secret_start_addr := custom_csrs.cf_secret_start_addr
+  io.lsu.cf_dbg.foreach(_ := cf_dbg)   // [DBGFREEZE] patch 85 (b): no s_acc in debug mode (lsu.scala TLB stage)
   io.lsu.cf_secret_end_addr   := custom_csrs.cf_secret_end_addr
 
   // getting the rob entries from the CSR
@@ -665,6 +689,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // IFT bridge: pass privilege mode to ROB for 256-bit record assembly.
   // RegNext matches the delay used in the commit printf (priv is the OLD privilege before any eret).
   rob.io.ift_priv := RegNext(csr.io.status.prv)
+  // [DBGFREEZE] patch 85 (b): commit records of debug-mode uops are masked and marked (rob.scala)
+  rob.io.cf_dbg.foreach(_ := cf_dbg)
+  io.ifu.cf_dbg.foreach(_ := cf_dbg)   // [DBGFREEZE] (b): no fetch-time edges / domain (fetch-buffer.scala)
 
   // corefuzzing: preg_secret — per-physical-register secret-taint bit array.
   // Updated EARLIER than taint_table (which only updates at commit via C7):
@@ -1001,13 +1028,26 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   //       FTQ packets are tagged when B resolves ([WINFTQ] patch 29b).
   val winW = log2Ceil(globalHistoryLength + 1)
   require(winW <= 7, "window counter must fit the 7-bit sbr/abr fields")
-  val win_arm_sec_v = brinfos.map(b => ENABLE_IFT.B && !cf_sec_disarm_c && b.valid && b.uop.is_br && b.cond_secret)
+  // [DBGFREEZE] patch 85 (a): no arm while the hart is in debug mode (the debug ROM's branches already resolve with
+  // clean operands, the register-read mask; this also drops the arm of a flushed program branch resolving after the
+  // entry, which re-arms when it re-executes after dret).  One more input on each arm LUT.
+  // [JALRWIN] r205 (owner-approved addition): a jalr whose TARGET register carries the secret tag also opens the
+  // window (brinfo.cond_secret = rs1 secret for a jalr, functional-unit.scala): the code it jumps to, and the
+  // predictor state trained there, depend on the secret (switch tables, secret-indexed calls).  The window still
+  // decays per committed GHR shift (patch 71); a jalr adds no shift, so its window lasts 64 shifts after it.
+  // With the one tag (regfile [ONETAG]) a `ret` whose ra was written by an s_prop instruction (a jal inside an
+  // open window) arms it too (flood item F-ret, OPEN O3).  One LUT input per lane, 0 levels.
+  val win_arm_sec_v = brinfos.map(b => ENABLE_IFT.B && !cf_sec_disarm_c && !cf_dbg && b.valid && (b.uop.is_br || b.uop.is_jalr) && b.cond_secret)
   // [GHRWIN] patch 62 (V3 (a), owner 2026-10-19 16:3x): the attacker window also ARMS on a VICTIM conditional
   // branch whose condition is attacker-tainted (cond_atk = rs1/rs2 taint_atk, the [FTQATK] bit): its outcome is
   // attacker-steered and enters the GHR like an attacker branch's (BHI-style steering).  +1 LUT input per lane
   // on a brinfos-register term (0 levels on the counter, whose arm mux already waits on the youngest-select).
-  val win_arm_atk_v = brinfos.map(b => ENABLE_IFT.B && b.valid && b.uop.is_br &&
-                                       (b.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U || b.cond_atk))
+  // [JALRWIN] r205 O11 (owner 2026-10-20, FINAL, symmetric to the secret window): a jalr whose TARGET register carries
+  // the attacker tag also arms the attacker window (cond_atk = rs1 taint_atk for a jalr).  An attacker-owned jalr with a
+  // clean target does not (the owner's words: "attacker-tagged target").  +1 LUT input per lane, 0 levels.
+  val win_arm_atk_v = brinfos.map(b => ENABLE_IFT.B && !cf_dbg && b.valid &&   // [DBGFREEZE]
+                                       ((b.uop.is_br && (b.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U || b.cond_atk)) ||
+                                        (b.uop.is_jalr && b.cond_atk)))
   val win_arm_sec = win_arm_sec_v.reduce(_||_)
   val win_arm_atk = win_arm_atk_v.reduce(_||_)
   def winRow(x: UInt): UInt  = if (coreWidth == 1) x else (x >> log2Ceil(coreWidth))
@@ -1025,9 +1065,80 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // ctr > cnt compare (not on the counter's own path).
   // [R124GATE] patch 26 (r151): the window state exists only with ENABLE_IFT; IFT off the
   // counter, epoch and close are constant 0 (winCtrIft is the unchanged step-20/21 logic).
-  def winCtr(arms: Seq[Bool], clr: Bool, ghrDecay: Boolean = false): (UInt, UInt, Bool) =
-    if (ENABLE_IFT) winCtrIft(arms, clr, ghrDecay) else (0.U(winW.W), 0.U(2.W), false.B)
-  def winCtrIft(arms: Seq[Bool], clr: Bool, ghrDecay: Boolean): (UInt, UInt, Bool) = {
+  // [GHRWIN2] patch 71 (secret twin of V3 (a), owner 2026-10-19; re-based on live 2026-10-20, owner ruling: after 85):
+  // BOTH windows now decay by committed GHR SHIFTS (patch 62 did the attacker one; the secret window kept the
+  // per-branch count, which closes it early in branch-dense code: under-taint).  The shift detector of patch 62 does
+  // not depend on the window (it models GlobalHistory.update over the committed conditional branches), so it is
+  // built ONCE here and shared; each counter keeps only its own B-gate and re-arm discard.  Per lane, registered:
+  // valid conditional branch, key = {ftq_idx, pc bank bit}.  A committed conditional branch is a shift iff its key
+  // differs from the previous committed conditional branch's (last_v / last_k carry it across cycles; lanes in
+  // commit order).  Explicit widths only (no getWidth on a RegNext / an inferred-width Reg): keyW = log2Ceil(ftqSz)
+  // + 1 (the bank bit is a constant 0 when nBanks = 1).
+  // [DBGFREEZE] patch 85 (a), kept for both windows: a branch retiring in debug mode (the debug ROM's polling loop)
+  // is not a shift (`!cf_dbg` on vbr_q), so neither window ages in debug mode and last_v / last_k do not move
+  // (the program's previous key survives the halt).  One more input on the existing valid && is_br LUT: 0 levels.
+  // Cost: the 62 chain moves here unchanged (coreWidth x (1 + keyW) + 1 + keyW FF = 35 for coreWidth 4, ftqSz 32);
+  // the secret counter adds its own gate / arm flops (coreWidth + 1 = 5 FF) and a 4-input PopCount, and loses its
+  // old commit-valid PopCount.  Levels: the secret decay path now starts at flops (shallower, as 62).
+  // IFT off: not elaborated (winCtrIft is IFT-only; the shared chain is constant false without ENABLE_IFT).
+  // [GHRSAME] r205-10a (t206 S4, 2026-10-20): the {ftq_idx, bank} key counts one shift per FTQ entry and bank, but a
+  // MISPREDICTED not-taken branch ends its FTQ entry inside a bank, and the frontend's repair (core.scala redirect,
+  // `use_same_ghist`, upstream BOOM) re-uses the entry's history with current_saw_branch_not_taken when the
+  // fall-through pc lies in the first bank of the 64-B line (block_pc there is aligned to icBlockBytes, not to the
+  // packet).  The next entry's first bank then adds the ONE shift for both (GlobalHistory.update, frontend.scala:
+  // first_bank_saw_not_taken), so a branch of that next entry in the line's first bank must not count again.  Without
+  // this, every such pair counted 2 shifts for 1 and the window closed early (under-taint, P5): t206 S4 packs 64
+  // cold-mispredicted not-taken bne's (BIM resets weakly taken), 4 of them at a line start: 64 counted, 60 real.
+  // Rule (exact for the use_same_ghist case): a committed conditional branch whose key differs from the previous one
+  // adds no shift when the previous one was NOT TAKEN with its fall-through (pc_lob + 2/4, the redirect's npc) inside
+  // the line's first bank, and this one is in the NEXT FTQ entry and also in the line's first bank.  Residual (late,
+  // safe): a not-taken branch followed in the same 8-B chunk by a taken jal/jalr back into that chunk also merges.
+  // Other GHR moves the key cannot see and that are not counted (late, safe): the extra shift a flagged entry adds
+  // with no branch of its own, and the ROB-flush redirect, which ZEROES the history (core.scala `new_ghist`).
+  // Cost: per lane 2 FF (same-ghist candidate, first-bank bit) + 1 FF (last_s); per lane a 5-bit equality of the
+  // lane's ftq_idx-1 (from the key flop) with the chain's previous ftq_idx and a 4-input AND: about 4 x 8 LUT.
+  // Levels: the decrement starts at the key flop, in parallel with the previous-key mux chain; the equality sits
+  // beside the existing key compare and folds into the same per-lane shift LUT: 0-1 level on a flop-to-flop path
+  // (key flops -> popcount -> 7-bit counter), not on the commit path.  IFT off: not elaborated (as before).
+  val cf_ghr_keyW = log2Ceil(ftqSz) + 1
+  val cf_ghr_shift_q: Seq[Bool] = if (!ENABLE_IFT) Seq.fill(coreWidth)(false.B) else {
+    def bankBit(u: MicroOp): UInt = if (nBanks == 1) 0.U(1.W) else u.pc_lob(log2Ceil(bankBytes))
+    val lobW   = log2Ceil(icBlockBytes)
+    val bnkW   = log2Ceil(bankBytes)
+    val vbr_q  = (0 until coreWidth).map(w => RegNext(rob.io.commit.valids(w) && !cf_dbg && rob.io.commit.uops(w).is_br, false.B))
+    val key_q  = Seq.fill(coreWidth)(Reg(UInt(cf_ghr_keyW.W)))
+    // [GHRSAME] first-bank bit and same-ghist candidate (not taken, npc = pc_lob + 2/4 still in the line's first bank)
+    val fb_q   = Seq.fill(coreWidth)(Reg(Bool()))
+    val sg_q   = Seq.fill(coreWidth)(Reg(Bool()))
+    for (w <- 0 until coreWidth) {
+      val cu = rob.io.commit.uops(w)
+      key_q(w) := Cat(cu.ftq_idx(log2Ceil(ftqSz) - 1, 0), bankBit(cu))
+      fb_q(w)  := (if (lobW > bnkW) cu.pc_lob(lobW - 1, bnkW) === 0.U else true.B)
+      sg_q(w)  := !cu.taken && ((cu.pc_lob(lobW - 1, 0) +& Mux(cu.is_rvc || cu.edge_inst, 2.U, 4.U)) < bankBytes.U)
+    }
+    val last_v = RegInit(false.B)
+    val last_k = Reg(UInt(cf_ghr_keyW.W))
+    val last_s = RegInit(false.B)
+    var pv: Bool = last_v
+    var pk: UInt = last_k
+    var ps: Bool = last_s
+    val sh = for (w <- 0 until coreWidth) yield {
+      val kftq   = key_q(w)(cf_ghr_keyW - 1, 1)
+      val merged = ps && fb_q(w) && WrapDec(kftq, ftqSz) === pk(cf_ghr_keyW - 1, 1)   // [GHRSAME]
+      val s = vbr_q(w) && (!pv || (key_q(w) =/= pk && !merged))
+      pv = pv || vbr_q(w)
+      pk = Mux(vbr_q(w), key_q(w), pk)
+      ps = Mux(vbr_q(w), sg_q(w), ps)
+      s
+    }
+    last_v := pv
+    last_k := pk
+    last_s := ps
+    sh
+  }
+  def winCtr(arms: Seq[Bool], clr: Bool): (UInt, UInt, Bool) =
+    if (ENABLE_IFT) winCtrIft(arms, clr) else (0.U(winW.W), 0.U(2.W), false.B)
+  def winCtrIft(arms: Seq[Bool], clr: Bool): (UInt, UInt, Bool) = {
     val ctr   = RegInit(0.U(winW.W))
     val ep    = RegInit(0.U(2.W))
     val b     = Reg(UInt(robAddrSz.W))
@@ -1044,48 +1155,21 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       nv = nv || a
     }
     val b_head_row = winRow(b) === winRow(head)
-    // [GHRWIN] patch 62 (V3 (a)): ghrDecay = decay by the number of committed GHR SHIFTS, not of committed
-    // conditional branches.  GlobalHistory.update (frontend.scala) shifts the history once per fetch BANK
-    // whose executed part holds a conditional branch (any number of not-taken ones, or the taken one), so
-    // a committed conditional branch adds a shift iff its (FTQ entry, bank) differs from that of the
-    // previous committed conditional branch.  The commit lanes are registered first (valid-branch,
-    // B-gate, key = {ftq_idx, pc bank bit}; coreWidth x (2 + key) FF), and the shifts are counted one
-    // cycle late from flops: a late decay only closes the window late (P5: never early), a re-arm in that
-    // cycle overrides it as before.  B's own bank: B is the previous branch of a same-bank successor, so
-    // that successor adds no shift (exact).  Residual (late, safe): an FTQ index that recurs after exactly
-    // ftqSz branch-free packets merges two banks into one shift.  The secret window keeps the branch count.
-    // Levels: the old cnt read the commit valids (deep) directly; this one starts at flops (shallower).
-    // Cost: coreWidth x (2 + log2(ftqSz) + 1) + key + 1 FF (about 40), about 40 LUT (prev-key chain,
-    // compares, popcount).  IFT off: winCtrIft is not elaborated.
-    val cnt = if (!ghrDecay) PopCount((0 until coreWidth).map { w =>
-      rob.io.commit.valids(w) && rob.io.commit.uops(w).is_br &&
-        (bpass || (b_head_row && winBank(b) < w.U)) }) else {
-      def bankBit(u: MicroOp): UInt = if (nBanks == 1) 0.U(1.W) else u.pc_lob(log2Ceil(bankBytes))
-      val vbr_q  = (0 until coreWidth).map(w => RegNext(rob.io.commit.valids(w) && rob.io.commit.uops(w).is_br, false.B))
-      val gate_q = (0 until coreWidth).map(w => RegNext(bpass || (b_head_row && winBank(b) < w.U), false.B))
-      // key = {ftq_idx, bank bit}: typed flops (a RegNext of a UInt leaves its width to inference, and
-      // last_k needs it at elaboration)
-      val keyW   = log2Ceil(ftqSz) + 1
-      val key_q  = (0 until coreWidth).map(w => Reg(UInt(keyW.W)))
-      for (w <- 0 until coreWidth) key_q(w) := Cat(rob.io.commit.uops(w).ftq_idx, bankBit(rob.io.commit.uops(w)))
-      val last_v = RegInit(false.B)
-      val last_k = Reg(UInt(keyW.W))
-      var pv = last_v
-      var pk = last_k
-      val shift = for (w <- 0 until coreWidth) yield {
-        val sh = vbr_q(w) && (!pv || key_q(w) =/= pk)
-        pv = pv || vbr_q(w)
-        pk = Mux(vbr_q(w), key_q(w), pk)
-        sh && gate_q(w)
-      }
-      last_v := pv
-      last_k := pk
-      // a re-arm in cycle c discards cycle c's commits (the old rule: `when (nv) ctr := 64` wins over that
-      // cycle's decrement); they are counted one cycle late here, so drop them explicitly (else the new
-      // window would start up to coreWidth shifts short: an early close)
-      val arm_q = RegNext(nv, false.B)
-      Mux(arm_q, 0.U, PopCount(shift))
-    }
+    // [GHRWIN] patch 62 (V3 (a)), [GHRWIN2] patch 71: decay by the number of committed GHR SHIFTS younger than B.
+    // GlobalHistory.update (frontend.scala) shifts the history once per fetch BANK whose executed part holds a
+    // conditional branch (any number of not-taken ones, or the taken one); cf_ghr_shift_q (above, shared by both
+    // windows, frozen in debug mode by 85) marks the committed conditional branches that add a shift, one cycle
+    // late from flops.  The B-gate is registered with them: before B retires a lane counts only if B is in the head
+    // row and the lane's bank is above B's (r137); after (bpass) every shift counts.  B's own bank: B is the previous
+    // branch of a same-bank successor, so that successor adds no shift (exact).  A late decay only closes the window
+    // late (P5: never early).  Residual (late, safe): an FTQ index that recurs after exactly ftqSz branch-free
+    // packets merges two banks into one shift.
+    val gate_q = (0 until coreWidth).map(w => RegNext(bpass || (b_head_row && winBank(b) < w.U), false.B))
+    // a re-arm in cycle c discards cycle c's commits (the old rule: `when (nv) ctr := 64` wins over that
+    // cycle's decrement); they are counted one cycle late here, so drop them explicitly (else the new
+    // window would start up to coreWidth shifts short: an early close)
+    val arm_q = RegNext(nv, false.B)
+    val cnt = Mux(arm_q, 0.U, PopCount((0 until coreWidth).map(w => cf_ghr_shift_q(w) && gate_q(w))))
     val b_com  = b_head_row && (0 until coreWidth).map(w =>
       rob.io.commit.valids(w) && winBank(b) === w.U).reduce(_||_)
     val killed = (bmask & brupdate.b1.mispredict_mask) =/= 0.U
@@ -1104,12 +1188,62 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     when (close) { ep := ep + 1.U }
     (ctr, ep, close)
   }
-  val (win_sec_ctr, win_sec_ep, win_sec_close) = winCtr(win_arm_sec_v, cf_sec_disarm_c)
-  val (win_atk_ctr, win_atk_ep, win_atk_close) = winCtr(win_arm_atk_v, false.B, ghrDecay = true)   // [GHRWIN] patch 62
+  // [FLUSHCLOSE] r205-10d (owner ruling 2026-10-20): a full pipeline flush ZEROES the frontend GHR (the
+  // `RegNext(rob.io.flush.valid)` redirect above: new_ghist = 0, for every ROB flush: exceptions, fence / fence.i,
+  // every CSR instruction (decode.scala: all CSR ops and FENCE are unique + flush_on_commit), other unique flushes),
+  // so it CLOSES both windows (counter := 0 through the existing clr input: epoch advance, shadow clear, as any
+  // close).  EXCEPT debug mode (patch 85 keeps the windows across DMI halts and freezes them while halted):
+  //   - debug ENTRY is an exception flush at cycle c; the CSR sees it at c+1 (csr.io.exception := RegNext(com_xcpt)),
+  //     reg_debug rises at c+2 and cf_dbg at c+3 (85 bracket).  The close is therefore applied at c+3 and dropped when
+  //     cf_dbg = 1 there.  c+3 is still before any refetched uop is observed: the frontend reads the exported counter
+  //     at f3 (redirect c+1 -> f3 c+4) and the fetch buffer at c+5, dispatch later, so every reader sees the close;
+  //   - flushes inside debug mode (debug ROM / program buffer) and dret's own flush (dret is unique + flush_on_commit;
+  //     cf_dbg falls at its CSR execution + 2, so its commit flush lands within 3 cycles of cf_dbg = 1) are dropped by
+  //     a 4-cycle debug history.  The first program flush after dret needs a refetch, dispatch and commit (> 4 cycles).
+  // An arm in c+1..c+3 (a stale brinfos resolve of a flushed branch) is overridden: clr wins over the arm in winCtrIft.
+  // Cost: 5 FF (2 debug-history, 3 flush-delay), 2 LUT; one more input on the secret clr OR, and the attacker counter's
+  // clr goes from constant false to this flop term.  Levels: all from flops; on the 7-bit counter D path the clear is
+  // the last term (the existing `when (clr)`), 0-1 LUT on a flop-to-flop path.  IFT off: cf_dbg is constant false and
+  // winCtr is not elaborated.
+  val cf_dbg_hist     = if (ENABLE_IFT) { val q2 = RegNext(cf_dbg_q, false.B); cf_dbg || cf_dbg_q || q2 || RegNext(q2, false.B) } else false.B
+  val cf_fl_q1        = if (ENABLE_IFT) RegNext(rob.io.flush.valid && !cf_dbg_hist, false.B) else false.B
+  val cf_fl_q3        = if (ENABLE_IFT) RegNext(RegNext(cf_fl_q1, false.B), false.B) else false.B
+  val win_flush_close = cf_fl_q3 && !cf_dbg   // [FLUSHCLOSE] drops the debug-entry flush (cf_dbg = 1 at flush + 3)
+  val (win_sec_ctr_r, win_sec_ep, win_sec_close) = winCtr(win_arm_sec_v, cf_sec_disarm_c || win_flush_close)   // [GHRWIN2] 71; [FLUSHCLOSE]
+  val (win_atk_ctr_r, win_atk_ep, win_atk_close) = winCtr(win_arm_atk_v, win_flush_close)                      // [GHRWIN] 62; [FLUSHCLOSE]
+  // [DBGFREEZE] patch 85 (a): the windows keep their state through debug mode (no decay, no arm, no close) but are
+  // seen CLOSED by every reader while the hart is in debug mode: dispatch membership (win_*_now, d_win_*), the
+  // record counters (dis_ift sbr/abr) and the frontend export (fetch-time ghist / FTQ enqueue tag / RAS push secret /
+  // I$ fill secret).  After dret the readers see the preserved counter again, so the refetched program resumes in
+  // the window it left.  Cost: 2 x 7 AND (the export) and one input on each `=/= 0` reduction: 0 levels there, one
+  // LUT on the flop-sourced export (core -> frontend).  IFT off: cf_dbg = false, the Mux folds.
+  val win_sec_ctr = Mux(cf_dbg, 0.U, win_sec_ctr_r)
+  val win_atk_ctr = Mux(cf_dbg, 0.U, win_atk_ctr_r)
   io.ifu.cf_win_sec_ctr := win_sec_ctr
   io.ifu.cf_win_atk_ctr := win_atk_ctr
   val win_sec_now = win_sec_ctr =/= 0.U || win_arm_sec
   val win_atk_now = win_atk_ctr =/= 0.U || win_arm_atk
+  // [L11CFATK] lean59 (Fable audit 2026-10-23 L11; RULES A "Record summary for both", U2 "all edges", D1 "Edge
+  // is_secret = producer s_acc || s_prop"): the CONTROL_FLOW (ty 20) edge's producer is the branch that ARMED the
+  // secret window, so its is_atk is that branch's attacker record (attacker domain || the issued uop's
+  // cf_attacker_influence = dispatch record [M4RECSUM] || operand attacker taint, register-read), no longer the
+  // dispatching consumer's own bit.  One flop holds the label of the last arm (the arm cycle's arming lanes, ORed:
+  // several arms in one cycle are rare); in an arm cycle the dispatch group reads the new arms directly (they are
+  // younger than the new B, which owns the window).  Not cleared at the close: a uop fetched in the window and
+  // dispatched after it closed (fetch-time membership, d_win_sec through pre.cf_win_sec) reads the label of the
+  // branch it was fetched under (approximate when a later arm replaced it: label noise only).
+  // Cost: 1 FF, ~3 LUT (coreWidth AND-ORs + the mux).  Levels: brinfos registers -> 1 LUT per lane -> OR (1 LUT)
+  // -> mux (select win_arm_sec, already built) -> the candidate's is_atk input, which feeds only the prefix
+  // network whose outputs are registers (0 levels on dis_fire); the flop D is the same depth.  IFT off: constant 0
+  // (the replaced term was the absent field's getOrElse(false.B)), nothing elaborated.  RECORD CHANGE.
+  val win_sec_lbl: Bool = if (ENABLE_IFT) {
+    val arm_lbl = (brinfos zip win_arm_sec_v).map { case (b, a) =>
+      a && (b.uop.cf_attacker_influence.getOrElse(false.B) || b.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U)
+    }.reduce(_||_)
+    val q = RegInit(false.B)
+    when (win_arm_sec) { q := arm_lbl }
+    Mux(win_arm_sec, arm_lbl, q)
+  } else false.B
 
   // [WINSHADOW] step 20, case (c): uops dispatched before B resolved and younger than B were
   // fetched without the window bit and may already have written back (an `x = 1` right after
@@ -1241,9 +1375,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // [t, c-1]) except the epoch's 2-bit wrap: an entry left untouched across 4k closes used to
   // revive (over-taint); it now stays clear.  The epochs stay for uops (cf_wep_*, res()) and
   // memory (STQ, D$ store meta).  close is the signal that advances ep on the same edge.
-  iregfile.io.cf_wclr := Cat(win_atk_close, win_sec_close)
-  io.lsu.cf_wclr_atk.foreach(_ := win_atk_close)   // [LSQWCLR] patch 64 (V7): the LSQ window bits expire too
-  pregfile.io.cf_wclr := Cat(win_atk_close, win_sec_close)
+  // [ONETAG] r205: the secret half never clears at the close (the tag stays until the register is overwritten)
+  // [ONETAGATK] r205 U8: the attacker half never clears at the close either; the LSQ close clear (patch 64) is removed
+  iregfile.io.cf_wclr := 0.U
+  io.lsu.cf_wsh_sec.foreach(_ := wsh_sec)          // [FILLSEC] r205: shadow loads mark the lines they fill (lsu.scala)
+  io.lsu.cf_wsh_atk.foreach(_ := wsh_atk)          // [ONETAGATK] r205 U8: the attacker twin (attacker shadow loads)
+  pregfile.io.cf_wclr := 0.U   // [ONETAG] [ONETAGATK]
   rob.io.cf_wsh_sec := wsh_sec
   rob.io.cf_wsh_atk := wsh_atk
 
@@ -1373,7 +1510,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // SRC=1 (decode). Gated by cf_debug_rob_enable + cf_debug_enable.
   {
     val decFlushInflFmt = (0 until numInfluencerSlotsCF).zipWithIndex.map{case(_,k) => s"I$k={v=%d,oc=%d,ty=%d,atk=%d,sec=%d}"}.mkString(" ")
-    val decFlushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d floc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d $decFlushInflFmt\n"
+    val decFlushFmt = s"[FLUSH] 0x%x (0x%x) CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_oc=%d fl=%d floc=%d) FU=0x%x SRC=%d INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d sftq=%d $decFlushInflFmt\n"   // [FTQHOLD] sftq: 0 here (printf commented out)
     // Task 3.3: the fetch list is no longer in the uop; fetchFlagsToList rebuilds it from the
     // FetchIftInfo flags (printf only).
     def printDecFlush(uop: MicroOp, ift: FetchIftInfo, fl: UInt, floc: UInt): Unit = {
@@ -1391,7 +1528,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
         // [CFNOISE-COMMENTED] uop.cf_secret_access, uop.cf_secret_propagation, uop.cf_secret_transmission,
         // [CFNOISE-COMMENTED] uop.cf_op_count_id, uop.cf_spec_branch_is_atk, uop.cf_spec_branch_op_id,
         // [CFNOISE-COMMENTED] fl, floc,
-        // [CFNOISE-COMMENTED] uop.cf_fu_bitmap, 1.U, inflBitmapFromList(dec_list.edges), dec_list.dropped, uop.cf_cntd_deny_count, uop.cf_stall_cycles_rob, uop.cf_stall_cycles_stq, dec_list.aliased
+        // [CFNOISE-COMMENTED] uop.cf_fu_bitmap, 1.U, inflBitmapFromList(dec_list.edges), dec_list.dropped, uop.cf_cntd_deny_count, uop.cf_stall_cycles_rob, uop.cf_stall_cycles_stq, dec_list.aliased, 0.U /* [FTQHOLD] sftq */
       // [CFNOISE-COMMENTED] ) ++ inflArgs): _*)
     }
     for (w <- 0 until coreWidth) {
@@ -1965,8 +2102,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     // While a window stays open both definitions agree.
     dis_uops(w).cf_win_sec.foreach(_ := win_sec_now)
     dis_uops(w).cf_win_atk.foreach(_ := win_atk_now && pre.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U)
-    dis_uops(w).cf_wep_sec.foreach(_ := win_sec_ep)
-    dis_uops(w).cf_wep_atk.foreach(_ := win_atk_ep)
+    // [ONETAG] r205: the secret epoch has no reader left (regfile, LSQ, STL and D$ dropped the secret window kind);
+    // a constant stamp lets firtool remove the 2-bit field from every uop register it rides in.
+    dis_uops(w).cf_wep_sec.foreach(_ := 0.U)
+    dis_uops(w).cf_wep_atk.foreach(_ := 0.U)   // [ONETAGATK] r205 U8: no attacker epoch reader left
     dis_win_sec_rec(w)     := d_win_sec
     // corefuzzing: REG_DATAFLOW is no longer raised here.  It was driven from the
     // rename-stage taint/producer tables, which are gone (taint-follows-data).  The
@@ -2057,7 +2196,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     // values are discarded either way.  Kept on dis_fire (state, not enqueue data): the
     // dis_stall_* RegNexts / enables, the ROB-stall counter, the IQ-head RegEnable, the
     // ftq_taint_compactor RegNext and the sys_pc2epc RegNext.
-    val dispCands = Seq(
+    val dispCands0 = Seq(
       // [REGSTUCK] 52d: the is_atk terms come from the same stuck-head capture (d_victim stays live).
       InfluencerCandidate(dis_valids(w) && dis_stall_was_reg(w), dis_stall_reg_head_op_count(w),  INFL_REG_PRESSURE, dis_stall_reg_head_domain(w) === 1.U || ((reg_stuck_ldatk || reg_stuck_valatk) && d_victim),  dis_stall_reg_head_is_secret(w)),
       // [FTQFULL] patch 59: the FTQ-starvation edge rides this candidate (see above); a real ROB_FULL
@@ -2084,7 +2223,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       // in software from the logged pregs, so no packet bloat (same rule as REG_DATAFLOW).
       // is_atk must come from the PRE-batch value: dis_uops(w).cf_attacker_influence is
       // ASSIGNED from dis_promoted_atk below, so reading it here closes a combinational loop
-      // (candidate -> batch -> the signal the candidate read).
+      // (candidate -> batch -> the signal the candidate read).  [L11CFATK] lean59: is_atk is now the arming
+      // branch's label (win_sec_lbl, brinfos-sourced, above), which has no path from the batch either.
       // [CFWIN] patch 31: the edge also fires for SECRET-WINDOW membership (d_win_sec, the same
       // term that sets s_prop above).  Step 20 removed cf_ctrl_secret_ctx and left this edge on
       // cf_spec_branch_is_secret alone, which is constant 0: its table is set only by an INT
@@ -2102,9 +2242,14 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       InfluencerCandidate(dis_valids(w) && (dis_uops(w).cf_spec_branch_is_secret.getOrElse(false.B) || d_win_sec ||
                                           (if (cfCtrlFlowAtkWin) d_win_atk else false.B)),
                           0.U, INFL_CONTROL_FLOW,
-                          pre.cf_attacker_influence.getOrElse(false.B) || (if (cfCtrlFlowAtkWin) d_win_atk else false.B),
+                          win_sec_lbl || (if (cfCtrlFlowAtkWin) d_win_atk else false.B),   // [L11CFATK] lean59: the arming branch's record
                           if (cfCtrlFlowAtkWin) (dis_uops(w).cf_spec_branch_is_secret.getOrElse(false.B) || d_win_sec) else true.B),   // [CFWIN]
     )
+    // [DBGFREEZE] patch 85 (b): a debug-mode uop takes no dispatch edge.  Its blockers are other debug uops or
+    // program stores still draining from the STQ; their sec / atk must not reach it (the edge list, dis_promoted_atk,
+    // dis_sec_any).  One more input on each condition LUT; the conditions feed only the prefix network, whose outputs
+    // are registers (0 levels on dis_fire).  The fetch candidates are clean at the source (fetch-buffer.scala).
+    val dispCands = dispCands0.map(c => c.copy(cond = c.cond && !cf_dbg))
     // Timing (plan Task 3.3 Step 3): the 16-candidate prefix network feeds only register
     // inputs (the C_disp LUTRAM write and the sticky atk flop), not the dispatch ready loop.
     val (dis_base, dis_promoted_atk) = addInfluencerBatchList(0.U.asTypeOf(new IftEdgeList),
@@ -2124,7 +2269,15 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     // time influence (domain-mismatch fetch flags, attacker window at fetch) || dispatch-time
     // attacker-window membership; both are rename-stage / window registers (no dis_fire term), so
     // this is shallower than the field it replaces on the dispatcher copy.
-    if (ENABLE_IFT) dis_iq_atk(w) := pre.cf_attacker_influence.getOrElse(false.B) || d_win_atk
+    // [M4RECSUM] lean58 (Fable audit M4, owner 2026-10-23 "stage it"; RULES A "Record summary for both", reading 4,
+    // U8): the IQ seed now carries the FULL attacker record known at dispatch, dis_promoted_atk included (ROB_FULL /
+    // LDQ_FULL / STQ_FULL / REG_PRESSURE / MEM_HOL / IQ_FULL atk edges, the attacker C5 twin), so the issue-time
+    // edge producers (contention winner, IQ_FULL head, FU_BUSY) and the writeback tag see it, as the ROB/LSQ heads
+    // already do ([RECEDGE]).  This deliberately re-opens the patch-49 chain (an IQ_FULL atk edge makes the refused
+    // uop an attacker occupant, which names the next refused uop): the owner's record-summary rule, flood check
+    // required.  Levels: dis_promoted_atk is a prefix-network output; it now also feeds the dispatcher's IQ copy
+    // (slot registers) besides the ROB/sticky flops: register endpoints, 0 levels on dis_fire.  RECORD CHANGE.
+    if (ENABLE_IFT) dis_iq_atk(w) := pre.cf_attacker_influence.getOrElse(false.B) || dis_promoted_atk || d_win_atk
     // [R117SWEEP] patch 33 (r117 + r93): the secret twin of dis_promoted_atk.  Every FIRING
     // candidate with is_secret=1 sets the row's sticky s_prop, whether or not the 4-slot list kept
     // it (the ROB used to OR is_secret over the SURVIVING base entries only, so a fetch ICACHE /
@@ -2137,9 +2290,17 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     if (ENABLE_IFT) dis_sec_any(w) := (fetchCands ++ dispCands).map(c => c.cond && c.is_secret).reduce(_ || _)
 
     // C5: if the blocking queue head was secret-dependent, propagate s_prop to this instruction.
-    when (dis_valids(w) && (dis_stall_was_rob_secret(w) || dis_stall_was_ldq_secret(w) || dis_stall_was_stq_secret(w))) {
+    // [DBGFREEZE] patch 85 (b): not in debug mode (a draining secret program store at the STQ head would otherwise
+    // put s_prop on a debug store, whose STQ uop bit is the stq_head_is_secret seen by program uops after dret).
+    when (dis_valids(w) && !cf_dbg && (dis_stall_was_rob_secret(w) || dis_stall_was_ldq_secret(w) || dis_stall_was_stq_secret(w))) {
       dis_uops(w).cf_secret_propagation.foreach(_ := true.B)
     }
+    // [M4RECSUM] lean58 (M4, secret side): every firing dispatch/fetch edge with sec=1 (dis_sec_any: MEM_HOL,
+    // REG_PRESSURE, IQ_FULL, I$/BTB-displacement fetch flags, ...) now sets the uop's s_prop on dis_uops itself, so
+    // the IQ slot, the issue-time edge producers, the LSU copy and the writeback tag see it (it reached only the ROB
+    // sticky bit before; registers got it through the commit-time late set).  No candidate reads
+    // dis_uops.cf_secret_propagation (no loop); every reader of dis_uops is a register.  RECORD CHANGE.
+    if (ENABLE_IFT) { when (dis_sec_any(w)) { dis_uops(w).cf_secret_propagation.foreach(_ := true.B) } }
     // Duration of the dispatch stall behind the INFL_ROB_FULL influencer above.
     // Read on the fire cycle: the counter\'s clear is registered, so it still holds
     // the accumulated count this cycle.
@@ -2165,6 +2326,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // read), so the dispatch-edge secret summary rides here: no new ROB wire (r98).
   if (ENABLE_IFT) {
     for (w <- 0 until coreWidth) {
+      // [M4RECSUM] lean58: dis_uops already carries dis_sec_any; the OR is kept (idempotent) so this site reads as before
       rob.io.enq_uops(w).cf_secret_propagation.foreach(_ := dis_uops(w).cf_secret_propagation.getOrElse(false.B) || dis_sec_any(w))
     }
   }
@@ -2211,6 +2373,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     // [IQHEAD] patch 49: the IQs' copy carries the chain-free seed (the slot used to zero this field on
     // load, so it had no reader; the ROB and the LSU read dis_uops(w) directly and are unchanged)
     dispatcher.io.ren_uops(w).bits.cf_attacker_influence.foreach(_ := dis_iq_atk(w))
+    // [FTQHOLD] FTQ plan T1 (option A): fu bits 3..1 carry sftq (fetch-buffer.scala [FTQHOLD]); only the ROB's dispatch
+    // column (rob.io.enq_uops = dis_uops) may hold them.  The IQ / FP copies drop them (constant mask, no logic), so no
+    // FU-side writeback can OR them into the record.  (The IQ slot already zeroes cf_fu_bitmap on load.)
+    dispatcher.io.ren_uops(w).bits.cf_fu_bitmap.foreach(_ := dis_uops(w).cf_fu_bitmap.get & ~0xE.U(numModules.W))
   }
 
   var iu_idx = 0
@@ -2482,6 +2648,54 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   iregister_read.io.bypass := bypasses
   iregister_read.io.pred_bypass := pred_bypasses
 
+  // [DBGFREEZE] patch 85 (b)+(c): register-read masks every operand taint of a debug-mode uop, and the program's
+  // x8 / x9 taint is carried across the halt.  The debug ROM saves s0 in dscratch0 and restores it; fesvr / OpenOCD
+  // save s0 and s1 through abstract commands (`sw sN, data0`), use them, and restore them from the host
+  // (`lw sN, data0`, a DM MMIO load).  Taint does not survive those round trips, so the program would resume with
+  // clean s0/s1 (an under-taint: the restored VALUE is the program's).  Per k in {x8, x9}:
+  //   dvP(k)  the preg that holds the program's value of x(8+k): latched from the int map table
+  //           (rename_stage.cf_map89) while the hart is in debug mode and no debug uop has dispatched yet (the
+  //           committed map after the entry rollback), and again on the dret fall (the final restore's preg: the map
+  //           is committed then, dret is unique and nothing younger has dispatched);
+  //   dvA(k)  the program's taint of that register {watk, wsec, atk, sec}: in debug mode, OR of every debug read of
+  //           dvP(k) (register-read cf_dbg_cap: the first save read of a value-restoring debugger, which must read
+  //           the register before it can restore it), zeroed at entry unless still live from the previous halt;
+  //   dvL(k)  dvP(k) is still the arch mapping: cleared when an x(8+k) writer commits (that commit frees dvP(k)).
+  // After dret, register-read ORs dvA(k) into every operand read of dvP(k) while dvL(k) ([DBGVT]): the restored
+  // register reads exactly as tainted as the one the halt interrupted, until the program overwrites it.  A window
+  // close clears the window bits of dvA (the regfile marks flash-clear on the same edge).  Other registers are not
+  // touched by these debuggers; a debugger WRITE of a register it did not read first is a harness value (clean).
+  // Cost: 2 x (8 + 4 + 1) FF + 1 FF (dsp_seen); about 25 LUT here; register-read about 150 LUT (2 x 8-bit preg
+  // compares per operand, shared by the capture and the apply).  IFT off: no ports, nothing elaborated.
+  if (ENABLE_IFT) {
+    iregister_read.io.cf_dbg.get := cf_dbg
+    val map89    = rename_stage.cf_map89.get
+    val dsp_seen = RegInit(false.B)
+    when (!cf_dbg) { dsp_seen := false.B } .elsewhen (dis_fire.reduce(_||_)) { dsp_seen := true.B }
+    val dbg_rise = cf_dbg && !cf_dbg_q
+    val dbg_fall = !cf_dbg && cf_dbg_q
+    val dvP = Reg(Vec(2, UInt(ipregSz.W)))
+    val dvA = RegInit(VecInit(Seq.fill(2)(0.U(4.W))))
+    val dvL = RegInit(VecInit(Seq.fill(2)(false.B)))
+    // [ONETAG] [ONETAGATK] r205: no window kind and no close clear; the carried {watk, wsec} bits are 0 and stay 0
+    val wclr = Fill(4, 1.U(1.W))   // {watk, wsec, atk, sec}
+    for (k <- 0 until 2) {
+      val wr = (0 until coreWidth).map { w =>
+        val cu = rob.io.commit.uops(w)
+        rob.io.commit.valids(w) && cu.ldst_val && cu.dst_rtype === RT_FIX && cu.ldst === (8 + k).U }.reduce(_||_)
+      val cap = Mux(cf_dbg && dsp_seen && dvL(k), iregister_read.io.cf_dbg_cap.get(k), 0.U)
+      dvA(k) := (Mux(dbg_rise && !dvL(k), 0.U, dvA(k)) | cap) & wclr
+      when (wr) { dvL(k) := false.B }
+      when ((cf_dbg && !dsp_seen) || dbg_fall) {
+        dvP(k) := map89(k)
+        dvL(k) := true.B
+      }
+      iregister_read.io.cf_dbg_preg.get(k).valid := dvL(k)
+      iregister_read.io.cf_dbg_preg.get(k).bits  := dvP(k)
+      iregister_read.io.cf_dbg_vt.get(k)         := dvA(k)
+    }
+  }
+
   //-------------------------------------------------------------
   // Privileged Co-processor 0 Register File
   // Note: Normally this would be bad in that I'm writing state before
@@ -2576,8 +2790,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
                       (csr_rw_cmd === freechips.rocketchip.rocket.CSR.W ||
                        (csr_rw_cmd.isOneOf(freechips.rocketchip.rocket.CSR.S, freechips.rocketchip.rocket.CSR.C) &&
                         wb_wdata(4, 0).orR))
+  // [DBGFREEZE] patch 85 (c): the program's fflags taint is frozen in debug mode (a debug-mode FP op or fflags write
+  // neither sets nor clears it).  One more input on each flop's D LUT.
   if (ENABLE_IFT) {
-    when (cf_ff_csr_wr) {
+    when (cf_dbg) {
+    } .elsewhen (cf_ff_csr_wr) {
       cf_ff_sec := false.B
       cf_ff_atk := false.B
     } .otherwise {
@@ -2630,8 +2847,20 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
           // unchanged.  `bypasses` feeds only iregister_read.  The epoch compare is one LUT in
           // parallel with in(); no added level on the bypass path.
           val byu = exe_unit.io.bypass(i).bits.uop
-          bypasses(bypass_idx).bits.uop.cf_win_sec.foreach(_ := wsh_sec.res(byu.cf_win_sec.getOrElse(false.B) || byu.cf_opnd_wsec.getOrElse(false.B), byu.cf_wep_sec.getOrElse(0.U(2.W)), byu.rob_idx))
-          bypasses(bypass_idx).bits.uop.cf_win_atk.foreach(_ := wsh_atk.res(byu.cf_win_atk.getOrElse(false.B) || byu.cf_opnd_watk.getOrElse(false.B), byu.cf_wep_atk.getOrElse(0.U(2.W)), byu.rob_idx))
+          // [ONETAG] r205 (RULES.md A reading 2): the bypassed value carries the ONE secret tag the regfile write
+          // will store (regfile.scala WritePort): data taint || the producer's s_acc / s_prop || shadow membership.
+          // This also closes the old bypass-vs-regfile difference (the shadow term was missing on the bypass).
+          // Levels: 0 added on the bypass DATA bits.  The TAG bits gain in() (two 8-bit IsOlder carry chains + a LUT)
+          // from the bypass uop's rob_idx flop into register-read's MuxCase, and the 2 x 19-bit window state plus
+          // rob_head is broadcast to every such site (corrected lean58, timing-audit-20261023 section 5: the cost
+          // that matters here is that fan-out and routing, not the level count).
+          bypasses(bypass_idx).bits.secret := exe_unit.io.bypass(i).bits.secret || byu.cf_secret_access.getOrElse(false.B) ||
+                                              byu.cf_secret_propagation.getOrElse(false.B) || wsh_sec.in(byu.rob_idx)
+          bypasses(bypass_idx).bits.uop.cf_win_sec.foreach(_ := false.B)   // [ONETAG] no secret window kind
+          // [ONETAGATK] r205 U8: the bypassed value carries the one attacker tag the regfile write stores
+          bypasses(bypass_idx).bits.taint_atk := exe_unit.io.bypass(i).bits.taint_atk || byu.cf_attacker_influence.getOrElse(false.B) ||
+                                                 wsh_atk.in(byu.rob_idx)
+          bypasses(bypass_idx).bits.uop.cf_win_atk.foreach(_ := false.B)
           bypasses(bypass_idx).bits.uop.cf_opnd_wsec.foreach(_ := false.B)
           bypasses(bypass_idx).bits.uop.cf_opnd_watk.foreach(_ := false.B)
           bypass_idx += 1
@@ -2656,6 +2885,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     io.lsu.dis_uops(w).valid := dis_fire(w)
     io.lsu.dis_valids(w)     := dis_valids(w)   // [DISPAR] patch 51 (A): pre-stall valids for the slot-parallel LDQ/STQ allocation
     io.lsu.dis_uops(w).bits  := dis_uops(w)
+    // [FTQHOLD] FTQ plan T1 (option A): the LDQ / STQ copies drop fu bits 3..1 (sftq, see the dispatcher copy above), so
+    // the load writeback and store clr_bsy bitmaps OR 0 there and the record keeps the dispatch-column value.  Constant
+    // mask: no logic; those LDQ/STQ/D$ copy bits become constant 0 (as bits 2-3 are today).
+    io.lsu.dis_uops(w).bits.cf_fu_bitmap.foreach(_ := dis_uops(w).cf_fu_bitmap.get & ~0xE.U(numModules.W))
   }
 
   // tell LSU about committing loads and stores to clear entries
@@ -2690,11 +2923,24 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   //-------------------------------------------------------------
 
   var w_cnt = 1
-  iregfile.io.write_ports(0) := WritePort(ll_wbarb.io.out, ipregSz, xLen, RT_FIX, wsh_sec, wsh_atk)   // [WINSHADOW]/[WINEXP]
+  // [F1WSH] lean58 timing F1 (timing-audit-20261023 section 6): the memory write ports take the window-shadow
+  // membership the LSU computed per response candidate before its late select (io.lsu.cf_resp_w*, lsu.scala
+  // cfRespWin), instead of running wsh_*.in() on the selected uop's rob_idx here.  Port 0 is the ll_wbarb output:
+  // each arbiter input gets its own membership (the LSU bit for input 0; in() on the FP-to-int / RoCC uop, whose
+  // rob_idx is not behind the LSU select, for the others) and the arbiter's own `chosen` picks it.  Exact:
+  // chisel3 Arbiter drives io.out.bits = io.in(io.chosen).bits in every cycle, so the picked bit is
+  // in(io.out.bits.uop.rob_idx) whenever in(0)'s bit is (lsu.scala argument); IFT off passes None (unchanged).
+  val ll_win_in: Option[(Bool, Bool)] = if (ENABLE_IFT) {
+    val srcs = Seq((io.lsu.cf_resp_wsec.get(0), io.lsu.cf_resp_watk.get(0))) ++
+               ll_wbarb.io.in.drop(1).map(i => (wsh_sec.in(i.bits.uop.rob_idx), wsh_atk.in(i.bits.uop.rob_idx)))
+    Some((VecInit(srcs.map(_._1))(ll_wbarb.io.chosen), VecInit(srcs.map(_._2))(ll_wbarb.io.chosen)))
+  } else None
+  iregfile.io.write_ports(0) := WritePort(ll_wbarb.io.out, ipregSz, xLen, RT_FIX, wsh_sec, wsh_atk, ll_win_in)   // [WINSHADOW]/[WINEXP] [F1WSH]
   ll_wbarb.io.in(0) <> mem_resps(0)
   assert (ll_wbarb.io.in(0).ready) // never backpressure the memory unit.
   for (i <- 1 until memWidth) {
-    iregfile.io.write_ports(w_cnt) := WritePort(mem_resps(i), ipregSz, xLen, RT_FIX, wsh_sec, wsh_atk)   // [WINSHADOW]/[WINEXP]
+    val mem_win_in = if (ENABLE_IFT) Some((io.lsu.cf_resp_wsec.get(i), io.lsu.cf_resp_watk.get(i))) else None   // [F1WSH]
+    iregfile.io.write_ports(w_cnt) := WritePort(mem_resps(i), ipregSz, xLen, RT_FIX, wsh_sec, wsh_atk, mem_win_in)   // [WINSHADOW]/[WINEXP] [F1WSH]
     w_cnt += 1
   }
 
@@ -2717,13 +2963,18 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
       iregfile.io.write_ports(w_cnt).valid     := wbIsValid(RT_FIX)
       iregfile.io.write_ports(w_cnt).bits.addr := wbpdst
-      iregfile.io.write_ports(w_cnt).bits.secret := wbresp.bits.secret
-      // [IMPLWIN] step 20: window taint of the result (in the window, or a window operand)
-      // [WINEXP] step 21: live only while the uop's dispatch epoch is current
-      iregfile.io.write_ports(w_cnt).bits.wsec := wsh_sec.res(wbresp.bits.uop.cf_win_sec.getOrElse(false.B) || wbresp.bits.uop.cf_opnd_wsec.getOrElse(false.B),
-                                                              wbresp.bits.uop.cf_wep_sec.getOrElse(0.U(2.W)), wbresp.bits.uop.rob_idx)   // [WINSHADOW]
-      iregfile.io.write_ports(w_cnt).bits.watk := wsh_atk.res(wbresp.bits.uop.cf_win_atk.getOrElse(false.B) || wbresp.bits.uop.cf_opnd_watk.getOrElse(false.B),
-                                                              wbresp.bits.uop.cf_wep_atk.getOrElse(0.U(2.W)), wbresp.bits.uop.rob_idx)
+      // [ONETAG] r205: the ONE secret tag (regfile.scala WritePort rule): data taint || writer s_acc / s_prop ||
+      // window-shadow membership.  No window kind.  (lean58 note: rob_idx here comes from the FU response
+      // registers, through the exe unit's own response select on units with several FUs; not behind the LSU select.
+      // The memory ports take the LSU's precomputed bit, [F1WSH].)
+      val wb_sec = wbresp.bits.secret || wbresp.bits.uop.cf_secret_access.getOrElse(false.B) ||
+                   wbresp.bits.uop.cf_secret_propagation.getOrElse(false.B) || wsh_sec.in(wbresp.bits.uop.rob_idx)
+      iregfile.io.write_ports(w_cnt).bits.secret := wb_sec
+      iregfile.io.write_ports(w_cnt).bits.wsec := false.B   // [ONETAG]
+      iregfile.io.write_ports(w_cnt).bits.watk := false.B   // [ONETAGATK] r205 U8
+      // [ONETAGATK] the one attacker tag: value taint || ownership || writer atk record || attacker-shadow membership
+      val wb_atk = wbresp.bits.taint_atk || (wbresp.bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U) ||
+                   wbresp.bits.uop.cf_attacker_influence.getOrElse(false.B) || wsh_atk.in(wbresp.bits.uop.rob_idx)
    // [PROBE STRIPPED 2026-09-11] A1UP -- diagnostic only, purpose discharged.
       // // [A1UP 2026-09-11] TEMPORARY.  The [A1AGU]/[A1RR2] probes localised A1 to UPSTREAM of
       // // register-read: the secret bit is on a store's data register only 14 times in 223,239
@@ -2741,15 +2992,14 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
             // wbresp.bits.uop.cf_domain_id)
         // }
       // }
-      iregfile.io.write_ports(w_cnt).bits.taint_atk := wbresp.bits.taint_atk || (wbresp.bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U)
+      iregfile.io.write_ports(w_cnt).bits.taint_atk := wb_atk   // [ONETAGATK]
       wbresp.ready := true.B
       if (exe_units(i).hasCSR) {
         iregfile.io.write_ports(w_cnt).bits.data := Mux(wbReadsCSR, csr.io.rw.rdata, wbdata)
         // [FFTAINT] step 18: a read of fflags/fcsr carries the sticky flags taint (this unit's
         // iresp is the one csr.io.rw reads, so cf_ff_rd_* already names this uop)
-        iregfile.io.write_ports(w_cnt).bits.secret    := wbresp.bits.secret || cf_ff_rd_sec
-        iregfile.io.write_ports(w_cnt).bits.taint_atk := wbresp.bits.taint_atk || cf_ff_rd_atk ||
-                                                         (wbresp.bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U)
+        iregfile.io.write_ports(w_cnt).bits.secret    := wb_sec || cf_ff_rd_sec   // [ONETAG]
+        iregfile.io.write_ports(w_cnt).bits.taint_atk := wb_atk || cf_ff_rd_atk   // [ONETAGATK]
       } else {
         iregfile.io.write_ports(w_cnt).bits.data := wbdata
       }
@@ -2776,12 +3026,14 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     pregfile.io.write_ports(0).bits.data := jmp_unit.io.iresp.bits.data
     // a secret-dependent branch condition yields a secret-dependent predicate:
     // predicated registers are tagged and propagate like any other value.
-    pregfile.io.write_ports(0).bits.secret := jmp_unit.io.iresp.bits.secret
-    pregfile.io.write_ports(0).bits.taint_atk := jmp_unit.io.iresp.bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U
-    pregfile.io.write_ports(0).bits.wsec := wsh_sec.res(jmp_unit.io.iresp.bits.uop.cf_win_sec.getOrElse(false.B) || jmp_unit.io.iresp.bits.uop.cf_opnd_wsec.getOrElse(false.B),
-                                                        jmp_unit.io.iresp.bits.uop.cf_wep_sec.getOrElse(0.U(2.W)), jmp_unit.io.iresp.bits.uop.rob_idx)   // [WINEXP]
-    pregfile.io.write_ports(0).bits.watk := wsh_atk.res(jmp_unit.io.iresp.bits.uop.cf_win_atk.getOrElse(false.B) || jmp_unit.io.iresp.bits.uop.cf_opnd_watk.getOrElse(false.B),
-                                                        jmp_unit.io.iresp.bits.uop.cf_wep_atk.getOrElse(0.U(2.W)), jmp_unit.io.iresp.bits.uop.rob_idx)
+    // [ONETAG] r205: the one secret tag, as the integer ports
+    pregfile.io.write_ports(0).bits.secret := jmp_unit.io.iresp.bits.secret || jmp_unit.io.iresp.bits.uop.cf_secret_propagation.getOrElse(false.B) ||
+                                              wsh_sec.in(jmp_unit.io.iresp.bits.uop.rob_idx)
+    pregfile.io.write_ports(0).bits.taint_atk := jmp_unit.io.iresp.bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) =/= 0.U ||
+                                                 jmp_unit.io.iresp.bits.uop.cf_attacker_influence.getOrElse(false.B) ||   // [ONETAGATK]
+                                                 wsh_atk.in(jmp_unit.io.iresp.bits.uop.rob_idx)
+    pregfile.io.write_ports(0).bits.wsec := false.B   // [ONETAG]
+    pregfile.io.write_ports(0).bits.watk := false.B   // [ONETAGATK]
   }
 
   // [WINSHADOW] step 20, coverage (c), second half: a shadow uop that wrote back BEFORE B
@@ -2789,24 +3041,39 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // range test, cf_com_win_*).  This is the existing per-lane commit path: it cannot be
   // avoided, because the register was written before the window existed and nothing else
   // writes it again.  coreWidth set ports on each of the int and FP window-taint Mems.
+  // [ONETAG] r205 (RULES.md A reading 2): the secret set port now sets the register's LATE secret tag for every
+  // committing writer whose RECORD is secret (rob.io.cf_com_sec = commit-time s_acc || s_prop || shadow, the bits
+  // the record carries), covering record bits that landed after the writeback (contention, MEM_ORDER, D$ edges,
+  // the commit-time shadow).  Registered one cycle (the commit readout -> cross-module -> 192-way decode leg is
+  // cut at the flop): a set one cycle late is safe, because a committed pdst is freed only when a LATER writer of
+  // the same logical register commits, and its next writer reaches writeback >= 3 cycles after reallocation; that
+  // writeback clears the bit (regfile.scala).  Readers between this writer's writeback and this set see the
+  // writeback-time tag only (residual, host-recoverable from pdst/prs).  Cost: coreWidth x (1 + 8) FF per file.
   for (w <- 0 until coreWidth) {
     val cu  = rob.io.commit.uops(w)
     val cwr = rob.io.commit.valids(w) && cu.rf_wen && cu.ldst_val
-    iregfile.io.win_set_sec(w).valid := cwr && cu.dst_rtype === RT_FIX && rob.io.cf_com_win_sec(w)
-    iregfile.io.win_set_sec(w).bits  := cu.pdst
-    iregfile.io.win_set_atk(w).valid := cwr && cu.dst_rtype === RT_FIX && rob.io.cf_com_win_atk(w)
-    iregfile.io.win_set_atk(w).bits  := cu.pdst
+    // RULES.md D3 (ENABLE_IFT gating, IFT-off Verilog unchanged): the flops exist only with IFT on
+    val com_sec_set = if (ENABLE_IFT) RegNext(cwr && rob.io.cf_com_sec.get(w), false.B) else false.B
+    val com_sec_rt  = if (ENABLE_IFT) RegNext(cu.dst_rtype) else cu.dst_rtype
+    val com_sec_pd  = if (ENABLE_IFT) RegNext(cu.pdst) else cu.pdst
+    iregfile.io.win_set_sec(w).valid := com_sec_set && com_sec_rt === RT_FIX
+    iregfile.io.win_set_sec(w).bits  := com_sec_pd
+    // [ONETAGATK] r205 U8: the late ATTACKER set for every committing writer whose record has atk (shares the
+    // registered rtype / pdst of the secret set: +1 FF per lane)
+    val com_atk_set = if (ENABLE_IFT) RegNext(cwr && rob.io.cf_com_atk.get(w), false.B) else false.B
+    iregfile.io.win_set_atk(w).valid := com_atk_set && com_sec_rt === RT_FIX
+    iregfile.io.win_set_atk(w).bits  := com_sec_pd
     if (usingFPU) {
-      fp_pipeline.io.win_set_sec(w).valid := cwr && cu.dst_rtype === RT_FLT && rob.io.cf_com_win_sec(w)
-      fp_pipeline.io.win_set_sec(w).bits  := cu.pdst
-      fp_pipeline.io.win_set_atk(w).valid := cwr && cu.dst_rtype === RT_FLT && rob.io.cf_com_win_atk(w)
-      fp_pipeline.io.win_set_atk(w).bits  := cu.pdst
+      fp_pipeline.io.win_set_sec(w).valid := com_sec_set && com_sec_rt === RT_FLT   // [ONETAG]
+      fp_pipeline.io.win_set_sec(w).bits  := com_sec_pd
+      fp_pipeline.io.win_set_atk(w).valid := com_atk_set && com_sec_rt === RT_FLT   // [ONETAGATK]
+      fp_pipeline.io.win_set_atk(w).bits  := com_sec_pd
     }
   }
   if (usingFPU) {
     fp_pipeline.io.wsh_sec := wsh_sec
     fp_pipeline.io.wsh_atk := wsh_atk
-    fp_pipeline.io.cf_wclr := Cat(win_atk_close, win_sec_close)   // [WINCLR] patch 35 C
+    fp_pipeline.io.cf_wclr := 0.U   // [WINCLR] patch 35 C; [ONETAG] [ONETAGATK] no close clear on either side
   }
 
   if (usingFPU) {
@@ -2925,6 +3192,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   rob.io.lsu_clr_bsy_cf_bitmap := io.lsu.clr_bsy_cf_bitmap
   rob.io.lsu_clr_bsy_cf_stx   := io.lsu.clr_bsy_cf_stx
   rob.io.lsu_clr_bsy_cf_sprop := io.lsu.clr_bsy_cf_sprop
+  rob.io.lsu_clr_bsy_cf_atk.foreach(_ := io.lsu.clr_bsy_cf_atk.get)   // [M7STATK] bundle61
   rob.io.lsu_clr_unsafe        := io.lsu.clr_unsafe
   rob.io.lxcpt          <> io.lsu.lxcpt
 
@@ -2936,6 +3204,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   rob.io.cf_lsu_s_acc_upd        := io.lsu.cf_s_acc_rob_upd
   // [MEMORD 2026-09-08] ty=8 MEM_ORDER edge from the LSU's order_fail sites.
   rob.io.cf_lsu_memord_upd       := io.lsu.cf_memord_upd
+  rob.io.cf_lsu_rdedge_upd.foreach(_ := io.lsu.cf_rdedge_upd.get)   // [RDEDGE] patch 80
 
   // Default driver for rob.io.cf_s_prop_rob_upd — always fires so the IO has a
   // valid default even when IFT is disabled. The IFT writeback-transitive block
@@ -3197,7 +3466,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
           // split across two printfs, which also opened a window for the MEMTRACE printf
           // to interleave BETWEEN them and corrupt records.  parse_ift_log.py was made
           // position-independent to follow this, not the other way round.
-          cfFmt = " CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_sec=%d spec_oc=%d pdst=%d prs1=%d prs2=%d rt1=%d rt2=%d brmask=0x%x brtag=%d abr=%d sbr=%d FU=0x%x INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d) "
+          cfFmt = " CF(domain=%d spec=%d atk=%d s_acc=%d s_prop=%d s_tx=%d opcount=%d spec_atk=%d spec_sec=%d spec_oc=%d pdst=%d prs1=%d prs2=%d rt1=%d rt2=%d brmask=0x%x brtag=%d abr=%d sbr=%d wsh=%d ce_repl=%d FU=0x%x INFL_FU=0x%x OVF=%d dcy=%d srob=%d sstq=%d alias=%d sftq=%d) "
           cfArgs = Seq[Bits](
             rob.io.commit.uops(w).cf_domain_id.getOrElse(0.U(iftTagWidth.W)),
             rob.io.commit_ift(w).speculated,
@@ -3230,13 +3499,25 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
             // retirements back to the branch that tainted the history.
             rob.io.commit_ift(w).atk_branch_ctr,
             rob.io.commit_ift(w).sec_branch_ctr,
+            // [HW1BIT75] wsh = bridge record bit [75] (rob.scala com_wsh): the commit-time secret-window
+            // shadow test of this lane.  Printed right after sbr, where the bridge decoder puts it.
+            // Printf only (this block is COMMIT_LOG_PRINTF + ENABLE_CF_DEBUG_PRINTF + ENABLE_IFT).
+            rob.io.cf_com_win_sec(w) && !cf_dbg,   // [DBGFREEZE] patch 85: = record bit [75] (rob.scala com_wsh)
+            // [CEREPL] lean59: ce_repl = bridge record bit [254] (a CACHE_EVICTION edge of this row named the access
+            // that last advanced the set's replacement state).  Printed after wsh, where the bridge decoder puts it.
+            rob.io.commit_ift(w).ce_repl.getOrElse(false.B),
             rob.io.commit.uops(w).cf_fu_bitmap.getOrElse(0.U(numModules.W)),
             inflBitmapFromList(rob.io.commit_ift(w).influencer_list),
             rob.io.commit_ift(w).infl_dropped,
             rob.io.commit_ift(w).cntd_deny_count,
             rob.io.commit_ift(w).stall_cycles_rob,
             rob.io.commit_ift(w).stall_cycles_stq,
-            rob.io.commit_ift(w).infl_oc_aliased)
+            rob.io.commit_ift(w).infl_oc_aliased,
+            // [FTQHOLD] FTQ plan T2 (option A): sftq = the f4 FTQ-hold bucket carried in fu bits 3..1 of the record's
+            // fu_bitmap (fetch-buffer.scala [FTQHOLD]: bit 2 = sftq[0], bit 3 = sftq[1], bit 1 = !sftq[2]).  Printed after
+            // alias= (not between sstq= and alias=: ift_core._UOP_CTR_RE reads "sstq=N" then "alias=N" adjacently, and a token
+            // between them would silently drop alias).  Printf only; FU=0x.. stays the raw record value.
+            rob.io.commit.uops(w).cf_fu_bitmap.map(f => Cat(!f(1), f(3), f(2))).getOrElse(0.U(3.W)))
 
           // [THINUOP] Task 3.5: the single-step marker printf was commented out and its
           // cf_single_step field left the MicroOp; the empty `when` is deleted.
@@ -3448,6 +3729,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   if (usingRoCC) {
     exe_units.rocc_unit.io.rocc.rocc         <> io.rocc
     exe_units.rocc_unit.io.rocc.dis_uops     := dis_uops
+    // [FTQHOLD] FTQ plan T2 (option A): the RoCC copy drops fu bits 3..1 like the IQ / LSU copies (core.scala
+    // dispatcher / io.lsu.dis_uops), so its writeback cannot trip the rob.scala [FTQHOLD] assert.  Constant mask.
+    for (w <- 0 until coreWidth)
+      exe_units.rocc_unit.io.rocc.dis_uops(w).cf_fu_bitmap.foreach(_ := dis_uops(w).cf_fu_bitmap.get & ~0xE.U(numModules.W))
     exe_units.rocc_unit.io.rocc.rob_head_idx := rob.io.rob_head_idx
     exe_units.rocc_unit.io.rocc.rob_pnr_idx  := rob.io.rob_pnr_idx
     exe_units.rocc_unit.io.com_exception     := rob.io.flush.valid

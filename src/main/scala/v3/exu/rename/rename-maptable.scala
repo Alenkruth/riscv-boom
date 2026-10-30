@@ -68,6 +68,11 @@ class RenameMapTable(
 
   // The map table register array and its branch snapshots.
   val map_table = RegInit(VecInit(Seq.fill(numLregs){0.U(pregSz.W)}))
+  // [DBGFREEZE] patch 85 (c): the current pregs of x8 / x9 (s0 / s1, the registers the debug ROM and the Debug
+  // Module's abstract commands overwrite and restore), read by core.scala while the map is the committed one
+  // (debug entry after the rollback, dret).  Plain wires off the table flops: 0 LUT.  INT table, IFT only.
+  val cf_map89 = if (ENABLE_IFT && !float) Some(IO(Output(Vec(2, UInt(pregSz.W))))) else None
+  cf_map89.foreach { o => o(0) := map_table(8); o(1) := map_table(9) }
   val br_snapshots = Reg(Vec(maxBrCount, Vec(numLregs, UInt(pregSz.W))))
 
   // The intermediate states of the map table following modification by each pipeline slot.

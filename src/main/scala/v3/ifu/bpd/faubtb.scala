@@ -95,7 +95,9 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
     s1_meta.hits(w)     := s1_hits(w)
     // O4: qualified on s1_hits -- this bank is tagged, so only a real hit means the
     // prediction actually came from that entry.
-    s1_ubtb_domain_mismatch(w) := s1_hits(w) && (entry_meta.domain.getOrElse(0.U(1.W)) =/= s1_domain)
+    // [ATKDMMASK] lean58 A5 (gap inventory 2026-10-23): the attacker-side twin of [BPDMASK]: a slot below the fetch
+    // PC, or a bank whose request is not valid, is not part of the packet; its domain label raises no edge either.
+    s1_ubtb_domain_mismatch(w) := s1_valid && s1_hits(w) && (entry_meta.domain.getOrElse(0.U(1.W)) =/= s1_domain) && s1_mask(w)
  // [BTBPROBE RETIRED 2026-09-10] purpose discharged: proved the channel WORKS
     // // [BTBPROBE 2026-09-10] TEMPORARY -- the hit half.  Printed on EVERY real hit, not only
     // // on mismatch: "mismatch never fired" and "the uBTB never hit at all" look identical
@@ -195,6 +197,23 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
         Mux(was_taken, 3.U, 0.U),
         bimWrite(meta(s1_update_write_way)(w).ctr, was_taken)
       )
+    }
+  }
+
+  // [SINKFACTS86] patch 86 (all-sinks study Q6): every uBTB commit write, debug printf builds only (the
+  // IftSquashMerge gate: IFT on, CF debug printfs on, no IFT bridge; IFT off / NoLog / FireSim elaborate nothing).
+  // pc = the bank-aligned update pc (bank = pc[3], tag = pc >> 4); way = write_way chosen at FETCH time (hit way,
+  // else the 4-bit-chunk XOR alloc of the tags held at fetch); hits = the fetch-time slot hits (a written slot with
+  // hit = 0 is reset to 3 / 0, else counted); wm / wb = meta / target slot masks; ctr = the way's counters BEFORE
+  // this write (registers, current).  The host replays these writes from the all-zero reset (meta is RegInit 0)
+  // and recomputes way and hits from the CURRENT tags: a difference is a fetch-vs-update interleaving event.
+  if (ENABLE_IFT && ENABLE_CF_DEBUG_PRINTF && !ENABLE_IFT_BRIDGE) {
+    val cf_sf_cyc = RegInit(0.U(40.W))
+    cf_sf_cyc := cf_sf_cyc + 1.U
+    when (s1_update_wmeta_mask =/= 0.U) {
+      printf("[UBTBW] cyc=%d pc=0x%x way=%d hits=0x%x wm=0x%x wb=0x%x brm=0x%x ctr=0x%x\n", cf_sf_cyc,
+        s1_update.bits.pc, s1_update_write_way, s1_update_meta.hits.asUInt, s1_update_wmeta_mask, s1_update_wbtb_mask,
+        s1_update.bits.br_mask, VecInit(meta(s1_update_write_way).map(_.ctr)).asUInt)
     }
   }
 

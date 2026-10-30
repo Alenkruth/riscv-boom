@@ -24,14 +24,16 @@ import boom.v3.exu.IssueContentionUpdate
 object IftStamp { val W = 16 }   // D15
 
 /** Everything the 256-bit record needs that the sidecar reconstructs at readout.
-  * op_count, domain and ras_pred_xdom stay in rob_uop; the four sticky flags live in
+  * op_count and domain stay in rob_uop ([RASEVERY]: ras_pred_xdom is in IftDispColumn); the four sticky flags live in
   * flip-flops next to rob_val.  attacker_influence here is the EDGE-derived part only;
   * rob.scala ORs the sticky bit in. */
 class IftCommitInfo(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
   val speculated            = Bool()
-  // (record bit [75], cf_src_tainted, has had no writer since Phase 2; Task 3.9 removed the
-  //  constant-false src_tainted field here, in IftDispColumn and in IftDispatchInfo.  The
-  //  packer emits the 0 directly, so the record is unchanged.)
+  // (record bit [75], cf_src_tainted, had no writer since Phase 2; Task 3.9 removed the
+  //  constant-false src_tainted field here, in IftDispColumn and in IftDispatchInfo.  Since
+  //  [HW1BIT75] (owner R-b, 2026-10-20) the bit is the commit-time secret-window shadow bit,
+  //  passed to uopToIFTBits by the ROB commit packer as an argument (rob.scala com_wsh), not
+  //  held here: it is computed at commit and is never stored per ROB row.)
   val single_step           = Bool()
   val spec_branch_is_atk    = Bool()
   val spec_branch_is_secret = Bool()
@@ -46,6 +48,11 @@ class IftCommitInfo(implicit p: Parameters) extends BoomBundle with CoreFuzzingC
   val infl_oc_aliased       = Bool()
   val cntd_deny_count       = UInt(3.W)
   val edge_atk              = Bool()      // [FIFO10] OR of is_atk over EVERY edge that reached the row (stored or dropped)
+  // [CEREPL] lean59 (owner 2026-10-23, RULES C "Replacement state": "keep it in cache eviction with a bit"): record bit
+  // [254].  1 = a CACHE_EVICTION (ty 12/21-23) edge that reached this row (stored or dropped, like edge_atk) named the
+  // access that last advanced the set's replacement state (ift_repl_sec / ift_repl_atk, or the LFSR taint under random
+  // replacement), not the evicting access itself.  dcache.scala [CEREPL] has the exact condition.  None IFT off.
+  val ce_repl               = if (ENABLE_IFT) Some(Bool()) else None
 }
 
 /** Written once at enqueue (D-column). */
@@ -64,6 +71,10 @@ class IftDispColumn(implicit p: Parameters) extends BoomBundle with CoreFuzzingC
   val oc_aliased            = Bool()
   val fu_bitmap             = UInt(numModules.W)
   val alloc_stamp           = UInt(IftStamp.W.W)
+  // [RASEVERY] owner 2026-10-21: the row's cf_ras_pred_xdom at dispatch (a ret that popped a RAS
+  // slot pushed by the other domain, or a victim ret that popped a stale slot).  IftMerge raises
+  // the RAS edge from it on every such ret, committed or squashed (147 -> 148 bits).
+  val ras_xdom              = Bool()
 }
 
 /** One LSU-fed writeback port's contribution. */
@@ -71,14 +82,22 @@ class IftWbColumn(implicit p: Parameters) extends BoomBundle with CoreFuzzingCon
   val edges     = Vec(numInfluencerSlotsCF, new InfluencerEntry)
   val dropped   = UInt(2.W)
   val aliased   = Bool()
+  val ce_repl   = Bool()      // [CEREPL] the response's IftEdgeList.ce_repl (the sidecar exists only with IFT on)
   val fu_bitmap = UInt(numModules.W)
   val stamp     = UInt(IftStamp.W.W)
 }
 
-/** A port that contributes only fu_bitmap bits (ALU/FP writeback ports, store clr_bsy). */
+/** A port that contributes only fu_bitmap bits (ALU/FP writeback ports). */
 class IftBitmapColumn(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
   val fu_bitmap = UInt(numModules.W)
   val stamp     = UInt(IftStamp.W.W)
+}
+
+/** [STTY0] bundle61: the store clr_bsy column (was IftBitmapColumn): + the store's 2 operand labels, from which the
+  * merge builds the store's REG_DATAFLOW (ty0) edge.  +2 LUTRAM bits per C_clr column. */
+class IftClrColumn(implicit p: Parameters) extends IftBitmapColumn {
+  val is_atk    = Bool()
+  val is_secret = Bool()
 }
 
 /** One influencer entry with its arrival stamp (issue contention, MEM_ORDER, later DTLB).
@@ -91,10 +110,8 @@ class IftEdgeColumn(val hasDeny: Boolean = true)(implicit p: Parameters) extends
   val stamp       = UInt(IftStamp.W.W)
 }
 
-/** Fixed-content event (RAS edge): only the arrival stamp is stored. */
-class IftStampColumn(implicit p: Parameters) extends BoomBundle {
-  val stamp = UInt(IftStamp.W.W)
-}
+// [RASEVERY] IftStampColumn (the C_ras arrival stamp) is removed with C_ras: the RAS edge is
+// IftDispColumn.ras_xdom, written at dispatch.
 
 /** The sprob mark (writeback-time INFL_REG_DATAFLOW).  Spec 5.1.2 amendment (2026-10-08,
   * owner-approved): the entry's is_atk / is_secret come from the writeback source (the
@@ -119,6 +136,13 @@ class IftRowReq(val rowW: Int)(implicit p: Parameters) extends BoomBundle {
 class IftRowBitmap(val rowW: Int)(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
   val row       = UInt(rowW.W)
   val fu_bitmap = UInt(numModules.W)
+}
+
+/** [STTY0] bundle61: the store clr_bsy payload = the bitmap plus the store's operand labels (data / address operand
+  * secret taint = the producers' s_acc || s_prop, lsu.scala cfStSprop; attacker taint, cfStAtk). */
+class IftRowClr(rowW: Int)(implicit p: Parameters) extends IftRowBitmap(rowW) {
+  val is_atk    = Bool()
+  val is_secret = Bool()
 }
 
 class IftRowIc(val rowW: Int)(implicit p: Parameters) extends BoomBundle {
@@ -166,7 +190,8 @@ class IftRawEdge(val hasDeny: Boolean)(implicit p: Parameters) extends BoomBundl
   * function of it.  147 + 9*19 + 7*37 + 4*92 + 2*34 + 17 + 1 + 2 = 1,033 bits for (9, 7, 4, 2) ([FIFO10])
   * (Task 3.9: the constant src_tainted bit left IftDispColumn, 148 -> 147).
   * ([FIFO10] step 10, owner ruling 94: the Task 3.2 DTLB columns `dt` (2 x 19 bits) are removed;
-  *  + 2 bits ic_dropped: 1,033 bits.) */
+  *  + 2 bits ic_dropped: 1,033 bits.)
+  * [RASEVERY]: - 17 bits `ras` (C_ras valid + stamp), + 1 bit disp.ras_xdom: 1,017 bits. */
 class IftRawRow(val nSprob: Int, val nIc: Int, val nWb: Int, val nMemord: Int)(implicit p: Parameters)
     extends BoomBundle with CoreFuzzingConstants {
   val disp   = new IftDispColumn                         // fu_bitmap = disp | valid wb | valid fu | valid clr
@@ -174,11 +199,17 @@ class IftRawRow(val nSprob: Int, val nIc: Int, val nWb: Int, val nMemord: Int)(i
   val ic     = Vec(nIc,     Valid(new IftRawEdge(hasDeny = true)))
   val wb     = Vec(nWb,     Valid(new IftWbEdgeColumn))
   val mo     = Vec(nMemord, Valid(new IftRawEdge(hasDeny = false)))
-  val ras    = Valid(new IftStampColumn)
   val domain = UInt(1.W)                                 // rob_uop(row).cf_domain_id at capture (RAS edge, record bit 69)
   // [FIFO10] step 10: saturating sum of the valid C_ic columns' `dropped` (replaced contention
   // winners), formed in rawRead so the raw row grows by 2 bits, not 7 x 2
   val ic_dropped = UInt(2.W)
+  // [CEREPL] OR of ce_repl over the valid C_wb columns, formed in rawRead (raw row + 1 bit, not nWb)
+  val ce_repl    = Bool()
+  // [STTY0] bundle61: OR of the store operand labels over the valid C_clr columns, formed in rawRead (raw row + 2 bits,
+  // not 3 x (2 + stamp)): the store's REG_DATAFLOW (ty0) edge in IftMerge.  Squash raw entry 1168 -> 1170 bits, still
+  // 17 RAMB36 (512 x 72) per bank.
+  val cl_atk     = Bool()
+  val cl_sec     = Bool()
 }
 
 /** Record fields that do not come from the merge, taken at capture.  116 bits. */
@@ -199,7 +230,7 @@ class IftSqSide(implicit p: Parameters) extends BoomBundle with CoreFuzzingConst
   val cause      = Bool()                                // D2b: 0 branch kill (SRC=3), 1 rollback (SRC=4)
 }
 
-/** One raw squash FIFO entry: 1,033 + 116 = 1,149 bits (Task 3.2: + 2 x 19 DTLB; Task 3.9: - 1;
+/** One raw squash FIFO entry: 1,017 + 116 = 1,133 bits ([RASEVERY]: was 1,149; still 16 RAMB36 of 72) (Task 3.2: + 2 x 19 DTLB; Task 3.9: - 1;
   * step 10: + 2 ic_dropped, - 2 x 19 DTLB; step 11: the FIFO is 512 deep = 16 RAMB36 (512 x 72) per bank, was 32 as 1K x 36). */
 class IftSqEntry(val nSprob: Int, val nIc: Int, val nWb: Int, val nMemord: Int)(implicit p: Parameters)
     extends BoomBundle {
@@ -227,9 +258,9 @@ class IftSqDbg(val shadow: Boolean)(implicit p: Parameters) extends BoomBundle w
 //------------------------------------------------------------------------------
 
 /** Fetch-time IFT information carried beside the uop from the fetch buffer to dispatch
-  * (never into IQ/LSQ/FU/ROB rows).  fetch_flags bit order = the fetch-buffer candidate
-  * order (fetch-buffer.scala:321-345): 0 icache_dom, 1 icache_sec, 2 ras_pop_secret, 3 bpd_dom,
-  * 4 bpd_sec, 5 btb_dom, 6 btb_target_xdom, 7 btb_sec.  ([FIFO10] step 10, ruling 94: the ITLB
+  * (never into IQ/LSQ/FU/ROB rows).  fetch_flags bit order (NOT the candidate order since [G1V2]:
+  * fetchFlagCandidates in util.scala puts bit 0 last): 0 icache_dom, 1 icache_sec, 2 ras_pop_secret, 3 bpd_dom,
+  * 4 bpd_sec, 5 btb_dom, 6 retired (was btb_target_xdom / ty27, [TY27RM] 2026-10-22: constant 0), 7 btb_sec.  ([FIFO10] step 10, ruling 94: the ITLB
   * bits 8/9 are removed.)  [BTBDISP] step 16: bit 7 also covers the BTB/uBTB displacement
   * filter, and btb_sec_pc is PC[13:2] of the secret allocator of bit 7 (fetchFlagCandidates).
   * [BTBATK] DF-btbatk: bit 8 = fetch of a tag an attacker-domain allocation displaced (victim
@@ -248,6 +279,10 @@ class IftEdgeList(implicit p: Parameters) extends BoomBundle with CoreFuzzingCon
   val edges   = Vec(numInfluencerSlotsCF, new InfluencerEntry)
   val dropped = UInt(2.W)
   val aliased = Bool()
+  // [CEREPL] lean59: this list carries a CACHE_EVICTION edge attributed through the set's replacement state (record
+  // bit [254], IftCommitInfo.ce_repl).  Set only by the D$ (dcache.scala [CEREPL]); every other list builds on a zero
+  // base or copies a D$ response list whole, so it is 0 there.  None IFT off.
+  val ce_repl = if (ENABLE_IFT) Some(Bool()) else None
 }
 
 /** What dispatch hands the ROB for the dispatch column (replaces the uop fields).
@@ -316,4 +351,5 @@ class IftRowEnq(val rowW: Int)(implicit p: Parameters) extends BoomBundle with C
   val fu_bitmap             = UInt(numModules.W)
   val spec_branch_is_secret = Bool()
   val info                  = new IftDispatchInfo
+  val ras_xdom              = Bool()                 // [RASEVERY] io.enq_uops(w).cf_ras_pred_xdom -> C_disp
 }

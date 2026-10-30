@@ -72,6 +72,11 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     // [FLUSH] SRC=0 entries carry the correct domain even before decode.
     val cf_attacker_start_addr = Input(UInt(vaddrBitsExtended.W))
     val cf_attacker_end_addr   = Input(UInt(vaddrBitsExtended.W))
+    // [DBGFREEZE] patch 85 (b): hart in debug mode (core.scala cf_dbg via frontend io.cpu).  IFT only.
+    val cf_dbg = if (ENABLE_IFT) Some(Input(Bool())) else None
+    // [FTQHOLD] FTQ plan T1 (option A): Log2Bucket of the f4 FTQ-full hold of the packet enqueued this cycle
+    // (frontend.scala f4_hold_b3, a register).  IFT only.
+    val cf_ftq_hold3 = if (ENABLE_IFT) Some(Input(UInt(3.W))) else None
     // 3-bit active width {4, 2, 1}: controls sub-row slicing and fetch cooldown
     val cf_active_width     = Input(UInt(3.W))
     // High when fetch cooldown is zero (gates IFU allow_fetch in the frontend)
@@ -96,6 +101,18 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   val ram_ift = if (ENABLE_IFT) Reg(Vec(numEntries, new FetchIftInfo))
                 else WireInit(0.U.asTypeOf(Vec(numEntries, new FetchIftInfo)))
   ram_ift.suggestName("fb_ift_ram")
+  // [FTQHOLD] FTQ plan T1, owner T-D1 option A: sftq rides cf_fu_bitmap in its three information-free bits, fu bit 2
+  // (l0BTBTagCF, no setter) = sftq[0], fu bit 3 (l1BTBTagCF, no setter) = sftq[1], fu bit 1 (itlbTagCF, the constant 1)
+  // = !sftq[2]; sftq = 0 gives exactly the old constant (bits 3..1 = 0,0,1).  The three bits are stored HERE, per entry,
+  // already in fu form (Cat(b1, b0, !b2)), and spliced into the dequeued uop's cf_fu_bitmap below, instead of being
+  // ORed into the fill at :288: today every fill writes the same constant, so firtool folds the whole 64 x 24-bit
+  // cf_fu_bitmap RAM away (RenameStage r_uop_cf_fu_bitmap <= 24'h1F3 in lean59 e59e), and writing the bucket at the
+  // fill would make all 24 bits of every entry live (+1536 FF, measured in the t1b scratch elaboration).  Here it is
+  // 3 x 64 = 192 FF; the value each dequeued uop carries is the same as the fill form.  Write: the bucket flop
+  // (io.cf_ftq_hold3) into the entry under the same enable as `ram` (the !b2 merges into the write LUT); read: the
+  // same head_row mux as every other field, then wiring.  IFT off: None.
+  val ram_ftqh = if (ENABLE_IFT) Some(Reg(Vec(numEntries, UInt(3.W)))) else None
+  ram_ftqh.foreach(_.suggestName("fb_ftqh_ram"))
   val deq_ift_vec = Wire(Vec(numRows, Vec(coreWidth, new FetchIftInfo)))
 
   // corefuzzing: track which RAM slots actually hold valid (enqueued, not yet dequeued/cleared)
@@ -276,11 +293,17 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // corefuzzing: FU bitmap base — all instructions pass through all IFU-stage modules.
   // ras/bpd/btb bits are set unconditionally (path tracking). Domain mismatch events
   // are tracked separately via the influencer list (INFL_RAS_STATE, INFL_BPD_STATE, etc.).
+  // [DBGFREEZE] patch 85 (b): a packet fetched in debug mode (debug ROM, abstract command, program buffer) gets no
+  // fetch-time label: domain 0, no fetch flags (so no fetch candidate edge at dispatch), no s_prop / atk, no RAS
+  // cross-domain mark.  The window bits (ghist_*) are already 0: core.scala exports the window closed in debug
+  // mode.  One AND on the shared range-valid term and on each packet-level flag (per packet, not per uop): about
+  // 13 LUT, flop-sourced, ending at the fetch-buffer RAM flops.  IFT off: cf_dbg is None, fb_dbg = false.
+  val fb_dbg = io.cf_dbg.getOrElse(false.B)
   for (i <- 0 until fetchWidth) {
     in_uops(i).cf_fu_bitmap.foreach(_ := (1.U << fbTagCF.U) | (1.U << icacheTagCF.U) | (1.U << itlbTagCF.U) | (1.U << ftqTagCF.U) | (1.U << rasTagCF.U) | (1.U << bpdTagCF.U) | (1.U << btbTagCF.U))
     // Compute domain_id from PC at fetch-buffer fill time (domain is purely PC-based).
     // This ensures [FLUSH] SRC=0 entries have the correct domain when clear fires.
-    val fb_in_attacker = (io.cf_attacker_start_addr =/= io.cf_attacker_end_addr) &&
+    val fb_in_attacker = (io.cf_attacker_start_addr =/= io.cf_attacker_end_addr) && !fb_dbg &&
                          (in_uops(i).debug_pc >= io.cf_attacker_start_addr) &&
                          (in_uops(i).debug_pc < io.cf_attacker_end_addr)
     in_uops(i).cf_domain_id.foreach(_ := fb_in_attacker.asUInt)
@@ -296,10 +319,11 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     in_uops(i).cf_wep_atk.foreach(_ := 0.U)
     in_uops(i).cf_dwin_sec.foreach(_ := false.B)   // [WINMEM] set at register-read
     in_uops(i).cf_dwin_atk.foreach(_ := false.B)
-    // doc 67 Part B: carry "this ret's RAS-predicted top was cross-domain" to the ROB, where
-    // the RAS edge is raised ONLY if the ret then mispredicts (real ret2spec) -- not at fetch
-    // on every cross-domain call (that was the co-location pollution).
-    in_uops(i).cf_ras_pred_xdom.foreach(_ := io.enq.bits.ras_domain_mismatch.getOrElse(false.B) && in_uops(i).taken)
+    // doc 67 Part B: carry "this ret's RAS-predicted top was cross-domain (or stale)" to the ROB,
+    // on the ret slot only (not a fetch flag on every slot of the packet: that was the
+    // co-location pollution).  [RASEVERY] owner 2026-10-21: the ROB raises the RAS edge on EVERY
+    // such ret, committed or squashed, mispredicted or not (rob-ift-sidecar.scala IftMerge).
+    in_uops(i).cf_ras_pred_xdom.foreach(_ := io.enq.bits.ras_domain_mismatch.getOrElse(false.B) && !fb_dbg && in_uops(i).taken)   // [DBGFREEZE]
     // [ABRGATE] zero defaults so the victim-only `when` below is the only writer; with the
     // DontCare default firtool folded the gate away (D11, bug 3).
     // [CNTDZERO] Task 0.14 (0.10 review Minor 4): the slot's contention state is loaded from
@@ -309,7 +333,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // corefuzzing: fetch-side influencers.  IFT overhaul Phase 3, Task 3.3: the fetch buffer no
   // longer builds a list.  It records the 10 packet-level flags in FetchIftInfo; dispatch
   // turns them into the first candidates of the base list (fetchFlagCandidates in util.scala,
-  // same order as the old fetch batch).
+  // the old fetch batch order except [G1V2]: the I$ attacker edge, bit 0, is the last fetch candidate).
   //
   // is_atk approximation: use any_is_victim = OR(domain=0 across all uops in packet).
   // This is conservative (never a false negative): if any uop is a victim, all uops get
@@ -318,7 +342,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   val any_is_victim  = VecInit((0 until fetchWidth).map(i => in_uops(i).cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U)).reduce(_ || _)
   val ras_pop_secret = io.enq.bits.ras_pop_secret.getOrElse(false.B)   // [R124GATE3] Option field
   // doc 67 Part B: ras_domain_mismatch is not a fetch flag (the RAS edge is raised at the ROB
-  // only when a cross-domain ret mispredicts); ras_pop_secret stays.
+  // on the ret itself, [RASEVERY] on every such ret); ras_pop_secret stays.
   // [GHISTFIELD/GHISTATK 2026-09-08] the GHR window rides the two counters, not a slot.
   // [FIFO10] step 10 (ruling 94): bits 8/9 (ITLB domain/secret) removed with the ITLB shadow.
   // [BTBDISP] step 16 (owner ruling 110): bit 7 also takes the BTB/uBTB displacement filter
@@ -329,20 +353,21 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // victim packets only (any_is_victim, the gate of every other attacker fetch edge: the
   // attacker's own fetches are not influenced by themselves).  Its PC rides btb_sec_pc.
   // [R124GATE] btb_atk_disp / btb_sec_disp / btb_sec_pc are None without ENABLE_IFT.
-  val fetch_flags = Cat(io.enq.bits.btb_atk_disp.getOrElse(false.B) && any_is_victim, // 8
+  val fetch_flags = Mux(fb_dbg, 0.U, Cat(io.enq.bits.btb_atk_disp.getOrElse(false.B) && any_is_victim, // 8   [DBGFREEZE] 0 in debug mode
                         io.enq.bits.btb_secret_mismatch.getOrElse(false.B) ||
                         io.enq.bits.btb_sec_disp.getOrElse(false.B),           // 7
-                        io.enq.bits.btb_target_xdom.getOrElse(false.B),        // 6
+                        false.B,                                               // 6   [TY27RM] retired (was btb_target_xdom, ty27)
                         io.enq.bits.btb_domain_mismatch.getOrElse(false.B),    // 5
                         io.enq.bits.bpd_secret_mismatch.getOrElse(false.B),    // 4
                         io.enq.bits.bpd_domain_mismatch.getOrElse(false.B),    // 3
                         ras_pop_secret,                     // 2
                         io.enq.bits.icache_secret_mismatch.getOrElse(false.B), // 1
-                        io.enq.bits.icache_domain_mismatch.getOrElse(false.B)) // 0
+                        io.enq.bits.icache_domain_mismatch.getOrElse(false.B))) // 0
   // [BROADATK] the attacker flag the old batch raised: every domain-mismatch candidate is
   // is_atk = any_is_victim, the secret-mismatch ones are is_atk = false.
   val fetch_dom_atk = (io.enq.bits.icache_domain_mismatch.getOrElse(false.B) || io.enq.bits.bpd_domain_mismatch.getOrElse(false.B) ||
-                       io.enq.bits.btb_domain_mismatch.getOrElse(false.B) || io.enq.bits.btb_target_xdom.getOrElse(false.B)) && any_is_victim
+                       io.enq.bits.btb_domain_mismatch.getOrElse(false.B)) && any_is_victim &&   // [TY27RM] btb_target_xdom term removed
+                      !fb_dbg   // [DBGFREEZE]
 
   for (i <- 0 until fetchWidth) {
     in_ift(i).fetch_flags   := fetch_flags
@@ -356,7 +381,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     in_ift(i).sec_branch_ctr := Mux(io.enq.bits.ghist_secret.getOrElse(false.B), io.enq.bits.ghist_secret_ctr.getOrElse(0.U(7.W)), 0.U)
     in_ift(i).atk_branch_ctr := Mux(io.enq.bits.ghist_atk.getOrElse(false.B) && any_is_victim, io.enq.bits.ghist_atk_ctr.getOrElse(0.U(7.W)), 0.U)
 
-    when (fetch_dom_atk || (io.enq.bits.ghist_atk.getOrElse(false.B) && any_is_victim)) {
+    when (fetch_dom_atk || (io.enq.bits.ghist_atk.getOrElse(false.B) && any_is_victim && !fb_dbg)) {   // [DBGFREEZE]
       in_uops(i).cf_attacker_influence.foreach(_ := true.B)
     }
     // [IMPLWIN] step 20: fetched inside the open window -> window-tainted result register
@@ -366,8 +391,8 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     in_uops(i).cf_win_atk.foreach(_ := io.enq.bits.ghist_atk.getOrElse(false.B) && any_is_victim)
     // Secret propagation: set when BPD, BTB, or RAS was trained/pushed by a secret instruction,
     // or the GHR window is secret.
-    when (io.enq.bits.bpd_secret_mismatch.getOrElse(false.B) || io.enq.bits.btb_secret_mismatch.getOrElse(false.B) || ras_pop_secret ||
-          io.enq.bits.ghist_secret.getOrElse(false.B)) {
+    when (!fb_dbg && (io.enq.bits.bpd_secret_mismatch.getOrElse(false.B) || io.enq.bits.btb_secret_mismatch.getOrElse(false.B) || ras_pop_secret ||
+          io.enq.bits.ghist_secret.getOrElse(false.B))) {   // [DBGFREEZE]
       in_uops(i).cf_secret_propagation.foreach(_ := true.B)
     }
   }
@@ -426,6 +451,10 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
       when (do_enq && in_mask(i) && enq_idxs(i)(j)) {
         ram(j) := in_uops(i) // in_uops_tagged(i)
         if (ENABLE_IFT) ram_ift(j) := in_ift(i)   // [R124GATE]
+        ram_ftqh.foreach { r =>   // [FTQHOLD] fu bits 3..1 of every uop of this packet (one value per packet)
+          val b = io.cf_ftq_hold3.get
+          r(j) := Cat(b(1), b(0), !b(2))
+        }
         ram_valid(j) := true.B
         // for debugging: printing ram index for every enqueue - alex
         // printf(p"($rowsUsed, $coreWidth, enq, $j), ")
@@ -476,6 +505,15 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   val deq_valids_sub = VecInit(deq_valids.zip(sub_row_mask).map { case (v, m) => v && m })
   io.deq.bits.uops zip deq_valids_sub        map {case (d,v) => d.valid := v}
   io.deq.bits.uops zip deq_vec(head_row)      map {case (d,q) => d.bits  := q}
+  // [FTQHOLD] splice the entry's sftq fu bits 3..1 into the dequeued uop (bits 23..4 and 0 are the fill constant).
+  // Only valid entries are dequeued (deq_valids gates by ram_valid), so an unwritten entry's bits are never used.
+  ram_ftqh.foreach { r =>
+    for (w <- 0 until coreWidth) {
+      val q = deq_vec(head_row)(w).cf_fu_bitmap.get
+      val h = VecInit((0 until numRows).map(row => r(row * coreWidth + w)))(head_row)
+      io.deq.bits.uops(w).bits.cf_fu_bitmap.get := Cat(q(numModules - 1, 4), h, q(0))
+    }
+  }
   io.deq.bits.ift  := deq_ift_vec(head_row)
   io.deq.valid := deq_valids_sub.reduce(_||_)
 

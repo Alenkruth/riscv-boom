@@ -65,14 +65,31 @@ class RegisterFileWritePort(val addrWidth: Int, val dataWidth: Int)(implicit p: 
 object WritePort
 {
   def apply(enq: DecoupledIO[ExeUnitResp], addrWidth: Int, dataWidth: Int, rtype: UInt,
-    wsh_sec: WinShadowInfo, wsh_atk: WinShadowInfo)   // [WINSHADOW] shadow mark, [WINEXP] epoch
+    wsh_sec: WinShadowInfo, wsh_atk: WinShadowInfo,   // [WINSHADOW] shadow mark, [WINEXP] epoch
+    win_in: Option[(Bool, Bool)] = None)   // [F1WSH] lean58: {sec, atk} = wsh_*.in(enq uop rob_idx), computed upstream
     (implicit p: Parameters): Valid[RegisterFileWritePort] = {
+     // [F1WSH] lean58 timing F1: a caller whose uop arrives through a late select (the LSU memory ports) passes the
+     // shadow membership computed before that select (lsu.scala cfRespWin); every other caller computes it here
+     // (inline below, so a caller without win_in elaborates exactly the old expression).
      val wport = Wire(Valid(new RegisterFileWritePort(addrWidth, dataWidth)))
 
      wport.valid     := enq.valid && enq.bits.uop.dst_rtype === rtype
      wport.bits.addr := enq.bits.uop.pdst
      wport.bits.data := enq.bits.data
-     wport.bits.secret    := enq.bits.secret
+     // [ONETAG] r205 (owner 2026-10-20, RULES.md A readings 1-2): ONE secret tag per register.  A register
+     // written by a secret (s_acc) or s_prop instruction carries the secret tag until it is overwritten: the
+     // result's data taint, OR the writer's record bits known at writeback (uop s_acc / s_prop: dispatch-time
+     // window membership, fetch-state and stall edges, operand taint), OR membership of the secret window
+     // shadow (in(): dispatched before the arming branch resolved, younger than it).  No window kind, no epoch
+     // and no clear at the window close.  Record bits that land after writeback reach the register through the
+     // commit-time set port (core.scala [ONETAG]).  Levels: 0 added on the DATA bits.  The TAG bit is another matter
+     // (corrected lean58, timing audit section 5): in() is two 8-bit IsOlder carry chains plus a LUT on the uop's
+     // rob_idx.  On the ALU ports rob_idx is a flop; on the memory ports it came through the LSU response select
+     // (fan-out 343/292), and that chain ending on this OR was all 10 lean57 worst paths.  [F1WSH]: the memory
+     // ports now pass win_in, computed in the LSU before its select, so only one OR input remains here.
+     wport.bits.secret    := enq.bits.secret || enq.bits.uop.cf_secret_access.getOrElse(false.B) ||
+                             enq.bits.uop.cf_secret_propagation.getOrElse(false.B) ||
+                             win_in.map(_._1).getOrElse(wsh_sec.in(enq.bits.uop.rob_idx))   // [F1WSH]
      // taint_atk is a property of the WRITER, not of the data, so it is taken from
      // the producing uop's domain here rather than pipelined through every FU stage.
      // This is exactly INFL_REG_DATAFLOW's stated intent: "victim reads physical reg
@@ -82,13 +99,18 @@ object WritePort
      // the whole gadget runs in domain=0 because the mispredicted bounds check is the
      // VICTIM's code -- the attacker only supplies the index.  ORing the propagated
      // operand taint makes a value derived from attacker-written data carry the tag.
-     wport.bits.taint_atk := enq.bits.taint_atk || (enq.bits.uop.cf_domain_id.getOrElse(0.U(1.W)) =/= 0.U)
+     // [ONETAGATK] r205 U8 (owner 2026-10-20: the attacker side is symmetric to RULES.md A reading 2): ONE attacker tag
+     // per register, kept until overwritten: value taint || attacker ownership || the writer's attacker RECORD known
+     // at writeback (uop cf_attacker_influence: dispatch seed, window membership, promotions, operand taint) ||
+     // attacker window-shadow membership.  No window kind, no epoch, no close clear.  Late record bits reach the
+     // register through the commit-time set (core.scala).  Levels: as the secret twin (data 0; tag: see above).
+     wport.bits.taint_atk := enq.bits.taint_atk || (enq.bits.uop.cf_domain_id.getOrElse(0.U(1.W)) =/= 0.U) ||
+                             enq.bits.uop.cf_attacker_influence.getOrElse(false.B) ||
+                             win_in.map(_._2).getOrElse(wsh_atk.in(enq.bits.uop.rob_idx))   // [F1WSH]
      // [IMPLWIN] window taint: produced in the window, or from a window-tainted operand.
      // [WINEXP] step 21: only while the uop's dispatch epoch is current (WinShadowInfo.res).
-     wport.bits.wsec      := wsh_sec.res(enq.bits.uop.cf_win_sec.getOrElse(false.B) || enq.bits.uop.cf_opnd_wsec.getOrElse(false.B),
-                                         enq.bits.uop.cf_wep_sec.getOrElse(0.U(2.W)), enq.bits.uop.rob_idx)
-     wport.bits.watk      := wsh_atk.res(enq.bits.uop.cf_win_atk.getOrElse(false.B) || enq.bits.uop.cf_opnd_watk.getOrElse(false.B),
-                                         enq.bits.uop.cf_wep_atk.getOrElse(0.U(2.W)), enq.bits.uop.rob_idx)
+     wport.bits.wsec      := false.B   // [ONETAG] r205: no secret window kind (merged into `secret` above)
+     wport.bits.watk      := false.B   // [ONETAGATK] r205 U8: no attacker window kind (merged into taint_atk above)
      // s0/sp carry taint (PROBE J: reqsec=1 on every stack load), and `addi s0,sp,N`
      // propagates rs1, so one taint on sp is self-sustaining.  Print the writer.
      enq.ready       := true.B
@@ -209,7 +231,7 @@ class RegisterFileSynthesizable(
 
   val read_data = Wire(Vec(numReadPorts, UInt(registerWidth.W)))
   val read_secret = Wire(Vec(numReadPorts, UInt(cfTaintW.W)))
-  val read_win    = Wire(Vec(numReadPorts, UInt(2.W)))   // {watk, wsec}
+  val read_win    = Wire(Vec(numReadPorts, UInt(2.W)))   // {watk, late secret} ([ONETAG]: bit 0 joins `secret`)
 
   // Register the read port addresses to give a full cycle to the RegisterRead Stage (if desired).
   val read_addrs = io.read_ports.map(p => RegNext(p.addr))
@@ -244,12 +266,16 @@ class RegisterFileSynthesizable(
         // taint rides the SAME bypass select as the data
         val bypass_taint = Mux1H(VecInit(bypass_ens.toSeq),
           VecInit(bypassable_wports.map(x => Cat(x.bits.taint_atk, x.bits.secret)).toSeq))
-        val sel_taint = Mux(bypass_ens.reduce(_|_), bypass_taint, read_secret(i))
+        // [ONETAG] r205: the stored secret tag is the Mem bit OR the commit-time late-set flop (regfile_wsec, now
+        // "late secret"); a bypassed write carries its own merged bit and overwrites both.  One OR on the read leg
+        // before the bypass mux (the old wsec leg had the same depth to the same register-read flops) [inf].
+        // [ONETAGATK] r205 U8: the attacker twin: the late-set flop (regfile_watk, now "late attacker") joins taint_atk
+        val sel_taint = Mux(bypass_ens.reduce(_|_), bypass_taint, read_secret(i) | read_win(i))
         val bypass_win = Mux1H(VecInit(bypass_ens.toSeq),
           VecInit(bypassable_wports.map(x => Cat(x.bits.watk, x.bits.wsec)).toSeq))
         val sel_win = Mux(bypass_ens.reduce(_|_), bypass_win, read_win(i))
-        io.read_ports(i).wsec := (if (ENABLE_IFT) sel_win(0) else false.B)   // [R124GATE]
-        io.read_ports(i).watk := (if (ENABLE_IFT) sel_win(1) else false.B)
+        io.read_ports(i).wsec := false.B   // [ONETAG] r205: no secret window kind
+        io.read_ports(i).watk := false.B   // [ONETAGATK] r205 U8
 
       io.read_ports(i).data   := Mux(bypass_ens.reduce(_|_), bypass_data,   read_data(i))
         io.read_ports(i).secret    := (if (ENABLE_IFT) sel_taint(0) else false.B)   // [R124GATE2]
@@ -258,10 +284,10 @@ class RegisterFileSynthesizable(
   } else {
     for (i <- 0 until numReadPorts) {
       io.read_ports(i).data   := read_data(i)
-        io.read_ports(i).secret    := (if (ENABLE_IFT) read_secret(i)(0) else false.B)   // [R124GATE2]
-        io.read_ports(i).taint_atk := (if (ENABLE_IFT) read_secret(i)(1) else false.B)
-        io.read_ports(i).wsec      := (if (ENABLE_IFT) read_win(i)(0) else false.B)   // [R124GATE]
-        io.read_ports(i).watk      := (if (ENABLE_IFT) read_win(i)(1) else false.B)
+        io.read_ports(i).secret    := (if (ENABLE_IFT) read_secret(i)(0) || read_win(i)(0) else false.B)   // [R124GATE2] [ONETAG]
+        io.read_ports(i).taint_atk := (if (ENABLE_IFT) read_secret(i)(1) || read_win(i)(1) else false.B)   // [ONETAGATK]
+        io.read_ports(i).wsec      := false.B   // [ONETAG] r205
+        io.read_ports(i).watk      := false.B   // [ONETAGATK] r205 U8
     }
   }
 
@@ -274,19 +300,24 @@ class RegisterFileSynthesizable(
       if (ENABLE_IFT) regfile_secret(wport.bits.addr) := Cat(wport.bits.taint_atk, wport.bits.secret)   // [R124GATE2]
       // [WINEXP] the port's bit is already live-checked (WinShadowInfo.res); [WINCLR] store it
       if (ENABLE_IFT) {   // [R124GATE]
-        regfile_wsec.get(wix(wport.bits.addr)) := wport.bits.wsec
-        regfile_watk.get(wix(wport.bits.addr)) := wport.bits.watk
+        regfile_wsec.get(wix(wport.bits.addr)) := false.B   // [ONETAG] an overwrite clears the late-set bit
+        regfile_watk.get(wix(wport.bits.addr)) := false.B   // [ONETAGATK] an overwrite clears the late-set bit
       }
     }
   }
   // [WINSHADOW] commit-time sets (never the same cycle as this register's own writeback: a
   // uop commits after it writes back, and its pdst is not reallocated before it commits).
   if (ENABLE_IFT) {   // [R124GATE]
+    // [ONETAG] r205: win_set_sec is the commit-time LATE SECRET set: a committing writer whose record is s_acc ||
+    // s_prop (bits that arrived after its writeback, e.g. contention / MEM_ORDER / D$ edges / the commit-time
+    // window shadow).  regfile_wsec is no longer a window kind: it is the second half of the one secret tag, read
+    // through `secret`, cleared only by the next write of the register (no close clear).
     for (s <- io.win_set_sec) { when (s.valid) { regfile_wsec.get(wix(s.bits)) := true.B } }
     for (s <- io.win_set_atk) { when (s.valid) { regfile_watk.get(wix(s.bits)) := true.B } }
     // [WINCLR] patch 35 C: the close clears last, so it wins over this cycle's writes and sets.
-    when (io.cf_wclr(0)) { regfile_wsec.get.foreach(_ := false.B) }
-    when (io.cf_wclr(1)) { regfile_watk.get.foreach(_ := false.B) }
+    // [ONETAG] r205: no secret clear at the window close (cf_wclr(0) is tied 0 by core.scala / fp-pipeline)
+    // [ONETAGATK] r205 U8: no attacker clear at the window close either (cf_wclr is tied 0 by core.scala / fp-pipeline);
+    // win_set_atk is the commit-time LATE ATTACKER set (a committing writer whose record has atk)
   }
 
   // ensure there is only 1 writer per register (unless to preg0)

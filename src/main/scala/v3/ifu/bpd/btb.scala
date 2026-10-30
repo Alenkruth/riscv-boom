@@ -92,7 +92,11 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
 
   val meta     = Seq.fill(nWays) { SyncReadMem(nSets, Vec(bankWidth, UInt(btbMetaSz.W))) }
   val btb      = Seq.fill(nWays) { SyncReadMem(nSets, Vec(bankWidth, UInt(btbEntrySz.W))) }
-  val ebtb     = SyncReadMem(extendedNSets, UInt(vaddrBitsExtended.W))
+  // [F8EBTB] lean58 timing F8 (timing-audit-20261023 section 2.1): IFT on, ebtb's three side tables (domain, secret,
+  // secret-writer PC, below) are packed into the ebtb word itself: {spc, sec, dom, target}, one memory, one read and
+  // one write port instead of four (same index, read enable and write enable).  IFT off: the original 40-bit table.
+  val ebtbIftW = if (ENABLE_IFT) 2 + inflPcBitsCF else 0
+  val ebtb     = SyncReadMem(extendedNSets, UInt((vaddrBitsExtended + ebtbIftW).W))
   // corefuzzing: domain shadow — tracks domain of the fetch that last wrote each BTB entry
   val btb_domain  = Seq.fill(nWays) { SyncReadMem(nSets, Vec(bankWidth, UInt(1.W))) }
   // corefuzzing: secret shadow — 1 if entry was trained by a secret-dependent instruction
@@ -102,16 +106,28 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   // domain overwrites the target a resident entry of the other domain jumps to, while that entry's meta domain
   // is unchanged (no BTB_STATE edge: under-taint of a branch-target-injection path).  1 bit per ebtb set,
   // written with ebtb (the update's domain), read with it.  IFT only (no memory, no port IFT off).
-  val ebtb_domain = if (ENABLE_IFT) Some(SyncReadMem(extendedNSets, UInt(1.W))) else None
+  // [F8EBTB] lean58: now bit vaddrBitsExtended of the ebtb word (s1_req_rebdom below).
+  // [EBTBSEC] r205 (owner-approved addition "ebtb secret shadow"; re-based patch 78, p4-70-author.md S4): the secret
+  // shadow of ebtb, the twin of [EBTBDOM].  An extended entry jumps through the ONE ebtb target of its set, which any
+  // extended allocation in the set rewrites, while the entry's own btb_secret bit (written with its meta) is not
+  // touched: a secret-trained far target used through a clean entry raised no BTB secret edge (UNDER-taint, r158).
+  // ebtb_secret = the update's cf_is_secret, written with ebtb; ebtb_spc = PC[13:2] of that secret writer (the bit-7
+  // edge names its trainer, as ift_btb_spc does for the entry).  IFT only (no memory, no port IFT off).
+  // [F8EBTB] lean58: now bits vaddrBitsExtended+1 (secret) and vaddrBitsExtended+2 .. +13 (spc) of the ebtb word.
 
   val mems = (((0 until nWays) map ({w:Int => Seq(
     (f"btb_meta_way$w", nSets, bankWidth * btbMetaSz),
-    (f"btb_data_way$w", nSets, bankWidth * btbEntrySz))})).flatten ++ Seq(("ebtb", extendedNSets, vaddrBitsExtended)))
+    (f"btb_data_way$w", nSets, bankWidth * btbEntrySz))})).flatten ++ Seq(("ebtb", extendedNSets, vaddrBitsExtended + ebtbIftW)))
 
   val s1_req_rbtb    = VecInit(btb.map { b => VecInit(b.read(s0_idx_masked, s0_valid).map(_.asTypeOf(new BTBEntry))) })
   val s1_req_rmeta   = VecInit(meta.map { m => VecInit(m.read(s0_idx_masked, s0_valid).map(_.asTypeOf(new BTBMeta))) })
-  val s1_req_rebtb   = ebtb.read(s0_idx_masked, s0_valid)
-  val s1_req_rebdom  = ebtb_domain.map(_.read(s0_idx_masked, s0_valid)).getOrElse(0.U(1.W))   // [EBTBDOM] patch 65
+  // [F8EBTB] IFT on: one read of the packed word; IFT off: the original read (same name, unchanged Verilog).
+  val s1_req_rebw    = if (ENABLE_IFT) Some(ebtb.read(s0_idx_masked, s0_valid)) else None
+  val s1_req_rebtb   = s1_req_rebw.map(_(vaddrBitsExtended - 1, 0)).getOrElse(ebtb.read(s0_idx_masked, s0_valid))
+  val s1_req_rebdom  = s1_req_rebw.map(_(vaddrBitsExtended)).getOrElse(0.U(1.W))              // [EBTBDOM] patch 65
+  val s1_req_rebsec  = s1_req_rebw.map(_(vaddrBitsExtended + 1).asBool).getOrElse(false.B)     // [EBTBSEC] patch 78
+  val s1_req_rebspc  = s1_req_rebw.map(_(vaddrBitsExtended + 1 + inflPcBitsCF, vaddrBitsExtended + 2))
+                                  .getOrElse(0.U(inflPcBitsCF.W))
   val s1_req_tag     = s1_idx >> log2Ceil(nSets)
   // corefuzzing: domain shadow read — same index/enable as btb/meta
   // [R124GATE3] patch 28 (B51): btb_domain is read/written only with ENABLE_IFT; IFT off it has no ports
@@ -175,14 +191,23 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   // [EBTBDOM] patch 65: ...or the hit entry jumps through ebtb (extended) and ebtb was last written by the other
   // domain.  entry.extended comes through the same hit-way select as the domain bit (parallel); the slot term
   // goes from 3 to 5 inputs, still one LUT after the selects: 0 levels (it ends at the f2 RegNext).
+  // [ATKDMMASK] lean58 A5 (gap inventory 2026-10-23): the attacker-side twin of [BPDMASK]: a slot below the fetch
+  // PC, or a bank whose request is not valid, is not part of the packet; its domain label raises no edge either.
+  // s1_valid and s1_mask are flops (the same terms as s1_btb_sec_slot); at most +1 LUT level, still ending at the f2 flop.
   val s1_btb_domain_mismatch = VecInit((0 until bankWidth).map { w =>
-    s1_hits(w) && ((s1_req_rdomain(s1_hit_ways(w))(w) =/= s1_domain) ||
-                   (s1_req_rbtb(s1_hit_ways(w))(w).extended && s1_req_rebdom =/= s1_domain))
+    s1_valid && s1_hits(w) && ((s1_req_rdomain(s1_hit_ways(w))(w) =/= s1_domain) ||
+                   (s1_req_rbtb(s1_hit_ways(w))(w).extended && s1_req_rebdom =/= s1_domain)) &&
+    s1_mask(w)
   }).reduce(_||_)
   // corefuzzing: BTB secret mismatch — any hit entry was trained by a secret instruction
   // [BPDMASK] r170 A (DF-dt-sprop): a slot below the fetch PC, or a bank whose request is not
   // valid, is not part of the packet; its secret label raises no edge.
-  def s1_btb_sec_slot(w: Int): Bool = s1_valid && s1_hits(w) && s1_req_rsecret(s1_hit_ways(w))(w).asBool && s1_mask(w)
+  // [EBTBSEC] patch 78: ...or the hit entry jumps through ebtb (extended) and ebtb was last written by a secret update.
+  // The per-way term (own bit || extended && ebtb bit) is formed from the registered reads, parallel to the tag
+  // compare, and selected by the same hit way, so the slot LUT keeps its 6 inputs: 0 added levels to the f2 flop.
+  def s1_way_sec(way: Int, w: Int): Bool = s1_req_rsecret(way)(w).asBool || (s1_req_rbtb(way)(w).extended && s1_req_rebsec)
+  def s1_btb_sec_slot(w: Int): Bool = s1_valid && s1_hits(w) && VecInit((0 until nWays).map(way => s1_way_sec(way, w)))(s1_hit_ways(w)) &&
+                                      s1_mask(w)
   val s1_btb_secret_mismatch = VecInit((0 until bankWidth).map(w => s1_btb_sec_slot(w))).reduce(_||_)
   // pipeline 2 cycles to f3 (s1→f2→f3)
   // [BTBMAIN2 2026-09-11] TEMPORARY.  The BTB channel is PROVEN working: on t15 the probe
@@ -298,8 +323,42 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
     }
   }
   when (s1_update_wbtb_mask =/= 0.U && offset_is_extended) {
-    ebtb.write(s1_update_idx_masked, s1_update.bits.target)
-    ebtb_domain.foreach(_.write(s1_update_idx_masked, s1_update.bits.cf_domain_id.getOrElse(0.U(1.W))))   // [EBTBDOM]
+    // [EBTBDOM] the update's domain; [EBTBSEC] patch 78: the secret label with every ebtb write (a clean write clears
+    // it) and the PC of the writer.  [F8EBTB] lean58: one packed write.  The PC field is now written by EVERY ebtb
+    // write (it was written only by a secret one).  Exact: its only reader is s1_sec_pc's per-slot Mux, which takes
+    // s1_req_rebspc only for a slot whose secret flag came from ebtb (s1_btb_sec_slot with the entry's own secret bit
+    // 0, so s1_req_rebsec = 1); rebsec = 1 means the last ebtb write of the set was a secret one, which wrote the
+    // same PC under either rule.  A never-written ebtb set is never read by an extended entry (an entry becomes
+    // extended only together with an ebtb write of its set; every BTB reset/reconfiguration sweep clears extended),
+    // so the initial memory contents stay unobserved as before.
+    ebtb.write(s1_update_idx_masked, (if (ENABLE_IFT)
+      Cat((s1_update.bits.pc + (s1_update_cfi_idx << 1))(inflPcBitsCF + 1, 2),
+          s1_update.bits.cf_is_secret.getOrElse(false.B),
+          s1_update.bits.cf_domain_id.getOrElse(0.U(1.W)),
+          s1_update.bits.target)
+      else s1_update.bits.target))
+  }
+
+  // [SINKFACTS86] patch 86 (all-sinks study Q6): every BTB commit write, debug printf builds only (the
+  // IftSquashMerge gate: IFT on, CF debug printfs on, no IFT bridge; IFT off / NoLog / FireSim elaborate nothing).
+  // pc = the bank-aligned update pc (bank = pc[3]); set = the written set; way = the meta write_way chosen at
+  // FETCH time (hit way, else the XOR-parity alloc of the tags read at fetch); tag = the written meta tag;
+  // wm / wb = meta / target slot masks; ext = the target went to ebtb.  The host replays these writes (reset tag
+  // 0; [BTBRST] marks a reconfiguration re-reset) and recomputes the way from the CURRENT tags: a difference is
+  // a fetch-vs-update interleaving event (models.py BTB chooses the way at commit).  cyc: debug-only counter from
+  // reset, aligned with the FTQ d4_cyc_q.
+  if (ENABLE_IFT && ENABLE_CF_DEBUG_PRINTF && !ENABLE_IFT_BRIDGE) {
+    val cf_sf_cyc = RegInit(0.U(40.W))
+    cf_sf_cyc := cf_sf_cyc + 1.U
+    when (!doing_reset && (s1_update_wmeta_mask =/= 0.U || s1_update_wbtb_mask =/= 0.U)) {
+      printf("[BTBW] cyc=%d pc=0x%x set=0x%x way=%d tag=0x%x wm=0x%x wb=0x%x brm=0x%x ext=%d tgt=0x%x\n", cf_sf_cyc,
+        s1_update.bits.pc, s1_update_idx_masked(log2Ceil(nSets)-1, 0), s1_update_meta.write_way,
+        (s1_update_idx >> log2Ceil(nSets))(tagSz-1, 0), s1_update_wmeta_mask, s1_update_wbtb_mask,
+        s1_update.bits.br_mask, offset_is_extended, s1_update.bits.target)
+    }
+    when (doing_reset && !RegNext(doing_reset, true.B)) {
+      printf("[BTBRST] cyc=%d\n", cf_sf_cyc)
+    }
   }
 
   // [BTBDISP 2026-10-13, series-r step 16, owner ruling 110] BTB displacement residue, tracked
@@ -410,8 +469,12 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
     val s1_evf_hit  = recHit(s1_ift_evf)
     val s1_eva_hit  = recHit(s1_ift_eva)
     val s1_sec_slot = (0 until bankWidth).map(w => s1_btb_sec_slot(w))   // [BPDMASK] same terms as the flag
+    // [EBTBSEC] patch 78: a slot whose own entry is not secret-trained took its bit from ebtb: name ebtb's trainer.
+    // One LUT per PC bit per slot (hit way, the two way bits, two spc bits, ebtb spc bit: 6 inputs), replacing the
+    // 2:1 way select: 0 added levels.
     val s1_sec_pc   = Mux(s1_sec_slot.reduce(_||_),
-      PriorityMux(s1_sec_slot, (0 until bankWidth).map(w => s1_ift_spc(s1_hit_ways(w)))),
+      PriorityMux(s1_sec_slot, (0 until bankWidth).map(w => Mux(s1_req_rsecret(s1_hit_ways(w))(w).asBool,
+                                                              s1_ift_spc(s1_hit_ways(w)), s1_req_rebspc))),
       Mux(s1_evf_hit, s1_ift_evf(inflPcBitsCF - 1, 0), s1_ift_eva(inflPcBitsCF - 1, 0)))
     io.f3_btb_sec_disp := RegNext(RegNext(s1_evf_hit))
     io.f3_btb_atk_disp := RegNext(RegNext(s1_eva_hit))

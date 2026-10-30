@@ -813,12 +813,17 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   replay_req(0).addr       := mshrs.io.replay.bits.addr
   replay_req(0).data       := mshrs.io.replay.bits.data
   replay_req(0).is_hella   := mshrs.io.replay.bits.is_hella
-  replay_req(0).cf_addr_sec.foreach(_ := false.B)   // [RESID] per-MSHR, see mshrs.scala
+  // [SECSTDW] patch 70: the replayed request's OWN secret-address bit (rpq, mshrs.scala), read only by the store
+  // metadata write (iftStoreMetaWrite).  Every other s2 reader of cf_addr_sec is t_lsu-only (cf_mark_sec needs
+  // cf_lsu_hit; the MSHR request, eviction, LFSR and replacement-state updates need an s2 miss / allocation or an
+  // LSU hit, which a replay never is), so loads and the residency marks see no change.  Was constant false.
+  replay_req(0).cf_addr_sec.foreach(_ := mshrs.io.replay.bits.cf_addr_sec.getOrElse(false.B))   // [RESID] [SECSTDW]
   replay_req(0).cf_addr_atk.foreach(_ := false.B)   // [ATKRES]
   replay_req(0).cf_res_v.foreach(_ := mshrs.io.replay.bits.cf_res_v.getOrElse(false.B))   // [RESID] miss-response edge
   replay_req(0).cf_res_pc.foreach(_ := mshrs.io.replay.bits.cf_res_pc.getOrElse(0.U))
   replay_req(0).cf_res_atk.foreach(_ := mshrs.io.replay.bits.cf_res_atk.getOrElse(false.B))   // [ATKEVICT]
   replay_req(0).cf_res_esec.foreach(_ := mshrs.io.replay.bits.cf_res_esec.getOrElse(false.B))
+  replay_req(0).cf_res_repl.foreach(_ := mshrs.io.replay.bits.cf_res_repl.getOrElse(false.B))   // [CEREPL]
   mshrs.io.replay.ready    := metaReadArb.io.in(0).ready && dataReadArb.io.in(0).ready
   // Tag read for MSHR replays
   metaReadArb.io.in(0).valid              := mshrs.io.replay.valid
@@ -845,6 +850,7 @@ mshr_read_req(0).cf_addr_atk.foreach(_ := false.B)   // [ATKRES]
 mshr_read_req(0).cf_res_v.foreach(_ := false.B)
 mshr_read_req(0).cf_res_atk.foreach(_ := false.B)   // [ATKEVICT]
 mshr_read_req(0).cf_res_esec.foreach(_ := false.B)
+mshr_read_req(0).cf_res_repl.foreach(_ := false.B)   // [CEREPL]
 metaReadArb.io.in(3).valid       := mshrs.io.meta_read.valid
 metaReadArb.io.in(3).bits.req(0) := mshrs.io.meta_read.bits
 metaReadArb.io.in(3).bits.req(0).idx := mshrs.io.meta_read.bits.idx & dcache_set_mask(idxBits-1, 0)
@@ -867,6 +873,7 @@ wb_req(0).cf_addr_atk.foreach(_ := false.B)   // [ATKRES]
 wb_req(0).cf_res_v.foreach(_ := false.B)
 wb_req(0).cf_res_atk.foreach(_ := false.B)   // [ATKEVICT]
 wb_req(0).cf_res_esec.foreach(_ := false.B)
+wb_req(0).cf_res_repl.foreach(_ := false.B)   // [CEREPL]
 // Tag read for write-back
 metaReadArb.io.in(2).valid        := wb.io.meta_read.valid
 metaReadArb.io.in(2).bits.req(0)  := wb.io.meta_read.bits
@@ -895,6 +902,7 @@ prober_req(0).cf_addr_atk.foreach(_ := false.B)   // [ATKRES]
 prober_req(0).cf_res_v.foreach(_ := false.B)
 prober_req(0).cf_res_atk.foreach(_ := false.B)   // [ATKEVICT]
 prober_req(0).cf_res_esec.foreach(_ := false.B)
+prober_req(0).cf_res_repl.foreach(_ := false.B)   // [CEREPL]
 // Tag read for prober
 metaReadArb.io.in(1).valid       := prober.io.meta_read.valid
 metaReadArb.io.in(1).bits.req(0) := prober.io.meta_read.bits
@@ -1022,6 +1030,37 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   val s2_sc = s2_req(0).uop.mem_cmd === M_XSC && (!RegNext(s1_nack(0)) || s2_type === t_replay)
   val s2_lrsc_addr_match = widthMap(w => lrsc_valid && lrsc_addr === (s2_req(w).addr >> blockOffBits))
   val s2_sc_fail = s2_sc && !s2_lrsc_addr_match(0)
+  // [RDEDGE] patch 80 (LRSC, v1 code 19, record v2 class 22): the label of the LR that last SET the reservation:
+  // its op_count (the edge key) and its address taint (secret-derived -> sec; attacker-tainted or attacker-domain ->
+  // atk).  An SC reads the reservation (success or failure is a function of the LR's address and of the time since
+  // it), so an SC served while the label is set gets INFL_LRSC {oc, atk, sec} on its response (edge only, no value
+  // taint; residual: the SC result value).  An LR that MISSES sets the reservation on its MSHR replay, whose uop has
+  // op_count 0 and no attacker-address bit (rpq zeroes them), so the label of the last LR seen at t_lsu is held in
+  // cf_lr_q and used for a replay.  The label is overwritten by every LR that sets the reservation (latest wins);
+  // it is not cleared when the reservation expires (an SC after expiry still reads state that LR set).
+  // Cost: 2 x (10 + 2) FF + 1 FF, ~6 LUT.  Levels: flop-to-flop beside the lrsc registers; the SC response gets one
+  // more candidate in its edge batch (below).  IFT off: not elaborated.
+  val cf_lrsc_v   = if (ENABLE_IFT) RegInit(false.B) else WireInit(false.B)
+  val cf_lrsc_oc  = if (ENABLE_IFT) Reg(UInt(inflOpCountWidthCF.W)) else WireInit(0.U(inflOpCountWidthCF.W))
+  val cf_lrsc_atk = if (ENABLE_IFT) Reg(Bool()) else WireInit(false.B)
+  val cf_lrsc_sec = if (ENABLE_IFT) Reg(Bool()) else WireInit(false.B)
+  if (ENABLE_IFT) {
+    val lr_oc  = s2_req(0).uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)).pad(inflOpCountWidthCF)(inflOpCountWidthCF - 1, 0)
+    val lr_sec = s2_req(0).cf_addr_sec.getOrElse(false.B)
+    val lr_atk = s2_req(0).cf_addr_atk.getOrElse(false.B) || s2_req(0).uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U
+    val q_oc   = Reg(UInt(inflOpCountWidthCF.W))
+    val q_sec  = Reg(Bool())
+    val q_atk  = Reg(Bool())
+    when (s2_valid(0) && s2_type === t_lsu && s2_req(0).uop.mem_cmd === M_XLR) { q_oc := lr_oc; q_sec := lr_sec; q_atk := lr_atk }
+    when (s2_valid(0) && ((s2_type === t_lsu && s2_hit(0) && !s2_nack(0)) ||
+                          (s2_type === t_replay && s2_req(0).uop.mem_cmd =/= M_FLUSH_ALL)) && s2_lr) {
+      val lsu = s2_type === t_lsu
+      cf_lrsc_oc  := Mux(lsu, lr_oc,  q_oc)
+      cf_lrsc_sec := Mux(lsu, lr_sec, q_sec || lr_sec)
+      cf_lrsc_atk := Mux(lsu, lr_atk, q_atk || lr_atk)
+      cf_lrsc_v   := Mux(lsu, lr_sec || lr_atk, q_sec || q_atk || lr_sec || lr_atk)
+    }
+  }
   when (lrsc_count > 0.U) { lrsc_count := lrsc_count - 1.U }
   when (s2_valid(0) && ((s2_type === t_lsu && s2_hit(0) && !s2_nack(0)) ||
                      (s2_type === t_replay && s2_req(0).uop.mem_cmd =/= M_FLUSH_ALL))) {
@@ -1191,16 +1230,31 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // edge for V, under-taint).  Now both lowerings see A's write (today's Verilator behaviour).
   // FPGA: LUTRAM async read -> forward mux (1 LUT) -> the existing s2 data FF; 0 levels after
   // the FF.  The forward select (write enable + 7-bit compare) ends at that FF, not on W.
-  val iftEvfBits    = 3 + cfTagBits + inflPcBitsCF
+  // [CEREPL] lean59 (owner 2026-10-23, RULES C "Replacement state": "keep it in cache eviction with a bit"): one more
+  // bit r at the TOP of the entry, {r, s, a, d, victim tag, PC[13:2]}: r = the entry's PC names the access that last
+  // advanced the set's replacement state (cf_rs_pc / cf_ra_pc), not the evicting access (definition at cf_evf_wd).
+  // s/a/d/tag/PC keep their bit positions from the LSB (iftEvfCoreBits), so the [EVFWR] wd print only gains bit r on
+  // top.  LUTRAM +1 bit per set (128 x 1: 2 RAM64X1D-class cells), 0 levels (same address, read and forward).
+  val iftEvfCoreBits = 3 + cfTagBits + inflPcBitsCF
+  val iftEvfBits    = 1 + iftEvfCoreBits
+  // [REPLUPDOC] lean59 (owner 2026-10-23 17:3x, Q-RU1 (b)): debug-only plusarg `+cf_replupd=1` turns the [REPLUPD] and
+  // [EVFWR] prints on from the start of the run, ORed with debug CSR 0xbc0 bit 7 (with bit 0), so existing ELFs (whose
+  // csrwi 0xbc0 cannot reach bit 7) can be logged unchanged.  Elaborated only in ENABLE_CF_DEBUG_PRINTF && ENABLE_IFT
+  // builds (a plusarg_reader in the Verilator debug sim); FireSim / NoLog / oracle and IFT-off builds: constant false.
+  val cf_replupd_pa = if (ENABLE_CF_DEBUG_PRINTF && ENABLE_IFT)
+                        PlusArg("cf_replupd", 0, "lean59 [REPLUPD]/[EVFWR] D$ replacement print enable (1 = on)", 1)(0)
+                      else false.B
+  val cf_repl_log   = io.lsu.cf_debug_repl_enable || cf_replupd_pa
   val ift_evf       = if (ENABLE_IFT) Some(Mem(nSets, UInt(iftEvfBits.W))) else None   // [IFTGATE]
   val cf_evf_we     = Wire(Bool())                       // [RUWEVF] the single write bus
   val cf_evf_wa     = Wire(UInt(idxBits.W))
   val cf_evf_wd     = Wire(UInt(iftEvfBits.W))
   val s2_evf        = widthMap(w => ift_evf.map(m => cfReplRead(m, cf_evf_we, cf_evf_wa, cf_evf_wd, s1_set_for_repl(w), s1_valid(w)))
                                            .getOrElse(0.U(iftEvfBits.W)))
-  val s2_evf_s      = widthMap(w => s2_evf(w)(iftEvfBits - 1))
-  val s2_evf_a      = widthMap(w => s2_evf(w)(iftEvfBits - 2))
-  val s2_evf_d      = widthMap(w => s2_evf(w)(iftEvfBits - 3))
+  val s2_evf_r      = widthMap(w => s2_evf(w)(iftEvfBits - 1))       // [CEREPL]
+  val s2_evf_s      = widthMap(w => s2_evf(w)(iftEvfCoreBits - 1))
+  val s2_evf_a      = widthMap(w => s2_evf(w)(iftEvfCoreBits - 2))
+  val s2_evf_d      = widthMap(w => s2_evf(w)(iftEvfCoreBits - 3))
   val s2_evf_tagm   = widthMap(w => s2_evf(w)(cfTagBits + inflPcBitsCF - 1, inflPcBitsCF) === (s2_req(w).addr >> cfTagLSB))
   val s2_evf_atk    = widthMap(w => s2_evf_a(w) && s2_evf_tagm(w) && s2_req(w).uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U)
   val s2_evf_hit    = widthMap(w => (s2_evf_s(w) && s2_evf_tagm(w)) || s2_evf_atk(w))   // an edge fires
@@ -1352,8 +1406,23 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     mshrs.io.req(w).bits.is_hella    := s2_req(w).is_hella
     mshrs.io.req_is_probe(w)         := s2_type === t_probe && s2_valid(w)
     // [RESID] step 15: secret-address bit and the eviction-filter result ride into the MSHR.
-    mshrs.io.req(w).bits.cf_addr_sec.foreach(_ := s2_req(w).cf_addr_sec.getOrElse(false.B))
-    mshrs.io.req(w).bits.cf_addr_atk.foreach(_ := s2_req(w).cf_addr_atk.getOrElse(false.B))   // [ATKRES] per-MSHR line mark
+    // [FILLSEC] r205 (RULES.md A reading 3, approved addition "D$ footprint marked secret, one tag, no refining"):
+    // a line FILLED by a secret (s_acc) or s_prop LOAD becomes secret.  Folded into the MSHR's per-line mark
+    // (req.cf_addr_sec / cf_sec_asec: primary or any merged secondary), which already gives the line residency
+    // tag at the meta write (ift_res_meta asec -> every later load of a DW not stored since the fill gets the
+    // secret value, patch 70) and the replayed loads' value (cf_rp_vsec).  Loads only (isRead: loads, LR, AMOs;
+    // a plain store's request s_prop is its DW tag, lsu.scala S-a).  Hits do not mark (reading 3 says "filled").
+    // Side effects (listed in p4-r205-author.md): the MSHR-busy nack edge (cf_asec_busy) and the next-line
+    // prefetch of such a miss are secret too.  Levels: s2 request flops -> 3-input AND/OR -> MSHR req: one LUT
+    // input on the existing bit, 0 added [inf].
+    mshrs.io.req(w).bits.cf_addr_sec.foreach(_ := s2_req(w).cf_addr_sec.getOrElse(false.B) ||
+      (isRead(s2_req(w).uop.mem_cmd) && (s2_req(w).uop.cf_secret_access.getOrElse(false.B) ||
+                                         s2_req(w).uop.cf_secret_propagation.getOrElse(false.B))))
+    // [ONETAGATK] r205 U8 (the attacker twin of [FILLSEC]): a line FILLED by a load with an attacker record (or an
+    // attacker-shadow load, lsu.scala cfLdAtk) carries the plain attacker tag: the MSHR's per-line attacker mark,
+    // read by victim loads as attacker value (per DW, patch 60) and the CACHE_EVICTION atk edge.  One LUT input.
+    mshrs.io.req(w).bits.cf_addr_atk.foreach(_ := s2_req(w).cf_addr_atk.getOrElse(false.B) ||
+      (isRead(s2_req(w).uop.mem_cmd) && s2_req(w).uop.cf_attacker_influence.getOrElse(false.B)))   // [ATKRES] per-MSHR line mark
     // [VSECEV] step 17 (owner ruling 119 (2)): a miss on a tag a SECRET-chosen eviction removed
     // returns a secret VALUE (any reader domain, like its edge).  Rides on the primary's uop flag;
     // the MSHR applies it to every response it drains (mshrs.scala cf_rp_vsec).
@@ -1378,6 +1447,9 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     mshrs.io.req(w).bits.cf_res_atk.foreach(_ := s2_evf_atk(w) || cf_nk_atk)
     mshrs.io.req(w).bits.cf_res_esec.foreach(_ := Mux(s2_evf_hit(w), !s2_evf_atk(w) || s2_evf_s(w),
                                                       s2_req(w).cf_res_esec.getOrElse(false.B)))
+    // [CEREPL] lean59: the eviction-filter edge (its PC wins, cf_res_pc above) carries the entry's r bit; a nack edge
+    // (s2_req.cf_res_*, LSU-driven) never is replacement-state.  One AND on the s2 evf register: 0 levels.
+    mshrs.io.req(w).bits.cf_res_repl.foreach(_ := s2_evf_hit(w) && s2_evf_r(w))
     // value taint (owner extension of C): the loaded value carries attacker taint when the
     // eviction's allocating access was attacker-domain (d).  Rides on the primary's uop flag;
     // the MSHR applies it to every response it drains (mshrs.scala cf_rp_vatk).
@@ -1399,8 +1471,13 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   val cf_rs_v       = widthMap(w => Mux(cf_repl_rand, cf_lfsr_sec_v,  s2_repl_sec(w)(inflPcBitsCF)))
   val cf_rs_pc      = widthMap(w => Mux(cf_repl_rand, cf_lfsr_sec_pc, s2_repl_sec(w)(inflPcBitsCF - 1, 0)))
   val cf_req_pc12   = widthMap(w => s2_req(w).uop.debug_pc(inflPcBitsCF + 1, 2))
-  val cf_evict_sec  = widthMap(w => cf_evicts(w) && (s2_req(w).cf_addr_sec.getOrElse(false.B) || cf_rs_v(w)))
-  val cf_evict_pc   = widthMap(w => Mux(s2_req(w).cf_addr_sec.getOrElse(false.B), cf_req_pc12(w), cf_rs_pc(w)))
+  // [O9FILL] r205 O9 (owner 2026-10-20, FINAL): an eviction caused by the fill of a secret (s_acc) or s_prop LOAD is
+  // secret-attributed too (the [FILLSEC] condition of the same request), with the allocating access's PC.  One more
+  // input on the existing OR and on the PC select: s2 request flops, 0 added levels.
+  val cf_fill_sec   = widthMap(w => isRead(s2_req(w).uop.mem_cmd) && (s2_req(w).uop.cf_secret_access.getOrElse(false.B) ||
+                                                                       s2_req(w).uop.cf_secret_propagation.getOrElse(false.B)))
+  val cf_evict_sec  = widthMap(w => cf_evicts(w) && (s2_req(w).cf_addr_sec.getOrElse(false.B) || cf_fill_sec(w) || cf_rs_v(w)))
+  val cf_evict_pc   = widthMap(w => Mux(s2_req(w).cf_addr_sec.getOrElse(false.B) || cf_fill_sec(w), cf_req_pc12(w), cf_rs_pc(w)))
   // [ATKEVICT] step 17 (ruling 116 C): attacker-caused evictions, the same rule with the domain
   // in place of the address taint.  d = the allocating access is attacker-domain.
   val cf_ra_v       = widthMap(w => Mux(cf_repl_rand, cf_lfsr_atk_v,  s2_repl_atk(w)(inflPcBitsCF)))
@@ -1410,7 +1487,19 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // ATTACKER-tainted address ([ATKRES] cf_addr_atk) chooses its eviction and advances the replacement
   // state like an attacker-domain access.  Record + edge only: the value-taint bit d stays domain-only
   // (owner extension of 116 C).  One OR on s2 flops, 0 levels.
-  val cf_req_atki   = widthMap(w => cf_req_atk(w) || s2_req(w).cf_addr_atk.getOrElse(false.B))
+  // [L10ATK] lean58 (Fable audit L10; RULES A O9 + U8 "symmetric"): ...and, as the secret side's [O9FILL]
+  // cf_fill_sec, a LOAD whose record has the attacker bit (isRead && uop.cf_attacker_influence, the [ONETAGATK]
+  // fill-mark term of the same request).  Feeds the attacker eviction record (cf_evict_atk / apc), the LFSR and
+  // the per-set replacement-state attacker taint.  The value bit d (cf_evict_d) is unchanged.  RECORD CHANGE.
+  // One more input on an s2-flop OR: 0 levels.  IFT off: the field is None (false).
+  // [REPLSATK] lean59 (owner 2026-10-23, RULES C "Replacement state": repl-satk goes into lean59): this [L10ATK]
+  // term IS the repl-satk change (phase4/repl-satk, full variant: its cf_fill_atk = isRead && the load's attacker
+  // record, folded into cf_req_atki), so all four uses take it: the eviction a-bit and PC (cf_evict_atk / apc), the
+  // per-set replacement-state attacker taint (cf_ratk_wd, ift_repl_atk) and the LFSR attacker taint (cf_lfsr_aset).
+  // Stores stay out (a store's uop cf_attacker_influence is its DW data tag); prefetches are NullMicroOp (0).
+  val cf_req_atki   = widthMap(w => if (ENABLE_IFT) cf_req_atk(w) || s2_req(w).cf_addr_atk.get ||
+                                      (isRead(s2_req(w).uop.mem_cmd) && s2_req(w).uop.cf_attacker_influence.get)
+                                    else cf_req_atk(w) || s2_req(w).cf_addr_atk.getOrElse(false.B))
   val cf_evict_d    = widthMap(w => cf_evicts(w) && cf_req_atk(w))
   val cf_evict_atk  = widthMap(w => cf_evicts(w) && (cf_req_atki(w) || cf_ra_v(w)))
   val cf_evict_apc  = widthMap(w => Mux(cf_req_atki(w), cf_req_pc12(w), cf_ra_pc(w)))
@@ -1449,7 +1538,18 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     // whenever the set's replacement state was also attacker-advanced (any attacker prime), so
     // the flow graph got the attacker load as the "secret source".  Same two early inputs, the
     // select moves from cf_evict_atk to cf_evict_sec: 0 levels, ends at the ift_evf LUTRAM DI.
-    cf_evf_wd := Mux(!cf_repl_rst && cf_evf_new(ew), Cat(cf_evict_sec(ew), cf_evict_atk(ew), cf_evict_d(ew), s2_repl_meta(ew).tag,
+    // [CEREPL] lean59 (owner 2026-10-23): r = the record's ONE PC (secret-first, [EVFPCSEC]) came from the set's
+    // replacement-state taint instead of the evicting access:
+    //   secret-named (cf_evict_sec):   r = !(cf_addr_sec || cf_fill_sec)  i.e. cf_evict_sec held only through cf_rs_v
+    //                                      (ift_repl_sec, or cf_lfsr_sec under random replacement), PC = cf_rs_pc;
+    //   attacker-named (a only):       r = !cf_req_atki                    i.e. cf_evict_atk held only through cf_ra_v
+    //                                      (ift_repl_atk, or cf_lfsr_atk), PC = cf_ra_pc.
+    // The evicting access's own terms win the PC and give r = 0 (cf_evict_pc / cf_evict_apc select them first).
+    // Levels: the own terms are s2 request flops (built for cf_evict_pc / apc); one 3-input LUT in parallel with the
+    // existing PC select, ending at the same ift_evf LUTRAM DI: 0 added.
+    val cf_own_sec = s2_req(ew).cf_addr_sec.getOrElse(false.B) || cf_fill_sec(ew)
+    val cf_evf_r   = Mux(cf_evict_sec(ew), !cf_own_sec, !cf_req_atki(ew))
+    cf_evf_wd := Mux(!cf_repl_rst && cf_evf_new(ew), Cat(cf_evf_r, cf_evict_sec(ew), cf_evict_atk(ew), cf_evict_d(ew), s2_repl_meta(ew).tag,
                                 Mux(cf_evict_sec(ew), cf_evict_pc(ew), cf_evict_apc(ew))),
                      0.U(iftEvfBits.W))
     when (cf_evf_we) { ift_evf.get.write(cf_evf_wa, cf_evf_wd) }
@@ -1461,7 +1561,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       cf_ev_cyc := cf_ev_cyc + 1.U
       val cf_ev_pfe = VecInit((0 until memWidth).map(w => cf_evicts(w) && cf_evf_pf(w))).asUInt
       val cf_ev_sup = VecInit((0 until memWidth).map(w => cf_evicts(w) && cf_evf_pf(w) && !cf_evf_wr(w))).asUInt
-      when ((cf_evf_we && !cf_repl_rst || cf_ev_pfe.orR) && io.lsu.cf_debug_repl_enable) {
+      when ((cf_evf_we && !cf_repl_rst || cf_ev_pfe.orR) && cf_repl_log) {   // [REPLUPDOC] + plusarg
         printf("[EVFWR] c=%d we=%d set=%d wd=%x pf=%b ev=%b pend=%b sup=%b set0=%d set1=%d\n",
           cf_ev_cyc, cf_evf_we, cf_evf_wa, cf_evf_wd, cf_ev_pfe, cf_evicts.asUInt,
           cf_evf_pend.asUInt, cf_ev_sup,
@@ -1474,14 +1574,16 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     // clears it.  This subsumes the old "consumed by the next eviction" clear, because the
     // evicting allocation is itself an MSHR fire.  Two fires in one cycle: either sets it.
     val cf_lfsr_fire = mshrs.io.req.map(_.fire).reduce(_||_)
-    // [ATKEVICT] LFSR attacker taint
+    // [ATKEVICT] LFSR attacker taint ([REPLSATK]: cf_req_atki includes the attacker-record load, twin of [REPLSPROP])
     val cf_lfsr_aset = widthMap(w => mshrs.io.req(w).fire && cf_req_atki(w))   // [MEMORDATK] E
     when (cf_lfsr_fire) {
       cf_lfsr_atk_v  := cf_lfsr_aset.reduce(_||_)
       cf_lfsr_atk_pc := cf_req_pc12(PriorityEncoder(cf_lfsr_aset))
     }
     // LFSR secret taint (random policy)
-    val cf_lfsr_set = widthMap(w => mshrs.io.req(w).fire && s2_req(w).cf_addr_sec.getOrElse(false.B))
+    // [REPLSPROP] (owner 2026-10-21, consistent with O9 [O9FILL]): a fire of a secret (s_acc) or s_prop LOAD
+    // (cf_fill_sec) sets it too.  One more input on the per-lane AND (s2 flops), 0 added levels.
+    val cf_lfsr_set = widthMap(w => mshrs.io.req(w).fire && (s2_req(w).cf_addr_sec.getOrElse(false.B) || cf_fill_sec(w)))
     when (cf_lfsr_fire) {
       cf_lfsr_sec_v  := cf_lfsr_set.reduce(_||_)
       cf_lfsr_sec_pc := cf_req_pc12(PriorityEncoder(cf_lfsr_set))
@@ -1519,8 +1621,13 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // s2_repl_way_raw), NOT the post-override allocated way — else a PLRU fixpoint
   // (get_next_state(0x7d,way0)==0x7d) freezes the set state and victim collapses to way 0. See
   // reg-based version notes. Identical when no override fires.
+  // [UPGRADEWAY] lean62: a primary allocation whose tag matches is a permission UPGRADE (mshrs.scala handle_pri_req
+  // tag_match): the line stays in, and the MSHR refills, its own way (mshrs.io.req.bits.way_en, line ~1403 below), so
+  // that way is the one accessed.  The state used to advance the unrelated raw victim, protecting a line nobody
+  // touched (seen on the HTIF tohost line, t53r/t64r: [REPLUPD] way=4, [FILL] wayen=0x01).  The select is the same
+  // s2_tag_match that already picks the MSHR way_en; one 2:1 mux ahead of the PLRU/LRU next-state function.
   val s2_repl_way   = widthMap(w => Mux(cf_alloc(w),
-                                        OHToUInt(s2_repl_way_raw(w)),
+                                        OHToUInt(Mux(s2_tag_match(w), s2_tag_match_way(w)(nWays-1, 0), s2_repl_way_raw(w)(nWays-1, 0))),
                                         OHToUInt(s2_tag_match_way(w)(nWays-1, 0))))
   // [REPLUPD] patch 30 F1 (DF-plru-serial): the write port goes to the lane whose MSHR request
   // FIRED, else to the first updating lane (hits).  Before, lane 0 always won, so a lane-0 hit
@@ -1572,11 +1679,18 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // requires conf =/= 3).  [EVFLAST] step 19 (owner, latest event wins): every update of the
   // set's replacement state replaces its taint with the updating access's own attribution --
   // a secret-address access sets it (its PC), any other access (hit or miss) clears it.
+  // [REPLSPROP] (owner 2026-10-21, consistent with O9 [O9FILL]): a secret-VALUE access -- an s_acc or s_prop LOAD
+  // (cf_fill_sec: loads, LR/SC, AMOs) -- that advances the state (its hit or its allocation, lane uw) sets it too,
+  // with its own PC.  Stores stay address-only (O9 names loads).  Levels: cf_fill_sec(w) || cf_addr_sec(w) is
+  // s2 flops only (2 LUTs, already built for cf_evict_sec) and runs in parallel with uw (MSHR fire, deeper); the
+  // final !rst && Mux(uw, s0, s1) LUT keeps its 4 inputs, so the write-data/forward path gains 0 levels.
   if (ENABLE_IFT) {
     cf_ift_we  := cf_repl_rst || upd
     cf_ift_wa  := Mux(cf_repl_rst, cf_repl_rst_idx, set)
-    cf_rsec_wd := Mux(!cf_repl_rst && s2_req(uw).cf_addr_sec.getOrElse(false.B), Cat(1.U(1.W), cf_req_pc12(uw)), 0.U((1 + inflPcBitsCF).W))
+    cf_rsec_wd := Mux(!cf_repl_rst && (s2_req(uw).cf_addr_sec.getOrElse(false.B) || cf_fill_sec(uw)), Cat(1.U(1.W), cf_req_pc12(uw)), 0.U((1 + inflPcBitsCF).W))
     // [ATKEVICT] attacker twin: an attacker-domain access sets it, any other access clears it
+    // [REPLSATK]: cf_req_atki also covers an attacker-RECORD load ([L10ATK]), the twin of [REPLSPROP] above; and an
+    // attacker-tainted-address access ([MEMORDATK] E).
     cf_ratk_wd := Mux(!cf_repl_rst && cf_req_atki(uw),        Cat(1.U(1.W), cf_req_pc12(uw)), 0.U((1 + inflPcBitsCF).W))   // [MEMORDATK] E
     when (cf_ift_we) {
       ift_repl_sec.get.write(cf_ift_wa, cf_rsec_wd)
@@ -1595,6 +1709,19 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // the write port; way = the policy victim (raw) for an allocation, the hit way for a hit;
   // byp(w) = lane w's s2 state came from the [REPLBYP] forward; old/new = the active policy's
   // state of the set (TrueLRU when conf = 1, else PseudoLRU).
+  // [REPLUPDOC] lean59 (owner 2026-10-23 ~16:3x; reports/evict-reconstruct-20261023.md section 4, "Simulation
+  // counterpart"): four fields APPENDED (the old ones keep their order and widths), so a host replay can name the access
+  // behind every write of the set's replacement state:
+  //   kind = 0 demand hit (s2 LSU hit refresh, lane uw), 1 demand allocation (primary cacheable MSHR allocation of a
+  //          load/store/AMO), 2 prefetch allocation (the NLPrefetcher's primary allocation; a parked prefetch that is
+  //          later cleared still advanced the state), 3 sweep (the [REPLRST] reset sweep: the set's state is written to 0
+  //          and a same-cycle update, if any, is NOT applied; old/new/way/uw then describe that dropped update);
+  //   oc   = the updating request's cf_op_count_id (full 16 b; it names the commit or [FLUSH] record of the access, so
+  //          squashed hits are attributed too; 0 for a prefetch, whose uop is NullMicroOp, and for kind 3);
+  //   pc   = its debug_pc (a prefetch carries its trigger load's PC);
+  //   wset = the set actually written (= set0/set1 of lane uw for kinds 0-2, the sweep counter for kind 3).
+  // The line now also prints in a sweep cycle (upd || cf_repl_rst); everything else unchanged.  Debug-print builds
+  // only (ENABLE_CF_DEBUG_PRINTF): FireSim, NoLog and oracle netlists are unchanged.
   if (ENABLE_CF_DEBUG_PRINTF) {
     val cf_ru_cyc = RegInit(0.U(32.W))
     cf_ru_cyc := cf_ru_cyc + 1.U
@@ -1602,11 +1729,29 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     val cf_ru_byp = RegNext(VecInit((0 until memWidth).map(w => Mux(cf_ru_lru,
                       cf_lru_we  && cf_lru_wa  === s1_set_for_repl(w),
                       cf_plru_we && cf_plru_wa === s1_set_for_repl(w)))))
-    when (upd && io.lsu.cf_debug_repl_enable) {
-      printf("[REPLUPD] c=%d conf=%d upd=%b fire=%b hit=%b set0=%d set1=%d uw=%d way=%d byp=%b old=%x new=%x\n",
-        cf_ru_cyc, io.lsu.cf_dcache_repl_conf, s2_repl_upd.asUInt, cf_repl_fire.asUInt, s2_lsu_hit.asUInt,
-        dcacheMaskIdx(s2_req(0).addr), dcacheMaskIdx(s2_req(memWidth - 1).addr), uw, way, cf_ru_byp.asUInt,
-        Mux(cf_ru_lru, s2_lru_state(uw), s2_plru_state(uw)), Mux(cf_ru_lru, cf_lru_next, cf_plru_next))
+    // [REPLUPDOC] IFT builds only: an IFT-off debug build (e.g. BaselineBoomConfig) keeps the old line byte for byte
+    // (RULES D3: IFT off, the generated Verilog is unchanged).
+    if (ENABLE_IFT) {
+      val cf_ru_alloc = cf_repl_fire.reduce(_||_)
+      val cf_ru_kind  = Mux(cf_repl_rst, 3.U(2.W),
+                        Mux(cf_ru_alloc, Mux(isPrefetch(s2_req(uw).uop.mem_cmd), 2.U(2.W), 1.U(2.W)), 0.U(2.W)))   // [REPLUPDOC]
+      val cf_ru_oc    = Mux(cf_repl_rst, 0.U(uopIDCounterWidthCF.W), s2_req(uw).uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)))
+      val cf_ru_pc    = Mux(cf_repl_rst, 0.U, s2_req(uw).uop.debug_pc)
+      val cf_ru_wset  = Mux(cf_repl_rst, cf_repl_rst_idx, set)
+      when ((upd || cf_repl_rst) && cf_repl_log) {   // [REPLUPDOC] 0xbc0 bit 7 or +cf_replupd=1
+        printf("[REPLUPD] c=%d conf=%d upd=%b fire=%b hit=%b set0=%d set1=%d uw=%d way=%d byp=%b old=%x new=%x kind=%d oc=%d pc=0x%x wset=%d\n",
+          cf_ru_cyc, io.lsu.cf_dcache_repl_conf, s2_repl_upd.asUInt, cf_repl_fire.asUInt, s2_lsu_hit.asUInt,
+          dcacheMaskIdx(s2_req(0).addr), dcacheMaskIdx(s2_req(memWidth - 1).addr), uw, way, cf_ru_byp.asUInt,
+          Mux(cf_ru_lru, s2_lru_state(uw), s2_plru_state(uw)), Mux(cf_ru_lru, cf_lru_next, cf_plru_next),
+          cf_ru_kind, cf_ru_oc, cf_ru_pc, cf_ru_wset)
+      }
+    } else {
+      when (upd && io.lsu.cf_debug_repl_enable) {
+        printf("[REPLUPD] c=%d conf=%d upd=%b fire=%b hit=%b set0=%d set1=%d uw=%d way=%d byp=%b old=%x new=%x\n",
+          cf_ru_cyc, io.lsu.cf_dcache_repl_conf, s2_repl_upd.asUInt, cf_repl_fire.asUInt, s2_lsu_hit.asUInt,
+          dcacheMaskIdx(s2_req(0).addr), dcacheMaskIdx(s2_req(memWidth - 1).addr), uw, way, cf_ru_byp.asUInt,
+          Mux(cf_ru_lru, s2_lru_state(uw), s2_plru_state(uw)), Mux(cf_ru_lru, cf_lru_next, cf_plru_next))
+      }
     }
   }
   tl_out.a <> mshrs.io.mem_acquire
@@ -1786,8 +1931,22 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // attacker-caused eviction) now applies to a DW only while its bit is 0, so a clean overwrite clears it, as
   // atkMask already does for store data (P5 "value: overwrite").  The edges are unchanged (line-level record).
   // IFT off the width is unchanged (the dead ift_sm_last_dat register keeps its _RANDOM layout).
-  val iftStoreBits   = CF_SUBLINE + CF_SUBLINE + inflPcBitsCF + CF_SUBLINE + 2 * (CF_SUBLINE + 2) +
-                       (if (ENABLE_IFT) CF_SUBLINE else 0)
+  // [ONETAG] r205 (RULES.md A reading 3, "for the cache, there is no epoch"; p4-r205-author.md C12): with IFT on the
+  // entry drops the secret window kind (wsecMask + wsecEp): -10 bits per way entry (128 x 8 x 10 = 10,240 bits, plus
+  // 8 x 10 FF of ift_sm_last_dat).  The edge-only line mask stays here; folding it into the value mask is RULES.md
+  // E/U1 (r205-u1-wholeline.diff).  New IFT-on format:
+  //   {stMask, watkEp[2], watkMask, edgeMask, atkMask, secMask, pc[13:2]}
+  // IFT off keeps the old width and layout (its Verilog is unchanged, RULES.md D3).
+  // [ONETAGATK] r205 U8: the attacker window kind (watkMask + watkEp) goes too: -10 more bits (IFT-on format
+  //   {stMask, edgeMask, atkMask, secMask, pc[13:2]}, 44 bits; IFT off unchanged).
+  // [U1DW] lean58 (Fable audit H2; owner U1 "Per doubleword", RULES A): the whole-line edge mask is removed IFT on:
+  // a secret-data store to a non-secret address marks only the doubleword it stores (secMask, as every store),
+  // and a load of another DW of that line gets neither a MEM_DATAFLOW sec edge nor (through the one-tag write
+  // rule) a secret register.  IFT-on format {stMask, atkMask, secMask, pc[13:2]}, 36 bits (-8 per way entry,
+  // 8,192 bits).  NOTE: phase4/patches/r205/r205-u1-wholeline.diff (which the audit cites) is the OPPOSITE
+  // variant (U1 = YES, whole-line VALUE) and was withdrawn when the owner answered "Per doubleword"; it is not used.
+  val iftStoreBits   = if (ENABLE_IFT) CF_SUBLINE + inflPcBitsCF + CF_SUBLINE + CF_SUBLINE
+                       else CF_SUBLINE + CF_SUBLINE + inflPcBitsCF + CF_SUBLINE + 2 * (CF_SUBLINE + 2)
   def cfSubIdx(addr: UInt): UInt = addr(log2Up(dcacheParams.blockBytes)-1, 3)
   def cfSubOH(addr: UInt): UInt  = UIntToOH(cfSubIdx(addr))(CF_SUBLINE-1, 0)
 
@@ -1809,6 +1968,10 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // [WINMEM] step 21 (owner r139, F2/F3): WINDOW-kind marks per doubleword (secret and attacker
   // windows) with the epoch of the store that set them.  A store keeps the old window bits only
   // when their epoch equals its own (otherwise they expired) and writes its own epoch.
+  // [ONETAG] r205: the IFT-on entry (see iftStoreBits); mkIftStore below is the IFT-off (old) layout only.
+  def mkIftStore1(pc12: UInt, secMask: UInt, atkMask: UInt, stMask: UInt): UInt =
+    Cat(stMask(CF_SUBLINE-1,0), atkMask(CF_SUBLINE-1,0), secMask(CF_SUBLINE-1,0),
+        pc12(inflPcBitsCF-1, 0))   // [ONETAGATK] [U1DW]
   def mkIftStore(pc12: UInt, secMask: UInt, atkMask: UInt, edgeMask: UInt,
                  wsecMask: UInt, wsecEp: UInt, watkMask: UInt, watkEp: UInt, stMask: UInt): UInt = {
     val lo = Cat(watkEp(1,0), watkMask(CF_SUBLINE-1,0), wsecEp(1,0), wsecMask(CF_SUBLINE-1,0),
@@ -1820,12 +1983,16 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   def iftAtkMask(e: UInt) : UInt = e(inflPcBitsCF + 2*CF_SUBLINE - 1, inflPcBitsCF + CF_SUBLINE)
   val iftEdgeLo = inflPcBitsCF + 2*CF_SUBLINE
   val iftWsecLo = iftEdgeLo + CF_SUBLINE
-  val iftWatkLo = iftWsecLo + CF_SUBLINE + 2
-  def iftEdgeMask(e: UInt): UInt = e(iftEdgeLo + CF_SUBLINE - 1, iftEdgeLo)
-  def iftWsecMask(e: UInt): UInt = e(iftWsecLo + CF_SUBLINE - 1, iftWsecLo)
-  def iftWsecEp(e: UInt)  : UInt = e(iftWsecLo + CF_SUBLINE + 1, iftWsecLo + CF_SUBLINE)
-  def iftWatkMask(e: UInt): UInt = e(iftWatkLo + CF_SUBLINE - 1, iftWatkLo)
-  def iftWatkEp(e: UInt)  : UInt = e(iftWatkLo + CF_SUBLINE + 1, iftWatkLo + CF_SUBLINE)
+  // [ONETAG] [ONETAGATK] IFT on there are no window fields; the IFT-on value only keeps the (dead) accessors in range
+  val iftWatkLo = if (ENABLE_IFT) iftEdgeLo else iftWsecLo + CF_SUBLINE + 2
+  def iftEdgeMask(e: UInt): UInt = if (ENABLE_IFT) 0.U(CF_SUBLINE.W) else e(iftEdgeLo + CF_SUBLINE - 1, iftEdgeLo)   // [U1DW] no field IFT on
+  // [ONETAG] r205: IFT on the entry has no secret window fields, so these accessors are constants (no slice of the
+  // narrower entry: a dead slice is still range-checked at elaboration)
+  def iftWsecMask(e: UInt): UInt = if (ENABLE_IFT) 0.U(CF_SUBLINE.W) else e(iftWsecLo + CF_SUBLINE - 1, iftWsecLo)
+  def iftWsecEp(e: UInt)  : UInt = if (ENABLE_IFT) 0.U(2.W) else e(iftWsecLo + CF_SUBLINE + 1, iftWsecLo + CF_SUBLINE)
+  // [ONETAGATK] r205 U8: IFT on there are no attacker window fields either: constant accessors (no slice)
+  def iftWatkMask(e: UInt): UInt = if (ENABLE_IFT) 0.U(CF_SUBLINE.W) else e(iftWatkLo + CF_SUBLINE - 1, iftWatkLo)
+  def iftWatkEp(e: UInt)  : UInt = if (ENABLE_IFT) 0.U(2.W) else e(iftWatkLo + CF_SUBLINE + 1, iftWatkLo + CF_SUBLINE)
   // [STDW] patch 60: the stored-since-fill mask (IFT only; constant 0 IFT off)
   def iftStMask(e: UInt)  : UInt = if (ENABLE_IFT) e(iftStoreBits - 1, iftStoreBits - CF_SUBLINE) else 0.U(CF_SUBLINE.W)
   def iftStAt(e: UInt, addr: UInt): Bool = (iftStMask(e) & cfSubOH(addr)).orR
@@ -1840,11 +2007,15 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   def iftSecretAt(e: UInt, addr: UInt): Bool = (iftSecMask(e) & cfSubOH(addr)).orR
   def iftAtkAt(e: UInt, addr: UInt)   : Bool = (iftAtkMask(e) & cfSubOH(addr)).orR
   // [WLEDGE] edge-only (whole-line) mark at this DW, or a value mark (which also has the edge)
-  def iftEdgeAt(e: UInt, addr: UInt)  : Bool = ((iftEdgeMask(e) | iftSecMask(e)) & cfSubOH(addr)).orR
+  // [U1DW] IFT on: the edge is the per-DW value mark only
+  def iftEdgeAt(e: UInt, addr: UInt)  : Bool = if (ENABLE_IFT) iftSecretAt(e, addr)
+                                               else ((iftEdgeMask(e) | iftSecMask(e)) & cfSubOH(addr)).orR
   // [WINMEM] live window mark at this DW: the epoch must match the READER's dispatch epoch (the
   // core then checks that against the current one at the register write)
-  def iftWsecAt(e: UInt, addr: UInt, ep: UInt): Bool = (iftWsecMask(e) & cfSubOH(addr)).orR && iftWsecEp(e) === ep
-  def iftWatkAt(e: UInt, addr: UInt, ep: UInt): Bool = (iftWatkMask(e) & cfSubOH(addr)).orR && iftWatkEp(e) === ep
+  def iftWsecAt(e: UInt, addr: UInt, ep: UInt): Bool = if (ENABLE_IFT) false.B   // [ONETAG] no secret window kind
+                                                      else (iftWsecMask(e) & cfSubOH(addr)).orR && iftWsecEp(e) === ep
+  def iftWatkAt(e: UInt, addr: UInt, ep: UInt): Bool = if (ENABLE_IFT) false.B   // [ONETAGATK] no attacker window kind
+                                                      else (iftWatkMask(e) & cfSubOH(addr)).orR && iftWatkEp(e) === ep
 
   val ift_fill_meta  = Seq.fill(nWays)(SyncReadMem(nSets, UInt(iftFillBits.W)))
   val ift_store_meta = Seq.fill(nWays)(SyncReadMem(nSets, UInt(iftStoreBits.W)))
@@ -1880,8 +2051,8 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   //   slot 1          set at the MSHR meta write when the primary or a merged secondary had a
   //                   secret address (set-only: a permission upgrade keeps the line's mark)
   //   slot 2+w        set by a secret-address load/store HIT on lane w
-  //   [D1FIXA] priority: lanes (2+w) > slot 0 > slot 1; a losing slot 0/1 write is deferred
-  //   (cf_prm_way / cf_prf_*), never dropped.  Lane 1 vs lane 0 on one way (R3) still drops.
+  //   [D1FIXA] priority: lanes (2+w) > slot 0 > slot 1.  [H1T] lean58: a losing slot 0/1 write is
+  //   DROPPED (counted in debug builds), no longer deferred.  Lane 1 vs lane 0 on one way (R3) drops.
   // Reader: every load (any domain) of a marked line gets CACHE_EVICTION {atk=0, sec=1,
   // PC = the secret-address access}.  [SECDEST] step 17 (owner ruling 116 A(2), answers
   // 2026-10-13) REPLACES step 15's "timing only, no value taint": the loaded VALUE is secret too
@@ -1915,22 +2086,18 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // clear, priority.  The clear is for a NEW line in (refill set, way); a lane write in the same
   // cycle to the same WAY but ANOTHER set lost its write (S1 clean store -> stale secret mark,
   // S2 secret store -> lost mark, R1 lane residency mark lost, R2 MSHR fill mark lost).
-  // Now LANE slots win.  A non-lane write that loses is DEFERRED, never dropped:
-  //   cf_psm_way / cf_prm_way  one-hot way of a lost refill clear (store meta / res meta); both
-  //                            share cf_pclr_idx (the same first beat writes both arrays)
-  //   cf_prf_way/idx/dat       a lost MSHR fill mark (res meta slot 1), with its data
-  // The deferred write re-enters its slot (the slot's "clear source" is
-  // Mux(cf_pend_hold, pending, new)) and lands on the first cycle no lane slot writes its way.
-  // cf_pend_hold (= any pending, one flop) holds every MSHR's refill beats and meta writes
-  // (mshrs.scala [D1FIXA]), so (1) no new clear / fill mark arrives while one is pending (one
-  // entry per kind is enough, and the slot source is exclusive), and (2) the MSHR whose clear is
-  // pending stays in s_commit_line (its next beat is held), so the clear lands before any replay
-  // or meta write of its line ([G9STMETA] order kept).  cacheDataBeats >= 2 is required for (2).
-  // Liveness: cf_pend_starve (16 cycles pending) blocks new LSU requests (as wk_block does), so the
-  // lane slots drain (MSHR replays are bounded: sec_rdy is off in s_drain_rpq, and held MSHRs
-  // cannot enter it).  R3 (lane 1 vs lane 0 res mark, same way) is not covered (decided later).
+  // Now LANE slots win.
+  // [H1T] lean58 (owner decision 2026-10-23 on Fable audit H1 (a); RULES B "no stalls, nacks or replays for
+  // IFT"): a non-lane write that loses (the refill first-beat clear, slot 0, or the MSHR fill mark, slot 1) is
+  // DROPPED.  The D1 fix A deferral (cf_psm/prm/prf pending entries, cf_pend_hold holding every MSHR's refill
+  // beats and meta writes, cf_pend_starve refusing LSU requests after 16 held cycles) is removed, so IFT never
+  // delays a refill, a meta write or an LSU request.  Consequence of a drop (accepted by the owner): a dropped
+  // clear leaves the previous line's store meta / residency mark on the new line in that (set, way) until the
+  // next store / mark of each DW (stale label: over- or under-taint of that line); a dropped fill mark loses the
+  // secret/attacker-address residency mark of that fill.  Debug printf builds count and print every drop
+  // ([IFTMDROP], below); nothing is added to the FPGA netlist.  Ordering: a clear, when it lands, still lands on
+  // the first refill beat, before every replay of its MSHR ([G9STMETA]); a dropped clear has no ordering.
   // IFT off: every one of these is a constant-false/zero wire; the merged writers do not exist.
-  require(!ENABLE_IFT || cacheDataBeats >= 2, "[D1FIXA] the pending clear needs >= 2 refill beats")
   // Lane-first one-hot select over a writer's slot vector: slots [nLow, n) (lanes) win, then
   // [0, nLow) in index order.  Same LUT shape as the PriorityEncoderOH it replaces.
   private def cfLaneFirstOH(wv: UInt, nLow: Int): UInt = {
@@ -1939,28 +2106,18 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     val oh  = PriorityEncoderOH(ord)
     Cat(oh(n-nLow-1, 0), oh(n-1, n-nLow))                  // back to slot order
   }
-  val cf_pend_hold   = if (ENABLE_IFT) RegInit(false.B) else WireInit(false.B)
-  val cf_pend_age    = if (ENABLE_IFT) RegInit(0.U(4.W)) else WireInit(0.U(4.W))
-  val cf_pend_starve = if (ENABLE_IFT) RegInit(false.B) else WireInit(false.B)
-  val cf_psm_way     = if (ENABLE_IFT) RegInit(0.U(nWays.W)) else WireInit(0.U(nWays.W))
-  val cf_prm_way     = if (ENABLE_IFT) RegInit(0.U(nWays.W)) else WireInit(0.U(nWays.W))
-  val cf_prf_way     = if (ENABLE_IFT) RegInit(0.U(nWays.W)) else WireInit(0.U(nWays.W))
-  val cf_pclr_idx    = if (ENABLE_IFT) Reg(UInt(idxBits.W)) else WireInit(0.U(idxBits.W))
-  val cf_prf_idx     = if (ENABLE_IFT) Reg(UInt(idxBits.W)) else WireInit(0.U(idxBits.W))
-  val cf_prf_dat     = if (ENABLE_IFT) Reg(UInt(iftResBits.W)) else WireInit(0.U(iftResBits.W))
-  mshrs.io.cf_ift_hold := cf_pend_hold   // a flop; constant false with IFT off
-  // Per-lane slot valids / res-mark data, for the deferral next-state below (set where the lane
-  // slots are written).  The pending next-state is written in terms of these, factored as
-  // lane valid AND (flop / early terms), so a late lane valid is 1-2 LUTs from its pending flop.
+  // [H1T] the hold is gone: constant false in every build (the MSHR port stays, tied off, so IFT-off
+  // Verilog is unchanged; mshrs.scala no longer reads it).
+  val cf_pend_hold   = WireInit(false.B)
+  mshrs.io.cf_ift_hold := cf_pend_hold
+  // Per-lane slot valids (set where the lane slots are written); [H1T] used only by the debug drop count.
   val cf_sm_lane_v = WireInit(VecInit(Seq.fill(memWidth)(false.B)))
   val cf_rm_lane_v = WireInit(VecInit(Seq.fill(memWidth)(false.B)))
   val cf_rm_lane_d = WireInit(VecInit(Seq.fill(memWidth)(0.U(iftResBits.W))))
-  // Slot index sources.  A valid clear slot under cf_pend_hold is the pending one (no first beat
-  // can fire under hold), otherwise the first beat; likewise for the fill slot.  The 2:1 mux has
-  // a flop select and register-sourced data, so it settles in parallel with the late slot valids.
-  val cf_clr_src_idx = Mux(cf_pend_hold, cf_pclr_idx, dcacheMaskIdx(mshrs.io.refill.bits.addr))
+  // Slot index sources: [H1T] the first beat's set (slot 0) and the MSHR fill's set (slot 1).
+  val cf_clr_src_idx = dcacheMaskIdx(mshrs.io.refill.bits.addr)
   val cf_fill_new_idx = mshrs.io.cf_meta_write_fill.bits.idx & dcache_set_mask(idxBits-1, 0)
-  val cf_fill_src_idx = Mux(cf_pend_hold, cf_prf_idx, cf_fill_new_idx)
+  val cf_fill_src_idx = cf_fill_new_idx
   // [RUWRES] the merged single write per way, shared by the write below and the forward.
   // [D1FIXA] lane slots (2+l) win, then slot 0 (refill clear), then slot 1 (MSHR fill mark).
   // The forward select uses the slot index SOURCES (as [STFWD-S1]): slot 0 = cf_clr_src_idx,
@@ -1976,12 +2133,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     val eq = VecInit(Seq(cf_clr_src_idx === ra, cf_fill_src_idx === ra) ++
                      (0 until memWidth).map(l => dcacheMaskIdx(s2_req(l).addr) === ra)).asUInt
     val hit = (ift_rm_wv(way) & ift_rm_oh(way) & eq).orR
-    // [D1FIXA] a deferred fill mark is forwarded until it lands: the array entry of that line is
-    // a subset of cf_prf_dat (its clear landed before the MSHR left s_commit_line, and every lane
-    // mark of the line since is merged into cf_prf_dat).  Flop-sourced select (8-b one-hot bit +
-    // 7-b eq): the read mux gains 2 inputs in the same LUT, no level.
-    val pf_hit = cf_prf_way(way) && cf_prf_idx === ra
-    RegEnable(Mux(hit, ift_rm_wd(way), Mux(pf_hit, cf_prf_dat, ift_res_meta(way).read(ra))), en)
+    RegEnable(Mux(hit, ift_rm_wd(way), ift_res_meta(way).read(ra)), en)   // [H1T] no deferred fill mark to forward
   }
 
   for (w <- 0 until memWidth) {
@@ -2004,6 +2156,24 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     val s2_fill_entry  = Mux1H(s2_tag_match_way(w), s2_fill_ways)
     val s2_store_entry = Mux1H(s2_tag_match_way(w), s2_store_ways_f)
     val s2_res_entry   = Mux1H(s2_tag_match_way(w), s2_res_ways)   // [RESID]
+    // [F9DW] lean58 timing F9 (timing-audit-20261023 sections 2.1, 6): the response's per-doubleword tests (stored
+    // since fill, secret, attacker, edge) select the addressed DW of EACH way first, from s2 flops (the way's store
+    // meta and the request address), and only then pick the hit way, instead of selecting the whole 32-bit entry by
+    // the late s2_tag_match_way and testing the DW after it.  Exact for any select vector: Mux1H on nWays = 8 inputs
+    // is the AND-OR form OR_i(sel_i ? e_i : 0), and slicing, & sub_oh and orR distribute over it, so
+    // (Mux1H(sel, e) & oh).orR == Mux1H(sel, e.map(x => (x & oh).orR)).  IFT off: the original tests (unchanged
+    // Verilog).  Cost: 4 x nWays small AND-OR trees (~32 LUT per lane) for ~1 LUT level off the hit-way leg.
+    val s2_sub_oh  = if (ENABLE_IFT) Some(cfSubOH(s2_req(w).addr)) else None
+    def cfDwSel(m: UInt => UInt): Option[Bool] =
+      s2_sub_oh.map(oh => Mux1H(s2_tag_match_way(w), s2_store_ways_f.map(e => (m(e) & oh).orR)))
+    val s2_dw_st_o   = cfDwSel(iftStMask)
+    val s2_dw_sec_o  = cfDwSel(iftSecMask)
+    val s2_dw_atk_o  = cfDwSel(iftAtkMask)
+    val s2_dw_edge_o = cfDwSel(iftSecMask)   // [U1DW] the edge is the value mask (no edge-only field IFT on)
+    def s2_dw_st:   Bool = s2_dw_st_o.getOrElse(iftStAt(s2_store_entry, s2_req(w).addr))
+    def s2_dw_sec:  Bool = s2_dw_sec_o.getOrElse(iftSecretAt(s2_store_entry, s2_req(w).addr))
+    def s2_dw_atk:  Bool = s2_dw_atk_o.getOrElse(iftAtkAt(s2_store_entry, s2_req(w).addr))
+    def s2_dw_edge: Bool = s2_dw_edge_o.getOrElse(iftEdgeAt(s2_store_entry, s2_req(w).addr))
 
     // [G9STMETA] (ruling 101, G-9) the per-doubleword store-metadata write, shared by the store
     // HIT path (t_lsu) and the MSHR REPLAY that performs a store which missed (t_replay).  Body
@@ -2050,9 +2220,23 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
         val new_ws_m   = (old_ws & ~sub_oh) | Mux(st_wsec, sub_oh, 0.U)
         val new_wa_m   = (old_wa & ~sub_oh) | Mux(st_watk, sub_oh, 0.U)
         // [STDW] patch 60: every store marks its DW as overwritten since the fill (one OR, parallel to atkMask)
-        val new_st_m   = iftStMask(s2_store_entry) | sub_oh
-        val entry      = mkIftStore(iftPcSlice(s2_req(w).uop.debug_pc), new_sec_m, new_atk_m, new_edge_m,
-                                    new_ws_m, st_ep_s, new_wa_m, st_ep_a, new_st_m)   // [PCPROV]
+        // [SECSTDW] patch 70 (secret twin of V1 (a), owner 2026-10-19): ...except a store at a secret-DERIVED
+        // address (cf_addr_sec: the LSU's bit on a hit, the rpq request's own bit on a replay, mshrs.scala
+        // [SECSTDW]).  Its location was chosen by the secret (r116 destination rule; r117: it marks the line in
+        // the same access), so its DW is NOT a clean overwrite: the bit is CLEARED and the line-state secret value
+        // applies to that DW again (as before patch 60).  No edge changes (a clean-data store at a secret address
+        // still gives only the residency edge: t53 m54, t64 m67).  Side effect, the safe side: an attacker
+        // line-state value of that DW also re-applies until the next store.  The OR becomes a set/clear (still
+        // one LUT per bit), 0 levels (cf_addr_sec is an s2 request flop).  IFT off: cf_addr_sec is None.
+        val st_asec    = s2_req(w).cf_addr_sec.getOrElse(false.B)
+        val new_st_m   = Mux(st_asec, iftStMask(s2_store_entry) & ~sub_oh, iftStMask(s2_store_entry) | sub_oh)
+        // [ONETAG] r205: IFT on, the secret window kind is gone (no epoch); the store's DW takes the store's tag
+        // (st_sec: data secret || the store's commit record, lsu.scala S-a).  IFT off: the old layout.
+        // [U1DW] IFT on: no whole-line mark (new_edge_m / st_wl feed the IFT-off layout only).
+        val entry      = if (ENABLE_IFT) mkIftStore1(iftPcSlice(s2_req(w).uop.debug_pc), new_sec_m, new_atk_m,
+                                                     new_st_m)   // [ONETAGATK]
+                         else mkIftStore(iftPcSlice(s2_req(w).uop.debug_pc), new_sec_m, new_atk_m, new_edge_m,
+                                         new_ws_m, st_ep_s, new_wa_m, st_ep_a, new_st_m)   // [PCPROV]
         cf_sm_lane_v(w) := true.B   // [D1FIXA]
         for (way <- 0 until nWays) {
           when (s2_tag_match_way(w)(way)) {
@@ -2094,7 +2278,17 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     // recorded by ift_repl_atk (overwrite, the eviction attribution).  The secret kind ([RESID], r116 A(2)) is
     // unchanged.  A secret hit keeps the line's attacker bit (old value) and, as before, takes the PC.
     // Cost: -2 LUT inputs (when + data), 0 FF, 0 levels.  IFT off: cf_addr_* are None (constant 0).
-    val cf_mark_sec = s2_req(w).cf_addr_sec.getOrElse(false.B)
+    // [M5HIT] lean58 (Fable audit M5; owner 2026-10-23 "hits also mark the line"; RULES A reading 3 / footprint
+    // quote): a secret (s_acc) or s_prop LOAD that HITS marks the line secret too, as [FILLSEC] does for one that
+    // fills (same request terms: isRead && (s_acc || s_prop), s2 request flops).  Every later load of a DW of that
+    // line not stored since the fill gets the residency edge and the secret value (patch 70).  RECORD CHANGE and a
+    // flood risk: under the FINAL window rules most records are s_prop, so most loaded lines become secret
+    // (flood check required).  More lane residency writes also mean more [H1T] dropped clears / fill marks.
+    // Levels: 2 more inputs on the existing hit-mark enable (flops): 0 added.  IFT off: the old term (Options).
+    val cf_mark_sec = if (ENABLE_IFT) s2_req(w).cf_addr_sec.get ||
+                        (isRead(s2_req(w).uop.mem_cmd) && (s2_req(w).uop.cf_secret_access.get ||
+                                                           s2_req(w).uop.cf_secret_propagation.get))
+                      else s2_req(w).cf_addr_sec.getOrElse(false.B)
     when (cf_lsu_hit && cf_mark_sec) {
       val old_s = iftResSec(s2_res_entry)
       val mk_pc = Mux(cf_mark_sec || !old_s, iftPcSlice(s2_req(w).uop.debug_pc), iftResPc(s2_res_entry))
@@ -2136,13 +2330,13 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       // INFL_MEM_DATAFLOW: victim LOAD reads a line last STORED by attacker (data channel, loads only)
       // [R1e] tests the DEDICATED atk bit, not the domain field: a victim store of
       // attacker-derived data must fire this too, and it no longer forges `domain`.
-      val memdf_fire  = cf_lsu_hit && uop_dom === 0.U && is_load && iftAtkAt(s2_store_entry, s2_req(w).addr)
+      val memdf_fire  = cf_lsu_hit && uop_dom === 0.U && is_load && s2_dw_atk   // [F9DW]
       // Fix 3a: memsec_fire — any LOAD reading a line whose last store had s_prop/s_acc set.
       // Same-domain secret propagation via memory: is_atk=false, is_secret=true.
       // Gated by !memdf_fire to avoid two INFL_MEM_DATAFLOW entries for the same store
       // when the store is simultaneously attacker-domain AND secret-marked.
       // [WLEDGE] step 21 (owner r139, F1): the EDGE fires for a whole-line mark too (edgeMask)
-      val memsec_fire = is_load && iftEdgeAt(s2_store_entry, s2_req(w).addr) && !memdf_fire
+      val memsec_fire = is_load && s2_dw_edge && !memdf_fire   // [F9DW]
       // [RESID] residency: any-domain load on a line marked by a secret-address access.
       // At most 3 edges fire (evict, memdf|memsec, res), within the 4-slot list.
       // [NACKRES] step 16: on an LSU hit, s2_req.cf_res_v is the nack edge (ldq cf_nack_res);
@@ -2173,18 +2367,27 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
         pcCandidates(evict_fire || ratk_fire,
                      Mux(evict_fire, iftFillPc(s2_fill_entry), iftResPc(s2_res_entry)),
                      INFL_CACHE_EVICTION, true.B, evict_fire && iftFillSecMask(s2_fill_entry).orR) ++
-        pcCandidates(memdf_fire,  iftPc(s2_store_entry),    INFL_MEM_DATAFLOW,   true.B,  iftEdgeAt(s2_store_entry, s2_req(w).addr)) ++   // [WLEDGE]
+        pcCandidates(memdf_fire,  iftPc(s2_store_entry),    INFL_MEM_DATAFLOW,   true.B,  s2_dw_edge) ++   // [WLEDGE] [F9DW]
         pcCandidates(memsec_fire, iftPc(s2_store_entry),    INFL_MEM_DATAFLOW,   false.B, true.B) ++
-        pcCandidates(res_fire,    res_pc,                   INFL_CACHE_EVICTION, res_atk, res_sec))   // [RESID]
+        pcCandidates(res_fire,    res_pc,                   INFL_CACHE_EVICTION, res_atk, res_sec) ++   // [RESID]
+        // [RDEDGE] patch 80: an SC (lane 0) served while the reservation's LR label is set.  At most 3 D$ edges fire
+        // for an SC (evict, res, this; memdf/memsec are loads only), so nothing drops.
+        (if (ENABLE_IFT && w == 0) Seq(InfluencerCandidate(s2_sc && cf_lrsc_v, cf_lrsc_oc, INFL_LRSC, cf_lrsc_atk, cf_lrsc_sec))
+         else Seq()))   // Scala-gated: IFT off the batch keeps its three candidate groups
       cache_resp(w).bits.edges := resp_edges
+      // [CEREPL] lean59: a replay load's MSHR edge (res_fire through s2_req.cf_res_v; the LSU's nack edge has
+      // cf_res_repl = 0) that names the replacement-state advancer.  A secret-resident line's own mark (res_line)
+      // takes the PC first and is not replacement-state.  The other D$ edges (evict_fire / ratk_fire: fill and
+      // residency marks; memdf / memsec; LRSC) never are.  Record bit [254] via the ROB sidecar (rob-ift-sidecar.scala).
+      cache_resp(w).bits.edges.ce_repl.foreach(_ := res_fire && !res_line && s2_req(w).cf_res_repl.getOrElse(false.B))
       // Set summary flags so writeback paths can skip scanning cf_influencer_list.
-      when (memdf_fire)  { uop_resp_final.cf_mem_dataflow_atk.foreach(_ := true.B) }
+      // (memdf_fire sets cf_mem_dataflow_atk: [F9FLAT] below.)
       // [FIFO10] step 10 (R-STICKY): the secret-dataflow summary is set for EVERY load that reads a
       // secret-written chunk.  `!memdf_fire` in memsec_fire only de-duplicates the EDGE (the
       // memdf edge already carries is_secret); it used to suppress the summary bit as well when
       // the last writer was attacker-influenced and secret.
       // [WLEDGE] step 21: the VALUE flag keys on the per-DW value mask only (never edgeMask).
-      when (is_load && iftSecretAt(s2_store_entry, s2_req(w).addr)) { uop_resp_final.cf_mem_sec_dataflow.foreach(_ := true.B) }
+      // (is_load && the DW's secret mask sets cf_mem_sec_dataflow: [F9FLAT] below.)
       // [WINMEM] step 21 (owner r139, F2): a load (or AMO) of a WINDOW-marked DW, in the reader's
       // window epoch, returns WINDOW taint on cf_opnd_* (LSU merges it into the load's uop).
       // No edge and no secret value: it never re-arms the window.
@@ -2197,7 +2400,15 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       // secret) -> core cf_s_prop_rob_upd + ROB sticky s_prop.  Keyed on the line's ADDRESS-taint
       // mark only (never on the requester's s_prop), and the nack half of res_fire (MSHR busy,
       // no line mark) is excluded.  Miss path: mshrs.scala sets the same flag on the rpq uop.
-      when (is_load && res_line) { uop_resp_final.cf_mem_sec_dataflow.foreach(_ := true.B) }
+      // [SECSTDW] patch 70 (secret twin of [STDW] patch 60 / V1 (a), owner 2026-10-19; claude-artifacts/
+      // 20-attacker-taint-lifecycle.md section 4 item 1): the line-state secret VALUE applies to a DW only while
+      // it has not been overwritten since the fill (stMask, iftStAt), so a clean overwrite clears it (P5 "value:
+      // overwrite"; r119 "a clean overwrite of doubleword k makes k clean" now covers the residency value too).
+      // A store at a secret-derived address does not count as an overwrite (it re-opens its DW, iftStoreMetaWrite).
+      // The residency EDGE (res_fire, line-level, sec=1 -> sticky s_prop, r117) is unchanged.  Levels: st_dw is the
+      // patch-60 term (same Mux1H + 8:1 DW select as iftSecretAt, parallel); the AND joins the flag's OR LUT: 0.
+      val st_dw = s2_dw_st   // [F9DW]
+      // (is_load && res_line && !st_dw sets cf_mem_sec_dataflow: [F9FLAT] below.)
       // [ATKEVICT] step 17 (owner extension of ruling 116 C): a victim LOAD hitting a line last
       // FILLED by an attacker-domain miss (evict_fire, ift_fill_meta domain) returns a value the
       // attacker placed there: attacker taint on the value (preg taint_atk via the LSU's
@@ -2207,21 +2418,34 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       // store (clean or not) overwrote it, and atkMask / memdf now carry that store's own taint.  The
       // CACHE_EVICTION edge (evict_fire, a line-level record) is unchanged.  Levels: iftStAt is the same
       // Mux1H + 8:1 DW select as iftAtkAt (memdf), parallel; the AND joins the flag's OR LUT: 0 added.
-      val st_dw = iftStAt(s2_store_entry, s2_req(w).addr)
-      when (is_load && evict_fire && !st_dw) { uop_resp_final.cf_mem_dataflow_atk.foreach(_ := true.B) }
+      // ([SECSTDW] patch 70: st_dw is now defined above, shared with the secret twin.)
+      // (is_load && evict_fire && !st_dw sets cf_mem_dataflow_atk: [F9FLAT] below.)
       // [ATKRES] step 17 (owner ruling 119 (3)): ...and on a line marked by an attacker-ADDRESS
       // access.  Miss path: mshrs.scala cf_rp_vatk.  [STDW] patch 60: per DW, as above.
-      when (ratk_fire && !st_dw) { uop_resp_final.cf_mem_dataflow_atk.foreach(_ := true.B) }
+      // (ratk_fire && !st_dw sets cf_mem_dataflow_atk: [F9FLAT] below.)
       // [STDW] patch 60, MSHR replay (t_replay) loads: the replay uop carries the MSHR's line-level value
       // taint (mshrs.scala cf_rp_vatk: attacker-caused eviction or attacker-address fill).  The store meta of
       // the new line is valid here (zeroed at the first refill beat, then written by this MSHR's store
       // replays, which precede this load in rpq order), so: a DW a replayed store overwrote loses the
       // line-level taint and takes that store's own (atkMask, VALUE only: the memdf EDGE stays hit-only as
       // before).  Line-buffer (s_drain_rpq_loads) responses keep cf_rp_vatk unchanged: no store precedes them.
-      when (ENABLE_IFT.B && cf_rp_load && is_load) {
-        when (st_dw) { uop_resp_final.cf_mem_dataflow_atk.foreach(_ := false.B) }
-        when (iftAtkAt(s2_store_entry, s2_req(w).addr)) { uop_resp_final.cf_mem_dataflow_atk.foreach(_ := true.B) }
-      }
+      // [SECSTDW] patch 70, the secret twin: the replay uop's cf_mem_sec_dataflow is line-level (mshrs.scala
+      // cf_rp_vsec: a secret-address fill of this MSHR [SECDEST], or a secret-chosen eviction [VSECEV]); a DW a
+      // replayed store overwrote loses it and keeps only the per-DW value mask (secMask: the store's own data).
+      // The edges (cf_res_v from the MSHR, memsec) are unchanged.
+      // [F9FLAT] lean58 timing F9: the two value flags as one expression each instead of the chain of when-blocks
+      // (set, set, set, then on a replay load: clear on st_dw, set on the DW mask).  Literal translation of the old
+      // last-connect chain, for every input (no exclusivity assumed): with v = the flag after the unconditional sets
+      // and rp = (IFT && cf_rp_load && is_load), old = rp ? ((st_dw ? 0 : v) || dw) : v = (v && !(rp && st_dw)) ||
+      // (rp && dw).  Checked by exhaustive truth table (lean58-staged/tools/f9_truth.py).  The base value (A0/S0)
+      // is the request uop's flag (uop_resp_base).  0 FF.
+      val cf_rp_ld = ENABLE_IFT.B && cf_rp_load && is_load
+      val cf_atk_v = uop_resp_base.cf_mem_dataflow_atk.getOrElse(false.B) || memdf_fire ||
+                     (is_load && evict_fire && !st_dw) || (ratk_fire && !st_dw)
+      val cf_sec_v = uop_resp_base.cf_mem_sec_dataflow.getOrElse(false.B) || (is_load && s2_dw_sec) ||
+                     (is_load && res_line && !st_dw)
+      uop_resp_final.cf_mem_dataflow_atk.foreach(_ := (cf_atk_v && !(cf_rp_ld && st_dw)) || (cf_rp_ld && s2_dw_atk))
+      uop_resp_final.cf_mem_sec_dataflow.foreach(_ := (cf_sec_v && !(cf_rp_ld && st_dw)) || (cf_rp_ld && s2_dw_sec))
 
       // corefuzzing: ift_store_meta writes are collected per-way and merged after the
       // memWidth loop so each SyncReadMem sees exactly ONE write port (Vivado dissolves
@@ -2240,6 +2464,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     cache_resp(w).bits.cf_res_pc.foreach(_ := 0.U)
     cache_resp(w).bits.cf_res_atk.foreach(_ := false.B)   // [ATKEVICT]
     cache_resp(w).bits.cf_res_esec.foreach(_ := false.B)
+    cache_resp(w).bits.cf_res_repl.foreach(_ := false.B)   // [CEREPL] edges already built above
   }
 
   // [FILLINIT 2026-09-07] A refill MUST clear this line's store-metadata.
@@ -2260,9 +2485,8 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // safe because "any store racing it is on the tag being evicted": that holds only for a store
   // to the SAME set.  The merged writer is per WAY, so the race that mattered was a lane write to
   // the same way in ANOTHER set, a live line, whose write the clear dropped: D1 S1/S2/R1.)
-  // Slot 0 now LOSES to the lane slots and is deferred (cf_psm_way / cf_prm_way + cf_pclr_idx)
-  // until its way is free; the MSHRs are held meanwhile (cf_pend_hold), so it still lands
-  // before every replay and meta write of its own line.
+  // Slot 0 now LOSES to the lane slots; [H1T] lean58: the losing clear is dropped (counted in debug builds),
+  // no longer deferred behind an MSHR hold.
   // [G9STMETA] (ruling 101) the clear is issued on the FIRST REFILL BEAT (the MSHR installing
   // the new line's data, s_commit_line), not at the MSHR's final meta write (s_meta_write_req):
   // that write comes AFTER s_drain_rpq, so it zeroed the metadata of every replayed store.
@@ -2270,12 +2494,10 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // that refills no data no longer clears the line (its content, and its taint, is kept).
   val cf_refill_first_beat = mshrs.io.refill.fire &&
     (if (rowOffBits < blockOffBits) mshrs.io.refill.bits.addr(blockOffBits-1, rowOffBits) === 0.U else true.B)
-  // [D1FIXA] slot 0 = this cycle's first beat, or the deferred clear (exclusive: no beat fires
-  // under cf_pend_hold).  Per way the valid is one LUT of (first beat, way_en, pending bit), as
-  // deep as the old (first beat && way_en); the index is the flop-selected cf_clr_src_idx.
+  // [H1T] slot 0 = this cycle's first beat only (no deferred clear).
   val cf_clr_new = (0 until nWays).map(way => cf_refill_first_beat && mshrs.io.refill.bits.way_en(way))
-  val cf_clr_sm  = (0 until nWays).map(way => cf_clr_new(way) || cf_psm_way(way))
-  val cf_clr_rm  = (0 until nWays).map(way => cf_clr_new(way) || cf_prm_way(way))
+  val cf_clr_sm  = cf_clr_new
+  val cf_clr_rm  = cf_clr_new
   for (way <- 0 until nWays) {
     when (cf_clr_sm(way)) {
       ift_sm_wr_valid(way)(0) := true.B
@@ -2293,7 +2515,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // corefuzzing: merged single-writer for ift_store_meta (one write port per way).
   // Stores use lane 0 only (lsu.scala), so the lane slots never collide with each other; the
   // only collision is a lane write with the slot-0 clear of ANOTHER set in the same way, and
-  // [D1FIXA] the lane wins and the clear is deferred (see cf_psm_way).  One write port per way
+  // [D1FIXA] the lane wins; [H1T] the clear is dropped (see [IFTMDROP]).  One write port per way
   // keeps Vivado LUTRAM inference.
   //
   // IFT compile-time gate: when ENABLE_IFT=false, the write loop is elided and
@@ -2318,7 +2540,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       // last_v = RegNext(any_wr), last_idx = RegNext(ift_sm_wr_idx(way)(sel)):
       //  (1) the slot compares use the slot's index SOURCE, which is exactly what the slot's
       //      ift_sm_wr_idx is when the slot is valid: slot 0 = cf_clr_src_idx (FILLINIT block;
-      //      [D1FIXA] the pending clear's index under cf_pend_hold, else the refill index),
+      //      [H1T] the refill index),
       //      slot l+1 = dcacheMaskIdx(s2_req(l).addr) (iftStoreMetaWrite, both callers).
       //  (2) (wv & first & eq).orR = any_wr && eq(winner): `first` is the one-hot of the slot
       //      actually written ([D1FIXA] cfLaneFirstOH, lanes before slot 0); for wv = 0 both are 0.
@@ -2356,7 +2578,9 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     // cycle is no longer a drop: the expected pattern is sel>=1 with the slot-0 clear deferred
     // (psm set on the next cycle).  sel=0 with a lane slot valid would be a lane write lost.
     // R3 (two res lane slots, same way) is the only remaining [RMDROP] drop.
-    if (ENABLE_CF_DEBUG_PRINTF) {
+    // Opt-in (owner 2026-10-21): these are D$ shadow-state prints for the oracle's dcheck only,
+    // so they sit behind ENABLE_CF_CACHE_SHADOW_PRINTF (WithCfCacheShadowPrintf), off by default.
+    if (ENABLE_CF_CACHE_SHADOW_PRINTF) {
       val cf_d1_cyc = RegInit(0.U(40.W))
       cf_d1_cyc := cf_d1_cyc + 1.U
       for (way <- 0 until nWays) {
@@ -2366,12 +2590,12 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
             cf_d1_cyc, way.U, smv, OHToUInt(ift_sm_oh(way)), Mux1H(ift_sm_oh(way), ift_sm_wr_idx(way)), ift_sm_wr_idx(way)(1),
             s2_req(0).uop.debug_pc, s2_req(0).uop.cf_op_count_id.getOrElse(0.U), s2_type,
             s2_req(0).uop.cf_secret_propagation.getOrElse(false.B), s2_req(0).uop.cf_secret_transmission.getOrElse(false.B),
-            cf_refill_first_beat, mshrs.io.refill.bits.addr, cf_pend_hold, cf_psm_way)
+            cf_refill_first_beat, mshrs.io.refill.bits.addr, false.B, 0.U(nWays.W))   // [H1T] hold/psm: always 0
         }
         when (PopCount(ift_rm_wv(way)) > 1.U) {
           printf("[RMDROP] cyc=%d way=%d wv=0x%x sel=%d i0=%d i1=%d i2=%d i3=%d hold=%d prm=0x%x prf=0x%x\n", cf_d1_cyc, way.U, ift_rm_wv(way), ift_rm_sel(way),
             ift_rm_wr_idx(way)(0), ift_rm_wr_idx(way)(1), ift_rm_wr_idx(way)(2), ift_rm_wr_idx(way)(3),
-            cf_pend_hold, cf_prm_way, cf_prf_way)
+            false.B, 0.U(nWays.W), 0.U(nWays.W))   // [H1T] hold/prm/prf: always 0
         }
       }
       when (s2_valid(0) && isWrite(s2_req(0).uop.mem_cmd) && (s2_type === t_lsu || s2_type === t_replay)) {
@@ -2382,30 +2606,25 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       when (cf_refill_first_beat) {
         printf("[RFB] cyc=%d addr=0x%x way_en=0x%x\n", cf_d1_cyc, mshrs.io.refill.bits.addr, mshrs.io.refill.bits.way_en)
       }
-      // [D1FIXA] the liveness guard fired (a deferred write waited 16 cycles): expected never
-      when (cf_pend_starve && !RegNext(cf_pend_starve, false.B)) {
-        printf("[D1STARVE] cyc=%d psm=0x%x prm=0x%x prf=0x%x clr_idx=%d prf_idx=%d\n", cf_d1_cyc,
-          cf_psm_way, cf_prm_way, cf_prf_way, cf_pclr_idx, cf_prf_idx)
-      }
+      // ([D1STARVE] removed with the liveness guard, [H1T].)
     }
 
     // [RESID] fill-set slot 1: the MSHR meta write of a secret-address fill (set-only)
     // [ATKRES] step 17: or of an attacker-address fill (the line was cleared at the refill beat,
     // so the write needs no merge)
-    // [D1FIXA] or the deferred fill mark (cf_prf_*): exclusive with a new one (the MSHR meta
-    // writes are held under cf_pend_hold), so the flop-selected 2:1 muxes pick the source.
+    // ([H1T] no deferred fill mark: a fill mark that loses its way's port is dropped and counted.)
     val cf_fill_new = mshrs.io.cf_meta_write_fill.valid &&
                       (mshrs.io.cf_meta_write_fill.bits.addr_sec || mshrs.io.cf_meta_write_fill.bits.addr_atk)
     val cf_fill_new_dat = Cat(mshrs.io.cf_meta_write_fill.bits.addr_sec,
                               mshrs.io.cf_meta_write_fill.bits.addr_atk,
                               mshrs.io.cf_meta_write_fill.bits.res_pc)
     val cf_fill_v = (0 until nWays).map(way =>
-                      (cf_fill_new && mshrs.io.cf_meta_write_fill.bits.way_en(way)) || cf_prf_way(way))
+                      cf_fill_new && mshrs.io.cf_meta_write_fill.bits.way_en(way))
     for (way <- 0 until nWays) {
       when (cf_fill_v(way)) {
         ift_rm_wr_valid(way)(1) := true.B
         ift_rm_wr_idx(way)(1)   := cf_fill_src_idx
-        ift_rm_wr_data(way)(1)  := Mux(cf_pend_hold, cf_prf_dat, cf_fill_new_dat)
+        ift_rm_wr_data(way)(1)  := cf_fill_new_dat
       }
     }
     // [RESID] merged single writer per way.  [D1FIXA] lane slots win (ift_rm_oh), then the clear,
@@ -2417,53 +2636,27 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       }
     }
 
-    // [D1FIXA] deferral state.  A slot-0/1 write "loses" when a higher slot of its way is valid;
-    // the loser's pending bit is set for the next cycle, and it re-enters its slot every cycle
-    // until it wins (no lane slot on its way).  Per way, next = (slot valid) AND (higher slot
-    // valid), written lane-factored: lane valid(l) AND (s2_tag_match_way(l)(way) AND slot
-    // valid(way)).  The bracket is flops / refill-side terms, so each late lane valid is one LUT
-    // from the per-way flop and <= 2 from cf_pend_hold (the exact OR of the same terms): the same
-    // depth as the existing ift_sm_fwd_hit D input, ending at a flop, not at the LUTRAM WE.
-    val cf_clr_sm_oh = VecInit(cf_clr_sm).asUInt
-    val cf_clr_rm_oh = VecInit(cf_clr_rm).asUInt
-    val cf_fill_oh   = VecInit(cf_fill_v).asUInt
-    val cf_sm_lane_w = (0 until memWidth).map(l => Mux(cf_sm_lane_v(l), s2_tag_match_way(l), 0.U))   // lane l's way, if it writes
-    val cf_rm_lane_w = (0 until memWidth).map(l => Mux(cf_rm_lane_v(l), s2_tag_match_way(l), 0.U))
-    val cf_sm_lanes  = cf_sm_lane_w.reduce(_ | _)
-    val cf_rm_lanes  = cf_rm_lane_w.reduce(_ | _)
-    val cf_psm_nxt = cf_clr_sm_oh & cf_sm_lanes
-    val cf_prm_nxt = cf_clr_rm_oh & cf_rm_lanes
-    val cf_prf_nxt = cf_fill_oh & (cf_rm_lanes | cf_clr_rm_oh)   // the fill mark also yields to the clear
-    cf_psm_way := cf_psm_nxt
-    cf_prm_way := cf_prm_nxt
-    cf_prf_way := cf_prf_nxt
-    cf_pend_hold := cf_psm_nxt.orR || cf_prm_nxt.orR || cf_prf_nxt.orR
-    when (cf_refill_first_beat) { cf_pclr_idx := dcacheMaskIdx(mshrs.io.refill.bits.addr) }
-    // A pending fill mark absorbs any lane mark written to its own line (same way and set) while
-    // it waits, so landing it later cannot erase that mark.  The lane's data was built from a read
-    // that already forwarded cf_prf_dat (cfResRead), so the OR is idempotent; the PC keeps the
-    // lane rule (the secret cause first).  Lane 0 first, as the writer (R3).  The way/set compares
-    // are flop-sourced (s2 tag-match way, s2 set, cf_prf_*); the late lane valid only selects the
-    // mux into cf_prf_dat (new endpoint: flops only).
-    val cf_prf_lane_hit = (0 until memWidth).map(l => cf_rm_lane_v(l) && (s2_tag_match_way(l) & cf_prf_way).orR &&
-                                                     dcacheMaskIdx(s2_req(l).addr) === cf_prf_idx)
-    def cfResMerge(old: UInt, nw: UInt): UInt =
-      Cat(iftResSec(nw) || iftResSec(old), iftResAtk(nw) || iftResAtk(old),
-          Mux(iftResSec(nw) || !iftResSec(old), iftResPc(nw), iftResPc(old)))
-    when (cf_fill_new) {
-      cf_prf_idx := cf_fill_new_idx
-      cf_prf_dat := cf_fill_new_dat
-    } .otherwise {
-      cf_prf_dat := PriorityMux(cf_prf_lane_hit :+ true.B,
-                                (0 until memWidth).map(l => cfResMerge(cf_prf_dat, cf_rm_lane_d(l))) :+ cf_prf_dat)
+    // [H1T] lean58: drop accounting, debug printf builds only (Verilator; FireSim / oracle / NoLog elaborate
+    // nothing, so the FPGA netlist gains nothing).  Per way, a slot-0 clear loses to a lane slot of the same way,
+    // and a slot-1 fill mark loses to a lane slot or to the clear; the merged writer (lane-first) drops it.  One
+    // 16-bit saturating count per kind and a print per dropping cycle (expected rare: a first beat or a fill
+    // meta write in the cycle a store / secret-address hit writes another set of the same way).
+    if (ENABLE_CF_DEBUG_PRINTF && !ENABLE_IFT_BRIDGE) {
+      val cf_sm_lanes = (0 until memWidth).map(l => Mux(cf_sm_lane_v(l), s2_tag_match_way(l), 0.U)).reduce(_ | _)
+      val cf_rm_lanes = (0 until memWidth).map(l => Mux(cf_rm_lane_v(l), s2_tag_match_way(l), 0.U)).reduce(_ | _)
+      val d_sm  = VecInit(cf_clr_sm).asUInt & cf_sm_lanes                               // store-meta clear dropped
+      val d_rm  = VecInit(cf_clr_rm).asUInt & cf_rm_lanes                               // res-meta clear dropped
+      val d_rf  = VecInit(cf_fill_v).asUInt & (cf_rm_lanes | VecInit(cf_clr_rm).asUInt) // fill mark dropped
+      val n_drop = RegInit(VecInit(Seq.fill(3)(0.U(16.W))))
+      val dv = Seq(d_sm.orR, d_rm.orR, d_rf.orR)
+      for (k <- 0 until 3) { when (dv(k) && n_drop(k) =/= "hffff".U) { n_drop(k) := n_drop(k) + 1.U } }
+      val cf_md_cyc = RegInit(0.U(40.W))
+      cf_md_cyc := cf_md_cyc + 1.U
+      when (dv.reduce(_ || _)) {
+        printf("[IFTMDROP] cyc=%d sm=0x%x rm=0x%x rf=0x%x clr_idx=%d fill_idx=%d n_sm=%d n_rm=%d n_rf=%d\n", cf_md_cyc,
+          d_sm, d_rm, d_rf, cf_clr_src_idx, cf_fill_src_idx, n_drop(0), n_drop(1), n_drop(2))
+      }
     }
-    // Liveness guard: 16 cycles under hold -> block new LSU requests (registered, as wk_block)
-    // until nothing is pending; lane writes then stop within 2 cycles and the deferral lands.
-    cf_pend_age    := Mux(cf_pend_hold, cf_pend_age + (cf_pend_age =/= 15.U).asUInt, 0.U)
-    cf_pend_starve := cf_pend_hold && cf_pend_age >= 14.U
-    when (cf_pend_starve) { io.lsu.req.ready := false.B }
-    assert(!(cf_pend_hold && (cf_refill_first_beat || mshrs.io.cf_meta_write_fill.valid)),
-           "[D1FIXA] a refill beat or MSHR meta write fired while a deferred IFT meta write was pending")
 
     // corefuzzing: update ift_fill_meta at MSHR fill completion (meta_write), one way at a time.
     when (mshrs.io.cf_meta_write_fill.valid) {
@@ -2529,10 +2722,15 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
                  mshrs.io.resp.bits.cf_res_atk.getOrElse(false.B),                                     // [ATKEVICT]
                  !mshrs.io.resp.bits.cf_res_atk.getOrElse(false.B) || mshrs.io.resp.bits.cf_res_esec.getOrElse(false.B)))
   uncache_resp.bits.edges               := cf_unc_edges
+  // [CEREPL] lean59: the line-buffer (miss) response's CACHE_EVICTION edge names the replacement-state advancer
+  // (mshrs.scala cf_rp_res_repl, already gated with the edge's eviction-record source).
+  uncache_resp.bits.edges.ce_repl.foreach(_ := mshrs.io.resp.bits.cf_res_v.getOrElse(false.B) &&
+                                                mshrs.io.resp.bits.cf_res_repl.getOrElse(false.B))
   uncache_resp.bits.cf_res_v.foreach(_ := false.B)
   uncache_resp.bits.cf_res_pc.foreach(_ := 0.U)
   uncache_resp.bits.cf_res_atk.foreach(_ := false.B)
   uncache_resp.bits.cf_res_esec.foreach(_ := false.B)
+  uncache_resp.bits.cf_res_repl.foreach(_ := false.B)
   // s_tx is NOT set at MSHR completion: cache miss fill is not a transmission event.
   uncache_resp.valid    := mshrs.io.resp.valid
   mshrs.io.resp.ready := !(cache_resp.map(_.valid).reduce(_&&_)) // We can backpressure the MSHRs, but not cache hits
@@ -2667,8 +2865,39 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // in the same cycle records nothing (under-taint only).
   io.lsu.cf_aatk_busy.foreach(_ := mshrs.io.cf_aatk_busy.get)
   io.lsu.cf_nack_aatk.foreach(_ := mshrs.io.cf_nack_aatk.get)   // [NACKCONF] patch 68 (V12)
+  io.lsu.cf_nack_asec.foreach(_ := mshrs.io.cf_nack_asec.get)   // [NACKCONFSEC] lean58 (M8)
   io.lsu.cf_nack_mshr.foreach(v => for (w <- 0 until memWidth) {
     v(w) := !s2_nack_hit(w) && !s2_nack_data(w)
+  })
+  // [RDEDGE] patch 80: lane w's DATA-ARRAY BANK-conflict nack (s2_nack_data = data.io.nacks, registered: an older
+  // lane j < w read the same bank at another row in s1) with the label of the older lanes' accesses ([F21REC] below:
+  // the older access's RECORD summary, was its address / domain only); key = lane 0's op_count (lane 0
+  // is the only older lane at memWidth 2; wider configs name lane 0 and OR every older lane's label).  Only LSU
+  // requests are multi-lane (s2_type === t_lsu).  The LSU turns it into an INFL_DC_BANKCONF edge on the nacked load.
+  // All terms are s2 flops: a new endpoint path (the LSU holding register), 0 levels on the nack path.
+  io.lsu.cf_bank_nack.foreach(v => for (w <- 0 until memWidth) {
+    // [F21REC] Fable review 2026-10-23 F2-1, owner answer "Use the producer record" (RULES.md C): the older lane's
+    // RECORD summary as its request carries it, like STL_FORWARD (M6) and the D$ store DW mark (st_sec / st_atk):
+    //   sec = cf_addr_sec || uop.cf_secret_access (s_acc) || uop.cf_secret_propagation (a load: its record s_prop
+    //         incl. the secret shadow, [FILLSEC] cfLdSprop; a committed store: data_is_secret || its commit-time
+    //         record cf_win_sec, [ONETAG] S-a)
+    //   atk = cf_addr_atk || attacker domain || uop.cf_attacker_influence (a load: its attacker record incl. the
+    //         attacker shadow, [ONETAGATK] cfLdAtk; a committed store: data_is_atk || cf_win_atk)
+    // The fire condition (sec || atk) follows.  Hella / prefetch requests carry NullMicroOp-style zeros (no change).
+    // Levels: s2 request flops only (5 / 3 extra OR inputs into the existing endpoint cone of the LSU holding
+    // register): at most +1 LUT on these flop leaves, 0 on the nack / brupdate leaves that set the depth.
+    // Cost [inf]: ~2-4 LUT, 0 FF.  IFT off: io.lsu.cf_bank_nack is None, not elaborated.
+    val olds = (0 until w)
+    val sec  = olds.map(j => s2_req(j).cf_addr_sec.getOrElse(false.B) ||
+                             s2_req(j).uop.cf_secret_access.getOrElse(false.B) ||
+                             s2_req(j).uop.cf_secret_propagation.getOrElse(false.B)).foldLeft(false.B)(_ || _)
+    val atk  = olds.map(j => s2_req(j).cf_addr_atk.getOrElse(false.B) ||
+                             s2_req(j).uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 1.U ||
+                             s2_req(j).uop.cf_attacker_influence.getOrElse(false.B)).foldLeft(false.B)(_ || _)
+    v(w).valid    := s2_nack_data(w) && s2_type === t_lsu && (sec || atk)
+    v(w).bits.oc  := s2_req(0).uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)).pad(inflOpCountWidthCF)(inflOpCountWidthCF - 1, 0)
+    v(w).bits.atk := atk
+    v(w).bits.sec := sec
   })
   // [QSREG R1] (Phase 4 timing, r142) `ordered` uses the REGISTERED wipe_active, not
   // dcache_wipe_busy = wipe_active || wipe_start.  wipe_start is combinational from the CSR
@@ -2691,7 +2920,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
 
   // The cache is idle when no MSHR is outstanding, no writeback/probe is pending, and
   // nothing is in flight in s1/s2.  A staged geometry change is applied ONLY here.
-  val dcache_idle = mshrs.io.cache_idle && !cf_pend_hold &&   // [D1FIXA] no deferred IFT write in flight
+  val dcache_idle = mshrs.io.cache_idle &&   // [H1T] lean58: no deferred IFT write exists any more (was !cf_pend_hold)
                     wb.io.req.ready &&
                     prober.io.req.ready &&
                     !s1_valid.reduce(_||_) && !s2_valid.reduce(_||_)

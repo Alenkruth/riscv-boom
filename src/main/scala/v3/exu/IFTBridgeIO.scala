@@ -45,7 +45,11 @@ class IFTTileIO(val retireWidth: Int) extends Bundle {
 //   [72]      cf_secret_access      1b
 //   [73]      cf_secret_propagation 1b
 //   [74]      cf_secret_transmission 1b
-//   [75]      cf_src_tainted        1b
+//   [75]      wsh                   1b   [HW1BIT75] commit records: the commit-time secret-window
+//                                        shadow test (rob.scala win_sec = io.cf_wsh_sec.inAge,
+//                                        the term that ORs s_prop at commit); 0 on squash (10)
+//                                        and kill (11) records.  Was the constant-0
+//                                        cf_src_tainted (no writer since Phase 2) until 2026-10-20
 //   [77:76]   cf_infl_dropped       2b   saturating COUNT of discarded influencers
 //                                        (0..3, 3 means ">=3"); was a 1b sticky flag
 //   [93:78]   cf_op_count_id        16b  uopIDCounterWidthCF -- the ANCHOR every
@@ -54,7 +58,9 @@ class IFTTileIO(val retireWidth: Int) extends Bundle {
 //   [95]      cf_spec_branch_is_secret 1b
 //   [103:96]  cf_spec_branch_op_id  8b   specBranchOpIdWidthCF -- LOW bits only
 //   [104]     cf_single_step        1b
-//   [128:105] cf_fu_bitmap          24b  one bit per pipeline module (numModules=24)
+//   [128:105] cf_fu_bitmap          24b  one bit per pipeline module (numModules=24); [FTQHOLD] option A: bits 1-3
+//                                        ([108:106]) carry sftq: [107] = sftq[0], [108] = sftq[1], [106] = !sftq[2]
+//                                        (sftq = 0 -> 0,0,1, the old constant); written by the dispatch column only
 //   [131:129] cf_cntd_deny_count    3b   Log2Bucket -- issue-port denial cycles
 //   [134:132] cf_stall_cycles_rob   3b   Log2Bucket -- ROB-full dispatch stall cycles
 //   [137:135] cf_stall_cycles_stq   3b   Log2Bucket -- STQ head-of-line residency
@@ -80,7 +86,11 @@ class IFTTileIO(val retireWidth: Int) extends Bundle {
 //   [252:246] cf_sec_branch_ctr      7b  GHR secret window counter
 //   [255:253] reserved/zero          3b  squash records (event_type 10): rob.scala ORs the
 //                                        squash cause into bit [253] (0 branch kill, SRC=3;
-//                                        1 exception rollback, SRC=4); [255:254] stay 0
+//                                        1 exception rollback, SRC=4)
+//   [254]     ce_repl                1b   [CEREPL] lean59: a CACHE_EVICTION edge of this row was
+//                                        attributed through the set's replacement state
+//                                        (IftCommitInfo.ce_repl; commit and squash records;
+//                                        0 on kill records and with IFT off); [255] stays 0
 //
 // Total: fixedBits 167 (incl. pregs and rtypes) + 72 influencers + 14 GHR counters
 // + 3 reserved = 256 bits.
@@ -102,7 +112,12 @@ object uopToIFTBits extends CoreFuzzingConstants {
   // [THINUOP] Phase 3 Task 3.5: every IFT field that left the MicroOp comes from `ift`; the four
   // sticky flags (s_acc, s_prop, s_tx, atk) come from `sticky`, with the attacker flag ORed with
   // ift.edge_atk (what IftApply did).  op_count / domain / pc / inst / pregs / rtypes stay on `uop`.
-  def apply(uop: MicroOp, ift: IftCommitInfo, sticky: (Bool, Bool, Bool, Bool), event_type: UInt, priv: UInt): UInt = {
+  // [HW1BIT75] (owner ruling R-b, 2026-10-20) `wsh` fills record bit [75].  Only the ROB's commit
+  // packer passes it (rob.scala: the lane's commit-time win_sec, already computed for s_prop); the
+  // squash packers (ift-squash-fifo.scala, the rob.scala capture shadow) and the kill packer
+  // (core.scala) keep the default false.B, so their bit [75] stays the constant 0 it always was.
+  def apply(uop: MicroOp, ift: IftCommitInfo, sticky: (Bool, Bool, Bool, Bool), event_type: UInt, priv: UInt,
+            wsh: Bool = false.B): UInt = {
     val (s_acc, s_prop, s_tx, atk) = sticky
     // Per-slot bit width: valid(1) + op_count(inflOpCountWidthCF) + infl_type(5) +
     //                     is_atk(1) + is_secret(1)
@@ -151,6 +166,7 @@ object uopToIFTBits extends CoreFuzzingConstants {
     // The assert below is the guard: if an image ever lands above 4GiB this FAILS LOUDLY
     // instead of silently truncating the anchor every downstream field reconstructs against.
     val reservedBits  = 256 - fixedBits - inflTotalBits - 7 - 7
+    require(reservedBits == 3, s"[CEREPL] bit 254 assumes the 3 reserved bits [255:253]; reserved=$reservedBits")
     require(reservedBits >= 0,
       s"IFT bridge record overflows 256 bits: fixed=$fixedBits infl=$inflTotalBits " +
       s"ghist=14 (atk 7 + sec 7) -> reserved=$reservedBits.  A negative reserve SILENTLY " +
@@ -158,7 +174,10 @@ object uopToIFTBits extends CoreFuzzingConstants {
       s"by design.")
     // Build 256-bit record (Cat: first arg = MSB, last arg = LSB)
     Cat(
-      0.U(reservedBits.W),                 // [255:253]   3b  reserved (fills to 256)
+      0.U((reservedBits - 2).W),           // [255]       1b  reserved (fills to 256)
+      ift.ce_repl.getOrElse(false.B),      // [254]       1b  [CEREPL] lean59 (owner 2026-10-23): replacement-
+                                           //      state-attributed CACHE_EVICTION edge on this row
+      0.U(1.W),                            // [253]       1b  reserved (squash packers OR the cause in)
       ift.sec_branch_ctr,               // [252:246]   7b  GHR SECRET window counter -- on the
                                            //      bridge as of PC32; previously log-only,
                                            //      which made half of descriptor.py's GHR
@@ -186,8 +205,9 @@ object uopToIFTBits extends CoreFuzzingConstants {
       ift.spec_branch_is_atk,           // [94]        1b
       uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)),                  // [93:78]     uopIDCounterWidthCF bits (full width)
       ift.infl_dropped,                 // [77:76]     2b
-      0.U(1.W),                         // [75]        1b  cf_src_tainted: no writer since Phase 2
-                                           //      (Task 3.9 dropped the constant column bit)
+      wsh,                              // [75]        1b  [HW1BIT75] commit-time secret-window shadow
+                                           //      bit (was the constant-0 cf_src_tainted; Task 3.9
+                                           //      had dropped its column).  Width unchanged: 1b
       s_tx,          // [74]        1b
       s_prop,           // [73]        1b
       s_acc,                // [72]        1b

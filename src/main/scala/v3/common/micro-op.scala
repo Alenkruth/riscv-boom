@@ -94,6 +94,18 @@ class CF_MemOrdUpdate(implicit p: Parameters) extends BoomBundle with CoreFuzzin
   val prod_op_count = UInt(inflOpCountWidthCF.W)    // the conflicting store/load's op_count
   val is_atk        = Bool()
   val is_secret     = Bool()
+  // [RDEDGE] patch 80: the edge's type.  INFL_MEM_ORDER on the two MEM_ORDER ports; INFL_STL_PARTIAL /
+  // INFL_DC_BANKCONF on the reader-edge port (rob.scala cf_lsu_rdedge_upd).  IFT only.
+  val infl_type     = if (ENABLE_IFT) Some(UInt(inflTypeWidthCF.W)) else None
+}
+
+/** [RDEDGE] patch 80: a D$ data-array BANK-conflict nack of lane w, with the label of the older lane's access that
+  * won the bank (dcache.scala cf_bank_nack): its op_count (the edge key) and whether its address is attacker-tainted /
+  * attacker-domain (atk) or secret-derived (sec).  Valid only when one of the two is set. */
+class CF_BankNack(implicit p: Parameters) extends BoomBundle with CoreFuzzingConstants {
+  val oc  = UInt(inflOpCountWidthCF.W)
+  val atk = Bool()
+  val sec = Bool()
 }
 
 /** ROB update for cf_secret_propagation, carrying WHY it fired.
@@ -274,7 +286,7 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   val cf_op_count_id = if (ENABLE_IFT) Some(UInt(uopIDCounterWidthCF.W)) else None // 16-bit sequential uop counter, assigned in fetch-buffer.
                                // Wraps at 65536. Provides comfortable headroom for all current workloads.
 
-  val cf_ras_pred_xdom        = if (ENABLE_IFT) Some(Bool()) else None      // ret whose RAS-predicted top was cross-domain (doc 67 Part B); RAS edge raised at ret-mispredict in ROB
+  val cf_ras_pred_xdom        = if (ENABLE_IFT) Some(Bool()) else None      // ret whose popped RAS slot was pushed by the other domain, or victim ret that popped a stale slot (doc 67 Part B, [RASPTR]); [RASEVERY] RAS edge on every such ret (ROB sidecar C_disp)
 
   // Bitmap of all pipeline modules this uop has visited (one bit per module, see CoreFuzzingConstants)
   val cf_fu_bitmap            = if (ENABLE_IFT) Some(UInt(numModules.W)) else None

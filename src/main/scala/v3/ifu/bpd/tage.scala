@@ -221,6 +221,35 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
     }
   }
 
+  // [SINKFACTS86] patch 86 (all-sinks study Q6): every TAGE table write, debug printf builds only (the
+  // IftSquashMerge gate: IFT on, CF debug printfs on, no IFT bridge; IFT off / NoLog / FireSim elaborate nothing).
+  // h / ts = this table's history length / tag size (the pair names the table; two tables share h = 16);
+  // pc = the bank-aligned update pc (bank = pc[3]); idx / tag = the hashed row and tag written; m = entry write
+  // mask, al = allocations, tk = taken; old = the FETCH-time provider counter (non-allocating slots); byp / bypv =
+  // the 2-entry write bypass hit and its row (used = bypv when byp = 1, else old); new = written counters;
+  // um / u = u-bit write mask and value; clr = {hi, lo} periodic u-clear in this cycle (it wins over the update's
+  // u write of that half, tage.scala hi_us / lo_us).  [TAGECLR] marks the start of each u-clear sweep (the time
+  // base of the u state).  The host replays the writes from the reset (ctr 0, valid 0): used =/= true is a
+  // fetch-vs-update interleaving event.  Unwritten slots are printed 0.
+  if (ENABLE_IFT && ENABLE_CF_DEBUG_PRINTF && !ENABLE_IFT_BRIDGE) {
+    val cf_sf_cyc = RegInit(0.U(40.W))
+    cf_sf_cyc := cf_sf_cyc + 1.U
+    def cfMasked(m: Seq[Bool], v: Seq[UInt], w: Int): UInt = VecInit(m.zip(v).map { case (b, x) => Mux(b, x, 0.U(w.W)) }).asUInt
+    when (!doing_reset && (io.update_mask.asUInt =/= 0.U || io.update_u_mask.asUInt =/= 0.U)) {
+      printf("[TAGEW] cyc=%d pc=0x%x h=%d ts=%d idx=0x%x tag=0x%x m=0x%x al=0x%x tk=0x%x old=0x%x byp=%d bypv=0x%x new=0x%x um=0x%x u=0x%x clr=%d\n",
+        cf_sf_cyc, io.update_pc, histLength.U, tagSz.U, update_idx, update_tag, io.update_mask.asUInt,
+        io.update_alloc.asUInt & io.update_mask.asUInt, io.update_taken.asUInt & io.update_mask.asUInt,
+        cfMasked((0 until bankWidth).map(w => io.update_mask(w) && !io.update_alloc(w)), io.update_old_ctr, 3),
+        wrbypass_hit, wrbypass(wrbypass_hit_idx).asUInt,
+        cfMasked(io.update_mask, update_wdata.map(_.ctr), 3),
+        io.update_u_mask.asUInt, cfMasked(io.update_u_mask, io.update_u, 2),
+        Cat(doing_clear_u_hi, doing_clear_u_lo))
+    }
+    when (!doing_reset && doing_clear_u && clear_u_idx(log2Ceil(nRows)-1, 0) === 0.U) {
+      printf("[TAGECLR] cyc=%d h=%d ts=%d hi=%d\n", cf_sf_cyc, histLength.U, tagSz.U, doing_clear_u_hi)
+    }
+  }
+
 
 
 }
@@ -440,7 +469,11 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
   }
 
   // corefuzzing: TAGE domain mismatch — any table hit a row last updated by a different domain
-  io.f3_bpd_domain_mismatch := tables.map(t => t.io.f3_domain_mismatch.reduce(_||_)).reduce(_||_)
+  // [ATKDMMASK] lean58 A5 (gap inventory 2026-10-23): the attacker-side twin of [BPDMASK]: a slot below the fetch
+  // PC, or a bank whose request is not valid, is not part of the packet; its domain label raises no edge either.
+  io.f3_bpd_domain_mismatch := (if (ENABLE_IFT) tables.map(t =>
+    (t.io.f3_domain_mismatch.asUInt & s3_mask & Fill(bankWidth, s3_valid)).orR).reduce(_||_)
+    else tables.map(t => t.io.f3_domain_mismatch.reduce(_||_)).reduce(_||_))   // IFT off: unchanged Verilog
   // corefuzzing: TAGE secret mismatch — any table hit a row trained by a secret instruction
   // [BPDMASK] r170 A (DF-dt-sprop): a slot below the fetch PC, or a bank whose request is not
   // valid, is not part of the packet; its secret label raises no edge.

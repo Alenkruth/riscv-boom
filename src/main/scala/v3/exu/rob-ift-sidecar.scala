@@ -37,11 +37,11 @@ class RobIftBankIO(numRows: Int, wbPorts: Int, clrPorts: Int, sprobPorts: Int,
   val enq    = Input(Valid(new IftRowEnq(rowW)))
   // Task 3.2 (D16): the thin writeback payload (row, the response's edge list, fu_bitmap)
   val wb     = Input(Vec(wbPorts,     Valid(new IftRowWb(rowW))))
-  val clr    = Input(Vec(clrPorts,    Valid(new IftRowBitmap(rowW))))
+  val clr    = Input(Vec(clrPorts,    Valid(new IftRowClr(rowW))))   // [STTY0] + the store operand labels
   val sprob  = Input(Vec(sprobPorts,  Valid(new IftRowSprob(rowW))))   // spec 5.1.2 amendment: row + is_atk + is_secret
   val ic     = Input(Vec(icPorts,     Valid(new IftRowIc(rowW))))
   val memord = Input(Vec(memordPorts, Valid(new IftRowMemord(rowW))))
-  val ras    = Input(Valid(UInt(rowW.W)))
+  // [RASEVERY] the b2 RAS port (C_ras) is removed: the RAS edge is the dispatch column's ras_xdom
   // op_count guard reads (async)
   val guard_row = Input(Vec(guardPorts, UInt(rowW.W)))
   val guard_oc  = Output(Vec(guardPorts, UInt(uopIDCounterWidthCF.W)))
@@ -113,10 +113,8 @@ object IftMerge extends CoreFuzzingConstants {
     e
   }
 
-  /** @param rasNow [RASBYP] patch 40: the RAS edge of this row is being written THIS cycle
-    *        (commit readout only; false for the squash merges).  It is the newest edge of the
-    *        row, so it is valid and its key is forced to the maximum (see raK). */
-  def apply(r: IftRawRow, rasNow: Bool = false.B)(implicit p: Parameters): (IftCommitInfo, Bool) = {
+  /** [RASEVERY] the rasNow parameter ([RASBYP] patch 40, same-cycle C_ras write) is gone with C_ras. */
+  def apply(r: IftRawRow)(implicit p: Parameters): (IftCommitInfo, Bool) = {
     val disp = r.disp
     def rel(s: UInt): UInt = s - disp.alloc_stamp        // mod 2^16 (D15)
 
@@ -125,11 +123,32 @@ object IftMerge extends CoreFuzzingConstants {
     val ic  = newestTwo(r.ic.map(_.valid), r.ic.map(_.bits), r.ic.map(c => rel(c.bits.stamp)))
     val wb  = newestTwo(r.wb.map(_.valid), r.wb.map(_.bits), r.wb.map(c => rel(c.bits.stamp)))
     val mo  = newestTwo(r.mo.map(_.valid), r.mo.map(_.bits), r.mo.map(c => rel(c.bits.stamp)))
-    // [RASBYP] patch 40: a same-cycle RAS write (rasNow) arrives after every stored column, so
-    // its key is all-ones: commit_age < 65535 (D15, asserted in the ROB) bounds every stored
-    // key below it.  The OR sits on the comparator's input LUT (+0 levels on the stamp path).
-    val raV = r.ras.valid || rasNow
-    val raK = rel(r.ras.bits.stamp) | Fill(IftStamp.W, rasNow)
+    // [RASEVERY] owner 2026-10-21 (RULES.md A, "RAS edge"): a ret that popped a RAS slot pushed
+    // by the other domain, or a victim ret that popped a stale slot ([RASPTR]), carries the
+    // edge with no mispredict gate, in the commit merge AND the squash merge (the raw row
+    // carries disp).  disp.ras_xdom is written at dispatch, so the edge exists from the row's
+    // first readout on (no same-cycle write to forward, [RASBYP] is gone with C_ras).
+    // Its key is the constant all-ones (the old rasNow key): commit_age < 65535 (D15, asserted
+    // in the ROB) bounds every stored key below it, so the edge is always among the four newest
+    // and never dropped ("every pop" holds on a full list too; an older fourth edge of that
+    // record is pushed out instead, counted in OVF as before).  A constant key folds the RAS
+    // group's 8 comparators to constants (pure logic removal, -levels at best).
+    val raV = disp.ras_xdom
+    val raK = Fill(IftStamp.W, 1.U(1.W))
+    // [STTY0] bundle61, owner 2026-10-24 13:1x (question tool) "Add store ty0 edges" (RULES A U2 "all edges"): a store
+    // gets the REG_DATAFLOW (ty0) edge from its data and address operands, as a register-writing instruction gets it
+    // at writeback (C_sprob): is_secret = an operand register is secret-tagged (its producer was s_acc || s_prop:
+    // lsu.scala cfStSprop = data_is_secret || addr_is_secret), is_atk = an operand is attacker-tagged (cfStAtk), with
+    // the same victim-consumer rule as the writeback twin (rob.scala sp_atk: domain 0).  op_count 0 like every ty0
+    // mark (taint follows data; there is no producer table).  The labels arrive on clr_bsy (C_clr); the entry is one
+    // OR-merged mark per row like sprobEntry.  Key: the constant all-ones (as the RAS group): clr_bsy is the store's
+    // last event (after dispatch and issue), so the mark sorts newest; ties: prio 5, before RAS.  A constant key folds
+    // this group's comparators.
+    val clrEntry = Wire(new InfluencerEntry)
+    clrEntry.valid := true.B; clrEntry.op_count := 0.U; clrEntry.infl_type := INFL_REG_DATAFLOW.U
+    clrEntry.is_atk    := r.cl_atk && r.domain === 0.U
+    clrEntry.is_secret := r.cl_sec
+    val clV = clrEntry.is_atk || clrEntry.is_secret
 
     // Spec 5.1.2 amendment (Task 2.4, ruling 38/Task 2.3 review): the sprob entry's
     // is_atk / is_secret come from the row's sprob columns.  The two oldest valid columns
@@ -156,6 +175,7 @@ object IftMerge extends CoreFuzzingConstants {
       new Grp(wb.v2,       wb.k2,             3, wb.c2.edges.map(e => (e.valid, e))),
       new Grp(mo.v1,       mo.k1,             4, Seq((true.B, ent(mo.c1)))),
       new Grp(mo.v2,       mo.k2,             4, Seq((true.B, ent(mo.c2)))),
+      new Grp(clV,         raK,               5, Seq((true.B, clrEntry))),   // [STTY0]
       new Grp(raV,         raK,               6, Seq((true.B, rasEntry))))
     val G = groups.length
     // One comparator per unordered pair (a < b).  On equal keys the lower prio wins,
@@ -170,13 +190,13 @@ object IftMerge extends CoreFuzzingConstants {
       val ga = groups(a); val gb = groups(b)
       ga.valid && gb.valid && (if (a < b) cmp(a)(b) else !cmp(b)(a))
     }
-    // flatten; rank(e) = number of valid entries that precede e (0..19), fixed 5 bits
+    // flatten; rank(e) = number of valid entries that precede e (0..20 with [STTY0]), fixed 5 bits
     val flat: Seq[Ent] = groups.zipWithIndex.flatMap { case (grp, gi) =>
       grp.ents.zipWithIndex.map { case ((ev, e), q) => new Ent(grp.valid && ev, e, gi, q) } }
     def entBefore(f: Ent, e: Ent): Bool = if (f.g == e.g) (f.q < e.q).B else before(f.g, e.g)
     val rank: Seq[UInt] = flat.indices.map { i =>
       PopCount(flat.indices.filter(_ != i).map(j => flat(j).valid && entBefore(flat(j), flat(i)))) }
-    val total    = PopCount(flat.map(_.valid))                          // <= 20, 5 bits
+    val total    = PopCount(flat.map(_.valid))                          // <= 21 ([STTY0]), 5 bits
     val over     = total > numInfluencerSlotsCF.U
     val dropHere = Mux(over, total - numInfluencerSlotsCF.U, 0.U)       // entries older than the four newest
     val out = Wire(new IftCommitInfo)
@@ -207,7 +227,11 @@ object IftMerge extends CoreFuzzingConstants {
                      r.ic.map(c => c.valid && c.bits.is_atk) ++
                      r.wb.flatMap(c => c.bits.edges.map(e => c.valid && e.valid && e.is_atk)) ++
                      r.mo.map(c => c.valid && c.bits.is_atk) ++
+                     Seq(clrEntry.is_atk) ++                                // [STTY0]
                      Seq(raV && r.domain === 0.U)).reduce(_ || _)
+    // [CEREPL] lean59 (owner 2026-10-23): record bit [254], the replacement-state-attributed CACHE_EVICTION flag of
+    // the row (rawRead's OR over the valid C_wb columns).  Off the merge path (a raw-row bit straight to the output).
+    out.ce_repl.foreach(_ := r.ce_repl)
     out.speculated := disp.speculated;  out.single_step := disp.single_step
     out.spec_branch_is_atk := disp.spec_branch_is_atk; out.spec_branch_is_secret := disp.spec_branch_is_secret
     out.spec_branch_op_id := disp.spec_branch_op_id
@@ -230,7 +254,7 @@ object IftApply {
     u.cf_secret_transmission.foreach(_ := s_tx)
     u.cf_fu_bitmap.foreach(_ := i.fu_bitmap)
     u.cf_spec_branch_is_secret.foreach(_ := i.spec_branch_is_secret)
-    // cf_op_count_id, cf_domain_id and cf_ras_pred_xdom come from rob_uop (spec 5.1.1), or from
+    // cf_op_count_id and cf_domain_id come from rob_uop (spec 5.1.1), or from
     // the squash side fields (IftSquashMerge).
   }
 }
@@ -277,11 +301,10 @@ class RobIftBank(numRows: Int, wbPorts: Int, lsuWbPorts: Seq[Int], clrPorts: Int
   val c_oc     = Seq.fill(ocCopies)(Mem(numRows, UInt(uopIDCounterWidthCF.W)))
   val c_wb     = lsuWbPorts.map(_ => Mem(numRows, new IftWbColumn))
   val c_fu     = fuPorts.map(_ => Mem(numRows, new IftBitmapColumn))
-  val c_clr    = Seq.fill(clrPorts)(Mem(numRows, new IftBitmapColumn))
+  val c_clr    = Seq.fill(clrPorts)(Mem(numRows, new IftClrColumn))   // [STTY0]
   val c_sprob  = Seq.fill(sprobPorts)(Mem(numRows, new IftSprobColumn))
   val c_ic     = Seq.fill(icPorts)(Mem(numRows, new IftEdgeColumn(hasDeny = true)))
   val c_memord = Seq.fill(memordPorts)(Mem(numRows, new IftEdgeColumn(hasDeny = false)))
-  val c_ras    = Mem(numRows, new IftStampColumn)
 
   def validVec() = RegInit(VecInit(Seq.fill(numRows)(false.B)))
   val v_wb     = lsuWbPorts.map(_ => validVec())
@@ -290,8 +313,8 @@ class RobIftBank(numRows: Int, wbPorts: Int, lsuWbPorts: Seq[Int], clrPorts: Int
   val v_sprob  = Seq.fill(sprobPorts)(validVec())
   val v_ic     = Seq.fill(icPorts)(validVec())
   val v_memord = Seq.fill(memordPorts)(validVec())
-  val v_ras    = validVec()
-  val allValids: Seq[Vec[Bool]] = v_wb ++ v_fu ++ v_clr ++ v_sprob ++ v_ic ++ v_memord ++ Seq(v_ras)
+  // [RASEVERY] C_ras / v_ras removed (the RAS edge is C_disp.ras_xdom)
+  val allValids: Seq[Vec[Bool]] = v_wb ++ v_fu ++ v_clr ++ v_sprob ++ v_ic ++ v_memord
 
   // ---------------------------------------------------------------- writes
   for (i <- 0 until wbPorts) {
@@ -304,6 +327,7 @@ class RobIftBank(numRows: Int, wbPorts: Int, lsuWbPorts: Seq[Int], clrPorts: Int
         col.edges     := b.edges.edges
         col.dropped   := b.edges.dropped
         col.aliased   := b.edges.aliased
+        col.ce_repl   := b.edges.ce_repl.getOrElse(false.B)   // [CEREPL] +1 LUTRAM bit per C_wb column
         col.fu_bitmap := b.fu_bitmap
         col.stamp     := io.stamp
         c_wb(lsuPos(i)).write(row, col)
@@ -319,9 +343,11 @@ class RobIftBank(numRows: Int, wbPorts: Int, lsuWbPorts: Seq[Int], clrPorts: Int
   }
   for (i <- 0 until clrPorts) {
     when (io.clr(i).valid) {
-      val col = Wire(new IftBitmapColumn)
+      val col = Wire(new IftClrColumn)
       col.fu_bitmap := io.clr(i).bits.fu_bitmap
       col.stamp     := io.stamp
+      col.is_atk    := io.clr(i).bits.is_atk      // [STTY0]
+      col.is_secret := io.clr(i).bits.is_secret
       c_clr(i).write(io.clr(i).bits.row, col)
       v_clr(i)(io.clr(i).bits.row) := true.B
     }
@@ -356,18 +382,13 @@ class RobIftBank(numRows: Int, wbPorts: Int, lsuWbPorts: Seq[Int], clrPorts: Int
       val col = Wire(new IftEdgeColumn(hasDeny = false))
       col.entry.valid     := true.B
       col.entry.op_count  := io.memord(i).bits.upd.prod_op_count
-      col.entry.infl_type := INFL_MEM_ORDER.U
+      col.entry.infl_type := io.memord(i).bits.upd.infl_type.getOrElse(INFL_MEM_ORDER.U)   // [RDEDGE] patch 80
       col.entry.is_atk    := io.memord(i).bits.upd.is_atk
       col.entry.is_secret := io.memord(i).bits.upd.is_secret
       col.stamp           := io.stamp
       c_memord(i).write(io.memord(i).bits.row, col)
       v_memord(i)(io.memord(i).bits.row) := true.B
     }
-  }
-  when (io.ras.valid) {
-    val col = Wire(new IftStampColumn); col.stamp := io.stamp
-    c_ras.write(io.ras.bits, col)
-    v_ras(io.ras.bits) := true.B
   }
   // Enqueue LAST so its valid-clear wins over any same-cycle stale write to the row.
   when (io.enq.valid) {
@@ -389,6 +410,7 @@ class RobIftBank(numRows: Int, wbPorts: Int, lsuWbPorts: Seq[Int], clrPorts: Int
     d.oc_aliased            := info.base.aliased
     d.fu_bitmap             := e.fu_bitmap | (1.U << robTagCF.U)
     d.alloc_stamp           := io.stamp
+    d.ras_xdom              := e.ras_xdom            // [RASEVERY]
     c_disp.write(io.enq.bits.row, d)
     c_oc.foreach(_.write(io.enq.bits.row, e.oc))
     allValids.foreach(v => v(io.enq.bits.row) := false.B)
@@ -436,9 +458,14 @@ class RobIftBank(numRows: Int, wbPorts: Int, lsuWbPorts: Seq[Int], clrPorts: Int
       r.wb(k).bits.aliased := wbCols(k).aliased
       r.wb(k).bits.stamp   := wbCols(k).stamp
     }
+    // [CEREPL] lean59: OR over the valid C_wb columns (every one, merged or older/dropped, like edge_atk); the raw row
+    // (and the squash raw FIFO entry) grows by 1 bit.  Levels: the existing async v/c reads -> one 8-input AND/OR.
+    r.ce_repl := wbCols.zip(v_wb).map { case (c, v) => v(row) && c.ce_repl }.reduce(_ || _)
+    // [STTY0] bundle61: the store operand labels of every valid C_clr column (a store clears busy once; the OR also
+    // covers a re-issued store).  Levels: the existing async clr reads -> one 6-input AND/OR per bit.
+    r.cl_atk := clrCols.zip(v_clr).map { case (c, v) => v(row) && c.is_atk    }.reduce(_ || _)
+    r.cl_sec := clrCols.zip(v_clr).map { case (c, v) => v(row) && c.is_secret }.reduce(_ || _)
     for (k <- 0 until memordPorts) { r.mo(k).valid := v_memord(k)(row); r.mo(k).bits := toRaw(c_memord(k).read(row), hasDeny = false) }
-    r.ras.valid := v_ras(row)
-    r.ras.bits  := c_ras.read(row)
     r.domain    := req.domain
     r
   }
@@ -451,6 +478,9 @@ class RobIftBank(numRows: Int, wbPorts: Int, lsuWbPorts: Seq[Int], clrPorts: Int
 
   // commit: raw read and merge in the commit cycle (functionally the old readout)
   val cRaw = rawRead(io.commit)
+  // [RASEVERY] owner 2026-10-21: the [RASBYP] forward below is history.  C_ras, its b2 writer
+  // (rob.scala [RASGATE]) and rasNow are removed; the RAS edge is C_disp.ras_xdom, written at
+  // dispatch, so no column can be written in its row's commit cycle any more ([SCFWD]).
   // [RASBYP] patch 40 (F-RAS-1 follow-up, t91 waveform 2026-10-15): the ROB writes the RAS edge
   // at brupdate.b2 (rob.scala [RASGATE]), and a ret that mispredicts can COMMIT IN THAT SAME
   // CYCLE (b1 unbusies it; BOOM's own b2 taken/fsrc fix-up at commit, rob.scala "Perform
@@ -473,8 +503,7 @@ class RobIftBank(numRows: Int, wbPorts: Int, lsuWbPorts: Seq[Int], clrPorts: Int
   // compare against the commit row (register, in parallel) -> 1 LUT -> the merge's valid / key
   // inputs, which already wait on the 64:1 v_ras / c_ras reads and the 16-bit rel subtract.
   // Cost: 1 compare (2 LUT), the valid OR and 16 OR terms absorbed in existing LUTs: about 4 LUT.
-  val rasNow = io.ras.valid && io.ras.bits === io.commit.row
-  val (co, ct) = IftMerge(cRaw, rasNow)
+  val (co, ct) = IftMerge(cRaw)
   io.commit_out   := co
   io.commit_third := ct
   io.commit_age   := io.stamp - cRaw.disp.alloc_stamp

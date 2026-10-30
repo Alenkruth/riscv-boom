@@ -73,9 +73,8 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     val prober_state = Input(Valid(UInt(coreMaxAddrBits.W)))
     // [reconf-fix 2026-08-12] active set mask, for PHYSICAL-row comparisons
     val dcache_set_mask = Input(UInt(idxBits.W))
-    // [D1FIXA] dcache.scala cf_pend_hold (a flop): a deferred IFT metadata write is pending.
-    // Holds this MSHR's refill beats (s_commit_line) and meta writes (s_meta_clear,
-    // s_meta_write_req).  Constant false with IFT off.
+    // [H1T] lean58: formerly the [D1FIXA] IFT hold of refill beats / meta writes; tied false by the D$ and
+    // not read (kept so IFT-off Verilog is unchanged).
     val cf_ift_hold = Input(Bool())
 
     val refill      = Decoupled(new L1DataWriteReq)
@@ -166,8 +165,11 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   // term stays one 5-input function of it, so 0 added levels on sec_rdy -> io.req.ready ->
   // s2_nack.  IFT off (no bubble) elaborates the original expression.
   val sec_rdy = (!cmd_requires_second_acquire && !io.req_is_probe &&
-                 !state.isOneOf(s_invalid, s_meta_write_req, s_mem_finish_1, s_mem_finish_2) &&
-                 (if (ENABLE_IFT) state =/= s_drain_rpq else true.B))// Always accept secondary misses
+                 !state.isOneOf(s_invalid, s_meta_write_req, s_mem_finish_1, s_mem_finish_2))// Always accept secondary misses
+  // [H1T] lean58 (Fable audit H1 (b), owner 2026-10-23): the [G9LIVE] refusal above is removed with the
+  // store-replay bubble it existed for (stock: secondaries are accepted while draining).  Without the bubble a
+  // store replay issues every cycle the D$ port is granted, as in stock BOOM, so the starvation it guarded
+  // against (one new secondary per bubble) cannot arise from IFT.
 
   // [AREA35] patch 35 (D): the 16-entry replay queue keeps its IFT uop fields in LUTRAM
   // (8 MSHRs x 16 entries; see BranchKillableQueue iftInRam).  Not on W: rpq.io.deq feeds
@@ -214,12 +216,17 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
                                                       else 0.U))
   // [RESID] step 15: the residency bits are per-MSHR (req + the regs below), never per rpq entry.
   // Constant inputs: firtool folds the rpq storage for them away (same idiom as above).
-  rpq.io.enq.bits.cf_addr_sec.foreach(_ := false.B)
+  // [SECSTDW] patch 70: ...except cf_addr_sec, now kept per rpq request (the request's own secret-derived
+  // address), so a REPLAYED store at a secret-derived address re-opens its DW like the hit path (dcache.scala
+  // [SECSTDW]); the per-MSHR line mark (req / cf_sec_asec) is unchanged.  Cost: +1 bit per rpq entry (the rpq
+  // ram row, LUTRAM: 8 MSHRs x 16 entries = 128 bits, about 8 LUT-as-RAM), 0 levels.
+  rpq.io.enq.bits.cf_addr_sec.foreach(_ := io.req.cf_addr_sec.getOrElse(false.B))
   rpq.io.enq.bits.cf_addr_atk.foreach(_ := false.B)   // [ATKRES] per-MSHR, like cf_addr_sec
   rpq.io.enq.bits.cf_res_v.foreach(_ := false.B)
   rpq.io.enq.bits.cf_res_pc.foreach(_ := 0.U)
   rpq.io.enq.bits.cf_res_atk.foreach(_ := false.B)   // [ATKEVICT] per-MSHR too
   rpq.io.enq.bits.cf_res_esec.foreach(_ := false.B)
+  rpq.io.enq.bits.cf_res_repl.foreach(_ := false.B)   // [CEREPL] per-MSHR (req), like cf_res_v/pc
   // [G9STMETA] (ruling 101, G-9) the store replay writes D$ store metadata, whose attacker
   // bit is `domain || cf_attacker_influence` on the hit path.  The domain is zeroed above, so
   // fold it into the (kept) attacker bit for STORES only: one LUT, no extra rpq bit.  The
@@ -311,7 +318,21 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   val cf_rp_res_atk  = Mux(req.cf_res_v.getOrElse(false.B), req.cf_res_atk.getOrElse(false.B),  !cf_rp_asec_e || cf_rp_nk)
   // !cf_res_v: sec = !atk || esec = asec_e both with and without cf_rp_nk (was esec = 0, same sec)
   val cf_rp_res_esec = Mux(req.cf_res_v.getOrElse(false.B), req.cf_res_esec.getOrElse(false.B), cf_rp_asec_e)
-  if (ENABLE_IFT) { when (rpq.io.deq.fire) { cf_first_rp := false.B } }   // [R124GATE]
+  // [CEREPL] lean59 (owner 2026-10-23): the edge's PC is the eviction record's (req.cf_res_v selects req.cf_res_pc) and
+  // that record named the replacement-state advancer (dcache.scala [CEREPL]).  The MSHR's own residency edges
+  // (asec_e / aatk_e) and the attacker-only nack edge never are.  1 FF per MSHR (req), one AND, 0 levels.
+  val cf_rp_res_repl = req.cf_res_v.getOrElse(false.B) && req.cf_res_repl.getOrElse(false.B)
+  // [RPQSKIP] D2-b2 (owner-approved scope 2026-10-21): a branch-killed or exception-flushed PRIMARY leaves the
+  // rpq through the BranchKillableQueue head skip (util.scala do_deq with !valids(head): deq_ptr moves, no
+  // deq.fire), so cf_first_rp stayed 1 and the first SURVIVING secondary was taken for the primary itself
+  // (cf_rp_asec_e / cf_rp_aatk_e = 0: its residency edge was lost although the primary's secret/attacker-
+  // address miss brought the line in).  The rpq is not flow-through, so with the queue non-empty deq.valid
+  // is 0 only when the head entry is dead (killed earlier, or killed/flushed this cycle and popped next
+  // cycle); while cf_first_rp = 1 that head is the primary (enqueued first into the empty rpq).  Clear the
+  // flag then too.  Levels: the flop's next-state already reads deq.valid/deq.ready; empty is a
+  // pointer compare from flops (shallower than deq.valid, which contains it): one more input to the same
+  // LUT, 0 added levels, 0 FF.  IFT off: unchanged (inside [R124GATE]).
+  if (ENABLE_IFT) { when (rpq.io.deq.fire || (!rpq.io.empty && !rpq.io.deq.valid)) { cf_first_rp := false.B } }   // [R124GATE] [RPQSKIP]
   // [SECDEST] step 17 (owner ruling 116 A(2)), miss path: the line this MSHR fills is marked by
   // a secret-ADDRESS access (the same bit the meta write puts in ift_res_meta), so every value
   // read out of it is secret.  Set on the dequeued request's uop flag cf_mem_sec_dataflow
@@ -337,16 +358,9 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
 
   io.meta_write.valid    := false.B
   io.meta_write.bits     := DontCare
-  // [D1FIXA] (dcache.scala, D1 fix A) while the D$ holds a deferred ift_store_meta /
-  // ift_res_meta write, no refill beat and no meta write may fire: a new first-beat clear or fill
-  // mark would need a second pending entry, and the MSHR whose clear is pending must not reach
-  // s_drain_rpq (replays) or s_meta_write_req before that clear lands.  Holding EVERY beat, not
-  // only the first, also holds the s_commit_line -> s_drain_rpq step (it fires on the last beat)
-  // and keeps the gate a single flop input: lb_read.valid / meta_write.valid become one LUT of
-  // (state, cf_ift_hold) = 6 inputs, as deep as the 5-bit state decode they replace.  Typical
-  // hold: 1 cycle (the next cycle without a lane write on that way); bound 16 + 2 cycles plus the
-  // bounded replay drain (dcache.scala cf_pend_starve).
-  val cf_hold = if (ENABLE_IFT) io.cf_ift_hold else false.B
+  // [H1T] lean58 (Fable audit H1 (a), owner 2026-10-23): the IFT hold is removed; refill beats and meta writes
+  // are never delayed for IFT (dcache.scala drops a colliding IFT metadata write instead).  io.cf_ift_hold is
+  // tied false by the D$ and no longer read.
   io.req_pri_rdy         := false.B
   io.req_sec_rdy         := sec_rdy && rpq.io.enq.ready
   io.mem_acquire.valid   := false.B
@@ -355,8 +369,6 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   io.refill.bits         := DontCare
   io.replay.valid        := false.B
   io.replay.bits         := DontCare
-  // [G9STMETA] a store replay fired last cycle (see s_drain_rpq)
-  val cf_st_replay_last = RegNext(io.replay.fire && isWrite(io.replay.bits.uop.mem_cmd), false.B)
   io.wb_req.valid        := false.B
   io.wb_req.bits         := DontCare
   io.resp.valid          := false.B
@@ -366,6 +378,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   io.resp.bits.cf_res_pc.foreach(_ := 0.U)
   io.resp.bits.cf_res_atk.foreach(_ := false.B)   // [ATKEVICT]
   io.resp.bits.cf_res_esec.foreach(_ := false.B)
+  io.resp.bits.cf_res_repl.foreach(_ := false.B)   // [CEREPL]
   io.commit_val          := false.B
   io.commit_addr         := req.addr
   io.commit_coh          := coh_on_grant
@@ -408,10 +421,13 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     // Convention follows dcache.scala:1511, whose comment notes the gate is what lets
     // FIRRTL DCE remove the machinery rather than relying on it to prove them dead.
     if (ENABLE_IFT) {
-      val cf_sec_req_tainted = io.req.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)).orR || io.req.uop.cf_secret_access.getOrElse(false.B)
+      // [SACCU] 2026-10-21: a secondary's s_acc joins the LINE mark (and the op_count adoption) only when it READS
+      // (isRead: load, LR, SC, AMO); a plain in-range store marks only its doubleword (U1/O4), at its rpq replay.
+      val cf_sec_req_sacc    = io.req.uop.cf_secret_access.getOrElse(false.B) && isRead(io.req.uop.mem_cmd)
+      val cf_sec_req_tainted = io.req.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)).orR || cf_sec_req_sacc
       val cf_pri_untainted   = !req.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)).orR && !req.uop.cf_secret_access.getOrElse(false.B)
       req.uop.cf_domain_id.foreach(_ := req.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) | io.req.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)))
-      req.uop.cf_secret_access.foreach(_ := req.uop.cf_secret_access.getOrElse(false.B) || io.req.uop.cf_secret_access.getOrElse(false.B))
+      req.uop.cf_secret_access.foreach(_ := req.uop.cf_secret_access.getOrElse(false.B) || cf_sec_req_sacc)
       when (cf_sec_req_tainted && cf_pri_untainted) {
         req.uop.cf_op_count_id.foreach(_ := io.req.uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)))
       }
@@ -462,6 +478,13 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
       cf_sec_asec := false.B   // [RESID]
       cf_sec_aatk := false.B   // [ATKRES]
       cf_first_rp := !isPrefetch(io.req.uop.mem_cmd)
+      // [SACCU] 2026-10-21 (one s_acc definition: the STQ uop bit is now set for a plain in-range store too): the
+      // primary's s_acc becomes the refill LINE mark (cf_req_secret, all 8 DWs) only when the primary READS
+      // (isRead: load, LR, SC, AMO).  A plain store primary keeps its s_acc on its rpq copy, so its replay marks
+      // its own doubleword (dcache st_sec, U1/O4), never the whole line.  Gated here, not at cf_req_secret,
+      // because req.uop.mem_cmd later becomes the secondary's dirtier_cmd.  One LUT on the req flop's D input
+      // (5-bit mem_cmd + s_acc = 6 inputs), beside the existing allocation mux: 0 added levels.
+      req.uop.cf_secret_access.foreach(_ := io.req.uop.cf_secret_access.getOrElse(false.B) && isRead(io.req.uop.mem_cmd))
     }
     val old_coh   = io.req.old_meta.coh
     req_needs_wb := old_coh.onCacheControl(M_FLUSH)._1 // does the line we are evicting need to be written back
@@ -554,6 +577,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     io.resp.bits.uop.cf_domain_id.foreach(_ := 0.U)   // [RDDOM] unchanged downstream (LSU uses the LDQ uop)
     io.resp.bits.cf_res_atk.foreach(_ := cf_rp_res_atk)   // [ATKEVICT]/[ATKRES] edge flags (per-MSHR)
     io.resp.bits.cf_res_esec.foreach(_ := cf_rp_res_esec)
+    io.resp.bits.cf_res_repl.foreach(_ := cf_rp_res_repl)   // [CEREPL]
     io.resp.bits.cf_res_v.foreach(_ := cf_rp_res_v)   // [RESID] line-buffer (miss) response edge
     io.resp.bits.cf_res_pc.foreach(_ := cf_rp_res_pc)
     when (rpq.io.deq.fire) {
@@ -586,7 +610,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     state := Mux(!io.meta_resp.valid, s_meta_read, // Prober could have nack'd this read
              Mux(needs_wb, s_meta_clear, s_commit_line))
   } .elsewhen (state === s_meta_clear) {
-    io.meta_write.valid         := !cf_hold   // [D1FIXA]
+    io.meta_write.valid         := true.B   // [H1T] (was !cf_hold, [D1FIXA])
     io.meta_write.bits.idx      := req_idx
     io.meta_write.bits.data.coh := coh_on_clear
     io.meta_write.bits.data.tag := req_tag
@@ -615,7 +639,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
       state := s_commit_line
     }
   } .elsewhen (state === s_commit_line) {
-    io.lb_read.valid       := !cf_hold   // [D1FIXA] refill.valid = lb_read.fire
+    io.lb_read.valid       := true.B   // [H1T] (was !cf_hold, [D1FIXA]) refill.valid = lb_read.fire
     io.lb_read.bits.id     := io.id
     io.lb_read.bits.offset := refill_ctr
 
@@ -632,16 +656,13 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     }
   } .elsewhen (state === s_drain_rpq) {
     io.replay <> rpq.io.deq
-    // [G9STMETA] (ruling 101) one bubble between two store replays of this MSHR.  A store
-    // replay's metadata read-modify-write reads in s1 and writes in s2; a second store replay
-    // to the same line one cycle later would read the SyncReadMem in the write cycle (old
-    // data) and overwrite the first store's doubleword bit.  Store replays only follow a miss,
-    // so the cost is one cycle per extra store to the missed line.
-    if (ENABLE_IFT) {
-      val st_rp_stall = cf_st_replay_last && isWrite(rpq.io.deq.bits.uop.mem_cmd)
-      io.replay.valid  := rpq.io.deq.valid && !st_rp_stall
-      rpq.io.deq.ready := io.replay.ready && !st_rp_stall
-    }
+    // [H1T] lean58 (Fable audit H1 (c), owner 2026-10-23): the [G9STMETA] bubble between two store replays is
+    // removed (stock replay timing).  Its hazard (a store replay's ift_store_meta read in s1 in the cycle the
+    // previous store replay writes in s2 returned the old entry) is already closed by [STFWD]/[STFWD-S1]
+    // (dcache.scala): that cycle's merged write of the way is compared with the s1 read's set and forwarded
+    // (ift_sm_last_dat) into s2, i.e. the write-first forward idiom of ift_res_meta ([RUWRES]) on this memory.
+    // A replay rides lane 0 (s0_req -> s1_req(0)), whose s1 set is one of the compared slots; the second replay's
+    // read-modify-write therefore sees the first one's DW bit, and later replays chain the same way.
     io.replay.bits.way_en    := req.way_en
     if (ENABLE_IFT) {   // [R124GATE] IFT off: the rpq uop's own bits, as before step 17
       io.replay.bits.uop.cf_mem_sec_dataflow.foreach(_ := rpq.io.deq.bits.uop.cf_mem_sec_dataflow.getOrElse(false.B) || cf_rp_vsec)   // [SECDEST]
@@ -650,6 +671,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     io.replay.bits.uop.cf_domain_id.foreach(_ := 0.U)   // [RDDOM] replays keep domain 0 in the D$ s2 checks
     io.replay.bits.cf_res_atk.foreach(_ := cf_rp_res_atk)   // [ATKEVICT]/[ATKRES]
     io.replay.bits.cf_res_esec.foreach(_ := cf_rp_res_esec)
+    io.replay.bits.cf_res_repl.foreach(_ := cf_rp_res_repl)   // [CEREPL]
     io.replay.bits.cf_res_v.foreach(_ := cf_rp_res_v)   // [RESID] replay (t_replay) response edge
     io.replay.bits.cf_res_pc.foreach(_ := cf_rp_res_pc)
     io.replay.bits.addr := Cat(req_tag, req_idx(cfIdxLowBits-1, 0), rpq.io.deq.bits.addr(blockOffBits-1,0))
@@ -663,7 +685,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
       state := s_meta_write_req
     }
   } .elsewhen (state === s_meta_write_req) {
-    io.meta_write.valid         := !cf_hold   // [D1FIXA]
+    io.meta_write.valid         := true.B   // [H1T] (was !cf_hold, [D1FIXA])
     io.meta_write.bits.idx      := req_idx
     io.meta_write.bits.data.coh := new_coh
     io.meta_write.bits.data.tag := req_tag
@@ -769,6 +791,7 @@ class BoomIOMSHR(id: Int)(implicit edge: TLEdgeOut, p: Parameters) extends BoomM
   io.resp.bits.cf_res_pc.foreach(_ := 0.U)
   io.resp.bits.cf_res_atk.foreach(_ := false.B)   // [ATKEVICT]
   io.resp.bits.cf_res_esec.foreach(_ := false.B)
+  io.resp.bits.cf_res_repl.foreach(_ := false.B)   // [CEREPL]
 
   when (io.req.fire) {
     req   := io.req.bits
@@ -893,6 +916,9 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     // evicting, its same-set writeback), else any valid MSHR (MSHRs full).  Same registered state as
     // cf_aatk_busy.  IFT only.
     val cf_nack_aatk = if (ENABLE_IFT) Some(Output(Vec(memWidth, Bool()))) else None
+    // [NACKCONFSEC] lean58 (Fable audit M8, owner 2026-10-23): the secret twin of cf_nack_aatk: lane w's
+    // CONFLICTING MSHR(s) hold a secret-address / secret-fill request (the cf_asec_live condition).  IFT only.
+    val cf_nack_asec = if (ENABLE_IFT) Some(Output(Vec(memWidth, Bool()))) else None
     // corefuzzing: fill-completion event — fires when an MSHR meta_write completes
     val cf_meta_write_fill = Output(Valid(new Bundle {
       val idx      = UInt(idxBits.W)
@@ -1156,6 +1182,15 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     for (w <- 0 until memWidth) {
       io.cf_nack_aatk.get(w) := Mux(idx_match(w), (idx_matches(w) zip cf_aatk_q).map { case (m, a) => m && a }.reduce(_ || _),
                                     cf_aatk_q.reduce(_ || _))
+    }
+    // [NACKCONFSEC] lean58 (M8): the same form for the secret side (patch 68's attacker rule): per-MSHR registered
+    // secret bits (nMSHRs FF; cf_asec_busy.valid is their OR one cycle old, so the timing reference is the same),
+    // the same-set MSHR when one matches, else any valid MSHR (MSHRs full).  0 levels on the nack path (beside it,
+    // ending at the LSU's LDQ flag write).  About 2 x (8 AND-OR + 1) LUT.
+    val cf_asec_q = cf_asec_live.map(RegNext(_, false.B))
+    for (w <- 0 until memWidth) {
+      io.cf_nack_asec.get(w) := Mux(idx_match(w), (idx_matches(w) zip cf_asec_q).map { case (m, a) => m && a }.reduce(_ || _),
+                                    cf_asec_q.reduce(_ || _))
     }
     io.cf_asec_busy.bits  := RegNext(PriorityMux(cf_asec_live ++ cf_aatk_live :+ true.B,
                                                  mshrs.map(_.io.cf_req_res_pc) ++ mshrs.map(_.io.cf_req_pc12) :+

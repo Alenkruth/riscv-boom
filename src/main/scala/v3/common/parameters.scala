@@ -149,7 +149,15 @@ case class BoomCoreParams(
    * DEFAULT TRUE: preserves existing corefuzzing behavior. Set FALSE (via
    * WithoutCfDebugPrintf) only in the dedicated spike-diff config, where the
    * commit log must match spike's format byte-for-byte. */
-  enableCfDebugPrintf: Boolean = true
+  enableCfDebugPrintf: Boolean = true,
+
+  /* D$/MSHR shadow-state printfs ([RFB], [SMWR], [SMDROP], [RMDROP], [D1STARVE], dcache.scala):
+   * they exist only to validate the host oracle's D$ model (phase4/oracle/dcheck.py) and the D1
+   * fix, and printed on every +verbose debug run.  Compile-time, nested inside
+   * enableCfDebugPrintf (no effect when that is false).  DEFAULT FALSE; turn on with
+   * WithCfCacheShadowPrintf for a dcheck run.  [FILL], [EVFWR] and [REPLUPD] are NOT under this
+   * flag: parse_ift_log.py / ift_timing.py / check_r21_plru_serial.py / check_t85 read them. */
+  enableCfCacheShadowPrintf: Boolean = false
 
 // DOC include end: BOOM Parameters
 ) extends freechips.rocketchip.tile.CoreParams
@@ -699,6 +707,7 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val ENABLE_RECONF       = boomParams.enableReconf    // compile-time gate for runtime reconfigurability
   val DCACHE_REPL_DEFAULT = boomParams.dcacheReplPolicy // [r147] D$ replacement design default (0/1/2)
   val ENABLE_CF_DEBUG_PRINTF = boomParams.enableCfDebugPrintf // compile-time gate for [FLUSH]/[SPECULATIVE] debug printfs
+  val ENABLE_CF_CACHE_SHADOW_PRINTF = boomParams.enableCfDebugPrintf && boomParams.enableCfCacheShadowPrintf // D$ shadow prints for dcheck
 
   //************************************
   // Other Non/Should-not-be sythesizable modules

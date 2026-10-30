@@ -101,5 +101,6 @@ class NLPrefetcher(implicit edge: TLEdgeOut, p: Parameters) extends DataPrefetch
   io.prefetch.bits.cf_res_v.foreach(_ := false.B)
   io.prefetch.bits.cf_res_atk.foreach(_ := false.B)   // [ATKEVICT]
   io.prefetch.bits.cf_res_esec.foreach(_ := false.B)
+  io.prefetch.bits.cf_res_repl.foreach(_ := false.B)   // [CEREPL] lean59
   io.prefetch.bits.cf_res_pc.foreach(_ := 0.U)
 }
