@@ -61,7 +61,8 @@
 //   STATE  [  9:  9]   1  gv_RAS
 //   STATE  [ 10: 10]   1  gv_PRED
 //   STATE  [ 11: 11]   1  gv_EPOCH        never with gv_PRED (the caller defers EPOCH)
-//   STATE  [ 15: 12]   4  rsv_15_12       0
+//   STATE  [ 14: 12]   3  pf_id           FIX-V2-11: lowest MSHR whose parked line dropped (0 when pf_drop = 0)
+//   STATE  [ 15: 15]   1  pf_multi        FIX-V2-11: more than one MSHR dropped in this cycle
 //   STATE  [ 31: 16]  16  cyc
 //   STATE  [ 33: 32]   2  r.kind          [ 40: 34] 7 r.set     [ 43: 41] 3 r.way    [ 44] r.vvalid [ 45] r.upg
 //   STATE  [ 46: 46]   1  r.esec          [ 47] r.eatk [ 48] r.sec [ 49] r.atk [ 50] r.dom
@@ -110,7 +111,7 @@ object IFTRecordV3 extends CoreFuzzingConstants {
   // ---- STATE record: design 5.1 (group bodies relative to their group's lsb)
   val STATE: Seq[F] = Seq(("class", 0, 4), ("gv_R", 4, 1), ("gv_M", 5, 1), ("gv_L", 6, 1), ("gv_IC", 7, 1),
                           ("dbg", 8, 1), ("gv_RAS", 9, 1), ("gv_PRED", 10, 1), ("gv_EPOCH", 11, 1),
-                          ("rsv_15_12", 12, 4), ("cyc", 16, 16), ("R", 32, 34), ("M", 66, 19), ("L", 85, 14),
+                          ("pf_id", 12, 3), ("pf_multi", 15, 1), ("cyc", 16, 16), ("R", 32, 34), ("M", 66, 19), ("L", 85, 14),
                           ("IC", 99, 15), ("RAS", 114, 21), ("PRED", 135, 119), ("pf_drop", 254, 1), ("wrport", 255, 1))
   val ST_R: Seq[F] = Seq(("kind", 0, 2), ("set", 2, 7), ("way", 9, 3), ("vvalid", 12, 1), ("upg", 13, 1),
                          ("esec", 14, 1), ("eatk", 15, 1), ("sec", 16, 1), ("atk", 17, 1), ("dom", 18, 1),
@@ -245,11 +246,11 @@ object IFTRecordV3 extends CoreFuzzingConstants {
     * `predOrEpoch` is statePRED(...) when gv(5), stateEpoch(...) when gv(6), else 0 (the caller never sets both:
     * EPOCH defers to a PRED-free cycle, design 5.2).  Absent groups are passed as 0 of their width. */
   def state(gv: UInt, dbg: Bool, cyc16: UInt, r: UInt, m: UInt, l: UInt, ic: UInt, ras: UInt, predOrEpoch: UInt,
-            pfDrop: Bool, wrport: Bool): UInt = {
+            pfDrop: Bool, wrport: Bool, pfId: UInt, pfMulti: Bool): UInt = {
     require(gv.getWidth == 7, "[IFTRecordV3] state: 7 group valids")
     place("STATE", STATE, 256, Seq("class" -> REC_STATE.U(4.W), "gv_R" -> gv(0), "gv_M" -> gv(1), "gv_L" -> gv(2),
       "gv_IC" -> gv(3), "dbg" -> dbg, "gv_RAS" -> gv(4), "gv_PRED" -> gv(5), "gv_EPOCH" -> gv(6),
-      "rsv_15_12" -> 0.U(4.W), "cyc" -> cyc16, "R" -> r, "M" -> m, "L" -> l, "IC" -> ic, "RAS" -> ras,
+      "pf_id" -> pfId, "pf_multi" -> pfMulti, "cyc" -> cyc16, "R" -> r, "M" -> m, "L" -> l, "IC" -> ic, "RAS" -> ras,
       "PRED" -> predOrEpoch, "pf_drop" -> pfDrop, "wrport" -> wrport))
   }
 }

@@ -119,6 +119,7 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
   // propagate corefuzzing cf_debug gate into FP issue unit
   issue_unit.io.cf_debug_issue_enable := io.cf_debug_issue_enable
   issue_unit.io.cf_iq_idx := io.cf_iq_idx
+  issue_unit.io.cf_pause_mem.foreach(_ := false.B)   // [V3PAUSE] SP-20: no LOAD_PAUSE in the FP IQ
   // Don't support ld-hit speculation to FP window.
   for (w <- 0 until memWidth) {
     issue_unit.io.spec_ld_wakeup(w).valid := false.B

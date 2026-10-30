@@ -460,6 +460,10 @@ class BoomFrontendBundle(val outer: BoomFrontend) extends CoreBundle()(outer.p)
 {
   val cpu = Flipped(new BoomFrontendIO())
   val ptw = new TLBPTWIO()
+  // [V3STATE] SP-14: the frontend STATE-record taps (IC, RAS, PRED), driven by the frontend cut-out register
+  // (SP-18/SP-19).  CoreBundle has no ENABLE_* vals: the gate reads the BoomCoreParams directly.
+  val cf_state = if (tileParams.core.asInstanceOf[BoomCoreParams].enableIFTBridge ||
+                     tileParams.core.asInstanceOf[BoomCoreParams].iftOracle) Some(Output(new IftFeState)) else None
 }
 
 /**
@@ -1372,6 +1376,110 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   bpd_update_arbiter.io.in(1) <> f4_btb_corrections.io.deq
   bpd.io.update := bpd_update_arbiter.io.out
   bpd_update_arbiter.io.out.ready := true.B
+  // [V3TAP-RAS] SP-18 (design 5.1 RAS [134:114]): the RAS write port; both writers (the f3 call push and the FTQ top
+  // repair below) drive ras.io.write_*, which end at the RAS register write.  Read here (final connected values)
+  // and registered once (the RAS tap register, E -> E+1).  Record/STATE builds only.
+  val cf_ras_tap_q = if (ENABLE_IFT_BRIDGE || IFT_ORACLE) Some {
+    require(log2Ceil(nRasEntries) == 5 && (new IftRasTap).getWidth == 22, "STATE RAS group: 32 entries (design 5.1)")
+    val t = Wire(new IftRasTap)
+    t.v        := ras.io.write_valid
+    t.g.push   := ras.io.write_push
+    t.g.sec    := ras.io.write_secret
+    t.g.watk   := ras.io.write_watk.get
+    t.g.dom    := ras.io.write_domain
+    t.g.idx    := ras.io.write_idx
+    t.g.addr12 := ras.io.write_addr(13, 2)
+    val cf_state_ras_tap = RegNext(t, 0.U.asTypeOf(t))   // the RAS tap register (named cf_state_*: SP-27, review M5)
+    cf_state_ras_tap
+  } else None
+  // [V3TAP-PRED] SP-19 (design 5.1 PRED [253:135], 5.3): one predictor update at its write stage.  The arbiter output
+  // (cycle u; ends at every bank's s1_update register) is piped u -> u+1 -> u+2; the banks' BTB / uBTB taps arrive
+  // padded to u+2 and the TAGE taps are the decode of the u+2 table-input registers.  All are sampled at E = u+2
+  // (the TAGE table write) by the PRED tap register (E -> E+1), then the SP-18 cut-out register.  An f4 fast repair
+  // (chosen = 1) carries btb_mispredicts in u_brmask and 0 in the cfi / taken / secret fields (DontCare at its
+  // source).  gv_PRED = an update or a BTB re-reset start.  Outputs only.
+  val cf_pred_tap_q = if (ENABLE_IFT_BRIDGE || IFT_ORACLE) Some {
+    require(nBanks == 2 && fetchWidth == 8 && (new IftPredTap).getWidth == 120, "STATE PRED: 2 banks, fetchWidth 8 (design 5.1)")
+    val ua = bpd_update_arbiter.io.out
+    val k1 = bpd_update_arbiter.io.chosen === 1.U
+    val u0 = Wire(new IftPredU)
+    u0.v       := ua.valid
+    u0.brmask  := Mux(k1, ua.bits.btb_mispredicts, ua.bits.br_mask)
+    u0.cfi_v   := ua.bits.cfi_idx.valid && !k1
+    u0.cfi_idx := Mux(k1, 0.U, ua.bits.cfi_idx.bits)
+    u0.taken   := ua.bits.cfi_taken && !k1
+    u0.mispred := ua.bits.cfi_mispredicted && !k1
+    u0.isbr    := ua.bits.cfi_is_br && !k1
+    u0.isjal   := ua.bits.cfi_is_jal && !k1
+    u0.sec     := ua.bits.cf_is_secret.get && !k1
+    u0.dom     := ua.bits.cf_domain_id.get(0)
+    u0.kind    := k1
+    u0.pc12    := ua.bits.pc(13, 2)
+    u0.nst     := ua.bits.ghist.new_saw_branch_taken
+    u0.nsnt    := ua.bits.ghist.new_saw_branch_not_taken
+    u0.hist16  := ua.bits.ghist.old_history(15, 0)
+    val u1 = RegNext(u0, 0.U.asTypeOf(u0))     // u+1
+    val u2 = RegNext(u1, 0.U.asTypeOf(u1))     // u+2 = E
+    val bt = bpd.io.cf_st.get                  // per physical bank, already at E
+    val rst = bt(0).btb_rst || bt(1).btb_rst
+    val a0 = bt(0).tg_alloc_v
+    val a1 = bt(1).tg_alloc_v
+    val d0 = bt(0).tg_udec_mask.orR
+    val d1 = bt(1).tg_udec_mask.orR
+    val p  = Wire(new IftPredTap)
+    p.v                := u2.v || rst
+    p.g.u_brmask       := u2.brmask
+    p.g.u_cfi_v        := u2.cfi_v
+    p.g.u_cfi_idx      := u2.cfi_idx
+    p.g.u_taken        := u2.taken
+    p.g.u_mispred      := u2.mispred
+    p.g.u_isbr         := u2.isbr
+    p.g.u_isjal        := u2.isjal
+    p.g.u_sec          := u2.sec
+    p.g.u_dom          := u2.dom
+    p.g.u_kind         := u2.kind
+    p.g.btb_rst        := rst
+    p.g.u_pc12         := u2.pc12
+    p.g.btb0_v         := bt(0).btb_v
+    p.g.btb0_set       := bt(0).btb_set
+    p.g.btb0_way       := bt(0).btb_way
+    p.g.btb1_v         := bt(1).btb_v
+    p.g.btb1_set       := bt(1).btb_set
+    p.g.btb1_way       := bt(1).btb_way
+    p.g.ubtb0_v        := bt(0).ubtb_v
+    p.g.ubtb0_way      := bt(0).ubtb_way
+    p.g.ubtb1_v        := bt(1).ubtb_v
+    p.g.ubtb1_way      := bt(1).ubtb_way
+    p.g.tg_prov        := Cat(bt(1).tg_prov, bt(0).tg_prov)          // bank-slot s = 4 * bank + slot, s = 0 at [2:0]
+    p.g.tg_alloc_v     := a0 || a1
+    p.g.tg_alloc_table := Mux(a0, bt(0).tg_alloc_table, Mux(a1, bt(1).tg_alloc_table, 0.U))
+    p.g.tg_alloc_slot  := Mux(a0, Cat(0.U(1.W), bt(0).tg_alloc_slot), Mux(a1, Cat(1.U(1.W), bt(1).tg_alloc_slot), 0.U))
+    p.g.tg_udec_mask   := bt(0).tg_udec_mask | bt(1).tg_udec_mask
+    p.g.tg_udec_slot   := Mux(d0, Cat(0.U(1.W), bt(0).tg_udec_slot), Mux(d1, Cat(1.U(1.W), bt(1).tg_udec_slot), 0.U))
+    p.g.tg_nst         := u2.nst
+    p.g.tg_nsnt        := u2.nsnt
+    p.g.tg_hist16      := u2.hist16
+    if (ENABLE_CF_DEBUG_PRINTF && ENABLE_IFT) {
+      assert(!(ua.valid && (ua.bits.is_mispredict_update || ua.bits.is_repair_update)),
+             "[V3TAP-PRED] a mispredict/repair predictor update reached the arbiter output (PRED u_kind cannot name it)")
+      assert(!(a0 && a1), "[V3TAP-PRED] TAGE allocations in both banks in one update")
+      assert(!(d0 && d1), "[V3TAP-PRED] TAGE u-only writes in both banks in one update")
+    }
+    val cf_state_pred_tap = RegNext(p, 0.U.asTypeOf(p))   // the PRED tap register: E -> E+1 (named cf_state_*: SP-27, M5)
+    cf_state_pred_tap
+  } else None
+  // [V3CUT] SP-18 (design 5.4, 6.6; 08 section 8.4): the frontend cut-out register.  IC tap (I$, held E+1), RAS tap
+  // (E+1), PRED tap (SP-19, E+1) -> held E+2 on io.cf_state, toward the tile's cut-in register (SP-16): 158 wires
+  // SLR3 -> SLR2, a register on both sides.
+  io.cf_state.foreach { o =>
+    require((new IftFeState).getWidth == 158, "STATE frontend cut = 158 wires (08 section 8.4)")
+    val fe = Wire(new IftFeState)
+    fe.ic   := icache.io.cf_ic_tap.get
+    fe.ras  := cf_ras_tap_q.get
+    fe.pred := cf_pred_tap_q.get
+    val cf_state_cut = RegNext(fe, 0.U.asTypeOf(fe))   // the cut-out register (named cf_state_*: SP-27, review M5)
+    o := cf_state_cut
+  }
 
   when (ftq.io.ras_update && enableRasTopRepair.B) {
     ras.io.write_valid := true.B

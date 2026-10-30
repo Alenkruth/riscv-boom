@@ -163,6 +163,9 @@ class IssueUnitIO(
   // tell the issue unit what each execution pipeline has in terms of functional units
   val fu_types         = Input(Vec(issueWidth, Bits(width=FUC_SZ.W)))
   // O1: aggregated occupancy taint of the non-pipelined FUs behind these ports.
+  // [V3PAUSE] SP-20 (design 6.2 LOAD_PAUSE 0x27): the core's pause_mem (the load-saturation pause that zeroes the mem
+  // issue port's fu_types for one cycle) into the mem IQ's deny latch; tied false for the other IQs.  IFT only.
+  val cf_pause_mem = if (ENABLE_IFT) Some(Input(Bool())) else None
   val cf_fu_busy       = Input(Valid(new Bundle {
     val op_count = UInt(uopIDCounterWidthCF.W)
     val is_atk   = Bool()

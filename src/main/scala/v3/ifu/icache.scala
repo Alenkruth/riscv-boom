@@ -92,6 +92,9 @@ class ICacheBundle(val outer: ICache) extends BoomBundle()(outer.p)
   // [ICFILL] runtime enable of the debug fill print (0xbc0 bit 4, cf_debug_rob_enable, as [D4RAS]); the port exists
   // only in debug-printf IFT builds (enableCfDebugPrintf && enableIFT), so other configs keep their Verilog.
   val cf_dbg_print  = if (ENABLE_CF_DEBUG_PRINTF && ENABLE_IFT) Some(Input(Bool())) else None
+  // [V3STATE] SP-18 (design 5.1 IC): the I$ refill / invalidate event, registered once (the IC tap register).
+  // Record/STATE builds only.
+  val cf_ic_tap = if (ENABLE_IFT_BRIDGE || IFT_ORACLE) Some(Output(new IftIcTap)) else None
 
   // corefuzzing: ICache set/way reconfiguration indices (from icacheCSRCF at 0xbcb)
   val cf_icache_set_conf = Input(UInt(2.W))  // index into icacheSetOptions = Seq(64, 32, 16, 8)
@@ -273,6 +276,23 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     }
   }
 
+  // [V3STATE] SP-18 (design 5.1 IC [113:99]): refill_done (the TL-D completion, ends at the tag / ift_tag_meta write
+  // enables) or io.invalidate (fence.i or debug-mode jalr, ends at vb_array).  With ic_inval alone the other IC
+  // fields are 0 (design 5.1).  Registered once: E -> E+1.  Outputs only.
+  io.cf_ic_tap.foreach { t =>
+    require(idxBits == 6 && log2Ceil(nWays) == 3 && (new IftIcTap).getWidth == 16, "STATE IC group: 64 sets x 8 ways (design 5.1)")
+    val w = Wire(new IftIcTap)
+    w.v       := refill_done || io.invalidate
+    w.g.inval := io.invalidate
+    w.g.drop  := refill_done && invalidated
+    w.g.dom   := refill_done && refill_domain_reg
+    w.g.sec   := refill_done && refill_secret_reg
+    w.g.set   := Mux(refill_done, refill_idx, 0.U)
+    w.g.way   := Mux(refill_done, repl_way, 0.U)
+    w.g.hi    := Mux(refill_done, refill_paddr(13, 12), 0.U)
+    val cf_state_ic_tap = RegNext(w, 0.U.asTypeOf(w))   // the IC tap register (named cf_state_*: SP-27, review M5)
+    t := cf_state_ic_tap
+  }
   when (io.invalidate) {
     vb_array := 0.U
     invalidated := true.B

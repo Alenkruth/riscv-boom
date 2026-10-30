@@ -119,6 +119,17 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     val cf_req_addr_sec = Output(Bool())
     val cf_req_addr_atk = Output(Bool())   // [ATKRES] attacker-address line mark
     val cf_req_res_pc   = Output(UInt(inflPcBitsCF.W))
+    // [V3EDGE] SP-20: this MSHR waits in s_wb_resp for the writeback unit (DC_PORT_BLOCK winner naming), and the
+    // primary's RECORD summary for the winner labels (RULES A "record summary for both": s_acc || s_prop || the
+    // address/line secret mark; attacker domain || cf_attacker_influence || the attacker address/line mark).  IFT only.
+    val cf_wb_wait     = if (ENABLE_IFT) Some(Output(Bool())) else None
+    val cf_req_sum_sec = if (ENABLE_IFT) Some(Output(Bool())) else None
+    val cf_req_sum_atk = if (ENABLE_IFT) Some(Output(Bool())) else None
+    // [V3STATE] SP-15 (design 5.1 M m_src, flag pf_drop [254]): this MSHR is in s_meta_clear (a granted meta write
+    // is its clear before writeback), and this MSHR leaves s_prefetch this cycle without writing the parked line.
+    // Record/STATE builds only.
+    val cf_meta_clr = if (ENABLE_IFT_BRIDGE || IFT_ORACLE) Some(Output(Bool())) else None
+    val cf_pf_drop  = if (ENABLE_IFT_BRIDGE || IFT_ORACLE) Some(Output(Bool())) else None
   })
 
   // TODO: Optimize this. We don't want to mess with cache during speculation
@@ -252,6 +263,21 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   io.probe_rdy   := (meta_hazard === 0.U && (state.isOneOf(s_invalid, s_refill_req, s_refill_resp, s_drain_rpq_loads) || (state === s_meta_read && grantack.valid)))
   // [reconf-fix] strict idle for the config-commit gate (see io declaration).
   io.state_invalid := state === s_invalid
+  io.cf_wb_wait.foreach(_ := state === s_wb_resp)   // [V3EDGE] SP-20
+  // [V3EDGE] SP-20: the primary's record summary (the same rule as the LSU_LANE winner, v3eWin in lsu.scala) ORed with
+  // the line/address marks the [NACKCONF] edges use; flops only.
+  io.cf_req_sum_sec.foreach(_ := req.uop.cf_secret_access.getOrElse(false.B) ||
+                                 req.uop.cf_secret_propagation.getOrElse(false.B) || io.cf_req_addr_sec)
+  io.cf_req_sum_atk.foreach(_ := req.uop.cf_domain_id.getOrElse(0.U(1.W))(0) ||
+                                 req.uop.cf_attacker_influence.getOrElse(false.B) || io.cf_req_addr_atk)
+  // [V3STATE] SP-15: decodes of the state flop and of the s_prefetch exit terms of the state machine below (the
+  // s_prefetch branch): a drop is the s_invalid exit or the reallocation exit; the sec_rdy exit is a promotion
+  // (s_meta_read) or a re-acquire (s_refill_req), whose line this MSHR writes later (an M fill), so not a drop.
+  // The terms are the existing next-state enables of `state`; they end here in the D$ tap register.
+  io.cf_meta_clr.foreach(_ := state === s_meta_clear)
+  io.cf_pf_drop.foreach(_ := state === s_prefetch &&
+    (((io.req_sec_val && !io.req_sec_rdy) || io.clear_prefetch) ||
+     (!(io.req_sec_val && io.req_sec_rdy) && io.req_pri_val && io.req_pri_rdy)))
   // corefuzzing: expose stored request domain for fill-completion tracking in dcache
   io.cf_req_domain   := req.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W))
   io.cf_req_op_count := req.uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
@@ -870,6 +896,20 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     // (fire && cacheable && !idx_match).  A secondary merges and evicts nothing; an uncacheable
     // request goes to an IOMSHR and touches no line.  Was cf_req_idx_match (fire && !it).
     val cf_req_alloc = Output(Vec(memWidth, Bool()))
+    // [V3EDGE] SP-20 (DC_PORT_BLOCK winners): the replaying MSHR, the meta-reading MSHR and the MSHR waiting for the
+    // writeback unit, each {op_count[11:0], atk, sec} (CF_BankNack).  IFT only.
+    val cf_blk = if (ENABLE_IFT) Some(Output(new Bundle {
+      val rp  = new CF_BankNack
+      val mr  = new CF_BankNack
+      val wbw = Valid(new CF_BankNack)
+    })) else None
+    // [V3STATE] SP-15 (design 5.1 R r_mshr, M m_mshr / m_src, flag pf_drop): the allocating MSHR (valid with
+    // cf_req_alloc), the meta-write arbiter's grant, whether the granted MSHR writes a clear, and the per-MSHR
+    // parked-prefetch drop terms (OR-ed in the D$).  Record/STATE builds only.
+    val cf_st_alloc_idx = if (ENABLE_IFT_BRIDGE || IFT_ORACLE) Some(Output(UInt(log2Ceil(cfg.nMSHRs).W))) else None
+    val cf_st_mw_chosen = if (ENABLE_IFT_BRIDGE || IFT_ORACLE) Some(Output(UInt(log2Ceil(cfg.nMSHRs).W))) else None
+    val cf_st_mw_clr    = if (ENABLE_IFT_BRIDGE || IFT_ORACLE) Some(Output(Bool())) else None
+    val cf_st_pf_drop   = if (ENABLE_IFT_BRIDGE || IFT_ORACLE) Some(Output(UInt(cfg.nMSHRs.W))) else None
     val block_hit = Output(Vec(memWidth, Bool()))
 
     val brupdate       = Input(new BrUpdateInfo)
@@ -1147,6 +1187,36 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
   // Try to round-robin the MSHRs
   val mshr_head      = RegInit(0.U(log2Ceil(cfg.nMSHRs).W))
   mshr_alloc_idx    := RegNext(AgePriorityEncoder(mshrs.map(m=>m.io.req_pri_rdy), mshr_head))
+  // [V3EDGE] SP-20: DC_PORT_BLOCK winner fields (dcache.scala [V3EDGE]); Mux1H of per-MSHR flops by the arbiter grants.
+  io.cf_blk.foreach { b =>
+    def lab(sel: Seq[Bool]): CF_BankNack = {
+      val r = Wire(new CF_BankNack)
+      r.oc  := Mux1H(sel, mshrs.map(_.io.cf_req_op_count))(r.oc.getWidth - 1, 0)
+      r.atk := Mux1H(sel, mshrs.map(_.io.cf_req_sum_atk.get))
+      r.sec := Mux1H(sel, mshrs.map(_.io.cf_req_sum_sec.get))
+      r
+    }
+    b.rp        := lab(UIntToOH(replay_arb.io.chosen, cfg.nMSHRs).asBools)
+    b.mr        := lab(UIntToOH(meta_read_arb.io.chosen, cfg.nMSHRs).asBools)
+    val ww       = mshrs.map(_.io.cf_wb_wait.get)
+    b.wbw.valid := ww.reduce(_ || _)
+    b.wbw.bits  := lab(ww)
+  }
+  // [V3STATE] SP-15: flop and arbiter-output taps, registered once in the D$ tap register (dcache.scala [V3STATE]).
+  io.cf_st_alloc_idx.foreach(_ := mshr_alloc_idx)
+  io.cf_st_mw_chosen.foreach(_ := meta_write_arb.io.chosen)
+  io.cf_st_mw_clr.foreach(_ := Mux1H(UIntToOH(meta_write_arb.io.chosen), VecInit(mshrs.map(_.io.cf_meta_clr.get))))
+  io.cf_st_pf_drop.foreach(_ := VecInit(mshrs.map(_.io.cf_pf_drop.get)).asUInt)
+  // [V3PRINT] SP-22 (design 9.6b): which MSHR(s) dropped a parked prefetch line, and how many lines were parked at that
+  // moment (> 1: the drop is ambiguous for the parser until that MSHR's next event).  Same event, same order as the
+  // tile's [MEM-PFDROP] line.  parked = idx.valid && !way.valid (the state is s_prefetch).  Debug-print builds only.
+  if (ENABLE_CF_DEBUG_PRINTF && ENABLE_IFT && (ENABLE_IFT_BRIDGE || IFT_ORACLE)) {
+    val pa  = boom.v3.util.CfStatePlusArg(true)
+    val drp = VecInit(mshrs.map(_.io.cf_pf_drop.get)).asUInt
+    when (pa && drp.orR) {
+      printf("[MEM-PFDROPV] mshr=0x%x parked=%d\n", drp, PopCount(mshrs.map(m => m.io.idx.valid && !m.io.way.valid)))
+    }
+  }
   when (pri_rdy && pri_val) { mshr_head := WrapInc(mshr_head, cfg.nMSHRs) }
 
 

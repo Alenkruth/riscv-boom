@@ -322,6 +322,24 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
       }
     }
   }
+  // [V3TAP-BTB] SP-19 (design 5.1 btb0/btb1 {v, set, way}, btb_rst; E5; 6.6): the entry this update writes, at the
+  // write stage (s1 = update cycle u+1), padded one register to the TAGE write cycle u+2.  v = a meta or target write
+  // with !doing_reset (the re-reset owns the port).  The set is recomputed from s1_update.bits.pc (a register of
+  // the same source as s1_update_idx, so the value is identical) and NOT read from s1_update_idx (lean54 worst
+  // family).  btb_rst = the set/way-CSR re-arm condition (doing_reset rises next cycle).  Outputs only.
+  io.cf_st.foreach { s =>
+    require(log2Ceil(nSets) == 7 && log2Ceil(nWays) == 1, "STATE PRED btb {v, set[6:0], way}: 128 sets x 2 ways (design 5.1)")
+    val stV   = !doing_reset && (s1_update_wmeta_mask =/= 0.U || s1_update_wbtb_mask =/= 0.U)
+    val stSet = (fetchIdx(s1_update.bits.pc) & (cf_btb_active_sets - 1.U))(log2Ceil(nSets) - 1, 0)
+    val stRst = (io.cf_btb_set_idx =/= prev_btb_set_idx) || (io.cf_btb_way_idx =/= prev_btb_way_idx)
+    s.btb_v   := RegNext(stV, false.B)
+    s.btb_set := RegNext(stSet)
+    s.btb_way := RegNext(s1_update_meta.write_way)
+    s.btb_rst := RegNext(stRst, false.B)
+    if (ENABLE_CF_DEBUG_PRINTF && ENABLE_IFT) {   // Verilator only: the check reads s1_update_idx, never in a FireSim/NoLog build
+      assert(!stV || stSet === s1_update_idx_masked(log2Ceil(nSets) - 1, 0), "[V3TAP-BTB] local BTB set != s1_update_idx_masked")
+    }
+  }
   when (s1_update_wbtb_mask =/= 0.U && offset_is_extended) {
     // [EBTBDOM] the update's domain; [EBTBSEC] patch 78: the secret label with every ebtb write (a clean write clears
     // it) and the PC of the writer.  [F8EBTB] lean58: one packed write.  The PC field is now written by EVERY ebtb

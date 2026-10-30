@@ -153,6 +153,10 @@ with CoreFuzzingConstants
   val cf_nack_asec = if (ENABLE_IFT) Some(Flipped(Vec(memWidth, Bool()))) else None
   // [RDEDGE] patch 80: lane w's nack was a data-array bank conflict with a TAGGED older lane (dcache.scala)
   val cf_bank_nack = if (ENABLE_IFT) Some(Flipped(Vec(memWidth, Valid(new CF_BankNack)))) else None
+  // [V3EDGE] SP-20 (design 6.2 DC_PORT_BLOCK 0x25): the D$ refused the LSU request vector this cycle
+  // (req.valid && !req.ready); bits = the winning read-port user's key and record-summary labels (0 when it has
+  // no single culprit).  IFT only.
+  val cf_port_blk = if (ENABLE_IFT) Some(Flipped(Valid(new CF_BankNack))) else None
 
   val brupdate     = Output(new BrUpdateInfo)
   val exception    = Output(Bool())
@@ -2533,8 +2537,68 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         pend(i)  := false.B
       }
     }
+    // [V3EDGE] SP-20 (record v3 design 6.2 / 6.2.1, V3-D11, N-D3 a): LSU_LANE (0x24) and DC_PORT_BLOCK (0x25),
+    // same cycle, on this port, drop-and-count.  Each edge lands on the DELAYED instruction's ROB row: {type, key =
+    // the winner's op_count[11:0] or 0, atk / sec = the winner's record summary} (RULES A "record summary for
+    // both").  No hold, stage or culprit register (V3-D14): the terms end in the port register `out`, which they
+    // take only when the [B61LDQ] grant is idle (gv = 0), so that table's timing is unchanged; a candidate that
+    // does not get the port is dropped (counted by the SP-22 debug prints).
+    //   LSU_LANE: lane w, a retry / wakeup / commit candidate X with can_fire && !will_fire lost to the FIRST
+    //   higher-priority candidate Y of the same lane (lsu_sched order) that fired and needs one of X's resources.
+    //   Y's summary: atk = attacker domain || cf_attacker_influence, sec = s_acc || s_prop (the ISSUE_CONTENTION
+    //   winner rule); Y without a uop (release, hellacache) -> key 0, labels 0.  A committed store-commit has no
+    //   live row: no edge.
+    //   DC_PORT_BLOCK: io.dmem.cf_port_blk.valid (the D$ refused the vector); every lane whose request has a live
+    //   row (not hellacache, not a committed store) is a loser; key / labels from io.dmem.cf_port_blk.bits.
+    def v3eWin(u: MicroOp): (UInt, Bool, Bool) =
+      (u.cf_op_count_id.get, u.cf_domain_id.get === 1.U || u.cf_attacker_influence.get,
+       u.cf_secret_access.get || u.cf_secret_propagation.get)
+    def v3eLive(u: MicroOp): Bool = !IsKilledByBranch(io.core.brupdate, u) && !io.core.exception
+    // (edge, kind: 1 DC_PORT_BLOCK / 0 LSU_LANE, lane, LSU_LANE candidate index 8..11 or 0)
+    val v3eCands = scala.collection.mutable.ArrayBuffer[(Valid[CF_MemOrdUpdate], Int, Int, Int)]()
+    val v3eBlk   = io.dmem.cf_port_blk.get
+    for (w <- 0 until memWidth) {
+      val u  = dmem_req(w).bits.uop
+      val cm = will_fire_store_commit(w) && stq_commit_e.bits.committed
+      v3eCands += ((rdeUpd(v3eBlk.valid && dmem_req(w).valid && !dmem_req(w).bits.is_hella && !cm && v3eLive(u),
+                           u, v3eBlk.bits.oc, v3eBlk.bits.atk, v3eBlk.bits.sec, INFL_DC_PORT_BLOCK), 1, w, 0))
+    }
+    for (w <- 0 until memWidth) {
+      // lane w in lsu_sched priority order: (can_fire, will_fire, resources T tlb / D dcache / L lcam / R rob, winner uop)
+      val ord = Seq(
+        (can_fire_load_incoming(w),  will_fire_load_incoming(w),  "TDL", Some(exe_req(w).bits.uop)),
+        (can_fire_stad_incoming(w),  will_fire_stad_incoming(w),  "TLR", Some(exe_req(w).bits.uop)),
+        (can_fire_sta_incoming(w),   will_fire_sta_incoming(w),   "TLR", Some(exe_req(w).bits.uop)),
+        (can_fire_std_incoming(w),   will_fire_std_incoming(w),   "R",   Some(exe_req(w).bits.uop)),
+        (can_fire_sfence(w),         will_fire_sfence(w),         "TR",  Some(exe_req(w).bits.uop)),
+        (can_fire_release(w),        will_fire_release(w),        "L",   None),
+        (can_fire_hella_incoming(w), will_fire_hella_incoming(w), "TD",  None),
+        (can_fire_hella_wakeup(w),   will_fire_hella_wakeup(w),   "D",   None),
+        (can_fire_load_retry(w),     will_fire_load_retry(w),     "TDL", Some(ldq_retry_e.bits.uop)),
+        (can_fire_sta_retry(w),      will_fire_sta_retry(w),      "TLR", Some(stq_retry_e.bits.uop)),
+        (can_fire_load_wakeup(w),    will_fire_load_wakeup(w),    "DL",  Some(ldq_wakeup_e.bits.uop)),
+        (can_fire_store_commit(w),   will_fire_store_commit(w),   "D",   Some(stq_commit_e.bits.uop)))
+      for (j <- 8 until 12) {   // load_retry, sta_retry, load_wakeup, store_commit (live only before commit: an AMO)
+        val (can, will, res, lu) = ord(j)
+        val ws   = ord.take(j).filter { case (_, _, r, _) => r.exists(c => res.contains(c)) }
+        val wsel = PriorityEncoderOH(ws.map(_._2))
+        val wv   = ws.map(_._4.map(v3eWin))
+        val key  = Mux1H(wsel, wv.map(_.map(_._1).getOrElse(0.U(uopIDCounterWidthCF.W))))
+        val atk  = Mux1H(wsel, wv.map(_.map(_._2).getOrElse(false.B)))
+        val sec  = Mux1H(wsel, wv.map(_.map(_._3).getOrElse(false.B)))
+        val live = if (j == 11) !stq_commit_e.bits.committed else true.B
+        v3eCands += ((rdeUpd(can && !will && live && v3eLive(lu.get), lu.get, key, atk, sec, INFL_LSU_LANE), 0, w, j))
+        if (ENABLE_CF_DEBUG_PRINTF) {
+          assert(!(can && !will) || ws.map(_._2).reduce(_ || _), "[V3EDGE] LSU_LANE loser without a firing winner")
+        }
+      }
+    }
+    val v3eAll = v3eCands.map(_._1).toSeq
+    val v3eSel = PriorityEncoderOH(v3eAll.map(_.valid))
+    val v3e    = Mux1H(v3eSel, v3eAll)
+    val v3eAny = v3eAll.map(_.valid).reduce(_ || _)
     val out = RegInit(0.U.asTypeOf(Valid(new CF_MemOrdUpdate)))
-    out.valid              := gv
+    out.valid              := gv || v3eAny   // [V3EDGE] SP-20
     out.bits.rob_idx       := ldq(gidx).bits.uop.rob_idx
     out.bits.op_count_id   := ldq(gidx).bits.uop.cf_op_count_id.get
     out.bits.prod_op_count := p_oc(gidx)
@@ -2542,6 +2606,32 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     out.bits.is_secret     := p_sec(gidx)
     out.bits.infl_type.get := (if (dcbOn) Mux(p_bank.get(gidx), INFL_DC_BANKCONF.U(inflTypeWidthCF.W), INFL_STL_PARTIAL.U(inflTypeWidthCF.W))
                                else INFL_STL_PARTIAL.U(inflTypeWidthCF.W))
+    when (!gv && v3eAny) { out.bits := v3e.bits }   // [V3EDGE] SP-20: a new edge takes the idle port (last connect)
+    // [V3PRINT] SP-22 (FT-7): one line per LSU_LANE / DC_PORT_BLOCK loser this cycle: emitted = it took the port,
+    // dropped = it did not (drop-and-count, N-D3 a); a refused COMMITTED store-commit (no live row, no edge) prints
+    // committed=1 emitted=0 dropped=0.  Debug-print builds only, +cf_state=1.
+    if (ENABLE_CF_DEBUG_PRINTF) {
+      val pa = boom.v3.util.CfStatePlusArg(true)
+      for (((e, kind, lane, src), k) <- v3eCands.zipWithIndex) {
+        val emitted = v3eSel(k) && e.valid && !gv
+        when (pa && e.valid) {
+          if (kind == 1) {
+            printf("[EDGE-DCPORT] c=%d lane=%d loser_oc=%d winner_oc=%d committed=0 emitted=%d dropped=%d\n",
+              io.core.tsc_reg, lane.U, e.bits.op_count_id, e.bits.prod_op_count, emitted, !emitted)
+          } else {
+            printf("[EDGE-LANE] c=%d lane=%d src=%d loser_oc=%d winner_oc=%d emitted=%d dropped=%d\n",
+              io.core.tsc_reg, lane.U, src.U, e.bits.op_count_id, e.bits.prod_op_count, emitted, !emitted)
+          }
+        }
+      }
+      for (w <- 0 until memWidth) {
+        when (pa && v3eBlk.valid && dmem_req(w).valid && will_fire_store_commit(w) && stq_commit_e.bits.committed) {
+          printf("[EDGE-DCPORT] c=%d lane=%d loser_oc=%d winner_oc=%d committed=1 emitted=0 dropped=0\n",
+            io.core.tsc_reg, w.U, stq_commit_e.bits.uop.cf_op_count_id.get, v3eBlk.bits.oc)
+        }
+      }
+    }
+    // [V3EDGE-END] SP-22 LSU prints are inserted above this line
     io.core.cf_rdedge_upd.get := out
     // Debug only (ENABLE_CF_DEBUG_PRINTF; no FPGA flops).  Observed one cycle late, from registered copies:
     //   [RDELOST] a load left the LDQ in cycle c while its entry was pending (incl. granted in c: the port register

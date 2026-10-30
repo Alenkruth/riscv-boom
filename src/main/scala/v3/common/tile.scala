@@ -228,6 +228,93 @@ class BoomTileModuleImp(outer: BoomTile) extends BaseTileModuleImp(outer){
       Some(o)
     } else None
 
+  // [V3ASM] SP-16 (record v3 design 5.1, 5.2, 5.4, 5.5; 6.6): assembly of the one STATE record (class 8) per cycle.
+  // All groups describe one event cycle E: D$ tap (E+1, SP-15) + two alignment registers here; frontend cut-out
+  // (E+2, SP-18/19) + the cut-in register here; so in cycle A = E+3 the assembly register samples the record with
+  // cyc = time - 3 = E.  The record leaves only in a cycle with a group event, a flag or a pending EPOCH; it takes
+  // the core's squash/kill lane with priority (SP-17).  No ready anywhere: nothing waits on it (RULES B).
+  // Time base: the core's free-running debug_tsc_reg (IftCoreToTile.tsc48), the counter every record class uses.
+  // EPOCH every 2^cfEpochLog2 cycles, deferred to the first PRED-free cycle (gv_EPOCH and gv_PRED never both 1).
+  if (outer.boomParams.core.enableIFTBridge || outer.boomParams.core.iftOracle) {
+    val cfEpochLog2 = 14                                  // INDEX-C C-1: < 2^15 keeps the host unwrap exact
+    val stDc  = outer.dcache.module.io.cf_state.get       // IftMemState, D$ tap register (E+1)
+    val stFe  = outer.frontend.module.io.cf_state.get     // IftFeState, frontend cut-out register (E+2)
+    val stCo  = core.ift_core_out.get                     // IftCoreToTile (core flops, no register here)
+    val stBo  = core.ift_bridge_out.get                   // the 5 record slots as presented to the bridge / oracle
+    val cf_state_al1 = RegNext(stDc, 0.U.asTypeOf(stDc))   // D$ alignment 1 (E+2)  (named cf_state_*: SP-27 timing pattern)
+    val cf_state_al2 = RegNext(cf_state_al1, 0.U.asTypeOf(stDc))   // D$ alignment 2 (E+3)
+    val cf_state_cin = RegNext(stFe, 0.U.asTypeOf(stFe))   // frontend cut-in (E+3)
+    // records presented on the 5 slots in the cycles before this one (records_total, design 5.4)
+    val stRecs = RegInit(0.U(32.W))
+    stRecs := stRecs + chisel3.util.PopCount(stBo.commit_valid :+ stBo.squash_valid)
+    // EPOCH: pending at reset and every 2^cfEpochLog2 cycles; emitted in the first cycle with gv_PRED = 0
+    val stEpPend = RegInit(true.B)
+    val stEpEmit = stEpPend && !cf_state_cin.pred.v
+    when (stEpEmit) { stEpPend := false.B }
+    when (stCo.tsc48(cfEpochLog2 - 1, 0).andR) { stEpPend := true.B }
+    val stGv  = chisel3.util.Cat(stEpEmit, cf_state_cin.pred.v, cf_state_cin.ras.v, cf_state_cin.ic.v, cf_state_al2.l_v, cf_state_al2.m_v, cf_state_al2.r_v)   // bit 0 R .. bit 6 EPOCH
+    val stCyc = stCo.tsc48(15, 0) - 3.U                   // the event cycle E (16-bit wrap)
+    // PRED positions [253:135]: the EPOCH overlay (IFTRecordV3.stateEpoch, 119 b) in an EPOCH cycle, else the PRED
+    // group; the SP-14 bundles are passed as asUInt (declaration order = the 5.1 range, SP-14 section 1).
+    val stPredOrEpoch = Mux(stEpEmit,
+      boom.v3.exu.IFTRecordV3.stateEpoch(stCo.tsc48, stRecs, stCo.sqovf16, stCo.killovf16),
+      cf_state_cin.pred.g.asUInt)
+    val stRec = boom.v3.exu.IFTRecordV3.state(stGv, stCo.dbg, stCyc, cf_state_al2.r.asUInt, cf_state_al2.m.asUInt, cf_state_al2.l.asUInt,
+                                              cf_state_cin.ic.g.asUInt, cf_state_cin.ras.g.asUInt, stPredOrEpoch,
+                                              cf_state_al2.pf_drop, cf_state_al2.wrport,
+                                              cf_state_al2.pf_id, cf_state_al2.pf_multi)   // FIX-V2-11
+    val stValid = stGv.orR || cf_state_al2.pf_drop || cf_state_al2.wrport
+    val stAsmV  = RegNext(stValid, false.B)               // the assembly register (A -> A+1)
+    val stAsmR  = chisel3.util.RegEnable(stRec, stValid)
+    core.ift_state_in.get.valid := stAsmV
+    core.ift_state_in.get.bits  := stAsmR
+    // [V3PRINT] SP-22 (FT-4..FT-9; design 9.6-9.7): one line per group event, printed from the registers the record is
+    // built from, each with c = the event cycle E (the D$ tap is seen at E+1, the frontend cut-out at E+2), so c equals
+    // the record's unwrapped cyc.  Debug-print IFT builds only, +cf_state=1.  The source-side checks are the existing
+    // [REPLUPD], [BTBW], [UBTBW], [TAGEW], [ICFILL], [D4RAS] prints.
+    if (outer.boomParams.core.enableCfDebugPrintf && outer.boomParams.core.enableIFT) {
+      val pa = boom.v3.util.CfStatePlusArg(true)
+      val cD = stCo.tsc48 - 1.U
+      val cF = stCo.tsc48 - 2.U
+      when (pa && stDc.r_v) {
+        printf("[MEM-R] c=%d kind=%d set=%d way=%d vv=%d upg=%d esec=%d eatk=%d sec=%d atk=%d dom=%d key=0x%x mshr=%d\n",
+          cD, stDc.r.kind, stDc.r.set, stDc.r.way, stDc.r.vvalid, stDc.r.upg, stDc.r.esec, stDc.r.eatk,
+          stDc.r.sec, stDc.r.atk, stDc.r.dom, stDc.r.key, stDc.r.mshr)
+      }
+      when (pa && stDc.m_v) {
+        printf("[MEM-M] c=%d src=%d set=%d way=%d mshr=%d coh=%d sec=%d dom=%d\n",
+          cD, stDc.m.src, stDc.m.set, stDc.m.way, stDc.m.mshr, stDc.m.coh, stDc.m.sec, stDc.m.dom)
+      }
+      when (pa && stDc.l_v)     { printf("[MEM-L] c=%d key=0x%x sec=%d atk=%d\n", cD, stDc.l.key, stDc.l.sec, stDc.l.atk) }
+      when (pa && stDc.pf_drop) { printf("[MEM-PFDROP] c=%d id=%d multi=%d\n", cD, stDc.pf_id, stDc.pf_multi) }
+      when (pa && stDc.wrport)  { printf("[MEM-WRPORT] c=%d\n", cD) }
+      when (pa && stFe.ic.v) {
+        printf("[FE-IC] c=%d inv=%d drop=%d dom=%d sec=%d set=%d way=%d hi=%d\n",
+          cF, stFe.ic.g.inval, stFe.ic.g.drop, stFe.ic.g.dom, stFe.ic.g.sec, stFe.ic.g.set, stFe.ic.g.way, stFe.ic.g.hi)
+      }
+      when (pa && stFe.ras.v) {
+        printf("[FE-RAS] c=%d push=%d sec=%d watk=%d dom=%d idx=%d addr12=0x%x\n",
+          cF, stFe.ras.g.push, stFe.ras.g.sec, stFe.ras.g.watk, stFe.ras.g.dom, stFe.ras.g.idx, stFe.ras.g.addr12)
+      }
+      when (pa && stFe.pred.v) {
+        val g = stFe.pred.g
+        printf("[PRED-U] c=%d kind=%d pc12=0x%x brm=0x%x cfi=%d/%d tk=%d mp=%d br=%d jal=%d sec=%d dom=%d rst=%d " +
+               "btb0=%d/0x%x/%d btb1=%d/0x%x/%d ubtb0=%d/%d ubtb1=%d/%d prov=0x%x alloc=%d/%d/%d udec=0x%x/%d nst=%d nsnt=%d h16=0x%x\n",
+          cF, g.u_kind, g.u_pc12, g.u_brmask, g.u_cfi_v, g.u_cfi_idx, g.u_taken, g.u_mispred, g.u_isbr, g.u_isjal,
+          g.u_sec, g.u_dom, g.btb_rst, g.btb0_v, g.btb0_set, g.btb0_way, g.btb1_v, g.btb1_set, g.btb1_way,
+          g.ubtb0_v, g.ubtb0_way, g.ubtb1_v, g.ubtb1_way, g.tg_prov, g.tg_alloc_v, g.tg_alloc_table, g.tg_alloc_slot,
+          g.tg_udec_mask, g.tg_udec_slot, g.tg_nst, g.tg_nsnt, g.tg_hist16)
+      }
+      when (pa && stEpEmit) {
+        printf("[EPOCH] c48=%d recs=%d sqovf=%d killovf=%d\n", stCo.tsc48, stRecs, stCo.sqovf16, stCo.killovf16)
+      }
+      when (pa && stBo.squash_valid) {
+        printf("[LANE] c=%d commits=%d cls=%d\n", stCo.tsc48, chisel3.util.PopCount(stBo.commit_valid), stBo.squash_record(3, 0))
+      }
+      assert(stCo.tsc48(15, 0) === stCo.cyc16, "[V3ASM] core ift_cyc16 != debug_tsc_reg(15,0): the record time bases differ")
+    }
+    // [V3ASM-END] SP-22 tile prints and asserts are inserted above this line
+  }
   // Connect the core pipeline to other intra-tile modules
   outer.frontend.module.io.cpu <> core.io.ifu
   core.io.lsu <> lsu.io.core

@@ -613,6 +613,9 @@ class BoomNonBlockingDCache(staticIdForMetadataUseOnly: Int)(implicit p: Paramet
 
 class BoomDCacheBundle(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p) {
   val lsu   = Flipped(new LSUDMemIO)
+  // [V3STATE] SP-14: the D$ STATE-record taps (R, M, L groups, pf_drop, wrport), driven by the D$ tap register
+  // (SP-15).  Record/STATE builds only (design V3-D10): None in every other build.
+  val cf_state = if (ENABLE_IFT_BRIDGE || IFT_ORACLE) Some(Output(new IftMemState)) else None
 }
 
 class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModuleImp(outer)
@@ -1759,6 +1762,67 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       }
     }
   }
+  // [V3STATE] SP-15 (record v3 design 5.1 R/M/L groups and flags [254] pf_drop, [255] wrport; 5.4; 6.6).
+  // V3-D9: every field is a register of a signal that already ends at a flop or a write port: the replacement-port
+  // write bus of lane uw (set, way, cf_rsec_wd / cf_ratk_wd -> ift_repl_sec/atk), the s2 request flops and the
+  // eviction labels (-> ift_evf write), the metaWriteArb output and grant (-> meta arrays), the MSHR file's
+  // allocation index (a flop), meta-write grant and state decodes, the MSHR fire terms (-> LFSR, state) and the
+  // dataWriteArb refill input (-> data array).  Registered ONCE here (the D$ tap register, cycle E -> E+1); the
+  // tile adds two alignment registers (SP-16).  Outputs only: nothing here reaches a D$ or MSHR control signal.
+  io.cf_state.foreach { st =>
+    require((new IftRGroup).getWidth == 34 && (new IftMGroup).getWidth == 19 && (new IftLGroup).getWidth == 14 &&
+            (new IftMemState).getWidth == 76, "STATE D$ group widths (design 5.1; FIX-V2-11 pf_id/pf_multi)")
+    require(idxBits == 7 && nWays == 8 && cfg.nMSHRs == 8 && inflPcBitsCF == 12 && memWidth == 2,
+            "STATE D$ fields are sized for 128 sets x 8 ways, 8 MSHRs, PC[13:2] keys, 2 lanes (design 5.1)")
+    val stw = Wire(new IftMemState)
+    // ---- R: every replacement-port write (upd: a hit refresh or an allocation, lane uw) and every MSHR allocation
+    //      (also under random replacement, conf 3, where upd is 0), outside the replacement-state reset sweep.
+    val stAlloc = cf_alloc.reduce(_ || _)      // one-hot or zero (asserted above); when set, uw is the allocating lane
+    val stPf    = isPrefetch(s2_req(uw).uop.mem_cmd)
+    stw.r_v        := (upd || stAlloc) && !cf_repl_rst
+    stw.r.kind     := Mux(stAlloc, Mux(stPf, 3.U, 2.U), 1.U)
+    stw.r.set      := set                       // dcacheMaskIdx(s2_req(uw).addr)
+    stw.r.way      := way                       // s2_repl_way(uw): UPGRADEWAY-corrected; conf 3: the LFSR victim
+    stw.r.vvalid   := cf_evicts(uw)             // the chosen victim way holds a valid line (it leaves at this MSHR's M event)
+    stw.r.upg      := stAlloc && VecInit(s2_tag_match)(uw)
+    stw.r.esec     := cf_evict_sec(uw)
+    stw.r.eatk     := cf_evict_atk(uw)
+    stw.r.sec      := cf_rsec_wd(inflPcBitsCF)  // the written per-set secret taint bit (conf 3: the LFSR taint of this fire)
+    stw.r.atk      := cf_ratk_wd(inflPcBitsCF)
+    stw.r.dom      := s2_req(uw).uop.cf_domain_id.get(0)
+    stw.r.key      := Mux(stAlloc && stPf, cf_req_pc12(uw), s2_req(uw).uop.cf_op_count_id.get(11, 0))
+    stw.r.mshr     := Mux(stAlloc, mshrs.io.cf_st_alloc_idx.get, 0.U)
+    // ---- M: the one meta write per cycle (metaWriteArb: in 0 MSHR file, 1 prober, 2 walker in reconf builds).
+    val stMwc  = metaWriteArb.io.chosen
+    val stMsh  = stMwc === 0.U
+    stw.m_v        := metaWriteArb.io.out.fire
+    stw.m.src      := Mux(stMsh, Mux(mshrs.io.cf_st_mw_clr.get, 1.U, 0.U), Mux(stMwc === 1.U, 2.U, 3.U))
+    stw.m.set      := metaWriteArb.io.out.bits.idx
+    stw.m.way      := Mux(stMwc === 2.U, 0.U, OHToUInt(metaWriteArb.io.out.bits.way_en))
+    stw.m.mshr     := Mux(stMsh, mshrs.io.cf_st_mw_chosen.get, 0.U)
+    stw.m.coh      := metaWriteArb.io.out.bits.data.coh.state
+    stw.m.sec      := stMsh && mshrs.io.cf_meta_write_fill.bits.secret
+    stw.m.dom      := stMsh && mshrs.io.cf_meta_write_fill.bits.domain(0)
+    // ---- L: replacement conf 3 only: an MSHR-file fire advanced the LFSR (replacer.miss) with no allocation
+    //      (secondary merge, MMIO).  The same terms as cf_lfsr_fire / cf_lfsr_set / cf_lfsr_aset (re-stated here:
+    //      those vals live inside an `if (ENABLE_IFT)` scope; firtool merges the duplicates).
+    val stFire = VecInit(mshrs.io.req.map(_.fire))
+    val stLw   = PriorityEncoder(stFire)
+    stw.l_v        := cf_repl_rand && stFire.asUInt.orR && !stAlloc
+    stw.l.key      := s2_req(stLw).uop.cf_op_count_id.get(11, 0)
+    stw.l.sec      := (0 until memWidth).map(i => stFire(i) && (s2_req(i).cf_addr_sec.getOrElse(false.B) || cf_fill_sec(i))).reduce(_ || _)
+    stw.l.atk      := (0 until memWidth).map(i => stFire(i) && cf_req_atki(i)).reduce(_ || _)
+    // ---- flags (each its own valid)
+    stw.pf_drop    := mshrs.io.cf_st_pf_drop.get.orR
+    // [V3STATE] FIX-V2-11: the dropping MSHR (lowest index) and "more than one".  Same 8 per-MSHR terms as the orR above,
+    // each output an 8-input function (2 LUT6 levels, the depth of that orR): 0 added levels, +4 tap FFs.  The Mux keeps
+    // pf_id 0 without pf_drop (PriorityEncoder of 0 is 7; the zero gate stays inside the same 8-input function).
+    stw.pf_id      := Mux(mshrs.io.cf_st_pf_drop.get.orR, PriorityEncoder(mshrs.io.cf_st_pf_drop.get), 0.U)
+    stw.pf_multi   := PopCount(mshrs.io.cf_st_pf_drop.get) > 1.U
+    stw.wrport     := dataWriteArb.io.in(1).valid && !dataWriteArb.io.in(1).ready
+    val cf_state_tap = RegNext(stw, 0.U.asTypeOf(stw))   // the D$ tap register: event cycle E -> held in E+1
+    st := cf_state_tap                                    // (named cf_state_*: SP-27 timing pattern, review M5)
+  }
   tl_out.a <> mshrs.io.mem_acquire
 
   // probes and releases
@@ -2900,6 +2964,22 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // is the only older lane at memWidth 2; wider configs name lane 0 and OR every older lane's label).  Only LSU
   // requests are multi-lane (s2_type === t_lsu).  The LSU turns it into an INFL_DC_BANKCONF edge on the nacked load.
   // All terms are s2 flops: a new endpoint path (the LSU holding register), 0 levels on the nack path.
+  // [V3EDGE] SP-20 (design 6.2 DC_PORT_BLOCK 0x25): the LSU request vector is refused when io.lsu.req.valid &&
+  // !io.lsu.req.ready (the meta / data read arbiters' pipeline inputs lose, or a reconf hold-off).  The winner is the
+  // read-arbiter user that fired this cycle (one grant per cycle): MSHR replay (in 0) -> the replaying MSHR's
+  // primary (the replayed request's own op_count is zeroed in the rpq); writeback unit (in 2) -> the MSHR waiting
+  // for it in s_wb_resp, else 0; MSHR meta read (in 3) -> that MSHR; prober (in 1), nothing, hold-off -> 0.  The
+  // prefetcher (in 5) is below the pipeline (in 4) and never blocks it.  Labels = the winner's record summary
+  // (RULES A) ORed with the MSHR's line marks.  IFT only.
+  // Wires (from flops and arbiter grants) into the LSU's port register.
+  io.lsu.cf_port_blk.foreach { pb =>
+    val mb = mshrs.io.cf_blk.get
+    pb.valid := io.lsu.req.valid && !io.lsu.req.ready
+    pb.bits  := 0.U.asTypeOf(pb.bits)
+    when (mshrs.io.meta_read.fire) { pb.bits := mb.mr }
+    when (wb_fire && mb.wbw.valid) { pb.bits := mb.wbw.bits }
+    when (mshrs.io.replay.fire)    { pb.bits := mb.rp }
+  }
   io.lsu.cf_bank_nack.foreach(v => for (w <- 0 until memWidth) {
     // [F21REC] Fable review 2026-10-23 F2-1, owner answer "Use the producer record" (RULES.md C): the older lane's
     // RECORD summary as its request carries it, like STL_FORWARD (M6) and the D$ store DW mark (st_sec / st_atk):

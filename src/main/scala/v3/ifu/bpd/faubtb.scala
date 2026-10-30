@@ -164,6 +164,13 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
   val s1_update_wmeta_mask = ((s1_update_wbtb_mask | s1_update.bits.br_mask) &
     Fill(bankWidth, s1_update.valid && s1_update.bits.is_commit_update))
 
+  // [V3TAP-UBTB] SP-19 (design 5.1 ubtb0/ubtb1 {v, way[3:0]}): the uBTB entry this commit update writes (s1, u+1),
+  // padded one register to the TAGE write cycle u+2.  16 entries, fully associative: entry = way.  Outputs only.
+  io.cf_st.foreach { s =>
+    require(log2Ceil(nWays) == 4, "STATE PRED ubtb {v, way[3:0]}: 16 entries (design 5.1)")
+    s.ubtb_v   := RegNext(s1_update_wmeta_mask =/= 0.U, false.B)
+    s.ubtb_way := RegNext(s1_update_write_way)
+  }
   // Write the BTB with the target
   when (s1_update.valid && s1_update.bits.cfi_taken && s1_update.bits.cfi_idx.valid && s1_update.bits.is_commit_update) {
     btb(s1_update_write_way)(s1_update_cfi_idx).offset := new_offset_value

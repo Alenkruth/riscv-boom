@@ -80,5 +80,8 @@ class ComposedBranchPredictorBank(implicit p: Parameters) extends BranchPredicto
   }
 
   val mems = components.map(_.mems).flatten
+  // [V3TAP-PRED] SP-19: each component drives only its own IftPredBankTap fields (0 elsewhere), so the bank's tap is
+  // the OR of its components (constant zeros fold away).  Record/STATE builds only.
+  io.cf_st.foreach(_ := components.map(_.io.cf_st.get.asUInt).reduce(_ | _).asTypeOf(new IftPredBankTap))
 
 }

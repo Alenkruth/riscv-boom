@@ -76,6 +76,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // the BoomTile oracle as FireSim builds it. None otherwise, so every other config
   // (baseline, FireSim printf path) elaborates exactly as before.
   val ift_bridge_out = if (ENABLE_IFT_BRIDGE || IFT_ORACLE) Some(IO(Output(new IFTTileIO(coreWidth)))) else None
+  // [V3LANE] SP-17 (record v3 design 5.5, 5.4): the STATE record from the tile's assembly register (valid + 256 b, no
+  // ready: no processor stage waits on it) and the core values the tile packs into it.  Record/STATE builds only.
+  val ift_state_in = if (ENABLE_IFT_BRIDGE || IFT_ORACLE) Some(IO(Input(Valid(UInt(256.W))))) else None
+  val ift_core_out = if (ENABLE_IFT_BRIDGE || IFT_ORACLE) Some(IO(Output(new IftCoreToTile))) else None
 
   io.ptw_tlb := DontCare
   io.ptw := DontCare
@@ -2563,6 +2567,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   require(iss_idx == exe_units.numIrfReaders)
 
   issue_units.map(_.io.tsc_reg := debug_tsc_reg)
+  // [V3PAUSE] SP-20: pause_mem (declared above) into the mem IQ's LOAD_PAUSE deny path; false for the int IQ.  IFT only.
+  issue_units.foreach(_.io.cf_pause_mem.foreach(_ := false.B))
+  mem_iss_unit.io.cf_pause_mem.foreach(_ := pause_mem)
   issue_units.map(_.io.brupdate := brupdate)
   issue_units.map(_.io.flush_pipeline := RegNext(rob.io.flush.valid))
 
@@ -3646,9 +3653,18 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     sq_arb.io.in(1).valid := kill_arb.io.out.valid
     sq_arb.io.in(1).bits  := kill_rec
     kill_arb.io.out.ready := sq_arb.io.in(1).ready
-    sq_arb.io.out.ready   := true.B
-    val sq_lane_v1    = RegNext(sq_arb.io.out.valid, false.B)      // keeps the lane registered (spec 5.3)
-    val sq_lane_r1    = RegEnable(sq_arb.io.out.bits, sq_arb.io.out.valid)
+    // [V3LANE] SP-17 (design 5.5, option (b)): the STATE record (class 8) takes the squash/kill lane with priority.
+    // sq_arb.io.out.ready := !state.valid: the RRArbiter grants nothing that cycle, the squash merge's output queue
+    // and the kill hold registers wait (their existing wait-or-count rule); the STATE record has no storage, so it
+    // is never the one that waits.  The 2:1 lane mux is the approved +1 site (design 6.4 / 08 section 8.2 d).
+    // No ift_state_in (no bridge / oracle): the original three lines, unchanged Verilog.
+    val st_v    = ift_state_in.map(_.valid).getOrElse(false.B)
+    val st_bits = ift_state_in.map(_.bits).getOrElse(0.U(256.W))
+    val (lane_v, lane_rec) = if (ift_state_in.isDefined) (st_v || sq_arb.io.out.valid, Mux(st_v, st_bits, sq_arb.io.out.bits))
+                             else (sq_arb.io.out.valid, sq_arb.io.out.bits)
+    sq_arb.io.out.ready   := (if (ift_state_in.isDefined) !st_v else true.B)
+    val sq_lane_v1    = RegNext(lane_v, false.B)      // keeps the lane registered (spec 5.3)
+    val sq_lane_r1    = RegEnable(lane_rec, lane_v)
     // [RECREG] (Phase 4 Task 4.3, ruling 44) one more stage, matching the commit lane's new
     // register in rob.scala, so a squash record keeps its place relative to the commit records
     // on the bridge token stream (both lanes now lag by one cycle more than before).  No
@@ -3664,6 +3680,29 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     }
     // 0xbce [15:0] share: hold registers overwritten before their drain (one per IQ per cycle at most)
     kill_ovf_cnt := satAdd16(kill_ovf_cnt, PopCount(kill_ovfs))
+    // [V3LANE] SP-17 (design 5.4, G10): the values the tile packs into the STATE record, all flops (sqovf16 is the
+    // ROB's satAdd16 of two counters); 97 wires core -> tile, both in SLR2.
+    ift_core_out.foreach { o =>
+      o.dbg       := cf_dbg
+      o.sqovf16   := rob.io.ift_squash_ovf_cnt
+      o.killovf16 := kill_ovf_cnt
+      o.tsc48     := debug_tsc_reg(47, 0)
+      o.cyc16     := ift_cyc16
+    }
+    // [V3PRINT] SP-22: the STATE record as it enters the lane (the decoder accepts these lines, SP-23) and the lane
+    // class checks (hard stop).  Debug-print builds with the STATE input only.
+    if (ENABLE_CF_DEBUG_PRINTF && ift_state_in.isDefined) {
+      val pa = boom.v3.util.CfStatePlusArg(true)
+      when (pa && st_v) { printf("[STATE] %x\n", st_bits) }
+      when (st_v) {
+        assert(st_bits(3, 0) === 8.U && (st_bits(254) || st_bits(15, 12) === 0.U) && !(st_bits(10) && st_bits(11)) &&   // [15:12] = pf_id/pf_multi only with pf_drop (FIX-V2-11)
+               (!st_bits(11) || st_bits(253, 247) === 0.U), "[V3LANE] malformed STATE record on the lane")
+      }
+      when (!st_v && sq_arb.io.out.valid) {
+        assert(sq_arb.io.out.bits(3, 0) === 2.U || sq_arb.io.out.bits(3, 0) === 3.U, "[V3LANE] lane record is neither SQUASH nor KILL")
+      }
+    }
+    // [V3LANE-END] SP-22 core prints and asserts are inserted above this line
     if (ENABLE_CF_DEBUG_PRINTF) {
       // Same tokens as the decoder's [KILLCNTD] line (dcy is the record's 3-bit bucket).
       // [R117SWEEP] patch 33: a trailing s_prop token (the record's s_prop bit) so the r117 kill

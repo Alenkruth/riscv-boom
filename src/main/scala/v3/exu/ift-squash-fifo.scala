@@ -83,6 +83,15 @@ class IftSquashMerge(nBanks: Int, nSprob: Int, nIc: Int, nWb: Int, nMemord: Int,
   val wr   = Seq.fill(nBanks)(RegInit(0.U(ptrW.W)))
   val rd   = Seq.fill(nBanks)(RegInit(0.U(ptrW.W)))
   val cnt  = Seq.fill(nBanks)(RegInit(0.U((ptrW + 1).W)))      // 0 .. depth; the top bit means full
+  // [V3PRINT] SP-22 (design 5.5 / 9.7, FT-6): the maximum squash-FIFO occupancy over the banks, printed whenever it
+  // grows; the last [SQOCC] line of a run is its maximum.  dbg builds only (IFT, debug prints, no bridge): 10 FF.
+  if (dbg) {
+    val pa  = boom.v3.util.CfStatePlusArg(true)
+    val mx  = RegInit(0.U((ptrW + 1).W))
+    val now = cnt.reduce((a, b) => Mux(a > b, a, b))
+    when (now > mx) { mx := now }
+    when (pa && now > mx) { printf("[SQOCC] max=%d\n", now) }
+  }
   // The same arbiter class and policy as the old IftSquashFifo, on control only.  Its
   // lastGrant register has no reset (review F2): on the FPGA it starts at 0; in Verilator
   // RANDOMIZE_REG_INIT may start it elsewhere, which can rotate the lane order only.

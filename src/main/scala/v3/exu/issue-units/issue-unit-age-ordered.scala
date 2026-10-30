@@ -237,6 +237,35 @@ class IssueUnitCollapsing(
     }
   }
 
+  // [V3PAUSE] SP-20 (record v3 design 6.2, 6.2.2 LOAD_PAUSE): in the pause cycle the core zeroes this (mem) IQ's
+  // fu_types, so no ready slot can use a port; each such slot records {LOAD_PAUSE, key 0, atk 0, sec 0} through the
+  // existing deny latch (newest denier + count; its dcy bucket counts the cycle).  No culprit register (V3-D14).
+  // Placed before the FU_BUSY block, which wins on the (impossible for mem slots) overlap by last connect.  Mem IQ
+  // only (Scala gate).  Levels: pause_mem is a 1-LUT function of two core flops; it joins the existing
+  // request / no-port AND (the FU_BUSY shape), 0 added levels.
+  if (ENABLE_IFT && iqType == IQT_MEM.litValue) {
+    val v3pPause = io.cf_pause_mem.get
+    for (i <- 0 until numIssueSlots) {
+      val v3pNoPort = !(0 until issueWidth).map(w => slot_can_use_port(i)(w)).reduce(_ || _)
+      when (v3pPause && issue_slots(i).request && v3pNoPort && !already_denied(i)) {
+        issue_slots(i).cf_contend_in.valid                := true.B
+        issue_slots(i).cf_contend_in.bits.winner_op_count := 0.U
+        issue_slots(i).cf_contend_in.bits.winner_is_atk   := false.B
+        issue_slots(i).cf_contend_in.bits.winner_is_sec   := false.B
+        issue_slots(i).cf_contend_in.bits.infl_type       := INFL_LOAD_PAUSE.U
+        issue_slots(i).cf_contend_in.bits.multi           := false.B
+        issue_slots(i).cf_contend_in.bits.any_atk         := false.B
+        issue_slots(i).cf_contend_in.bits.any_sec.foreach(_ := false.B)
+      }
+    }
+    if (ENABLE_CF_DEBUG_PRINTF) {   // [V3PRINT] SP-22 (FT-7): the ready mem slots LOAD_PAUSE denied this cycle
+      val pa = boom.v3.util.CfStatePlusArg(true)
+      val dn = (0 until numIssueSlots).map(i => issue_slots(i).request &&
+                 !(0 until issueWidth).map(w => slot_can_use_port(i)(w)).reduce(_ || _))
+      when (pa && v3pPause) { printf("[EDGE-PAUSE] c=%d denied=%d\n", io.tsc_reg, PopCount(dn)) }
+    }
+    // [V3PAUSE-END] SP-22 [EDGE-PAUSE] print is inserted above this line
+  }
   // O1: FU-occupancy denial.  A non-pipelined unit (div/fdivsqrt) holds its slot for
   // ~20-30 cycles; a slot needing that unit finds no usable port at all, so there is
   // no winner/loser pair and INFL_ISSUE_CONTENTION can never fire for it.

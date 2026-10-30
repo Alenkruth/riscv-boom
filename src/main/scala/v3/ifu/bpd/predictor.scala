@@ -227,6 +227,10 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
     // [BTBATK] DF-btbatk: the fetch hit the tag an ATTACKER-domain allocation displaced; its PC is
     // f3_btb_sec_pc when neither f3_btb_secret_mismatch nor f3_btb_sec_disp fires.
     val f3_btb_atk_disp        = Output(Bool())
+    // [V3TAP-PRED] SP-19 (design 5.1 PRED): this bank's write-stage taps aligned to the TAGE table-write cycle.  The
+    // BTB, uBTB and TAGE components drive their own fields; every other component (and the base) drives 0.
+    // Record/STATE builds only.
+    val cf_st = if (ENABLE_IFT_BRIDGE || IFT_ORACLE) Some(Output(new IftPredBankTap)) else None
   })
   io.resp := io.resp_in(0)
 
@@ -239,6 +243,7 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
   io.f3_btb_sec_disp        := false.B
   io.f3_btb_sec_pc          := 0.U
   io.f3_btb_atk_disp        := false.B
+  io.cf_st.foreach(_ := 0.U.asTypeOf(new IftPredBankTap))   // [V3TAP-PRED] default; BTB / uBTB / TAGE override fields
 
   val s0_idx       = fetchIdx(io.f0_pc)
   val s1_idx       = RegNext(s0_idx)
@@ -308,6 +313,8 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     // corefuzzing: domain of the fetch request for BPD/BTB domain shadow comparisons
     val f0_req_domain_id = Input(UInt(1.W))   // IFT off only (IFT on: tied 0 by the frontend, unused)
     val f1_req_domain_id = if (ENABLE_IFT) Some(Input(UInt(1.W))) else None   // [F4S1RNG] lean58: the s1 fetch domain
+    // [V3TAP-PRED] SP-19: per PHYSICAL bank b (banked_predictors(b)) write-stage taps, aligned to the TAGE write cycle.
+    val cf_st = if (ENABLE_IFT_BRIDGE || IFT_ORACLE) Some(Output(Vec(nBanks, new IftPredBankTap))) else None
   })
 
   var total_memsize = 0
@@ -622,6 +629,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
   io.resp.f2.btb_atk_disp.foreach(_ := false.B)
   io.resp.f1.btb_sec_pc.foreach(_ := 0.U)
   io.resp.f2.btb_sec_pc.foreach(_ := 0.U)
+  io.cf_st.foreach(o => for (b <- 0 until nBanks) { o(b) := banked_predictors(b).io.cf_st.get })   // [V3TAP-PRED]
 
   when (io.update.valid) {
     when (io.update.bits.cfi_is_br && io.update.bits.cfi_idx.valid) {

@@ -480,6 +480,31 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
   io.f3_bpd_secret_mismatch := tables.map(t =>
     (t.io.f3_secret_mismatch.asUInt & s3_mask & Fill(bankWidth, s3_valid)).orR).reduce(_||_)
 
+  // [V3TAP-TAGE] SP-19 (design 5.1 tg_prov / tg_alloc / tg_udec): decode of the table-input registers (cycle u+2, the
+  // cycle every TageTable writes).  Per slot w: provider = the table with update_mask && !update_alloc (0 none,
+  // t+1 = table t); allocation = update_mask && update_alloc; u-only write = update_u_mask && !update_mask.
+  // update_alloc is read only under update_mask (it is DontCare elsewhere).  One-hot AND-OR of flops into the PRED
+  // tap register (frontend).  Outputs only.
+  io.cf_st.foreach { s =>
+    require(tageNTables == 7 && bankWidth == 4, "STATE PRED TAGE fields: 7 tables, 4 slots per bank (design 5.1)")
+    val stM  = tables.map(_.io.update_mask)
+    val stA  = tables.map(_.io.update_alloc)
+    val stU  = tables.map(_.io.update_u_mask)
+    val stProvOH = (0 until bankWidth).map(w => VecInit((0 until tageNTables).map(i => stM(i)(w) && !stA(i)(w))).asUInt)
+    s.tg_prov := VecInit(stProvOH.map(oh => Mux(oh.orR, OHToUInt(oh) +& 1.U, 0.U)(2, 0))).asUInt   // slot w at [3w+2:3w]
+    val stAl = (0 until tageNTables).map(i => (0 until bankWidth).map(w => stM(i)(w) && stA(i)(w)))
+    s.tg_alloc_v     := stAl.flatten.reduce(_ || _)
+    s.tg_alloc_table := OHToUInt(VecInit(stAl.map(_.reduce(_ || _))).asUInt)
+    s.tg_alloc_slot  := OHToUInt(VecInit((0 until bankWidth).map(w => stAl.map(_(w)).reduce(_ || _))).asUInt)
+    val stUd = (0 until tageNTables).map(i => (0 until bankWidth).map(w => stU(i)(w) && !stM(i)(w)))
+    s.tg_udec_mask := VecInit(stUd.map(_.reduce(_ || _))).asUInt
+    s.tg_udec_slot := OHToUInt(VecInit((0 until bankWidth).map(w => stUd.map(_(w)).reduce(_ || _))).asUInt)
+    if (ENABLE_CF_DEBUG_PRINTF && ENABLE_IFT) {
+      for (w <- 0 until bankWidth) { assert(PopCount(stProvOH(w)) <= 1.U, "[V3TAP-TAGE] two provider tables trained in one slot") }
+      assert(PopCount(stAl.flatten) <= 1.U, "[V3TAP-TAGE] more than one TAGE allocation in one bank")
+      assert(PopCount((0 until bankWidth).map(w => stUd.map(_(w)).reduce(_ || _))) <= 1.U, "[V3TAP-TAGE] u-only writes in two slots")
+    }
+  }
   //io.f3_meta := Cat(f3_meta.asUInt, micro.io.f3_meta(micro.metaSz-1,0), base.io.f3_meta(base.metaSz-1, 0))
   io.f3_meta := f3_meta.asUInt
 }
