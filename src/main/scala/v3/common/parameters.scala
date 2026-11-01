@@ -130,6 +130,21 @@ case class BoomCoreParams(
    * structures use their hardware-built maximum sizes.
    * Set via WithReconf config fragment. */
   enableReconf: Boolean = false,
+  // ---- Hardware defenses (defense-clean-plans *-plan-v5.md). All off by default; each has a runtime CSR that resets to 0. ----
+  enableSTT: Boolean = false,                               // STT (stt-plan-v5.md)
+  enableDoppelganger: Boolean = false,                      // Doppelganger Loads, requires enableSTT (dgl-plan-v5.md)
+  doppelgangerEntries: Int = 1024,                          // predictor entries (paper Table 1)
+  doppelgangerWays: Int = 8,                                // predictor associativity (paper Table 1)
+  doppelgangerTrainQueueDepth: Int = 32,                    // commit-side training queue (decodeWidth banks); overflow dropped + counted
+  doppelgangerConfThreshold: Int = 1,                       // 0..3: repeated strides before a prediction is used
+  doppelgangerNackRetries: Int = 3,                         // doppelganger re-issues after a D$ nack or DTLB miss (owner DGL-2)
+  doppelgangerTagBits: Int = 10,                            // request identity width
+  enableSpecASan: Boolean = false,                          // SpecASan (specasan-plan-v5.md)
+  specasanTagWindowBase: BigInt = BigInt("80000000", 16),   // tagged memory window base (DRAM)
+  specasanTagWindowBytes: BigInt = BigInt(64) << 20,        // tagged window size; the tag storage (1 B per 16 B) follows it
+  specasanTagCacheEntries: Int = 64,                        // tag-line buffer lines of 64 tag bytes
+  specasanPaintQueue: Int = 8,                              // outstanding csrw SPECASAN_PAINT writes
+  enableCeviche: Boolean = false,                           // Ceviche: CRF in L1-D and L1-I (ceviche-plan-v5.md)
 
   /* [r147/r149] D$ replacement policy DESIGN DEFAULT, the single source of truth for every
    * BOOM v3 config (stock and reconfig).  Codes (= 0xbc1 bits [5:4], ruling 149):
@@ -171,6 +186,21 @@ case class BoomCoreParams(
     "iftOracle is the Verilator/OOC stand-in for the IFT bridge: it needs enableIFT and no enableIFTBridge")
   require(dcacheReplPolicy >= 0 && dcacheReplPolicy <= 3,
     "dcacheReplPolicy must be 0/2 (PseudoLRU), 1 (TrueLRU) or 3 (LFSR random)")
+  require(!enableSTT || !enableSFBOpt, "STT: SFB predication not supported (sfb shadow uops are predicated, not branch-gated)")
+  require(!enableDoppelganger || enableSTT, "Doppelganger is an optimization on top of STT")
+  require(isPow2(doppelgangerEntries) && isPow2(doppelgangerWays) && doppelgangerWays >= 2 &&
+          doppelgangerEntries / doppelgangerWays >= 2, "doppelgangerEntries/Ways: powers of 2, >= 2 sets")
+  require(isPow2(decodeWidth) && doppelgangerTrainQueueDepth % decodeWidth == 0 &&
+          isPow2(doppelgangerTrainQueueDepth / decodeWidth), "train queue: decodeWidth banks of a power-of-2 depth")
+  require(doppelgangerConfThreshold >= 0 && doppelgangerConfThreshold <= 3, "doppelgangerConfThreshold is a 2-bit count")
+  require(doppelgangerNackRetries >= 0 && doppelgangerNackRetries <= 3, "doppelgangerNackRetries is a 2-bit count")
+  require(doppelgangerTagBits >= 4 && doppelgangerTagBits <= 16, "doppelgangerTagBits")
+  require(isPow2(specasanTagCacheEntries) && specasanTagCacheEntries >= 16, "SpecASan: tag-line buffer entries must be a power of two >= 16")
+  require(isPow2(specasanTagWindowBytes) && specasanTagWindowBytes >= (BigInt(specasanTagCacheEntries) << 10) &&
+          specasanTagWindowBase % specasanTagWindowBytes == 0, "SpecASan: the tagged window must be a power of two, aligned, and cover the buffer")
+  require(specasanPaintQueue >= 2, "SpecASan: paint queue depth")
+  require(!enableCeviche || enableIFT,    "Ceviche uses the IFT domain plumbing (cf_domain_id, fetch domain)")
+  require(!enableCeviche || enableReconf, "Ceviche switches the D$ mode through the 2.10f writeback walk (exists only with enableReconf)")
 
   override def traceCustom = Some(new BoomTraceBundle)
   val xLen = 64
@@ -358,6 +388,56 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     val idx = decls.indexWhere(_.id == c.id)
     if (idx >= 0) { csrs(idx).set := true.B; csrs(idx).sdata := v }
   }
+  // ==== Hardware defenses (defense-clean-plans *-plan-v5.md, shared T0 block) ====
+  // Early-init rule (NOTE above cfIFTEnabled): `decls` runs inside the base-class constructor, before any val of this class is
+  // initialised, so everything it reaches is a def that reads tileParams.  [v5] FULL64 is a def (it was a val in stt-plan-v4).
+  private def bp = tileParams.core.asInstanceOf[BoomCoreParams]
+  private def cfSTTEnabled:          Boolean = bp.enableSTT
+  private def cfDoppelgangerEnabled: Boolean = bp.enableDoppelganger
+  private def cfSpecASanEnabled:     Boolean = bp.enableSpecASan
+  private def cfCevicheEnabled:      Boolean = bp.enableCeviche
+  private def FULL64 = BigInt("ffffffffffffffff", 16)
+  // Hardware-written read-only CSR: set every cycle; a software write is overwritten the next cycle.  The mask must be all ones:
+  // CSRFile.setCustomCSR writes (sdata & mask) | (reg & ~mask) (rocket CSR.scala:1529-1533).  [v5] SPECASAN_STAT used mask 0.
+  private def publish(csr: Option[CustomCSR], v: UInt): Unit = csr.foreach { c =>
+    val idx = decls.indexWhere(_.id == c.id); if (idx >= 0) { csrs(idx).set := true.B; csrs(idx).sdata := v } }
+  // ---- STT (stt-plan-v5.md section 6) ----
+  override def sttCtlCSRCF  = if (cfSTTEnabled) Some(CustomCSR(sttCtlCSRIdCF, BigInt(0x77), Some(BigInt(0)))) else None   // [v6]
+  override def sttStatCSRCF = if (cfSTTEnabled) Some(CustomCSR(sttStatCSRIdCF, FULL64, Some(BigInt(0)))) else None
+  def stt_en       = getOrElse(sttCtlCSRCF, _.value(0), false.B)
+  def stt_fut      = getOrElse(sttCtlCSRCF, _.value(1), false.B)   // 0 = Spectre VP, 1 = Futuristic VP (paper 6.1)
+  def stt_sta_notx = getOrElse(sttCtlCSRCF, _.value(2), false.B)   // 1 = stores are not transmitters (paper 7.3 assumption)
+  def stt_exp_only = getOrElse(sttCtlCSRCF, _.value(4), false.B)   // 1 = DelayExecute+STT-ExpOnly (paper Table 3)
+  def stt_delay    = getOrElse(sttCtlCSRCF, _.value(5), false.B)   // 1 = DelayExecute (paper Table 3, section 1); bit 4 ignored   // [v6]
+  def stt_dbg      = getOrElse(sttCtlCSRCF, _.value(6), false.B)
+  def stt_gate_exp = stt_en                                         // explicit channels: loads/AMO address, DIV/REM, FDIV/FSQRT
+  def stt_gate_br  = stt_en && !stt_exp_only && !stt_delay          // explicit branches and jumps (implicit channels)   // [v6]
+  def stt_gate_sta = stt_en && !stt_sta_notx                        // store address generation (owner STT-4: transmitter)
+  def stt_impl     = stt_en && !stt_exp_only && !stt_delay          // implicit branches: 6.4.2 hold, 7.3 PendingSquash   // [v6]
+  def stt_dx       = stt_en && stt_delay                            // DelayExecute: hold until the transmitter's own VP   // [v6]
+  def stt_stat_set(v: UInt): Unit = publish(sttStatCSRCF, v)
+  // ---- Doppelganger (dgl-plan-v5.md section 6) ----
+  override def doppelgangerCtlCSRCF  = if (cfDoppelgangerEnabled) Some(CustomCSR(doppelgangerCtlCSRIdCF, BigInt(0x1), Some(BigInt(0)))) else None
+  override def doppelgangerStatCSRCF = if (cfDoppelgangerEnabled) Some(CustomCSR(doppelgangerStatCSRIdCF, FULL64, Some(BigInt(0)))) else None
+  def doppelganger_en = getOrElse(doppelgangerCtlCSRCF, _.value(0), false.B)
+  def doppelganger_stat_set(v: UInt): Unit = publish(doppelgangerStatCSRCF, v)
+  // ---- SpecASan (specasan-plan-v5.md section 6) ----
+  override def specasanCtlCSRCF   = if (cfSpecASanEnabled) Some(CustomCSR(specasanCtlCSRIdCF, BigInt(0x3), Some(BigInt(0)))) else None
+  override def specasanPaintCSRCF = if (cfSpecASanEnabled) Some(CustomCSR(specasanPaintCSRIdCF, FULL64, Some(BigInt(0)))) else None
+  override def specasanStatCSRCF  = if (cfSpecASanEnabled) Some(CustomCSR(specasanStatCSRIdCF, FULL64, Some(BigInt(0)))) else None
+  def sa_ctl_en     = getOrElse(specasanCtlCSRCF, _.value(0), false.B)
+  def sa_tbi        = getOrElse(specasanCtlCSRCF, _.value(1), false.B)
+  def sa_paint_wen  = getOrElse(specasanPaintCSRCF, _.wen, false.B)
+  def sa_paint_data = getOrElse(specasanPaintCSRCF, _.wdata, 0.U(64.W))
+  def sa_stat_set(v: UInt): Unit = publish(specasanStatCSRCF, v)
+  // ---- Ceviche (ceviche-plan-v5.md section 6) ----
+  override def cevicheCtlCSRCF = if (cfCevicheEnabled) Some(CustomCSR(cevicheCtlCSRIdCF, (BigInt(1) << 51) - 1, Some(BigInt(0)))) else None
+  def cf_ceviche_en     = getOrElse(cevicheCtlCSRCF, _.value(0),      false.B)
+  def cf_ceviche_pol    = getOrElse(cevicheCtlCSRCF, _.value(8,1),    0.U(8.W))    // {pol1[3:0], pol0[3:0]}, nibble = {S,I,W,R}
+  def cf_ceviche_hard_d = getOrElse(cevicheCtlCSRCF, _.value(19,9),   0.U(11.W))   // lines; 0 -> 768 (75 % of 1024)
+  def cf_ceviche_soft_d = getOrElse(cevicheCtlCSRCF, _.value(30,20),  0.U(11.W))   // lines; 0 -> 512 (50 %)
+  def cf_ceviche_hard_i = getOrElse(cevicheCtlCSRCF, _.value(40,31),  0.U(10.W))   // lines; 0 -> 384
+  def cf_ceviche_soft_i = getOrElse(cevicheCtlCSRCF, _.value(50,41),  0.U(10.W))   // lines; 0 -> 256
   
   // Debug-log enable CSR: controls IFT-specific debug printfs throughout the core.
   // Gated on ENABLE_IFT because all consumers are inside IFT logic blocks.
@@ -705,6 +785,22 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val IFT_ORACLE          = boomParams.iftOracle       // [Task 2.10g] Verilator/OOC: keep the record outputs at the tile
   val ENABLE_IFT          = boomParams.enableIFT       // compile-time gate for DIFT tracking logic
   val ENABLE_RECONF       = boomParams.enableReconf    // compile-time gate for runtime reconfigurability
+  val ENABLE_STT                  = boomParams.enableSTT
+  val ENABLE_DOPPELGANGER         = boomParams.enableDoppelganger
+  val doppelgangerEntries         = boomParams.doppelgangerEntries
+  val doppelgangerWays            = boomParams.doppelgangerWays
+  val doppelgangerSets            = boomParams.doppelgangerEntries / boomParams.doppelgangerWays
+  val doppelgangerSetBits         = log2Ceil(doppelgangerSets)
+  val doppelgangerTrainQueueDepth = boomParams.doppelgangerTrainQueueDepth
+  val doppelgangerConfThreshold   = boomParams.doppelgangerConfThreshold
+  val doppelgangerNackRetries     = boomParams.doppelgangerNackRetries
+  val doppelgangerTagBits         = boomParams.doppelgangerTagBits
+  val SPECASAN                    = boomParams.enableSpecASan
+  val specasanTagWindowBase       = boomParams.specasanTagWindowBase
+  val specasanTagWindowBytes      = boomParams.specasanTagWindowBytes
+  val specasanTagCacheEntries     = boomParams.specasanTagCacheEntries
+  val specasanPaintQueue          = boomParams.specasanPaintQueue
+  val ENABLE_CEVICHE              = boomParams.enableCeviche
   val DCACHE_REPL_DEFAULT = boomParams.dcacheReplPolicy // [r147] D$ replacement design default (0/1/2)
   val ENABLE_CF_DEBUG_PRINTF = boomParams.enableCfDebugPrintf // compile-time gate for [FLUSH]/[SPECULATIVE] debug printfs
   val ENABLE_CF_CACHE_SHADOW_PRINTF = boomParams.enableCfDebugPrintf && boomParams.enableCfCacheShadowPrintf // D$ shadow prints for dcheck

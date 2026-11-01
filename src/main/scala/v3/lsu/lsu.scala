@@ -100,6 +100,14 @@ class BoomDCacheReq(implicit p: Parameters) extends BoomBundle()(p)
   // set's replacement state, not the evicting access (dcache.scala [CEREPL]).  D$-internal; LSU drives 0.
   val cf_res_repl = if (ENABLE_IFT) Some(Bool()) else None
   val cf_res_nack = if (ENABLE_IFT) Some(Bool()) else None   // [RECV3] SP-07 3.D: the cf_res_* PC is a nack edge's (DC_NACK)
+  // [SA-D1] SpecASan: the pointer key (raw EA[59:56]); "non-speculative" (no older unresolved branch and no older unknown
+  // store address / store commit); "verify" (Spectre-v4 held load: check + fill, never data).  sa_unsafe / sa_fault are
+  // D$-SET verdicts echoed on io.lsu.nack(w).bits (the LSU drives 0 on requests).
+  val sa_key     = if (SPECASAN) Some(UInt(4.W)) else None
+  val sa_nonspec = if (SPECASAN) Some(Bool()) else None
+  val sa_verify  = if (SPECASAN) Some(Bool()) else None
+  val sa_unsafe  = if (SPECASAN) Some(Bool()) else None
+  val sa_fault   = if (SPECASAN) Some(Bool()) else None
 }
 
 class BoomDCacheResp(implicit p: Parameters) extends BoomBundle()(p)
@@ -133,6 +141,10 @@ with CoreFuzzingConstants
   val resp        = Flipped(Vec(memWidth, new ValidIO(new BoomDCacheResp)))
   // In our response stage, if we get a nack, we need to reexecute
   val nack        = Flipped(Vec(memWidth, new ValidIO(new BoomDCacheReq)))
+  // [SA-D2] SpecASan control into the D$ and status back (Option: absent when compiled out)
+  val sa_ctl_en   = if (SPECASAN) Some(Output(Bool())) else None
+  val sa_paint    = if (SPECASAN) Some(Output(Valid(UInt(64.W)))) else None   // one csrw SPECASAN_PAINT pulse
+  val sa_stat     = if (SPECASAN) Some(Input(UInt(64.W))) else None           // SPECASAN_STAT word (D$ counters)
   // [RESPSEL] patch 25 row 2d (IFT builds only): the D$ store-only-miss acks, moved off `resp`
   // (lane w carries one here exactly when the old resp(w) carried it; then resp(w).valid = 0).
   val st_ack      = if (boomParams.enableIFT) Some(Flipped(Vec(memWidth, new ValidIO(new BoomDCacheResp)))) else None
@@ -180,6 +192,9 @@ with CoreFuzzingConstants
   val cf_dcache_set_conf  = Output(UInt(dcacheParamsWidthCF.W))
   val cf_dcache_way_conf  = Output(UInt(dcacheParamsWidthCF.W))
   val cf_dcache_repl_conf = Output(UInt(dcacheParamsWidthCF.W))
+  val cf_ceviche_en     = if (ENABLE_CEVICHE) Some(Output(Bool()))     else None
+  val cf_ceviche_hard_d = if (ENABLE_CEVICHE) Some(Output(UInt(11.W))) else None
+  val cf_ceviche_soft_d = if (ENABLE_CEVICHE) Some(Output(UInt(11.W))) else None
   // [reconf-fix Phase C] L1 invalidate-all walker (CSR 0xbc4, RESTORE-ONLY):
   // write pulse + wdata (bit1 = discard walk), and busy back-channel to core
   // (published as 0xbcd[17]).  Constant-tied in the baseline flavor → pruned.
@@ -374,6 +389,24 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   val cf_secret_end_addr   = Input(UInt(coreMaxAddrBits.W))
   // [DBGFREEZE] patch 85 (b): the hart is in debug mode (core.scala cf_dbg, a flop); no s_acc then.  IFT only.
   val cf_dbg               = if (ENABLE_IFT) Some(Input(Bool())) else None
+  // ---- Hardware defenses (T0 block; order STT, Doppelganger, SpecASan, Ceviche) ----
+  val stt_fut      = if (ENABLE_STT) Some(Input(Bool())) else None                   // STT: Futuristic VP (STT_CTL[1])
+  val stt_impl     = if (ENABLE_STT) Some(Input(Bool())) else None                   // STT: implicit-branch rules
+  val stt_dbg      = if (ENABLE_STT) Some(Input(Bool())) else None                   // STT: debug prints
+  val stt_stl_blk  = if (ENABLE_STT) Some(Output(Bool())) else None                  // STT: a load search was held (stats)
+  val stt_ldq_safe = if (ENABLE_STT) Some(Output(UInt(numLdqEntries.W))) else None   // STT: per-entry VP flags
+  val stt_ldq_head = if (ENABLE_STT) Some(Output(UInt(ldqAddrSz.W))) else None       // STT: age reference of the roots
+  val stt_fail_rob = if (ENABLE_STT) Some(Output(Valid(UInt(robAddrSz.W)))) else None   // STT: oldest order-failing load (P-F2)   // [v7]
+  val dgl_ctl      = if (ENABLE_DOPPELGANGER) Some(Input(Bool())) else None          // Doppelganger: runtime enable
+  val dgl_stat     = if (ENABLE_DOPPELGANGER) Some(Output(UInt(48.W))) else None     // Doppelganger: four 12-bit counters
+  // (Doppelganger's T1d inserts `dgl_train` here: its type DglTrainReq is defined in T1d's new file)
+  val sa_ctl_en     = if (SPECASAN) Some(Input(Bool())) else None                     // SpecASan: SPECASAN_CTL[0]
+  val sa_paint_wen  = if (SPECASAN) Some(Input(Bool())) else None                     // SpecASan: csrw 0xbd5 pulse
+  val sa_paint_data = if (SPECASAN) Some(Input(UInt(64.W))) else None                // SpecASan: the paint word
+  val sa_stat       = if (SPECASAN) Some(Output(UInt(64.W))) else None               // SpecASan: SPECASAN_STAT word
+  val cf_ceviche_en     = if (ENABLE_CEVICHE) Some(Input(Bool()))     else None      // Ceviche: CEVICHE_CTL[0]
+  val cf_ceviche_hard_d = if (ENABLE_CEVICHE) Some(Input(UInt(11.W))) else None      // Ceviche: D$ hard limit (0 = 768)
+  val cf_ceviche_soft_d = if (ENABLE_CEVICHE) Some(Input(UInt(11.W))) else None      // Ceviche: D$ soft limit (0 = 512)
 }
 
 class LSUIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
@@ -1394,6 +1427,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   io.dmem.cf_dcache_set_conf  := io.core.cf_dcache_set_conf
   io.dmem.cf_dcache_way_conf  := io.core.cf_dcache_way_conf
   io.dmem.cf_dcache_repl_conf := io.core.cf_dcache_repl_conf
+  io.dmem.cf_ceviche_en.foreach(_     := io.core.cf_ceviche_en.get)
+  io.dmem.cf_ceviche_hard_d.foreach(_ := io.core.cf_ceviche_hard_d.get)
+  io.dmem.cf_ceviche_soft_d.foreach(_ := io.core.cf_ceviche_soft_d.get)
   io.dmem.cf_debug_dcache_enable := io.core.cf_debug_dcache_enable && io.core.cf_debug_lsu_enable
   io.dmem.cf_debug_repl_enable   := io.core.cf_debug_repl_enable
   // [reconf-fix Phase C] invalidate-walker trigger down, busy back up

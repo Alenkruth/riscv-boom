@@ -99,6 +99,14 @@ class ICacheBundle(val outer: ICache) extends BoomBundle()(outer.p)
   // corefuzzing: ICache set/way reconfiguration indices (from icacheCSRCF at 0xbcb)
   val cf_icache_set_conf = Input(UInt(2.W))  // index into icacheSetOptions = Seq(64, 32, 16, 8)
   val cf_icache_way_conf = Input(UInt(2.W))  // index into cacheWayOptions  = Seq(8, 4, 2, 1)
+  private val cevOn = p(TileKey).core.asInstanceOf[BoomCoreParams].enableCeviche   // Ceviche (C4g)
+  val cf_ceviche_en     = if (cevOn) Some(Input(Bool()))     else None
+  val cf_ceviche_pol    = if (cevOn) Some(Input(UInt(8.W)))  else None
+  val cf_ceviche_hard_i = if (cevOn) Some(Input(UInt(10.W))) else None
+  val cf_ceviche_soft_i = if (cevOn) Some(Input(UInt(10.W))) else None
+  val cf_cev_inval_dom  = if (cevOn) Some(Input(Bool()))     else None
+  val cf_cev_s1_dom     = if (cevOn) Some(Input(Bool()))     else None   // pure PC-range domain of the s1 fetch (F1)
+  val cf_cev_dbg_flush  = if (cevOn) Some(Input(Bool()))     else None
 
   val perf = Output(new Bundle {
     val acquire = Bool()
@@ -129,6 +137,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   // FIRRTL DCE elides the BRAM; downstream s1_domain_mismatch constant-props to
   // false and the IFU's INFL_ICACHE_STATE injection path dies at the consumer.
   val ENABLE_IFT = tileParams.core.asInstanceOf[BoomCoreParams].enableIFT
+  val ENABLE_CEVICHE = tileParams.core.asInstanceOf[BoomCoreParams].enableCeviche
   val io = IO(new ICacheBundle(outer))
   val (tl_out, edge_out) = outer.masterNode.out(0)
 

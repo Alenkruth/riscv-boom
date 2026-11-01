@@ -145,6 +145,43 @@ class WithReconf extends Config((site, here, up) => {
     case other => other
   }
 })
+// WithSTT: compile-time gate for Speculative Taint Tracking (stt-plan-v5.md). Runtime: STT_CTL (0xbd0), reset 0 = off.
+class WithSTT extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      enableSTT = true
+    )))
+    case other => other
+  }
+})
+// WithDoppelganger: Doppelganger Loads on top of WithSTT (required). Runtime: DOPPELGANGER_CTL (0xbd2) bit 0, reset 0 = off.
+class WithDoppelganger(entries: Int = 1024, ways: Int = 8, conf: Int = 1, retries: Int = 3) extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      enableDoppelganger = true, doppelgangerEntries = entries, doppelgangerWays = ways,
+      doppelgangerConfThreshold = conf, doppelgangerNackRetries = retries
+    )))
+    case other => other
+  }
+})
+// WithSpecASan: SpecASan (specasan-plan-v5.md). Runtime: SPECASAN_CTL (0xbd4), reset 0 = off.
+class WithSpecASan(windowBytes: BigInt = BigInt(64) << 20, tagCacheEntries: Int = 64) extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      enableSpecASan = true, specasanTagWindowBytes = windowBytes, specasanTagCacheEntries = tagCacheEntries
+    )))
+    case other => other
+  }
+})
+// WithCeviche: Ceviche CRF in L1-D and L1-I (ceviche-plan-v5.md). Needs WithIFT and WithReconf. Runtime: CEVICHE_CTL (0xbd6).
+class WithCeviche extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      enableCeviche = true
+    )))
+    case other => other
+  }
+})
 
 class WithBoomBranchPrintf extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {

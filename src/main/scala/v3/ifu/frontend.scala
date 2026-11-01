@@ -404,6 +404,12 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   // bits[3:2]: way index into cacheWayOptions  = Seq(8, 4, 2, 1)
   val cf_icache_set_conf = Output(UInt(2.W))
   val cf_icache_way_conf = Output(UInt(2.W))
+  val cf_ceviche_en     = if (ENABLE_CEVICHE) Some(Output(Bool()))     else None
+  val cf_ceviche_pol    = if (ENABLE_CEVICHE) Some(Output(UInt(8.W)))  else None
+  val cf_ceviche_hard_i = if (ENABLE_CEVICHE) Some(Output(UInt(10.W))) else None
+  val cf_ceviche_soft_i = if (ENABLE_CEVICHE) Some(Output(UInt(10.W))) else None
+  val cf_cev_inval_dom  = if (ENABLE_CEVICHE) Some(Output(Bool()))     else None   // domain of the committing fence.i (K2)
+  val cf_cev_dbg_flush = if (ENABLE_CEVICHE) Some(Output(Bool())) else None
 
   // corefuzzing: attacker address range for fetch-domain computation in frontend
   val cf_attacker_start_addr = Output(UInt(vaddrBitsExtended.W))
@@ -633,6 +639,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s2_redir_atk    = if (ENABLE_IFT) RegNext(s1_redir_atk, false.B) else false.B
   val s2_fetch_domain = if (ENABLE_IFT) RegNext(s1_fetch_domain, false.B) else false.B
   icache.io.s1_domain_id := s1_fetch_domain || s1_redir_atk
+  icache.io.cf_cev_s1_dom.foreach(_ := s1_fetch_domain)   // Ceviche: the running domain by PC range, without the IFT redirect bit
   // [M3ATKWIN] lean58 (Fable audit M3; RULES A U8 "symmetric", reading 1): a line FILLED while the attacker window is open takes the attacker fill
   // domain (the twin of the secret window term on s1_is_secret, registered the same way).  Fill side only: the
   // fetch's own domain for the I$ mismatch compare is unchanged (a domain compare, unlike the secret flag, would
@@ -1286,6 +1293,13 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   icache.io.cf_icache_set_conf := io.cpu.cf_icache_set_conf
   icache.io.cf_dbg_print.foreach(_ := io.cpu.cf_debug_rob_enable)   // [ICFILL] debug print enable (0xbc0 bit 4)
   icache.io.cf_icache_way_conf := io.cpu.cf_icache_way_conf
+  // Ceviche (C4f): local copies on the frontend side of the SLR2-SLR3 cut (quasi-static CSR values, exact).
+  icache.io.cf_ceviche_en.foreach(_     := RegNext(io.cpu.cf_ceviche_en.get, false.B))
+  icache.io.cf_ceviche_pol.foreach(_    := RegNext(io.cpu.cf_ceviche_pol.get))
+  icache.io.cf_ceviche_hard_i.foreach(_ := RegNext(io.cpu.cf_ceviche_hard_i.get))
+  icache.io.cf_ceviche_soft_i.foreach(_ := RegNext(io.cpu.cf_ceviche_soft_i.get))
+  icache.io.cf_cev_inval_dom.foreach(_  := io.cpu.cf_cev_inval_dom.get)          // same cycle as flush_icache (:499)
+  icache.io.cf_cev_dbg_flush.foreach(_ := io.cpu.cf_cev_dbg_flush.get)
 
   // When we mispredict, we need to repair
 

@@ -419,6 +419,13 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   io.lsu.cf_dcache_set_conf  := custom_csrs.cf_dcache_set_conf
   io.lsu.cf_dcache_way_conf  := custom_csrs.cf_dcache_way_conf
   io.lsu.cf_dcache_repl_conf := custom_csrs.cf_dcache_repl_conf
+  io.lsu.cf_ceviche_en.foreach(_     := custom_csrs.cf_ceviche_en)
+  io.lsu.cf_ceviche_hard_d.foreach(_ := custom_csrs.cf_ceviche_hard_d)
+  io.lsu.cf_ceviche_soft_d.foreach(_ := custom_csrs.cf_ceviche_soft_d)
+  io.ifu.cf_ceviche_en.foreach(_     := custom_csrs.cf_ceviche_en)
+  io.ifu.cf_ceviche_pol.foreach(_    := custom_csrs.cf_ceviche_pol)
+  io.ifu.cf_ceviche_hard_i.foreach(_ := custom_csrs.cf_ceviche_hard_i)
+  io.ifu.cf_ceviche_soft_i.foreach(_ := custom_csrs.cf_ceviche_soft_i)
   // [reconf-fix Phase C] 0xbc4 invalidate-walker trigger to the D$ (via LSU),
   // and the walker's busy published as 0xbcd[17] (hardware-set every cycle;
   // must come after the csrs.foreach defaults above so the connect wins).
@@ -440,6 +447,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   io.lsu.cf_secret_start_addr := custom_csrs.cf_secret_start_addr
   io.lsu.cf_dbg.foreach(_ := cf_dbg)   // [DBGFREEZE] patch 85 (b): no s_acc in debug mode (lsu.scala TLB stage)
   io.lsu.cf_secret_end_addr   := custom_csrs.cf_secret_end_addr
+  // ---- Hardware defenses: CSR fan-out to the LSU (T0). STT's fan-out is C-CORE-1 (e) (registered copies, task T3s). ----
+  io.lsu.dgl_ctl.foreach(_       := custom_csrs.doppelganger_en)                // Doppelganger (registered in the LSU, L1)
+  io.lsu.sa_ctl_en.foreach(_     := custom_csrs.sa_ctl_en)                      // SpecASan SA-8
+  io.lsu.sa_paint_wen.foreach(_  := custom_csrs.sa_paint_wen)
+  io.lsu.sa_paint_data.foreach(_ := custom_csrs.sa_paint_data)
+  io.lsu.sa_stat.foreach(s => custom_csrs.sa_stat_set(s))
 
   // getting the rob entries from the CSR
   rob.io.cf_rob_entries := custom_csrs.cf_rob_entries
@@ -862,6 +875,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     (rob.io.commit.arch_valids(i) && rob.io.commit.uops(i).is_fencei && !cf_quiesce_core) ||
     (RegNext(dec_valids(i) && dec_uops(i).is_jalr && csr.io.status.debug))
   }.reduce(_||_)
+  // Ceviche (K2): the domain whose fence.i commits this cycle; 1 = attacker. A debug-mode jalr flush (no domain) is
+  // reported as "all domains" by the I$ (I5) because it never coincides with a fence.i commit (debug mode).
+  io.ifu.cf_cev_inval_dom.foreach(_ := (0 until coreWidth).map(i => rob.io.commit.arch_valids(i) && rob.io.commit.uops(i).is_fencei &&
+                                         rob.io.commit.uops(i).cf_domain_id.get === 1.U).reduce(_||_))
+  io.ifu.cf_cev_dbg_flush.foreach(_ := (0 until coreWidth).map(i => RegNext(dec_valids(i) && dec_uops(i).is_jalr && csr.io.status.debug)).reduce(_||_))
 
   // TODO FIX THIS HACK
   // The below code works because of two quirks with the flush mechanism

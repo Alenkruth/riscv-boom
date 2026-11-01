@@ -598,8 +598,14 @@ class BoomNonBlockingDCache(staticIdForMetadataUseOnly: Int)(implicit p: Paramet
     sourceId      = IdRange(cfg.nMSHRs + 1, cfg.nMSHRs + 1 + cfg.nMMIOs),
     requestFifo   = true))
 
+  // [SA-D3] SpecASan tag-storage client: one source id for the tag-line fetch (Get 64 B) and the paint (Put 1 B).
+  protected def specasanClientParameters =
+    if (tileParams.core.asInstanceOf[boom.v3.common.BoomCoreParams].enableSpecASan) Seq(TLMasterParameters.v1(
+      name          = s"Core ${staticIdForMetadataUseOnly} DCache SpecASan tags",
+      sourceId      = IdRange(cfg.nMSHRs + 1 + cfg.nMMIOs, cfg.nMSHRs + 2 + cfg.nMMIOs),
+      requestFifo   = true)) else Seq()
   val node = TLClientNode(Seq(TLMasterPortParameters.v1(
-    cacheClientParameters ++ mmioClientParameters,
+    cacheClientParameters ++ mmioClientParameters ++ specasanClientParameters,
     minLatency = 1)))
 
 
