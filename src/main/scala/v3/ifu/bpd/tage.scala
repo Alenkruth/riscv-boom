@@ -53,6 +53,16 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
     // corefuzzing: secret shadow — entry was trained by a secret-dependent instruction
     val update_cf_is_secret = Input(Bool())
     val f3_secret_mismatch  = Output(Vec(bankWidth, Bool()))  // hit entry trained by secret instr
+    // [SPECBPU-REP] (owner 2026-11-02 'Speculative BPU repair'; spec-bpu-plan-final C-TAGE-3): repair / relabel
+    // controls, registered in the bank like the other update inputs (cycle u+2), and the old value the provider
+    // write of a resolution update used, registered here (u+3) for the bank's undo log
+    val update_repair   = Input(Bool())       // the masked slot of this table is a repair write (restore or undo)
+    val update_inval    = Input(Bool())       // ... an allocation undo: valid 0, ctr 0, label 0
+    val update_used_ctr = Output(UInt(3.W))   // the old counter the provider write used (bypass word, else meta)
+    val update_rp_lbl   = if (ENABLE_IFT) Some(Input(UInt(2.W))) else None                   // restored {dom, sec}
+    val update_old_lbl  = if (ENABLE_IFT) Some(Input(Vec(bankWidth, UInt(2.W)))) else None   // fetch-time provider lbl
+    val update_used_lbl = if (ENABLE_IFT) Some(Output(UInt(2.W))) else None                  // label of the old value
+    val update_lbl_only = if (CF_SPEC_RELABEL) Some(Input(Bool())) else None               // [SPECBPU-RLB]
   })
 
   def compute_folded_hist(hist: UInt, l: Int) = {
@@ -147,11 +157,16 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
   val (update_idx, update_tag) = compute_tag_and_hash(fetchIdx(io.update_pc), io.update_hist)
 
   val update_wdata = Wire(Vec(bankWidth, new TageEntry))
+  // [SPECBPU-REP] / [SPECBPU-RLB] (C-TAGE-3): a relabel writes the shadow only; a repair writes the logged counter
+  // (restore) or an empty entry (allocation undo) with the logged / zero label
+  val cf_lonly = io.update_lbl_only.getOrElse(false.B)
+  val cf_nlbl  = Cat(io.update_cf_domain_id, (if (ENABLE_IFT) io.update_cf_is_secret else false.B))
+  val cf_wlbl  = Mux(io.update_repair, Mux(io.update_inval, 0.U(2.W), io.update_rp_lbl.getOrElse(0.U(2.W))), cf_nlbl)
 
   table.write(
     Mux(doing_reset, reset_idx                                          , update_idx),
     Mux(doing_reset, VecInit(Seq.fill(bankWidth) { 0.U(tageEntrySz.W) }), VecInit(update_wdata.map(_.asUInt))),
-    Mux(doing_reset, ~(0.U(bankWidth.W))                                , io.update_mask.asUInt).asBools
+    Mux(doing_reset, ~(0.U(bankWidth.W))                                , io.update_mask.asUInt & ~Fill(bankWidth, cf_lonly)).asBools
   )
 
   // corefuzzing: write {domain, secret} shadow in parallel with the main table.
@@ -162,7 +177,7 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
   table_shadow.write(
     Mux(doing_reset, reset_idx, update_idx),
     Mux(doing_reset, VecInit(Seq.fill(bankWidth)(0.U(2.W))),
-                     VecInit(Seq.fill(bankWidth)(Cat(io.update_cf_domain_id, shadow_secret_bit)))),
+                     VecInit(Seq.fill(bankWidth)(cf_wlbl))),   // [SPECBPU-REP] train = cf_nlbl, repair, relabel
     Mux(doing_reset, ~(0.U(bankWidth.W)), io.update_mask.asUInt).asBools
   )
   }
@@ -184,6 +199,16 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
   val wrbypass_tags    = Reg(Vec(nWrBypassEntries, UInt(tagSz.W)))
   val wrbypass_idxs    = Reg(Vec(nWrBypassEntries, UInt(log2Ceil(nRows).W)))
   val wrbypass         = Reg(Vec(nWrBypassEntries, Vec(bankWidth, UInt(3.W))))
+  // [SPECBPU-B1] (review spec-bpu-review-20261102 B1; owner 2026-11-02 'Speculative BPU follow-ups'): one valid bit
+  // per bypass entry and slot.  The bypass used to keep a whole row, so a slot outside update_mask stored
+  // inc_ctr(DontCare, DontCare) and a later update of that slot (same row and tag) took that value instead of its
+  // fetch-time provider counter.  The resolution update trains ONE slot per update, so the two branches of a packet
+  // would corrupt each other on every iteration.  Now a slot's bypass word is used only when this entry wrote it.
+  // Cost per table: 2 x bankWidth FF (reset) and about 12 LUT.  Levels: +1 AND on the existing hit select (update
+  // side only, s1-registered inputs -> table write data), none on the fetch path.
+  val wrbypass_v       = RegInit(VecInit(Seq.fill(nWrBypassEntries)(VecInit(Seq.fill(bankWidth)(false.B)))))
+  // [SPECBPU-REP] (IFT) the label of each bypass word, so the undo log records the label the write overwrote
+  val wrbypass_lbl     = if (ENABLE_IFT) Some(Reg(Vec(nWrBypassEntries, Vec(bankWidth, UInt(2.W))))) else None
   val wrbypass_enq_idx = RegInit(0.U(log2Ceil(nWrBypassEntries).W))
 
   val wrbypass_hits    = VecInit((0 until nWrBypassEntries) map { i =>
@@ -193,40 +218,75 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
   })
   val wrbypass_hit     = wrbypass_hits.reduce(_||_)
   val wrbypass_hit_idx = PriorityEncoder(wrbypass_hits)
+  // [SPECBPU-B1] per slot: the hit entry holds this slot's counter
+  val wrbypass_use     = VecInit((0 until bankWidth).map(w => wrbypass_hit && wrbypass_v(wrbypass_hit_idx)(w)))
 
   for (w <- 0 until bankWidth) {
-    update_wdata(w).ctr   := Mux(io.update_alloc(w),
+    // [SPECBPU-REP] a repair writes the logged old counter (restore) or an empty entry (allocation undo)
+    update_wdata(w).ctr   := Mux(io.update_repair, Mux(io.update_inval, 0.U, io.update_old_ctr(w)),
+      Mux(io.update_alloc(w),
       Mux(io.update_taken(w), 4.U,
                               3.U
       ),
-      Mux(wrbypass_hit,       inc_ctr(wrbypass(wrbypass_hit_idx)(w), io.update_taken(w)),
+      Mux(wrbypass_use(w),    inc_ctr(wrbypass(wrbypass_hit_idx)(w), io.update_taken(w)),
                               inc_ctr(io.update_old_ctr(w), io.update_taken(w))
       )
-    )
-    update_wdata(w).valid := true.B
+    ))
+    update_wdata(w).valid := !(io.update_repair && io.update_inval)
     update_wdata(w).tag   := update_tag
 
     update_hi_wdata(w)    := io.update_u(w)(1)
     update_lo_wdata(w)    := io.update_u(w)(0)
   }
 
-  when (io.update_mask.reduce(_||_)) {
+  // [SPECBPU-REP] a restore updates the bypass like a write; an allocation undo and a relabel do not (below)
+  when (io.update_mask.reduce(_||_) && !cf_lonly && !(io.update_repair && io.update_inval)) {
     when (wrbypass_hits.reduce(_||_)) {
-      wrbypass(wrbypass_hit_idx) := VecInit(update_wdata.map(_.ctr))
+      // [SPECBPU-B1] only the written slots change; the others keep their word and valid bit
+      for (w <- 0 until bankWidth) {
+        when (io.update_mask(w)) {
+          wrbypass  (wrbypass_hit_idx)(w) := update_wdata(w).ctr
+          wrbypass_v(wrbypass_hit_idx)(w) := true.B
+          wrbypass_lbl.foreach(_(wrbypass_hit_idx)(w) := cf_wlbl)   // [SPECBPU-REP]
+        }
+      }
     } .otherwise {
       wrbypass     (wrbypass_enq_idx) := VecInit(update_wdata.map(_.ctr))
+      wrbypass_v   (wrbypass_enq_idx) := io.update_mask           // [SPECBPU-B1] valid = the written slots only
+      wrbypass_lbl.foreach(_(wrbypass_enq_idx) := VecInit(Seq.fill(bankWidth)(cf_wlbl)))   // [SPECBPU-REP]
       wrbypass_tags(wrbypass_enq_idx) := update_tag
       wrbypass_idxs(wrbypass_enq_idx) := update_idx
       wrbypass_enq_idx := WrapInc(wrbypass_enq_idx, nWrBypassEntries)
     }
   }
+  // [SPECBPU-REP] an allocation undo drops the slot's bypass word (the entry is empty again)
+  when (io.update_repair && io.update_inval && wrbypass_hit) {
+    for (w <- 0 until bankWidth) { when (io.update_mask(w)) { wrbypass_v(wrbypass_hit_idx)(w) := false.B } }
+  }
+  // [SPECBPU-RLB] a relabel rewrites the label of a bypass word it covers
+  if (CF_SPEC_RELABEL) {
+    when (cf_lonly && wrbypass_hit) {
+      for (w <- 0 until bankWidth) {
+        when (io.update_mask(w) && wrbypass_v(wrbypass_hit_idx)(w)) { wrbypass_lbl.get(wrbypass_hit_idx)(w) := cf_nlbl }
+      }
+    }
+  }
+  // [SPECBPU-REP] the old value the provider write used (this slot's bypass word, else the fetch-time counter /
+  // label): one slot per update (one CFI per update), registered (u+3) for the bank's undo log.  Same select as the
+  // counter mux above (shared by synthesis); 4-way one-hot AND-OR -> 3 FF (+2 IFT).
+  private val cf_prov_sel = VecInit((0 until bankWidth).map(w => io.update_mask(w) && !io.update_alloc(w)))
+  io.update_used_ctr := RegNext(Mux1H(cf_prov_sel, (0 until bankWidth).map(w =>
+    Mux(wrbypass_use(w), wrbypass(wrbypass_hit_idx)(w), io.update_old_ctr(w)))))
+  io.update_used_lbl.foreach(_ := RegNext(Mux1H(cf_prov_sel, (0 until bankWidth).map(w =>
+    Mux(wrbypass_use(w), wrbypass_lbl.get(wrbypass_hit_idx)(w), io.update_old_lbl.get(w))))))
 
   // [SINKFACTS86] patch 86 (all-sinks study Q6): every TAGE table write, debug printf builds only (the
   // IftSquashMerge gate: IFT on, CF debug printfs on, no IFT bridge; IFT off / NoLog / FireSim elaborate nothing).
   // h / ts = this table's history length / tag size (the pair names the table; two tables share h = 16);
   // pc = the bank-aligned update pc (bank = pc[3]); idx / tag = the hashed row and tag written; m = entry write
   // mask, al = allocations, tk = taken; old = the FETCH-time provider counter (non-allocating slots); byp / bypv =
-  // the 2-entry write bypass hit and its row (used = bypv when byp = 1, else old); new = written counters;
+  // the 2-entry write bypass hit and its row; bypm = the slots whose counter came from the bypass ([SPECBPU-B1]: used
+  // = bypv for a slot in bypm, else old; a byp = 1 slot outside bypm uses old); new = written counters;
   // um / u = u-bit write mask and value; clr = {hi, lo} periodic u-clear in this cycle (it wins over the update's
   // u write of that half, tage.scala hi_us / lo_us).  [TAGECLR] marks the start of each u-clear sweep (the time
   // base of the u state).  The host replays the writes from the reset (ctr 0, valid 0): used =/= true is a
@@ -236,14 +296,16 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
     cf_sf_cyc := cf_sf_cyc + 1.U
     def cfMasked(m: Seq[Bool], v: Seq[UInt], w: Int): UInt = VecInit(m.zip(v).map { case (b, x) => Mux(b, x, 0.U(w.W)) }).asUInt
     when (!doing_reset && (io.update_mask.asUInt =/= 0.U || io.update_u_mask.asUInt =/= 0.U)) {
-      printf("[TAGEW] cyc=%d pc=0x%x h=%d ts=%d idx=0x%x tag=0x%x m=0x%x al=0x%x tk=0x%x old=0x%x byp=%d bypv=0x%x new=0x%x um=0x%x u=0x%x clr=%d\n",
+      printf("[TAGEW] cyc=%d pc=0x%x h=%d ts=%d idx=0x%x tag=0x%x m=0x%x al=0x%x tk=0x%x old=0x%x byp=%d bypv=0x%x new=0x%x um=0x%x u=0x%x clr=%d bypm=0x%x k=%d\n",
         cf_sf_cyc, io.update_pc, histLength.U, tagSz.U, update_idx, update_tag, io.update_mask.asUInt,
         io.update_alloc.asUInt & io.update_mask.asUInt, io.update_taken.asUInt & io.update_mask.asUInt,
         cfMasked((0 until bankWidth).map(w => io.update_mask(w) && !io.update_alloc(w)), io.update_old_ctr, 3),
         wrbypass_hit, wrbypass(wrbypass_hit_idx).asUInt,
         cfMasked(io.update_mask, update_wdata.map(_.ctr), 3),
         io.update_u_mask.asUInt, cfMasked(io.update_u_mask, io.update_u, 2),
-        Cat(doing_clear_u_hi, doing_clear_u_lo))
+        Cat(doing_clear_u_hi, doing_clear_u_lo),
+        (wrbypass_use.asUInt & (io.update_mask.asUInt & ~io.update_alloc.asUInt)),
+        Mux(cf_lonly, 2.U, Mux(io.update_repair, 1.U, 0.U)))   // [SPECBPU-REP] k = 0 train, 1 repair, 2 relabel
     }
     when (!doing_reset && doing_clear_u && clear_u_idx(log2Ceil(nRows)-1, 0) === 0.U) {
       printf("[TAGECLR] cyc=%d h=%d ts=%d hi=%d\n", cf_sf_cyc, histLength.U, tagSz.U, doing_clear_u_hi)
@@ -273,6 +335,9 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
   with freechips.rocketchip.util.CoreFuzzingConstants
 {
   val tageUBitPeriod = params.uBitPeriod
+  // [SPECBPU] (owner 2026-11-02, RULES C 'Speculative TAGE/BTB updates'): trained once per resolved CFI at
+  // resolution (wrong path included) from io.spec_update; no commit training (predictor.scala cf_upd_bus).
+  override def trainsAtResolution: Boolean = true
   val tageNTables    = params.tableInfo.size
 
   class TageMeta extends Bundle
@@ -282,6 +347,8 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
     val provider_u    = Vec(bankWidth, Output(UInt(2.W)))
     val provider_ctr  = Vec(bankWidth, Output(UInt(3.W)))
     val allocate      = Vec(bankWidth, Valid(UInt(log2Ceil(tageNTables).W)))
+    // [SPECBPU-REP] (labels "Restore old label"): the fetch-time {domain, secret} of the provider entry (IFT only)
+    val provider_lbl  = if (ENABLE_IFT) Some(Vec(bankWidth, UInt(2.W))) else None
   }
 
   val f3_meta = Wire(new TageMeta)
@@ -351,6 +418,9 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
     )
   }).asUInt
 
+  // [SPECBPU-REP] the fetch domain at f3: TageTable's f3 mismatch flops compare the entry domain with
+  // s2_fetch_domain = RegNext(f1 domain), so one more register gives the value they compared with
+  val cf_s3_fdom = if (ENABLE_IFT) RegNext(RegNext(s1_domain)) else 0.U(1.W)
   for (w <- 0 until bankWidth) {
     var altpred = io.resp_in(0).f3(w).taken
     val final_altpred = WireInit(io.resp_in(0).f3(w).taken)
@@ -383,6 +453,10 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
     f3_meta.alt_differs(w)    := final_altpred =/= io.resp.f3(w).taken
     f3_meta.provider_u(w)     := f3_resps(provider)(w).bits.u
     f3_meta.provider_ctr(w)   := f3_resps(provider)(w).bits.ctr
+    // [SPECBPU-REP] provider label from the table's f3 mismatch flops: secret = secret_mismatch (a hit), domain =
+    // domain_mismatch ^ the compared fetch domain (domain_mismatch = hit && entry domain =/= fetch domain)
+    f3_meta.provider_lbl.foreach(_(w) := Cat(VecInit(tables.map(_.io.f3_domain_mismatch(w))).asUInt(provider) ^ cf_s3_fdom,
+                                             VecInit(tables.map(_.io.f3_secret_mismatch(w))).asUInt(provider)))
 
     // Create a mask of tables which did not hit our query, and also contain useless entries
     // and also uses a longer history than the provider
@@ -452,6 +526,101 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
 
 
 
+  // [SPECBPU-REP] (owner 2026-11-02 'Speculative BPU repair'; spec-bpu-plan-final C-TAGE-5) local undo log, one word per
+  // record id: what this bank's write of that resolution update overwrote.  Written at u+3 (the tables register the
+  // old counter / label they used at u+3), read at the s1 of a repair (u'+1 >= u+4: the FTQ holds every repair 2
+  // cycles after an allocation).  The slot is the repair's cfi_idx (the same bank split as the original update).
+  // Restore: the provider entry gets its logged counter, u and label back; allocation undo: the allocated entry is
+  // emptied (valid 0, u 0, label 0).  Left and counted ([TAGERP] left_ud): a failed allocation's u := 0.
+  // [SPECBPU-RLB] relabel: the same entries' shadow only, with the update's (new) label.
+  class TageUndo extends Bundle {
+    val pv = Bool()                                    // the update trained a provider entry ...
+    val pt = UInt(log2Ceil(tageNTables).W)             // ... in this table
+    val pc = UInt(3.W)                                 // its old counter (bypass word, else fetch-time)
+    val pu = UInt(2.W)                                 // its fetch-time u
+    val av = Bool()                                    // the update allocated an entry ...
+    val at = UInt(log2Ceil(tageNTables).W)             // ... in this table
+    val ud = Bool()                                    // failed allocation (u := 0 above the provider: left)
+    val pl = if (ENABLE_IFT) Some(UInt(2.W)) else None  // the provider's old {domain, secret}
+  }
+  val cf_tlog   = Mem(cfSpecLogN, new TageUndo)
+  val s1_lslot  = s1_update.bits.cfi_idx.bits
+  val s1_lw     = s1_update.valid && s1_update.bits.is_commit_update && s1_update.bits.cfi_idx.valid
+  val s1_lu     = Wire(new TageUndo)
+  s1_lu.pv := s1_update.bits.br_mask(s1_lslot) && s1_update_meta.provider(s1_lslot).valid
+  s1_lu.pt := s1_update_meta.provider(s1_lslot).bits
+  s1_lu.pc := 0.U                                       // taken from the provider table at u+3
+  s1_lu.pu := s1_update_meta.provider_u(s1_lslot)
+  s1_lu.av := s1_update.bits.cfi_mispredicted && s1_update_meta.allocate(s1_lslot).valid
+  s1_lu.at := s1_update_meta.allocate(s1_lslot).bits
+  s1_lu.ud := s1_update.bits.cfi_mispredicted && !s1_update_meta.allocate(s1_lslot).valid
+  s1_lu.pl.foreach(_ := 0.U)                            // taken from the provider table at u+3
+  val s3_lw  = RegNext(RegNext(s1_lw, false.B), false.B)
+  val s3_lid = RegNext(RegNext(s1_update.bits.cf_log_id))
+  val s3_lu  = RegNext(RegNext(s1_lu))
+  when (s3_lw) {
+    val wd = WireInit(s3_lu)
+    wd.pc := VecInit(tables.map(_.io.update_used_ctr))(s3_lu.pt)
+    wd.pl.foreach(_ := VecInit(tables.map(_.io.update_used_lbl.get))(s3_lu.pt))
+    cf_tlog.write(s3_lid, wd)
+  }
+  val s1_rp  = s1_update.valid && s1_update.bits.is_repair_update && s1_update.bits.cfi_idx.valid
+  val s1_rlb = s1_rp && s1_update.bits.cf_relabel.getOrElse(false.B)
+  val s1_rst = s1_rp && !s1_rlb
+  val s1_ru  = cf_tlog.read(s1_update.bits.cf_log_id)
+  val s1_rp_restore = WireInit(VecInit(Seq.fill(tageNTables)(false.B)))
+  val s1_rp_inval   = WireInit(VecInit(Seq.fill(tageNTables)(false.B)))
+  when (s1_rp) {
+    when (s1_ru.pv) {
+      s1_update_mask   (s1_ru.pt)(s1_lslot) := true.B
+      s1_update_alloc  (s1_ru.pt)(s1_lslot) := false.B
+      s1_update_taken  (s1_ru.pt)(s1_lslot) := false.B
+      s1_update_old_ctr(s1_ru.pt)(s1_lslot) := s1_ru.pc
+      when (s1_rst) {
+        s1_update_u_mask(s1_ru.pt)(s1_lslot) := true.B
+        s1_update_u     (s1_ru.pt)(s1_lslot) := s1_ru.pu
+        s1_rp_restore   (s1_ru.pt)           := true.B
+      }
+    }
+    when (s1_ru.av) {
+      s1_update_mask (s1_ru.at)(s1_lslot) := true.B
+      s1_update_alloc(s1_ru.at)(s1_lslot) := true.B
+      s1_update_taken(s1_ru.at)(s1_lslot) := false.B
+      when (s1_rst) {
+        s1_update_u_mask(s1_ru.at)(s1_lslot) := true.B
+        s1_update_u     (s1_ru.at)(s1_lslot) := 0.U
+        s1_rp_inval     (s1_ru.at)           := true.B
+      }
+    }
+  }
+  // one register each, shared by the 7 tables (the label is per slot, not per table)
+  val cf_s2_rp_lbl  = RegNext(s1_ru.pl.getOrElse(0.U(2.W)))
+  val cf_s2_old_lbl = RegNext(VecInit((0 until bankWidth).map(w =>
+                        s1_update_meta.provider_lbl.map(_(w)).getOrElse(0.U(2.W)))))
+  val cf_s2_lonly   = RegNext(s1_rlb, false.B)
+  if (ENABLE_IFT && ENABLE_CF_DEBUG_PRINTF && !ENABLE_IFT_BRIDGE) {
+    // [TAGERP] every repair (k=1) / relabel (k=2) this bank decodes; left_ud = running count of restored records whose
+    // failed-allocation u := 0 stays (RULES C: left and counted)
+    val cf_rp_cyc = RegInit(0.U(40.W))
+    cf_rp_cyc := cf_rp_cyc + 1.U
+    val c_ud = RegInit(0.U(40.W))
+    when (s1_rst && s1_ru.ud) { c_ud := c_ud + 1.U }
+    // [SPECBPU-REP] DMI reconfiguration measurement (owner 2026-11-02 ~21:0x 'Speculative BPU gaps and
+    // reconfiguration': D-2 "Accept + measure", no RTL fix; spec-bpu-plan-final 4.8): off = this repair / relabel
+    // writes a table the current mask disables (bit 0 its provider table pt, bit 1 its allocation table at): a record
+    // logged before a 0xbca / 0x7c2 change; the write happens (prediction does not read the table).  left_off =
+    // running count.
+    val d_off = Cat(s1_ru.av && !bank_enable_mask(s1_ru.at), s1_ru.pv && !bank_enable_mask(s1_ru.pt))
+    val c_off = RegInit(0.U(40.W))
+    when (s1_rp && d_off =/= 0.U) { c_off := c_off + 1.U }
+    when (s1_rp) {
+      printf("[TAGERP] cyc=%d id=%d k=%d slot=%d pv=%d pt=%d pc=%d pu=%d av=%d at=%d ud=%d left_ud=%d off=%d " +
+             "left_off=%d\n", cf_rp_cyc,
+        s1_update.bits.cf_log_id, Mux(s1_rlb, 2.U, 1.U), s1_lslot, s1_ru.pv, s1_ru.pt, s1_ru.pc, s1_ru.pu, s1_ru.av,
+        s1_ru.at, s1_ru.ud, c_ud + (s1_rst && s1_ru.ud), d_off, c_off + (d_off =/= 0.U))
+    }
+  }
+
   for (i <- 0 until tageNTables) {
     for (w <- 0 until bankWidth) {
       tables(i).io.update_mask(w)    := RegNext(s1_update_mask(i)(w))
@@ -468,6 +637,12 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
     // [R124GATE3] patch 28: IFT off the update domain/secret flops do not exist (constant 0 into the table).
     tables(i).io.update_cf_domain_id   := (if (ENABLE_IFT) RegNext(s1_update.bits.cf_domain_id.getOrElse(0.U(1.W))) else 0.U)
     tables(i).io.update_cf_is_secret   := (if (ENABLE_IFT) RegNext(s1_update.bits.cf_is_secret.getOrElse(false.B)) else false.B)
+    // [SPECBPU-REP] / [SPECBPU-RLB] repair / relabel controls and the fetch-time provider label (u+2, like the others)
+    tables(i).io.update_repair := RegNext(s1_rp_restore(i) || s1_rp_inval(i), false.B)
+    tables(i).io.update_inval  := RegNext(s1_rp_inval(i), false.B)
+    tables(i).io.update_rp_lbl.foreach(_ := cf_s2_rp_lbl)
+    tables(i).io.update_old_lbl.foreach(_ := cf_s2_old_lbl)
+    tables(i).io.update_lbl_only.foreach(_ := cf_s2_lonly)
   }
 
   // corefuzzing: TAGE domain mismatch — any table hit a row last updated by a different domain

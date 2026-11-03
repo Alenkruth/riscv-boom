@@ -85,6 +85,43 @@ class FTQBundle(implicit p: Parameters) extends BoomBundle
 }
 
 /**
+ * [SPECBPU] (owner 2026-11-02, RULES C 'Speculative TAGE/BTB updates') one resolved CFI, core -> FTQ: the lane chosen
+ * from the brinfos registers (core.scala [SPECBPU]), registered in the core.  The FTQ reads the branch's entry (pc,
+ * fetch-time ghist, predictor meta slice, labels) at ftq_idx and sends one TAGE/BTB/BIM/uBTB update.
+ */
+class BpuResolveInfo(implicit p: Parameters) extends BoomBundle
+{
+  val ftq_idx       = UInt(log2Ceil(ftqSz).W)
+  val pc_lob        = UInt(log2Ceil(icBlockBytes).W)
+  val edge_inst     = Bool()
+  val is_br         = Bool()
+  val is_jal        = Bool()
+  val is_jalr       = Bool()
+  val taken         = Bool()
+  val mispredict    = Bool()
+  val target_offset = SInt(21.W)                       // brinfo.target_offset (imm[20:0]) for br / jal
+  val jalr_target   = UInt(vaddrBitsExtended.W)         // jump-unit lane only
+  // IFT: the resolving CFI's own condition / target taint (brinfos cond_secret / cond_atk)
+  val cond_secret   = if (ENABLE_IFT) Some(Bool()) else None
+  val cond_atk      = if (ENABLE_IFT) Some(Bool()) else None
+  // [SPECBPU-REP] (spec-bpu-plan-final 6.3) debug printf builds only (the [SINKFACTS86] gate): the resolving CFI's
+  // cf_op_count_id (uopIDCounterWidthCF = 16 b, micro-op.scala), printed with its undo-log record so the directed
+  // checker joins every record to the commit log (a repaired record's CFI never commits, a retired one's does)
+  val dbg_oc        = if (ENABLE_IFT && ENABLE_CF_DEBUG_PRINTF && !ENABLE_IFT_BRIDGE) Some(UInt(16.W)) else None
+}
+
+/**
+ * [SPECBPU-REP] (owner 2026-11-02, RULES C 'Speculative BPU repair'): the slot rule of a redirect, core -> FTQ, read
+ * with io.redirect.  pc_lob = the redirecting uop's pc_lob (the mispredicted CFI, or the flushing uop); incl = that uop
+ * itself does not commit (exception or refetch flush), so a CFI in its own slot is squashed too.
+ */
+class BpuSquashInfo(implicit p: Parameters) extends BoomBundle
+{
+  val pc_lob = UInt(log2Ceil(icBlockBytes).W)
+  val incl   = Bool()
+}
+
+/**
  * IO to provide a port for a FunctionalUnit to get the PC of an instruction.
  * And for JALRs, the PC of the next instruction.
  */
@@ -109,7 +146,7 @@ class GetPCFromFtqIO(implicit p: Parameters) extends BoomBundle
  *
  * @param num_entries # of entries in the FTQ
  */
-class FetchTargetQueue(implicit p: Parameters) extends BoomModule
+class FetchTargetQueue(specMetaLo: Int = 0, specMetaW: Int = -1)(implicit p: Parameters) extends BoomModule
   with HasBoomCoreParameters
   with HasBoomFrontendParameters
   with CoreFuzzingConstants
@@ -178,6 +215,16 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
     val bpdupdate = Output(Valid(new BranchPredictionUpdate))
 
+    // [SPECBPU] the resolved CFI (core.scala, a register) and the predictor update built from its FTQ entry.
+    val bpu_res        = Input(Valid(new BpuResolveInfo))
+    val spec_bpdupdate = Output(Valid(new BranchPredictionUpdate))
+    // [SPECBPU-REP] the redirect's slot rule (with io.redirect), for the undo-log squash test
+    val bpu_sq         = Input(new BpuSquashInfo)
+    // [SPECBPU-REP] debug printf builds only (the [SINKFACTS86] gate): the config-CSR indices this change reads,
+    // {btb way, btb set (2), gshare, tage count (3), ftq (2)} (frontend), for the DMI reconfiguration measurement of
+    // the undo log ([BPDC], spec-bpu-plan-final 4.8); no port in FireSim / NoLog / IFT-off builds
+    val dbg_cfg        = if (ENABLE_IFT && ENABLE_CF_DEBUG_PRINTF && !ENABLE_IFT_BRIDGE) Some(Input(UInt(9.W))) else None
+
     val ras_update = Output(Bool())
     val ras_update_idx = Output(UInt(log2Ceil(nRasEntries).W))
     val ras_update_pc  = Output(UInt(vaddrBitsExtended.W))
@@ -212,7 +259,21 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val pcs      = Reg(Vec(num_entries, UInt(vaddrBitsExtended.W)))
   val meta     = SyncReadMem(num_entries, Vec(nBanks, UInt(bpdMaxMetaLength.W)))
   val ram      = Reg(Vec(num_entries, new FTQBundle))
-  val ghist    = Seq.fill(2) { SyncReadMem(num_entries, new GlobalHistory) }
+  // [SPECBPU] a third copy for the resolution-time read (one copy per read port, as for the two existing ports).
+  val ghist    = Seq.fill(3) { SyncReadMem(num_entries, new GlobalHistory) }
+  // [SPECBPU] the BIM + uBTB + BTB + TAGE slice of each bank's meta (bits [specMetaLo, specMetaLo + specMetaW), the
+  // composer's layout: [0, 73) in WithTAGELBPD), the only part the resolution update needs; written with meta at
+  // enqueue, read at the resolving branch's ftq_idx.  The loop's meta (above bit 73) is not kept: the loop is not
+  // trained at resolution.  32 x 2 x 73 b LUTRAM (registered address, asynchronous read).
+  private val spMetaW = if (specMetaW < 0) bpdMaxMetaLength else specMetaW
+  require(specMetaLo >= 0 && specMetaLo + spMetaW <= bpdMaxMetaLength, "[SPECBPU] spec meta slice out of range")
+  val spec_meta = if (spMetaW > 0) Some(SyncReadMem(num_entries, Vec(nBanks, UInt(spMetaW.W)))) else None
+  // [SPECBPU] the fetch pc (and, IFT on, the fetch domain, also written only at enqueue) for the resolution read:
+  // a 32 x 41 b LUTRAM copy (7 RAM32M, registered address) instead of one more 32:1 mux of the pcs flop array
+  // (about 9 LUT per bit, 360 LUT).  pcs and cf_fetch_domain are written only at enqueue (the redirect write-back
+  // rewrites cf_fetch_domain with its own value), so the copy is always equal to them.
+  private val spPcW = vaddrBitsExtended + (if (ENABLE_IFT) 1 else 0)
+  val spec_pcs  = SyncReadMem(num_entries, UInt(spPcW.W))
   val lhist    = if (useLHist) {
     Some(SyncReadMem(num_entries, Vec(nBanks, UInt(localHistoryLength.W))))
   } else {
@@ -309,6 +370,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     lhist.map( l => l.write(enq_ptr, io.enq.bits.lhist))
     ghist.map( g => g.write(enq_ptr, new_ghist))
     meta.write(enq_ptr, io.enq.bits.bpd_meta)
+    spec_meta.foreach(_.write(enq_ptr, VecInit(io.enq.bits.bpd_meta.map(m => m(specMetaLo + spMetaW - 1, specMetaLo)))))
+    spec_pcs.write(enq_ptr, (if (ENABLE_IFT) Cat(new_entry.cf_fetch_domain.get, io.enq.bits.pc) else io.enq.bits.pc))
     ram(enq_ptr) := new_entry
 
     prev_pc    := io.enq.bits.pc
@@ -494,6 +557,99 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
         io.bpdupdate.bits.is_repair_update, io.bpdupdate.bits.cf_domain_id.getOrElse(0.U(1.W)),
         io.bpdupdate.bits.cf_is_secret.getOrElse(false.B))
     }
+  }
+
+  // [SPECBPU] (owner 2026-11-02, RULES C 'Speculative TAGE/BTB updates' + 'Speculative BPU follow-ups'): the
+  // resolution-time predictor update (TAGE, BTB, BIM, uBTB).
+  // Cycle c: io.bpu_res (a core register) addresses the entry: pcs / ram are flop arrays (32:1 read mux, like
+  // get_ftq_pc), spec_pcs / ghist(2) / spec_meta are SyncReadMem (data at c+1).  Cycle c+1: the update leaves on
+  // io.spec_bpdupdate (predictor.scala io.spec_update, read by the TAGE, BTB, BIM and uBTB).
+  // GHR (design note 1b): the update indexes / tags the TAGE with the branch's OWN fetch-time history, the ghist
+  // stored at its enqueue (the same value the commit update read), never the live one.  ghist / meta / pcs of an
+  // entry are written only at its enqueue; the entry is read at most 2 cycles after the branch resolved, and the
+  // earliest re-enqueue of any entry after a redirect is at least 4 cycles away (redirect -> f0 .. f4 -> enqueue),
+  // so a wrong-path branch whose entry a redirect frees still reads its own entry.  An on-path branch's entry is
+  // not committed, so it lies in [bpd_ptr, enq_ptr) and cannot be overwritten (the `full` check).
+  // The packet's predicted cfi fields are NOT used (the redirect write-back may be rewriting them): the outcome
+  // comes from the resolving lane itself.  No ram field read here is written by that write-back except the
+  // monotone labels (OR-kept there).
+  // Encoding: a one-CFI packet update, which the predictor code consumes unchanged (is_commit_update = 1 on
+  // their bus): br_mask = the branch's slot (0 for jal/jalr), cfi_idx = the slot (valid), cfi_taken /
+  // cfi_mispredicted = the resolution, target = the resolved target.  TAGE: provider counter / u update for that
+  // slot, allocation when mispredicted (as at commit).  BTB: meta (tag, is_br) for the slot; target when taken.
+  // Levels (rev1, review S3: a SyncReadMem lowers to a REGISTERED ADDRESS + an asynchronous LUTRAM read; the data
+  // is not registered): c: bpu_res flops -> the memories' address registers (route only); the 2 monotone label
+  // bits: 32:1 mux of the ram flops (3 LUT) -> flops.  c+1: address registers -> LUTRAM read (RAM32M, about 1 LUT
+  // delay) -> uop pc OR + 40-bit add (1 LUT + carry chain) -> jalr 2:1 (1 LUT) -> predictor bank split (bank(pc)
+  // 2:1, nextBank carry; 1 LUT) -> bank s1_update flops, and -> fetchIdx -> the BTB's s0 IFT LUTRAM reads (btb.scala
+  // cfFwdRead) -> forward mux -> flops.  The commit path into the same flops starts at the bpd_pc flop; this one
+  // adds the LUTRAM read: +1 level plus the carry chain (D3 maximum; Phase 4 timing check, rev1 report section 5).
+  // Cost: LUTRAM pc+dom 41 b, ghist 72 b, meta slice 2 x 73 b, 32 deep (about 44 RAM32M = 176 LUT) + their address
+  // registers (3 x 5 FF); label read 18 LUT + 2 FF; request flops about 80 FF; target adder 40 LUT (5 CARRY8).
+  // [SPECBPU-REP] the resolution update is built into sp_res; the undo-log block at the end of this module decides
+  // whether it leaves (Q2 (a) drop filter) or a repair / relabel takes the free bus cycle, and drives
+  // io.spec_bpdupdate.  sp_res_ftq / sp_res_slot export the CFI's FTQ index and packet slot (flops) to that block.
+  val sp_res      = Wire(Valid(new BranchPredictionUpdate))
+  val sp_res_ftq  = Wire(UInt(idx_sz.W))
+  val sp_res_slot = Wire(UInt(log2Ceil(fetchWidth).W))
+  // [SPECBPU-REP] (spec-bpu-plan-final 6.3) debug printf builds only: the resolving CFI's op count, for the log prints
+  val sp_res_oc   = if (ENABLE_IFT && ENABLE_CF_DEBUG_PRINTF && !ENABLE_IFT_BRIDGE) Some(Wire(UInt(16.W))) else None
+  locally {
+    val r     = io.bpu_res
+    val rq    = RegNext(r.bits)
+    val rv    = RegNext(r.valid, false.B)
+    val sp_pw = spec_pcs.read(r.bits.ftq_idx, r.valid)
+    val sp_pc = sp_pw(vaddrBitsExtended - 1, 0)
+    val sp_e  = ram(r.bits.ftq_idx)
+    // [SPECBPU-REP] the entry's start_bank from the ram flops, registered: equal to bank(sp_pc) (both are set from the
+    // enqueue pc), so the slot, and the undo-log squash filter on it, start at flops instead of the LUTRAM read
+    val sp_sb = RegNext(sp_e.start_bank)
+    val sp_gh = ghist(2).read(r.bits.ftq_idx, r.valid)
+    val sp_mt = spec_meta.map(_.read(r.bits.ftq_idx, r.valid))
+    // slot in the packet: the same function as the redirect write-back (new_cfi_idx above) and the jump unit
+    val slot  = (rq.pc_lob ^ Mux(sp_sb === 1.U, 1.U << log2Ceil(bankBytes), 0.U))(log2Ceil(fetchWidth), 1)
+    // resolved target: the core's redirect formula (core.scala mispredict_target), for every CFI kind
+    val uop_maybe_pc = AlignPCToBoundary(sp_pc, icBlockBytes) | rq.pc_lob
+    val br_target    = (uop_maybe_pc.asSInt + rq.target_offset +
+                        (Fill(vaddrBitsExtended-1, rq.edge_inst) << 1).asSInt).asUInt
+    val u = sp_res
+    sp_res_ftq  := rq.ftq_idx
+    sp_res_slot := slot
+    sp_res_oc.foreach(_ := rq.dbg_oc.get)                // [SPECBPU-REP] debug builds only
+    u.valid                     := rv
+    u.bits                      := DontCare
+    u.bits.is_mispredict_update := false.B
+    u.bits.is_repair_update     := false.B
+    u.bits.btb_mispredicts      := 0.U
+    u.bits.pc                   := sp_pc
+    u.bits.br_mask              := Mux(rq.is_br, UIntToOH(slot, fetchWidth), 0.U)
+    u.bits.cfi_idx.valid        := true.B
+    u.bits.cfi_idx.bits         := slot
+    u.bits.cfi_taken            := rq.taken
+    u.bits.cfi_mispredicted     := rq.mispredict
+    u.bits.cfi_is_br            := rq.is_br
+    u.bits.cfi_is_jal           := rq.is_jal || rq.is_jalr
+    u.bits.cfi_is_jalr          := rq.is_jalr
+    u.bits.target               := Mux(rq.is_jalr, rq.jalr_target, br_target)
+    u.bits.ghist                := sp_gh
+    u.bits.lhist                := VecInit(Seq.fill(nBanks) { 0.U(localHistoryLength.W) })
+    u.bits.meta                 := VecInit((0 until nBanks).map { b =>
+      sp_mt.map(m => (m(b) << specMetaLo).pad(bpdMaxMetaLength)).getOrElse(0.U(bpdMaxMetaLength.W)) })
+    // [SPECBPU-IFT] (RULES A; closes scope gaps B and C for TAGE / BTB / BIM / uBTB): the labels the commit update
+    // would carry for this entry so far (fetch domain | attacker-steered CFI / attacker window; secret window /
+    // secret CFI / secret access in the packet), ORed with the resolving CFI's OWN condition taint, which reaches the
+    // entry bits only through the compactor / [FTQATK] ports a cycle later.  Written into btb_domain / btb_secret /
+    // ebtb / the BTB displacement records, the TAGE table_shadow, the BIM data_shadow, the uBTB meta domain / secret
+    // and the uBTB displacement records by the existing write logic.  Levels: 2 bits of the
+    // same 32:1 read mux -> flop -> 1 LUT OR.
+    if (ENABLE_IFT) {
+      val sp_dom = sp_pw(vaddrBitsExtended)            // the fetch domain, from the LUTRAM word
+      val sp_sec = RegNext(sp_e.cf_fetch_secret.get)
+      val sp_atk = RegNext(sp_e.cf_fetch_atk.get)
+      u.bits.cf_domain_id.get := sp_dom | (sp_atk || rq.cond_atk.get).asUInt
+      u.bits.cf_is_secret.get := sp_sec || rq.cond_secret.get
+    }
+    // [SPECBPU-REP] the [BPDS] print moved to the undo-log block: it prints only the updates that leave
   }
 
   io.enq.ready := RegNext(!full || do_commit_update)
@@ -727,6 +883,326 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   when (quiesce_reset_d1 && io.redirect.valid) {
     bpd_ptr := io.redirect.bits
     deq_ptr := io.redirect.bits
+  }
+
+  //-------------------------------------------------------------
+  // **** [SPECBPU-REP] undo log of the resolution updates ****
+  //-------------------------------------------------------------
+  // Owner 2026-11-02 (RULES C 'Speculative BPU repair'): mechanism "A undo log", pre-write squash "Drop at the FTQ",
+  // labels "Restore old label", scope "TAGE+BTB+BIM+uBTB"; repair yields to resolution updates on the bus
+  // (spec-bpu-plan-final.md 4.2-4.6).  One record per resolution update that leaves
+  // (live only while its CFI's FTQ entry is not fully committed); allocation order = index order mod cfSpecLogN.  Control in flops {v, sq, ftq, slot} (+ IFT
+  // the label sent); payload in a 16-deep LUTRAM {pc, history, slot, cfi kind / outcome}.  Each predictor keeps its
+  // own 16-deep undo word per record id with what its write of that update overwrote (tage / bim / btb / faubtb).
+  //  * order base: lg_dq = deq_ptr of the previous cycle.  Every index the log compares lies
+  //    in [lg_dq, enq_ptr]: a live record's entry, because a record is live only if its entry is not behind deq_ptr
+  //    and the retire below frees it in the cycle deq_ptr has passed it (it then lies in [lg_dq, deq_ptr)); a redirect
+  //    point, because it is
+  //    an uncommitted uop (at or after deq_ptr of its own cycle); the CFI of an update leaving at u, because it
+  //    resolved at u-3, wrote back at u-2 at the earliest and so committed at u-1 at the earliest, so deq_ptr(u-1) =
+  //    lg_dq(u) is not past it.  IsOlder(a, b, lg_dq) therefore orders them exactly.  (bpd_ptr is
+  //    no order base: a fast-committing CFI's entry is already behind it when its update leaves, so its record would
+  //    never retire and a later redirect would "repair" a committed training.)
+  //  * squash: a redirect (registered: sq1) marks every record younger than the redirecting uop: its entry is younger
+  //    than the redirect entry R (IsOlder(R, f, lg_dq)), or it is entry R at a later slot (the same slot too for an
+  //    exception / refetch flush, bpu_sq.incl).
+  //  * Q2 (a) drop: a resolution update that a redirect of the last two cycles (sq1, sq2) already squashes does not
+  //    leave and allocates nothing ([BPDX]).
+  //  * allocate: every leaving update takes the next record slot (so every predictor's undo word at that id is its
+  //    own); the record is live (lg_v) only if its CFI's entry is not behind deq_ptr.  A fully committed entry can
+  //    never be squashed: its record starts retired (v = 0, counted nlg) and keeps only its label life.
+  //  * retire: a non-squashed record whose entry deq_ptr has passed (IsOlder(f, deq_ptr, lg_dq)) is freed.
+  //  * repair: the youngest squashed record (exact for several squashed writes to one entry) goes out as a repair
+  //    update (is_repair_update = 1, cf_log_id = its id) in a cycle without a resolution update, never within 2
+  //    cycles after an allocation (the TAGE undo word is written at u+3) and never in the 2 cycles after a redirect
+  //    (sq1_v / sq2_v: the marks of a redirect land one cycle after sq1, so the pick registered in those cycles may
+  //    miss a record that redirect squashed); it is freed then.
+  //  * [SPECBPU-RLB] relabel (CF_SPEC_RELABEL): a non-squashed record whose entry's attacker / secret bit was set after
+  //    its update left goes out as a relabel update with label = sent | entry bits (a label-only rewrite in every
+  //    predictor), when no squashed record waits.  Its label life (lg_lv) outlasts the retire: an entry's bits grow
+  //    only while its uops are in flight (window range, packet-mate cond_atk, dispatch / TLB-stage secret ports), so
+  //    they are final when it commits; the record stays relabel-eligible until its entry index is enqueued again or
+  //    its slot is reallocated (the prompt retire would otherwise race the relabel of the t116 J / K case).
+  //  * overflow: an allocation over a valid record drops that record (counted).
+  //  * reset: power-on only in the owner's flow.  A DMI reconfiguration (RULES C 'Reconfiguration is DMI only') runs in
+  //    debug mode, where cf_ftq_quiesce_reset is 0 (core.scala cf_quiesce_core), so the log persists across it
+  //    (measured: [BPDC]).  The FTQ quiesce pointer reset, reachable only from the in-program r01-r11 regression
+  //    tests, moves the FTQ pointers, so the log clears with it (counted qclr); nothing relies on that clear.
+  // Levels: sq flops -> 5-bit compares (1 LUT + carry-free XOR) -> record flops; allocation: sp_res flops + deq_ptr /
+  // lg_dq -> IsOlder (2 LUT) -> AND res_ok (1) -> record write enables (1); picker: flops -> fired mask and AND (2
+  // LUT) -> 16-bit leading one (3 LUT) -> 2:1 (1) -> pick flops; issue: pick valid + 5 flops -> rp_fire (1 LUT) -> 2:1
+  // bus mux beside the LUTRAM read (pc / ghist / fields; the target sub-path is not muxed) -> predictor bank split ->
+  // bank s1 flops; the drop filter (compares) reaches the s1 flops only through is_mispredict_update (no split logic
+  // on it).  Cost (section 7): about 345 LUT, 215 FF (IFT +64 FF), 19 RAM32M; the IFT relabel about +480 LUT.
+  require(isPow2(cfSpecLogN))
+  val lgN = cfSpecLogN
+  val lgW = cfSpecLogW
+  val slW = log2Ceil(fetchWidth)
+  class SpecLogPay extends Bundle {
+    val pc     = UInt(vaddrBitsExtended.W)
+    val hist   = UInt(globalHistoryLength.W)     // ghist.old_history (histories() reads only it and nst / nsnt)
+    val nst    = Bool()                           // ghist.new_saw_branch_taken
+    val nsnt   = Bool()                           // ghist.new_saw_branch_not_taken
+    val slot   = UInt(log2Ceil(fetchWidth).W)
+    val isbr   = Bool()
+    val isjal  = Bool()                           // cfi_is_jal of the update (jal or jalr)
+    val isjalr = Bool()
+    val tk     = Bool()
+    val mp     = Bool()
+  }
+  val lg_pay  = Mem(lgN, new SpecLogPay)
+  val lg_v    = RegInit(VecInit(Seq.fill(lgN)(false.B)))
+  val lg_sq   = RegInit(VecInit(Seq.fill(lgN)(false.B)))
+  val lg_f    = Reg(Vec(lgN, UInt(idx_sz.W)))
+  val lg_s    = Reg(Vec(lgN, UInt(slW.W)))
+  val lg_tail = RegInit(0.U(lgW.W))
+  val lg_lbl  = if (ENABLE_IFT) Some(Reg(Vec(lgN, UInt(2.W)))) else None   // {domain, secret} the record sent
+  // the order base of every log compare: deq_ptr of the previous cycle (same reset value as deq_ptr)
+  val lg_dq   = RegNext(deq_ptr, 0.U(idx_sz.W))
+
+  // the squash point of the redirect, registered: sq1 = the redirect of the previous cycle, sq2 = the one before
+  val rd_slot = (io.bpu_sq.pc_lob ^ Mux(redirect_entry.start_bank === 1.U, 1.U << log2Ceil(bankBytes), 0.U))(slW, 1)
+  val sq1_v = RegNext(io.redirect.valid && !io.cf_ftq_quiesce_reset, false.B)
+  val sq1_r = RegNext(io.redirect.bits)
+  val sq1_s = RegNext(rd_slot)
+  val sq1_i = RegNext(io.bpu_sq.incl)
+  val sq2_v = RegNext(sq1_v, false.B)
+  val sq2_r = RegNext(sq1_r)
+  val sq2_s = RegNext(sq1_s)
+  val sq2_i = RegNext(sq1_i)
+  def sqHit(v: Bool, r: UInt, s: UInt, i: Bool, f: UInt, fs: UInt): Bool =
+    v && (IsOlder(r, f, lg_dq) || (f === r && (fs > s || (i && fs === s))))
+
+  // Q2 (a) "Drop at the FTQ": the resolution update leaves only if no registered redirect squashes it
+  val res_drop1 = sqHit(sq1_v, sq1_r, sq1_s, sq1_i, sp_res_ftq, sp_res_slot)
+  val res_drop2 = sqHit(sq2_v, sq2_r, sq2_s, sq2_i, sp_res_ftq, sp_res_slot)
+  val res_ok    = sp_res.valid && !res_drop1 && !res_drop2
+  // the CFI's entry is already fully committed (deq_ptr has passed it): the update trains and takes its
+  // record slot, but the record starts retired (nothing can squash it)
+  val res_cmt   = IsOlder(sp_res_ftq, deq_ptr, lg_dq)
+  val lg_alloc  = res_ok
+  val lg_hold   = RegNext(lg_alloc, false.B) || RegNext(RegNext(lg_alloc, false.B), false.B)
+
+  // [SPECBPU-RLB] the record entries' attacker / secret bits (registered), the label life, and the records whose
+  // label is behind their entry's bits
+  val lg_lv   = if (CF_SPEC_RELABEL) Some(RegInit(VecInit(Seq.fill(lgN)(false.B)))) else None
+  val lg_cur  = if (CF_SPEC_RELABEL) Some(RegNext(VecInit(lg_f.map(f =>
+                  Cat(ram(f).cf_fetch_atk.get, ram(f).cf_fetch_secret.get))))) else None
+  val lg_pend = VecInit((0 until lgN).map(i => if (CF_SPEC_RELABEL)
+                  lg_lv.get(i) && !lg_sq(i) && (lg_cur.get(i) & ~lg_lbl.get(i)).orR else false.B)).asUInt
+
+  // picker (registered): the youngest squashed record, else ([SPECBPU-RLB]) the lowest-index pending relabel.  The
+  // record that fires this cycle is masked out of the next pick (rp_q_oh is the pick as a one-hot flop vector), so a
+  // repair can go every free cycle, and a relabel never delays a repair (the functional repair stream is the same with
+  // CF_SPEC_RELABEL on or off: a relabel takes only a cycle in which no repair was picked).  No pick fires in
+  // the two cycles after a redirect (sq1_v, sq2_v): the redirect's marks reach lg_sq one cycle after sq1, so a pick
+  // registered before them could restore an older squashed record ahead of a younger one that wrote the same entry.
+  val rp_q_v  = RegInit(false.B)
+  val rp_q_i  = Reg(UInt(lgW.W))
+  val rp_q_oh = RegInit(0.U(lgN.W))
+  val rp_q_rl = Reg(Bool())
+  val rp_fire = rp_q_v && !sp_res.valid && !lg_hold && !sq1_v && !sq2_v
+  val fired   = rp_q_oh & Fill(lgN, rp_fire)
+  val sqv     = VecInit((0 until lgN).map(i => lg_v(i) && lg_sq(i))).asUInt & ~fired
+  val pendv   = lg_pend & ~fired
+  val younger = (UIntToOH(lg_tail, lgN) - 1.U)(lgN - 1, 0)       // indices below the tail: allocated most recently
+  val sq_lo   = sqv & younger
+  val ysq     = Mux(sq_lo.orR, Log2(sq_lo), Log2(sqv))
+  val nxt_i   = Mux(sqv.orR, ysq, PriorityEncoder(pendv))
+  rp_q_v  := (sqv.orR || pendv.orR) && !io.cf_ftq_quiesce_reset
+  rp_q_i  := nxt_i
+  rp_q_oh := UIntToOH(nxt_i, lgN)
+  rp_q_rl := !sqv.orR
+  val rp_pay = lg_pay.read(rp_q_i)
+
+  val lg_ret = VecInit((0 until lgN).map(i => lg_v(i) && !lg_sq(i) && IsOlder(lg_f(i), deq_ptr, lg_dq)))
+  for (i <- 0 until lgN) {
+    when (lg_ret(i)) { lg_v(i) := false.B }                                                           // committed: retire
+    when (lg_v(i) && sqHit(sq1_v, sq1_r, sq1_s, sq1_i, lg_f(i), lg_s(i))) { lg_sq(i) := true.B }    // squashed
+    when (rp_fire && !rp_q_rl && rp_q_i === i.U) { lg_v(i) := false.B }                           // repaired
+    if (CF_SPEC_RELABEL) {
+      when (rp_fire && rp_q_rl && rp_q_i === i.U) { lg_lbl.get(i) := lg_lbl.get(i) | lg_cur.get(i) }  // relabelled
+      // the label life ends when the entry index takes a new packet, or with the record's repair
+      when ((do_enq && enq_ptr === lg_f(i)) || (rp_fire && !rp_q_rl && rp_q_i === i.U)) { lg_lv.get(i) := false.B }
+    }
+    when (lg_alloc && lg_tail === i.U) {                                                            // allocation wins
+      lg_v(i)  := !res_cmt                                                // live only if its entry is uncommitted
+      lg_sq(i) := false.B
+      lg_f(i)  := sp_res_ftq
+      lg_s(i)  := sp_res_slot
+      lg_lbl.foreach(_(i) := Cat(sp_res.bits.cf_domain_id.get, sp_res.bits.cf_is_secret.get))
+      lg_lv.foreach(_(i) := true.B)
+    }
+  }
+  when (lg_alloc) {
+    val w = Wire(new SpecLogPay)
+    w.pc     := sp_res.bits.pc
+    w.hist   := sp_res.bits.ghist.old_history
+    w.nst    := sp_res.bits.ghist.new_saw_branch_taken
+    w.nsnt   := sp_res.bits.ghist.new_saw_branch_not_taken
+    w.slot   := sp_res_slot
+    w.isbr   := sp_res.bits.cfi_is_br
+    w.isjal  := sp_res.bits.cfi_is_jal
+    w.isjalr := sp_res.bits.cfi_is_jalr
+    w.tk     := sp_res.bits.cfi_taken
+    w.mp     := sp_res.bits.cfi_mispredicted
+    lg_pay.write(lg_tail, w)
+    lg_tail := lg_tail + 1.U
+  }
+  when (io.cf_ftq_quiesce_reset) {          // last connect: a quiesce reset clears the log
+    lg_v.foreach(_ := false.B)
+    lg_lv.foreach(_.foreach(_ := false.B))
+    lg_tail := 0.U
+  }
+
+  // the bus: the resolution update, or in a free cycle the picked repair / relabel (repair yields to resolution)
+  val o = io.spec_bpdupdate
+  o := sp_res
+  // Q2 (a): a dropped resolution update keeps its bus cycle as a NON-training update (is_mispredict_update = 1, so
+  // is_commit_update = 0 in every predictor; no predictor on this bus reads is_mispredict_update itself, the loop
+  // is on io.update), which keeps the filter's compares off the bank s1 valid path (section 7, F3d).  An update of
+  // an already committed CFI (res_cmt) trains normally and takes record lg_tail like any other (so the predictors'
+  // undo words at that id are its own); that record is born retired.
+  o.valid                     := sp_res.valid || rp_fire
+  o.bits.is_mispredict_update := sp_res.valid && !res_ok
+  o.bits.cf_log_id := Mux(rp_fire, rp_q_i, lg_tail)
+  o.bits.cf_relabel.foreach(_ := rp_fire && rp_q_rl)
+  when (rp_fire) {
+    o.bits.is_repair_update               := true.B
+    o.bits.pc                             := rp_pay.pc
+    o.bits.br_mask                        := Mux(rp_pay.isbr && !rp_q_rl, UIntToOH(rp_pay.slot, fetchWidth), 0.U)
+    o.bits.cfi_idx.valid                  := true.B
+    o.bits.cfi_idx.bits                   := rp_pay.slot
+    o.bits.cfi_taken                      := rp_pay.tk     && !rp_q_rl
+    o.bits.cfi_mispredicted               := rp_pay.mp     && !rp_q_rl
+    o.bits.cfi_is_br                      := rp_pay.isbr   && !rp_q_rl
+    o.bits.cfi_is_jal                     := rp_pay.isjal  && !rp_q_rl
+    o.bits.cfi_is_jalr                    := rp_pay.isjalr && !rp_q_rl
+    o.bits.ghist                          := 0.U.asTypeOf(new GlobalHistory)
+    o.bits.ghist.old_history              := rp_pay.hist
+    o.bits.ghist.new_saw_branch_taken     := rp_pay.nst
+    o.bits.ghist.new_saw_branch_not_taken := rp_pay.nsnt
+    o.bits.meta                           := VecInit(Seq.fill(nBanks)(0.U(bpdMaxMetaLength.W)))
+    if (ENABLE_IFT) {
+      // repair: the label the record sent (the STATE PRED record names the training it undoes); relabel: sent | the
+      // entry's bits now (the label every predictor rewrites)
+      val ilbl = if (CF_SPEC_RELABEL) Mux(rp_q_rl, lg_lbl.get(rp_q_i) | lg_cur.get(rp_q_i), lg_lbl.get(rp_q_i))
+                 else lg_lbl.get(rp_q_i)
+      o.bits.cf_domain_id.get := ilbl(1)
+      o.bits.cf_is_secret.get := ilbl(0)
+    }
+  }
+
+  // debug printf builds only (the [SINKFACTS86] / IftSquashMerge gate: IFT on, CF debug printfs on, no IFT bridge):
+  //  [BPDS] every resolution update that leaves (rev2 format + id = its record, lg = 1 if that record is live, 0 if
+  //  the CFI's entry was already committed (born retired), oc = the CFI's op count);  [BPDX] one dropped at the FTQ (Q2 (a));  [BPDQ]
+  //  every redirect that squashes records (n = records newly marked, msk = their ids);  [BPDF] every retire (the
+  //  record's entry committed);  [BPDR] every repair (k=1) / relabel (k=2) with the running counters: occ / hw = log
+  //  occupancy now / high water; ovf / ovfsq / ovfrl = allocations over a valid / squashed / relabel-pending record
+  //  (lost undo / relabel); clb = repairs issued while a non-squashed record allocated after the repaired one is
+  //  valid (upper bound of hazard H1, an on-path write the restore may clobber); rpr / rlb = repairs / relabels;
+  //  fdrop / fdrop2 = FTQ drops / drops only sq2 caught (expected 0); sqtot = records marked squashed; qclr =
+  //  squashed records cleared by the r01-r11 quiesce reset (0 under DMI); nlg = records born retired; stl = cycles in
+  //  which a valid non-squashed record, or a leaving update, names an entry behind lg_dq (the order base broken:
+  //  expected 0); rlx = relabel-pending records whose label life ended (entry re-enqueued) before the relabel.
+  if (ENABLE_IFT && ENABLE_CF_DEBUG_PRINTF && !ENABLE_IFT_BRIDGE) {
+    val occ    = PopCount(lg_v)
+    val c_hw   = RegInit(0.U((lgW + 1).W))
+    val c_ovf  = RegInit(0.U(40.W)); val c_ovfsq = RegInit(0.U(40.W)); val c_ovfrl = RegInit(0.U(40.W))
+    val c_clb  = RegInit(0.U(40.W)); val c_rpr   = RegInit(0.U(40.W)); val c_rlb   = RegInit(0.U(40.W))
+    val c_fd   = RegInit(0.U(40.W)); val c_fd2   = RegInit(0.U(40.W)); val c_sq    = RegInit(0.U(40.W))
+    val c_qclr = RegInit(0.U(40.W)); val c_nlg   = RegInit(0.U(40.W)); val c_stl   = RegInit(0.U(40.W))
+    val c_rlx  = RegInit(0.U(40.W))
+    val lg_oc  = Reg(Vec(lgN, UInt(16.W)))                                  // the record's CFI op count
+    when (lg_alloc) { lg_oc(lg_tail) := sp_res_oc.get }
+    val ovf    = lg_alloc && lg_v(lg_tail)
+    val pos    = (0 until lgN).map(j => j.U(lgW.W) - lg_tail)            // allocation age, 0 = oldest slot
+    val rpos   = rp_q_i - lg_tail
+    val clb    = rp_fire && !rp_q_rl && (0 until lgN).map(j => lg_v(j) && !lg_sq(j) && pos(j) > rpos).reduce(_ || _)
+    val nsqv   = VecInit((0 until lgN).map(i => lg_v(i) && !lg_sq(i) &&
+                   sqHit(sq1_v, sq1_r, sq1_s, sq1_i, lg_f(i), lg_s(i)))).asUInt
+    val nsq    = PopCount(nsqv)
+    // order-base check (outside the 2 cycles after a redirect, whose squashed entries lie beyond the new
+    // enq_ptr until they are marked): an entry older than lg_dq, seen from enq_ptr, is a stale index
+    val stl    = !sq1_v && !sq2_v && ((0 until lgN).map(i => lg_v(i) && !lg_sq(i) && IsOlder(lg_f(i), lg_dq, enq_ptr))
+                   .reduce(_ || _) || (sp_res.valid && IsOlder(sp_res_ftq, lg_dq, enq_ptr)))
+    val rlx    = PopCount((0 until lgN).map(i => do_enq && enq_ptr === lg_f(i) && lg_pend(i)))
+    when (occ > c_hw)                    { c_hw    := occ }
+    when (ovf)                           { c_ovf   := c_ovf + 1.U }
+    when (ovf && (lg_sq(lg_tail) || nsqv(lg_tail))) { c_ovfsq := c_ovfsq + 1.U }
+    when (lg_alloc && lg_pend(lg_tail))  { c_ovfrl := c_ovfrl + 1.U }
+    when (clb)                           { c_clb   := c_clb + 1.U }
+    when (rp_fire && !rp_q_rl)           { c_rpr   := c_rpr + 1.U }
+    when (rp_fire && rp_q_rl)            { c_rlb   := c_rlb + 1.U }
+    when (sp_res.valid && !res_ok)       { c_fd    := c_fd + 1.U }
+    when (sp_res.valid && !res_drop1 && res_drop2) { c_fd2 := c_fd2 + 1.U }
+    when (res_ok && res_cmt)             { c_nlg   := c_nlg + 1.U }
+    when (stl)                           { c_stl   := c_stl + 1.U }
+    c_sq  := c_sq + nsq
+    c_rlx := c_rlx + rlx
+    // exact accounting (D2 rule (1) sqtot = rpr + ovfsq + qclr): an allocation over a record marked in the
+    // same cycle loses a repair too (lg_sq is set only next cycle, the allocation wins), and a quiesce reset counts
+    // only the squashed records it clears (not the one repaired or overwritten in that cycle, counted as rpr / ovfsq)
+    val qsq    = VecInit((0 until lgN).map(i => lg_v(i) && (lg_sq(i) || nsqv(i)))).asUInt & ~fired &
+                 ~Mux(lg_alloc, UIntToOH(lg_tail, lgN), 0.U(lgN.W))
+    when (io.cf_ftq_quiesce_reset)       { c_qclr  := c_qclr + PopCount(qsq) }
+    // [SPECBPU-REP] DMI reconfiguration measurement (owner 2026-11-02 ~21:0x, RULES C 'Speculative BPU gaps and
+    // reconfiguration': D-1 / D-2 "Accept + measure", no RTL fix; spec-bpu-plan-final 4.8).  The log, its pending
+    // repairs and the label lives persist across a DMI config-CSR write.  [BPDC] at every change of the config indices
+    // this change reads (io.dbg_cfg = {btb way, btb set, gshare, tage count, ftq}): cfg / old = new / previous value;
+    // live / sq / lv / pend = valid records, of them squashed (repairs still to come), records with a label life,
+    // pending relabels, at the change.  lg_pre(i) = record i was allocated before the last change; rpre / rlpre
+    // (in [BPDC] and [BPDR]) = repairs / relabels issued since for such records (the writes D-1 / D-2 name); cfgc =
+    // changes so far.  The CSRs reset to index 0, so dcfg_q resets to 0.
+    val dcfg    = io.dbg_cfg.get
+    val dcfg_q  = RegNext(dcfg, 0.U(9.W))
+    val cfg_chg = dcfg =/= dcfg_q
+    val lg_pre  = RegInit(VecInit(Seq.fill(lgN)(false.B)))
+    val lvv     = lg_lv.map(_.asUInt).getOrElse(0.U(lgN.W))
+    for (i <- 0 until lgN) {
+      when (cfg_chg && (lg_v(i) || lvv(i))) { lg_pre(i) := true.B }
+      when (lg_alloc && lg_tail === i.U)    { lg_pre(i) := false.B }                  // last connect: a new record
+    }
+    val pre_f   = rp_fire && lg_pre(rp_q_i)
+    val c_cfgc  = RegInit(0.U(40.W)); val c_rpre  = RegInit(0.U(40.W)); val c_rlpre = RegInit(0.U(40.W))
+    when (cfg_chg)           { c_cfgc  := c_cfgc + 1.U }
+    when (pre_f && !rp_q_rl) { c_rpre  := c_rpre + 1.U }
+    when (pre_f && rp_q_rl)  { c_rlpre := c_rlpre + 1.U }
+    when (cfg_chg) {
+      printf("[BPDC] cyc=%d cfg=0x%x old=0x%x live=%d sq=%d lv=%d pend=%d cfgc=%d rpre=%d rlpre=%d\n", d4_cyc_q,
+        dcfg, dcfg_q, PopCount(lg_v), PopCount(VecInit((0 until lgN).map(i => lg_v(i) && lg_sq(i)))), PopCount(lvv),
+        PopCount(lg_pend), c_cfgc + 1.U, c_rpre, c_rlpre)
+    }
+    when (res_ok) {
+      printf("[BPDS] cyc=%d ftq=%d pc=0x%x slot=%d br=%d jal=%d jalr=%d tk=%d mp=%d tgt=0x%x dom=%d sec=%d id=%d " +
+             "lg=%d oc=%d\n",
+        d4_cyc_q, sp_res_ftq, sp_res.bits.pc, sp_res_slot, sp_res.bits.cfi_is_br,
+        sp_res.bits.cfi_is_jal && !sp_res.bits.cfi_is_jalr, sp_res.bits.cfi_is_jalr, sp_res.bits.cfi_taken,
+        sp_res.bits.cfi_mispredicted, sp_res.bits.target, sp_res.bits.cf_domain_id.get, sp_res.bits.cf_is_secret.get,
+        lg_tail, !res_cmt, sp_res_oc.get)
+    }
+    when (sp_res.valid && !res_ok) {
+      printf("[BPDX] cyc=%d ftq=%d pc=0x%x slot=%d by=%d\n", d4_cyc_q, sp_res_ftq, sp_res.bits.pc, sp_res_slot,
+        Mux(res_drop1, 1.U, 2.U))
+    }
+    when (nsq =/= 0.U) {
+      printf("[BPDQ] cyc=%d ridx=%d rslot=%d incl=%d n=%d sqtot=%d msk=0x%x\n", d4_cyc_q, sq1_r, sq1_s, sq1_i, nsq,
+        c_sq + nsq, nsqv)
+    }
+    for (i <- 0 until lgN) {
+      when (lg_ret(i)) {
+        printf("[BPDF] cyc=%d id=%d ftq=%d slot=%d oc=%d\n", d4_cyc_q, i.U(lgW.W), lg_f(i), lg_s(i), lg_oc(i))
+      }
+    }
+    when (rp_fire) {
+      printf("[BPDR] cyc=%d id=%d k=%d ftq=%d slot=%d pc=0x%x br=%d jal=%d dom=%d sec=%d oc=%d occ=%d hw=%d ovf=%d " +
+             "ovfsq=%d ovfrl=%d clb=%d rpr=%d rlb=%d fdrop=%d fdrop2=%d sqtot=%d qclr=%d nlg=%d stl=%d rlx=%d " +
+             "pre=%d cfgc=%d rpre=%d rlpre=%d\n",
+        d4_cyc_q, rp_q_i, Mux(rp_q_rl, 2.U, 1.U), lg_f(rp_q_i), rp_pay.slot, rp_pay.pc, rp_pay.isbr, rp_pay.isjal,
+        o.bits.cf_domain_id.get, o.bits.cf_is_secret.get, lg_oc(rp_q_i), occ, c_hw, c_ovf, c_ovfsq, c_ovfrl,
+        c_clb + clb, c_rpr + !rp_q_rl, c_rlb + rp_q_rl, c_fd, c_fd2, c_sq, c_qclr, c_nlg, c_stl, c_rlx,
+        lg_pre(rp_q_i), c_cfgc, c_rpre + (pre_f && !rp_q_rl), c_rlpre + (pre_f && rp_q_rl))
+    }
   }
 
   //-------------------------------------------------------------

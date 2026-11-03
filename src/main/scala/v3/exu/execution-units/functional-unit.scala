@@ -174,6 +174,10 @@ class BrResolutionInfo(implicit p: Parameters) extends BoomBundle
   val cond_secret = Bool()
   // attacker taint of the CONDITION -- steering, not ownership.  See the branch unit.
   val cond_atk    = Bool()
+  // [SPECBPU] (owner 2026-11-02, RULES C 'Speculative TAGE/BTB updates'): a JAL executed in this lane.  A JAL has no
+  // branch tag, so it is NOT in `valid` (that would set a resolve-mask bit); this bit lets the resolution-time BTB
+  // training (core.scala [SPECBPU]) see the JAL.  Read nowhere else (b1/b2 keep using `valid`).
+  val jal_res     = Bool()
 }
 
 class BrUpdateInfo(implicit p: Parameters) extends BoomBundle
@@ -607,6 +611,7 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
 
   // note: jal doesn't allocate a branch-mask, so don't clear a br-mask bit
   brinfo.valid          := is_br || is_jalr
+  brinfo.jal_res        := is_jal   // [SPECBPU] the resolution-time BTB training of a JAL (core.scala)
   brinfo.mispredict     := mispredict
   brinfo.uop            := uop
   brinfo.cfi_type       := Mux(is_jalr, CFI_JALR,

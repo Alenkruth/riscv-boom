@@ -78,6 +78,31 @@ class ComposedBranchPredictorBank(implicit p: Parameters) extends BranchPredicto
     c.io.update.bits.cf_is_secret.foreach(_ := io.update.bits.cf_is_secret.getOrElse(false.B))
     update_meta = update_meta >> c.metaSz
   }
+  // [SPECBPU] (owner 2026-11-02, RULES C 'Speculative TAGE/BTB updates'): the resolution-time bus, with the same
+  // per-component meta shift (the FTQ rebuilds the full-width meta from its stored slice, zeros elsewhere).
+  var spec_update_meta = io.spec_update.bits.meta
+  for (c <- components.reverse) {
+    c.io.spec_update := io.spec_update
+    c.io.spec_update.bits.meta := spec_update_meta
+    spec_update_meta = spec_update_meta >> c.metaSz
+  }
+  // [SPECBPU] the meta slice of the resolution-trained components in the packed f3_meta (component k sits at the
+  // sum of the metaSz of the components after it in `components`, the order of the shift above).  They must be
+  // contiguous: in WithTAGELBPD (loop, tage, btb, ubtb, bim) bim, ubtb, btb, tage are bits [0, 73) and the loop
+  // (commit bus, inert) sits above them; WithBoom2BPD trains all three of its components.
+  private val cf_spec_meta: (Int, Int) = {
+    val offs = components.reverse.scanLeft(0)(_ + _.metaSz).zip(components.reverse)
+    val sel  = offs.filter { case (_, c) => c.trainsAtResolution && c.metaSz > 0 }
+    if (sel.isEmpty) (0, 0) else {
+      val lo = sel.map(_._1).min
+      val hi = sel.map { case (o, c) => o + c.metaSz }.max
+      require(sel.map(_._2.metaSz).sum == hi - lo,
+        "[SPECBPU] the resolution-trained predictor components must be adjacent in the meta layout")
+      (lo, hi - lo)
+    }
+  }
+  override def specMetaLo: Int = cf_spec_meta._1
+  override def specMetaW: Int  = cf_spec_meta._2
 
   val mems = components.map(_.mems).flatten
   // [V3TAP-PRED] SP-19: each component drives only its own IftPredBankTap fields (0 elsewhere), so the bank's tap is

@@ -26,7 +26,22 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
 {
   override val nSets         = params.nSets
   override val nWays         = params.nWays
-  val tagSz         = vaddrBitsExtended - log2Ceil(nSets) - log2Ceil(fetchWidth) - 1
+  // [SPECBPU-REP] (owner 2026-11-02 ~21:0x, RULES C 'Speculative BPU gaps and reconfiguration': live defect "In this
+  // final plan", D-3 "Fix with live alias"; spec-bpu-plan-final C-BTB-4): with runtime reconfiguration (ENABLE_RECONF)
+  // the meta tag is the fetch-block index above the set bits of the SMALLEST set option (btbSetOptions, capped at the
+  // built nSets), not of the built nSets.  The set is idx & (active sets - 1), so with fewer active sets the index
+  // bits between log2(active) and log2(nSets) were in neither the set nor the tag (idx >> log2(nSets)): two blocks 64
+  // sets apart (64 active) or 32 / 64 / 96 sets apart (32 active) shared a slot with equal tags (false fetch hits;
+  // and the repair's refresh / allocation split, read from the tag copy cf_btv, aliased the same way).  With this
+  // tag, set and tag together hold every index bit at every set option.  Without ENABLE_RECONF the BTB CSR does not
+  // exist and cf_btb_set_idx is 0, so nSets sets are active at all times, no alias exists and the tag stays
+  // idx >> log2(nSets) (cfTagLo = 0: the tagged tree's widths).  cfTagLo = the low bits this tag adds below the old
+  // one (2 for 128 / 32); the old tag is tag(tagSz-1, cfTagLo), which the replacement hash and the tagh records keep
+  // using (unchanged behaviour).  Cost (ENABLE_RECONF builds): +cfTagLo bits per slot in the meta memories and in
+  // cf_btv; the fetch and update tag compares grow from 29 to 31 bits in the same 3-LUT equality tree (+0 levels).
+  val cfMinSetsLg   = if (ENABLE_RECONF) log2Ceil(btbSetOptions.map(_ min nSets).min) else log2Ceil(nSets)
+  val cfTagLo       = log2Ceil(nSets) - cfMinSetsLg
+  val tagSz         = vaddrBitsExtended - cfMinSetsLg - log2Ceil(fetchWidth) - 1
   val offsetSz      = params.offsetSz
   val extendedNSets = params.extendedNSets
 
@@ -41,6 +56,9 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   }
   val btbEntrySz = offsetSz + 1
   override def cfDrivesBtbPc: Boolean = ENABLE_IFT   // [BTBATK] composer PC select (predictor.scala)
+  // [SPECBPU] (owner 2026-11-02, RULES C 'Speculative TAGE/BTB updates'): trained once per resolved CFI at
+  // resolution (wrong path included) from io.spec_update; no commit training (predictor.scala cf_upd_bus).
+  override def trainsAtResolution: Boolean = true
 
   class BTBMeta extends Bundle {
     val is_br = Bool()
@@ -50,6 +68,10 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
 
   class BTBPredictMeta extends Bundle {
     val write_way = UInt(log2Ceil(nWays).W)
+    // [SPECBPU-REP] (owner decision OD-4) only when CF_BTB_UPD_TAG is false: per slot, the slot hit at fetch in
+    // write_way, i.e. the write only refreshes that entry; C-BTB-3 then classifies the training by it.  With
+    // CF_BTB_UPD_TAG the classification reads the update-side tag copy (cf_btv) at the write and the meta is unchanged.
+    val hits      = if (!CF_BTB_UPD_TAG) Some(Vec(bankWidth, Bool())) else None
   }
 
   val s1_meta = Wire(new BTBPredictMeta)
@@ -66,11 +88,12 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   when (reset_idx === (nSets-1).U) { doing_reset := false.B }
 
   // corefuzzing: re-arm reset when BTB set/way config changes.
-  // SyncReadMem entries from the old config remain valid in SRAM.  With a smaller
-  // set-count mask, two PCs that differ only in masked-out bits alias to the same set
-  // with identical tags (tag = idx >> log2Ceil(nSets), fixed at max), producing false
-  // hits that redirect the IFU to wrong PCs.  Reset takes nSets(=128) cycles; fetch
-  // is blocked during QS_EXECUTING so the BTB is clean before execution resumes.
+  // SyncReadMem entries from the old config remain valid in SRAM; the sweep removes them (an entry written under
+  // another set mask or way count sits in a slot the new geometry maps differently).  [SPECBPU-REP] (C-BTB-4) two
+  // blocks of the NEW configuration never alias in a slot: the tag holds every index bit above the smallest set
+  // option.  Reset takes nSets(=128) cycles.  Under DMI reconfiguration (the owner's only method, RULES C) fetch is
+  // not blocked: predictions are off while the sweep runs (s1_resp gated by doing_reset) and the sweep owns the
+  // update port (trainings, repairs and relabels in those cycles write nothing; measured, [BTBRSW]).
   val prev_btb_set_idx = RegNext(io.cf_btb_set_idx, 0.U)
   val prev_btb_way_idx = RegNext(io.cf_btb_way_idx, 0.U)
   when ((io.cf_btb_set_idx =/= prev_btb_set_idx) || (io.cf_btb_way_idx =/= prev_btb_way_idx)) {
@@ -130,7 +153,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   val s1_req_rebsec  = s1_req_rebw.map(_(vaddrBitsExtended + 1).asBool).getOrElse(false.B)     // [EBTBSEC] patch 78
   val s1_req_rebspc  = s1_req_rebw.map(_(vaddrBitsExtended + 1 + inflPcBitsCF, vaddrBitsExtended + 2))
                                   .getOrElse(0.U(inflPcBitsCF.W))
-  val s1_req_tag     = s1_idx >> log2Ceil(nSets)
+  val s1_req_tag     = s1_idx >> cfMinSetsLg      // [SPECBPU-REP] C-BTB-4: the tag above the smallest set option
   // corefuzzing: domain shadow read — same index/enable as btb/meta
   // [R124GATE3] patch 28 (B51): btb_domain is read/written only with ENABLE_IFT; IFT off it has no ports
   // (removed, like btb_secret) and the domain-mismatch output is 0.
@@ -233,7 +256,10 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   io.f3_btb_secret_mismatch  := (if (ENABLE_IFT) RegNext(RegNext(s1_btb_secret_mismatch)) else false.B)
 
   val alloc_way = if (nWays > 1) {
-    val r_metas = Cat(VecInit(s1_req_rmeta.map { w => VecInit(w.map(_.tag)) }).asUInt, s1_req_tag(tagSz-1,0))
+    // [SPECBPU-REP] C-BTB-4: the hash reads the old tag field (above the built set bits), so the chosen way is the
+    // tagged tree's for every fetch
+    val r_metas = Cat(VecInit(s1_req_rmeta.map { w => VecInit(w.map(_.tag(tagSz-1, cfTagLo))) }).asUInt,
+                      s1_req_tag(tagSz-1, cfTagLo))
     val l = log2Ceil(nWays)
     val nChunks = (r_metas.getWidth + l - 1) / l
     val chunks = (0 until nChunks) map { i =>
@@ -248,9 +274,70 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   s1_meta.write_way := Mux(s1_hits.reduce(_||_),
     PriorityEncoder(s1_hit_ohs.map(_.asUInt).reduce(_|_)),
     alloc_way_clamped)
+  s1_meta.hits.foreach(h => for (w <- 0 until bankWidth) { h(w) := s1_hit_ohs(w)(s1_meta.write_way) })  // [SPECBPU-REP]
 
   val s1_update_cfi_idx = s1_update.bits.cfi_idx.bits
   val s1_update_meta    = s1_update.bits.meta.asTypeOf(new BTBPredictMeta)
+  // [SPECBPU-REP] (owner 2026-11-02 'Speculative BPU repair'; spec-bpu-plan-final C-BTB-3) local undo log, one word
+  // per record id: did that resolution update write this bank's slot, in which way, and what must a repair do.  A
+  // write that can change the slot's content is undone by INVALIDATING the slot (meta tag 0, the btb_mispredicts
+  // encoding; labels 0): an allocation (the slot did not hold this update's tag), a jalr write (its target can change
+  // without a mispredict when the RAS predicted it), and a taken write into a slot whose target is not valid (tv = 0:
+  // the slot was allocated by a not-taken br, so its btb data still holds the previous occupant's offset / extended
+  // bit or the reset 0, and this write is the first that writes its target).  Any other write (a refresh) rewrote the
+  // same {tag, is_br, offset}: the tag is the full tag above the set index, the target is PC-relative from the
+  // instruction itself (the f3 predecode corrects a wrong BTB target before execute; the branch unit flags only
+  // direction mispredicts for a br; a JAL never mispredicts there) and tv = 1 says the data already holds it; its
+  // repair writes back only the slot's label from just before the write (read at update time, so a committed
+  // training in between keeps its label).  Every restore also writes back the way's tagh word (IFT).  "Held the tag"
+  // is read at the write from the update-side tag copy when CF_BTB_UPD_TAG (owner decision OD-4: exact), else taken
+  // from the fetch-time hit in the meta (stale when the slot was written between this update's fetch and its write).
+  // Left and counted ([BTBRP]): the ebtb far target (one per set) and the entry an allocation displaced.
+  // [SPECBPU-RLB] relabel: btb_domain / btb_secret of the slot only, ORed with the slot's current label.
+  class BtbUndo extends Bundle {
+    val w    = Bool()                       // the update wrote this bank's slot (meta)
+    val inv  = Bool()                       // a repair invalidates it (allocation, jalr write or first target write)
+    val mis  = Bool()                       // ... because it was an allocation (a displaced entry is not restored)
+    val ext  = Bool()                       // the write also wrote ebtb (not restored)
+    val way  = UInt(log2Ceil(nWays).W)
+    val odom = if (ENABLE_IFT) Some(UInt(1.W)) else None   // the slot's label just before the write
+    val osec = if (ENABLE_IFT) Some(Bool()) else None
+  }
+  val cf_tlog   = Mem(cfSpecLogN, new BtbUndo)
+  val s1_slot   = s1_update.bits.cfi_idx.bits
+  val s1_rp     = s1_update.valid && s1_update.bits.is_repair_update && s1_update.bits.cfi_idx.valid
+  val s1_rlb    = s1_rp && s1_update.bits.cf_relabel.getOrElse(false.B)
+  val s1_rst    = s1_rp && !s1_rlb
+  val s1_tu     = cf_tlog.read(s1_update.bits.cf_log_id)
+  val s1_rp_inv = s1_rst && s1_tu.w && s1_tu.inv
+  val s1_rp_lb  = s1_rst && s1_tu.w && !s1_tu.inv     // a refresh: its old label back (label memories only)
+  val s1_rl_w   = s1_rlb && s1_tu.w
+  val s1_wway   = Mux(s1_rp, s1_tu.way, s1_update_meta.write_way)
+  // [SPECBPU-REP] (spec-bpu-plan-final 4.5) update-side slot state per (way, set, slot), read and written only by
+  // the update port.  cf_btv word = {tag, tv} (the tag field only when CF_BTB_UPD_TAG):
+  //  * tag = a copy of the slot's meta tag, written by exactly the meta writes (same way, set, slot mask and data: 0 for
+  //    the reset sweep, a btb_mispredicts write and a repair invalidation, else the update's tag);
+  //  * tv  = the slot's btb data holds a target written since the slot's meta was last allocated (set by a target
+  //    write, kept by a refresh, cleared by an allocation without a target write, an invalidation and the reset sweep).
+  // cf_blb (IFT) = a copy of btb_domain / btb_secret {sec, dom}, written by exactly the same writes as they are.
+  // Asynchronous read and synchronous write at the same s1 address cf_bu_wa in the same cycle: the read returns the
+  // slot as it is before this update's write (the previous update's write is already in), so there is no forward and
+  // no register.  s1_bw_hit = the write way's slot holds this update's tag just before the write (exact), or with
+  // CF_BTB_UPD_TAG false the fetch-time hit of the meta.  FPGA: single-port LUTRAM (one address), per bank 2 ways x 4
+  // slots x 128 x (1 + tagSz) b and x 2 b (IFT labels); no fetch read: every fetch path is unchanged.
+  val cfBtvW     = 1 + (if (CF_BTB_UPD_TAG) tagSz else 0)
+  val cf_btv     = Seq.fill(nWays) { Mem(nSets, Vec(bankWidth, UInt(cfBtvW.W))) }
+  val cf_blb     = if (ENABLE_IFT) Some(Seq.fill(nWays) { Mem(nSets, Vec(bankWidth, UInt(2.W))) }) else None
+  val cf_bu_wa   = Mux(doing_reset, reset_idx, s1_update_idx_masked)
+  val s1_btv     = VecInit(cf_btv.map(_.read(cf_bu_wa)))
+  val s1_blb     = cf_blb.map(m => VecInit(m.map(_.read(cf_bu_wa))))
+  val s1_upd_tag = (s1_update_idx >> cfMinSetsLg)(tagSz - 1, 0)                         // the tag this update writes
+  val s1_bw_tv   = VecInit((0 until bankWidth).map(j => s1_btv(s1_update_meta.write_way)(j)(0)))  // before its write
+  val s1_bw_hit  = if (CF_BTB_UPD_TAG) VecInit((0 until bankWidth).map(j =>
+                     VecInit(s1_btv.map(_(j)(cfBtvW - 1, 1) === s1_upd_tag))(s1_update_meta.write_way)))
+                   else s1_update_meta.hits.get
+  val s1_bw_lb   = s1_blb.map(_(s1_update_meta.write_way))
+  val s1_cur_lb  = s1_blb.map(v => v(s1_wway)(s1_slot))        // [SPECBPU-RLB] the written slot's label now
 
   val max_offset_value = Cat(0.B, ~(0.U((offsetSz-1).W))).asSInt
   val min_offset_value = Cat(1.B,  (0.U((offsetSz-1).W))).asSInt
@@ -271,15 +358,59 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
      (Fill(bankWidth, s1_update.valid) & s1_update.bits.btb_mispredicts)
     )
   )
+  // [SPECBPU-REP] the meta mask with a repair invalidation, and the label mask with a label restore or a relabel
+  val s1_rp_oh     = UIntToOH(s1_slot, bankWidth)
+  val s1_wmeta_all = s1_update_wmeta_mask | Mux(s1_rp_inv, s1_rp_oh, 0.U)
+  val s1_wlbl_mask = s1_wmeta_all | Mux(s1_rl_w || s1_rp_lb, s1_rp_oh, 0.U)
+  // [SPECBPU-REP] IFT: the label the label memories of the written slots get: 0 for an invalidation, the logged old
+  // label for a label restore (the label from just before the training's write), the update's own for a training;
+  // [SPECBPU-RLB] a relabel ORs its label into the slot's current one, so a label a younger training wrote stays
+  val s1_lbl_dom   = if (ENABLE_IFT) Some(Mux(s1_rp_inv, 0.U(1.W), Mux(s1_rp_lb, s1_tu.odom.get,
+                       s1_update.bits.cf_domain_id.getOrElse(0.U(1.W)) | (s1_rl_w && s1_cur_lb.get(0)).asUInt))) else None
+  val s1_lbl_sec   = if (ENABLE_IFT) Some(!s1_rp_inv && Mux(s1_rp_lb, s1_tu.osec.get,
+                       s1_update.bits.cf_is_secret.getOrElse(false.B) || (s1_rl_w && s1_cur_lb.get(1)))) else None
+  when (!doing_reset && s1_update.valid && s1_update.bits.is_commit_update && s1_update.bits.cfi_idx.valid) {
+    val wd = Wire(new BtbUndo)
+    wd.w   := s1_update_wmeta_mask(s1_slot)
+    // a repair invalidates: an allocation, a jalr write, or a target write into a slot whose target was not valid
+    // (the first taken write after a not-taken allocation: the target changed).  Every other write is a refresh.
+    wd.inv := !s1_bw_hit(s1_slot) || s1_update.bits.cfi_is_jalr ||
+              (s1_update_wbtb_mask(s1_slot) && !s1_bw_tv(s1_slot))
+    wd.mis := !s1_bw_hit(s1_slot)
+    wd.ext := s1_update_wbtb_mask(s1_slot) && offset_is_extended
+    wd.way := s1_update_meta.write_way
+    wd.odom.foreach(_ := s1_bw_lb.get(s1_slot)(0))       // the slot's label just before this write
+    wd.osec.foreach(_ := s1_bw_lb.get(s1_slot)(1))
+    cf_tlog.write(s1_update.bits.cf_log_id, wd)
+  }
+  // [SPECBPU-REP] cf_btv / cf_blb follow every meta / label write of this bank: same way and set as the meta and
+  // btb_domain / btb_secret writes, cf_btv under the meta mask with the meta's tag data, cf_blb under the label mask
+  // (the reset sweep writes 0).  tv of a meta-written slot = this write wrote the target, or it is a refresh of a slot
+  // whose target was valid (0 for an invalidation and for a btb_mispredicts tag-0 write).
+  val cf_btv_tv  = VecInit((0 until bankWidth).map(j => !doing_reset && !s1_rp_inv && !s1_update.bits.btb_mispredicts(j) &&
+                     (s1_update_wbtb_mask(j) || (s1_bw_hit(j) && s1_bw_tv(j)))))
+  val cf_btv_wd  = VecInit((0 until bankWidth).map(j => if (CF_BTB_UPD_TAG)
+                     Cat(Mux(doing_reset || s1_rp_inv || s1_update.bits.btb_mispredicts(j), 0.U(tagSz.W), s1_upd_tag),
+                         cf_btv_tv(j))
+                   else cf_btv_tv(j).asUInt))
+  val cf_btv_wm  = VecInit((0 until bankWidth).map(j => doing_reset || s1_wmeta_all(j)))
+  for (w <- 0 until nWays) {
+    when (doing_reset || s1_wway === w.U || (nWays == 1).B) {
+      cf_btv(w).write(cf_bu_wa, cf_btv_wd, cf_btv_wm)
+      cf_blb.foreach(_(w).write(cf_bu_wa,
+        VecInit(Seq.fill(bankWidth)(Mux(doing_reset, 0.U(2.W), Cat(s1_lbl_sec.get, s1_lbl_dom.get)))),
+        VecInit((0 until bankWidth).map(j => doing_reset || s1_wlbl_mask(j)))))
+    }
+  }
   val s1_update_wmeta_data = Wire(Vec(bankWidth, new BTBMeta))
 
   for (w <- 0 until bankWidth) {
-    s1_update_wmeta_data(w).tag     := Mux(s1_update.bits.btb_mispredicts(w), 0.U, s1_update_idx >> log2Ceil(nSets))
-    s1_update_wmeta_data(w).is_br   := s1_update.bits.br_mask(w)
+    s1_update_wmeta_data(w).tag     := Mux(s1_update.bits.btb_mispredicts(w) || s1_rp_inv, 0.U, s1_update_idx >> cfMinSetsLg)
+    s1_update_wmeta_data(w).is_br   := s1_update.bits.br_mask(w) && !s1_rp_inv   // [SPECBPU-REP] invalidation
   }
 
   for (w <- 0 until nWays) {
-    when (doing_reset || s1_update_meta.write_way === w.U || (w == 0 && nWays == 1).B) {
+    when (doing_reset || s1_wway === w.U || (w == 0 && nWays == 1).B) {   // [SPECBPU-REP] a repair's way: the log
       btb(w).write(
         Mux(doing_reset,
           reset_idx,
@@ -300,15 +431,15 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
           VecInit(s1_update_wmeta_data.map(_.asUInt))),
         Mux(doing_reset,
           (~(0.U(bankWidth.W))),
-          s1_update_wmeta_mask).asBools
+          s1_wmeta_all).asBools
       )
       // corefuzzing: write domain shadow alongside meta (same index/mask)
       if (ENABLE_IFT) btb_domain(w).write(   // [R124GATE3]
         Mux(doing_reset, reset_idx, s1_update_idx_masked),
         Mux(doing_reset,
           VecInit(Seq.fill(bankWidth)(0.U(1.W))),
-          VecInit(Seq.fill(bankWidth)(s1_update.bits.cf_domain_id.getOrElse(0.U(1.W))))),
-        Mux(doing_reset, (~(0.U(bankWidth.W))), s1_update_wmeta_mask).asBools
+          VecInit(Seq.fill(bankWidth)(s1_lbl_dom.get))),   // [SPECBPU-REP] invalidated 0 / old label / update / relabel
+        Mux(doing_reset, (~(0.U(bankWidth.W))), s1_wlbl_mask).asBools
       )
       // corefuzzing: write secret shadow alongside domain (same index/mask)
       // IFT gate: elided when ENABLE_IFT=false; btb_secret SRAMs become dead
@@ -318,8 +449,8 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
           Mux(doing_reset, reset_idx, s1_update_idx_masked),
           Mux(doing_reset,
             VecInit(Seq.fill(bankWidth)(false.B)),
-            VecInit(Seq.fill(bankWidth)(s1_update.bits.cf_is_secret.getOrElse(false.B)))),
-          Mux(doing_reset, (~(0.U(bankWidth.W))), s1_update_wmeta_mask).asBools
+            VecInit(Seq.fill(bankWidth)(s1_lbl_sec.get))),   // [SPECBPU-REP] as btb_domain
+          Mux(doing_reset, (~(0.U(bankWidth.W))), s1_wlbl_mask).asBools
         )
       }
     }
@@ -331,12 +462,12 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   // family).  btb_rst = the set/way-CSR re-arm condition (doing_reset rises next cycle).  Outputs only.
   io.cf_st.foreach { s =>
     require(log2Ceil(nSets) == 7 && log2Ceil(nWays) == 1, "STATE PRED btb {v, set[6:0], way}: 128 sets x 2 ways (design 5.1)")
-    val stV   = !doing_reset && (s1_update_wmeta_mask =/= 0.U || s1_update_wbtb_mask =/= 0.U)
+    val stV   = !doing_reset && (s1_wmeta_all =/= 0.U || s1_update_wbtb_mask =/= 0.U)   // [SPECBPU-REP] + repairs
     val stSet = (fetchIdx(s1_update.bits.pc) & (cf_btb_active_sets - 1.U))(log2Ceil(nSets) - 1, 0)
     val stRst = (io.cf_btb_set_idx =/= prev_btb_set_idx) || (io.cf_btb_way_idx =/= prev_btb_way_idx)
     s.btb_v   := RegNext(stV, false.B)
     s.btb_set := RegNext(stSet)
-    s.btb_way := RegNext(s1_update_meta.write_way)
+    s.btb_way := RegNext(s1_wway)
     s.btb_rst := RegNext(stRst, false.B)
     if (ENABLE_CF_DEBUG_PRINTF && ENABLE_IFT) {   // Verilator only: the check reads s1_update_idx, never in a FireSim/NoLog build
       assert(!stV || stSet === s1_update_idx_masked(log2Ceil(nSets) - 1, 0), "[V3TAP-BTB] local BTB set != s1_update_idx_masked")
@@ -370,11 +501,53 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   if (ENABLE_IFT && ENABLE_CF_DEBUG_PRINTF && !ENABLE_IFT_BRIDGE) {
     val cf_sf_cyc = RegInit(0.U(40.W))
     cf_sf_cyc := cf_sf_cyc + 1.U
-    when (!doing_reset && (s1_update_wmeta_mask =/= 0.U || s1_update_wbtb_mask =/= 0.U)) {
-      printf("[BTBW] cyc=%d pc=0x%x set=0x%x way=%d tag=0x%x wm=0x%x wb=0x%x brm=0x%x ext=%d tgt=0x%x\n", cf_sf_cyc,
-        s1_update.bits.pc, s1_update_idx_masked(log2Ceil(nSets)-1, 0), s1_update_meta.write_way,
-        (s1_update_idx >> log2Ceil(nSets))(tagSz-1, 0), s1_update_wmeta_mask, s1_update_wbtb_mask,
-        s1_update.bits.br_mask, offset_is_extended, s1_update.bits.target)
+    when (!doing_reset && (s1_wmeta_all =/= 0.U || s1_update_wbtb_mask =/= 0.U)) {
+      printf("[BTBW] cyc=%d pc=0x%x set=0x%x way=%d tag=0x%x wm=0x%x wb=0x%x brm=0x%x ext=%d tgt=0x%x k=%d uh=0x%x\n",
+        cf_sf_cyc, s1_update.bits.pc, s1_update_idx_masked(log2Ceil(nSets)-1, 0), s1_wway,
+        Mux(s1_rp_inv, 0.U, (s1_update_idx >> cfMinSetsLg)(tagSz-1, 0)), s1_wmeta_all, s1_update_wbtb_mask,
+        s1_update.bits.br_mask, offset_is_extended, s1_update.bits.target, s1_rp_inv, s1_bw_hit.asUInt)
+    }
+    // [SPECBPU-REP] [BTBW] uh = the slots of the write way that held this update's tag before the write (s1_bw_hit:
+    // the classification a repair of this training uses).  [BTBRP] every repair (k=1) / relabel (k=2) this bank
+    // decodes; lb = a label restore of a refresh with the logged old label od / os (the slot's label just before the
+    // training's write); inv = 1 also for a first target write; left_ext / left_vic = running counts of restores
+    // whose ebtb target stays / of invalidations whose displaced entry stays (RULES C: left and counted)
+    val c_ext = RegInit(0.U(40.W))
+    val c_vic = RegInit(0.U(40.W))
+    when (s1_rst && s1_tu.w && s1_tu.ext) { c_ext := c_ext + 1.U }
+    when (s1_rp_inv && s1_tu.mis)         { c_vic := c_vic + 1.U }
+    // [SPECBPU-REP] DMI reconfiguration measurement (owner 2026-11-02 ~21:0x 'Speculative BPU gaps and
+    // reconfiguration': D-1 "Accept + measure", no RTL fix; spec-bpu-plan-final 4.8).  A set / way change re-arms
+    // the reset sweep, which owns the update port for nSets cycles; neither the undo words nor the FTQ log are
+    // cleared (no quiesce under DMI).  d_old(id) = this bank's undo word of record id predates the last re-reset, or
+    // its training came inside the sweep and wrote nothing (the word is then the one of the record 16 allocations
+    // earlier).  swtr / swrp = trainings / repairs + relabels the sweep absorbed; orp / orl = repairs / relabels of a
+    // d_old record that wrote this bank after the sweep (old-geometry writes); owy = those of them whose logged way
+    // is not active now.  [BTBRSW] at every sweep end.  Debug builds only.
+    val d_old   = RegInit(VecInit(Seq.fill(cfSpecLogN)(false.B)))
+    val d_trn   = s1_update.valid && s1_update.bits.is_commit_update && s1_update.bits.cfi_idx.valid
+    val d_rearm = (io.cf_btb_set_idx =/= prev_btb_set_idx) || (io.cf_btb_way_idx =/= prev_btb_way_idx)
+    when (d_trn)   { d_old(s1_update.bits.cf_log_id) := doing_reset }
+    when (d_rearm) { d_old.foreach(_ := true.B) }                                      // last connect
+    val d_stale = !doing_reset && s1_rp && s1_tu.w && d_old(s1_update.bits.cf_log_id)
+    val c_swtr  = RegInit(0.U(40.W)); val c_swrp = RegInit(0.U(40.W))
+    val c_orp   = RegInit(0.U(40.W)); val c_orl  = RegInit(0.U(40.W)); val c_owy = RegInit(0.U(40.W))
+    when (d_trn && doing_reset) { c_swtr := c_swtr + 1.U }
+    when (s1_rp && doing_reset) { c_swrp := c_swrp + 1.U }
+    when (d_stale && !s1_rlb)   { c_orp  := c_orp + 1.U }
+    when (d_stale && s1_rlb)    { c_orl  := c_orl + 1.U }
+    when (d_stale && s1_tu.way >= cf_btb_active_ways) { c_owy := c_owy + 1.U }
+    when (s1_rp) {
+      printf("[BTBRP] cyc=%d id=%d k=%d slot=%d w=%d inv=%d mis=%d ext=%d way=%d lb=%d od=%d os=%d left_ext=%d " +
+             "left_vic=%d dold=%d swp=%d swtr=%d swrp=%d orp=%d orl=%d owy=%d\n", cf_sf_cyc,
+        s1_update.bits.cf_log_id, Mux(s1_rlb, 2.U, 1.U), s1_slot, s1_tu.w, s1_tu.inv, s1_tu.mis, s1_tu.ext, s1_tu.way,
+        s1_rp_lb, s1_tu.odom.get, s1_tu.osec.get,
+        c_ext + (s1_rst && s1_tu.w && s1_tu.ext), c_vic + (s1_rp_inv && s1_tu.mis),
+        d_old(s1_update.bits.cf_log_id), doing_reset, c_swtr, c_swrp + doing_reset,
+        c_orp + (d_stale && !s1_rlb), c_orl + (d_stale && s1_rlb), c_owy + (d_stale && s1_tu.way >= cf_btb_active_ways))
+    }
+    when (!doing_reset && RegNext(doing_reset, true.B)) {
+      printf("[BTBRSW] cyc=%d swtr=%d swrp=%d\n", cf_sf_cyc, c_swtr, c_swrp)
     }
     when (doing_reset && !RegNext(doing_reset, true.B)) {
       printf("[BTBRST] cyc=%d\n", cf_sf_cyc)
@@ -485,7 +658,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
     val s1_ift_evf  = cfFwdRead(ift_btb_evf, evf_we, rec_wa, evf_wd, s0_idx_masked, s0_valid)
     val s1_ift_eva  = cfFwdRead(ift_btb_eva, eva_we, rec_wa, eva_wd, s0_idx_masked, s0_valid)
     def recHit(r: UInt): Bool = s1_valid && !doing_reset && r(recW - 1) &&
-                                r(recW - 2, inflPcBitsCF) === s1_req_tag(tag8W - 1, 0)
+                                r(recW - 2, inflPcBitsCF) === s1_req_tag(cfTagLo + tag8W - 1, cfTagLo)   // old tag [7:0]
     val s1_evf_hit  = recHit(s1_ift_evf)
     val s1_eva_hit  = recHit(s1_ift_eva)
     val s1_sec_slot = (0 until bankWidth).map(w => s1_btb_sec_slot(w))   // [BPDMASK] same terms as the flag
@@ -512,14 +685,28 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
     val s1_upd_atk    = s1_update.bits.cf_domain_id.getOrElse(0.U(1.W)) === 1.U
     val s1_any_disp   = s1_upd_alloc && s1_upd_old(tag8W) && s1_upd_old(tag8W - 1, 0) =/= s1_upd_new8
     tagh_wa := Mux(doing_reset, reset_idx, s1_update_idx_masked)
-    tagh_wd := Mux(doing_reset, 0.U((tag8W + 1).W), Cat(true.B, s1_upd_new8))
+    // [SPECBPU-REP] (spec-bpu-plan-final 4.5) tagh keeps ONE tag per (set, way) for all the way's slots, and every
+    // training that writes meta rewrites it (s1_upd_alloc is true for a refresh too).  Each training logs the way's
+    // tagh word from before its write (s1_upd_old: forwarded read, so exactly that value) and every restore of a
+    // training that wrote the slot (invalidation or label restore) writes it back: after an allocation undo the
+    // displaced tag, still resident in the way's other slots, keeps its displacement detection; after a hit undo the
+    // way's word is again the one before the squashed write.  IFT only.
+    val cf_thlog  = Mem(cfSpecLogN, UInt((tag8W + 1).W))
+    when (!doing_reset && s1_update.valid && s1_update.bits.is_commit_update && s1_update.bits.cfi_idx.valid) {
+      cf_thlog.write(s1_update.bits.cf_log_id, s1_upd_old)
+    }
+    val s1_th_rst = s1_rst && s1_tu.w                                     // every restore of a training that wrote
+    tagh_wd := Mux(doing_reset, 0.U((tag8W + 1).W),
+                 Mux(s1_th_rst, cf_thlog.read(s1_update.bits.cf_log_id), Cat(true.B, s1_upd_new8)))
     for (w <- 0 until nWays) {
       val wsel = s1_update_meta.write_way === w.U || (nWays == 1).B
-      tagh_we(w) := doing_reset || (s1_upd_alloc && wsel)
+      val rsel = s1_tu.way === w.U || (nWays == 1).B                                     // [SPECBPU-REP]
+      tagh_we(w) := doing_reset || (s1_upd_alloc && wsel) || (s1_th_rst && rsel)
       when (tagh_we(w)) {
         ift_btb_tagh(w).write(tagh_wa, tagh_wd)
       }
-      when (s1_upd_alloc && wsel && s1_upd_sec) {
+      // [SPECBPU-RLB] a relabel to secret names the record's CFI as the trainer (one write port: merged condition)
+      when ((s1_upd_alloc && wsel && s1_upd_sec) || (s1_rl_w && rsel && s1_upd_sec)) {
         ift_btb_spc(w).write(s1_update_idx_masked, s1_upd_pc12)
       }
     }

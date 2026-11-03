@@ -632,7 +632,7 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     val init = BigInt(0x0)   // index 0 = N=4 (full width, default)
     Some(CustomCSR(coreWidthCSRIdCF, mask, Some(init)))
   } else None
-  def cf_core_width_idx = getOrElse(coreWidthCSRCF, _.value(1,0), 0.U)
+  def cf_core_width_idx = getOrElse(coreWidthCSRCF, _.value(1,0), 0.U(2.W))   // 2-bit default: a 1-bit 0.U makes Chisel 6 MuxLookup treat keys {1,2} as exhaustive and drop the coreWidth default (active width 2 in every reconf-off build)
   // Derive active width as a hardware signal: 0→4, 1→2, 2→1
   def cf_active_width: UInt = MuxLookup(cf_core_width_idx, coreWidth.U)(
     Seq(1.U -> 2.U, 2.U -> 1.U))
@@ -727,7 +727,12 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val globalHistoryLength = boomParams.globalHistoryLength
   val localHistoryLength = boomParams.localHistoryLength
   val localHistoryNSets = boomParams.localHistoryNSets
-  val bpdMaxMetaLength = boomParams.bpdMaxMetaLength
+  // [SPECBPU-REP] (owner 2026-11-02, RULES C 'Speculative BPU repair', labels "Restore old label"): IFT on, the TAGE
+  // meta carries the fetch-time provider label and the BIM meta the fetch-time row labels (2 b per slot each, so 16 b
+  // per bank), the old label a repair restores.  The BTB old label is read at update time from its own update-side
+  // memory (btb.scala cf_blb), not carried in the meta.  boomParams.enableIFT, not ENABLE_IFT: that val is declared
+  // further down this trait and still reads false while this one initialises (trait initialisation order, gotcha G1).
+  val bpdMaxMetaLength = boomParams.bpdMaxMetaLength + (if (boomParams.enableIFT) 16 else 0)
 
   def getBPDComponents(resp_in: BranchPredictionBankResponse, p: Parameters) = {
     boomParams.branchPredictor(resp_in, p)
@@ -785,6 +790,17 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val ENABLE_IFT_BRIDGE   = boomParams.enableIFTBridge // export IFT records as tile IO for FireSim IFTBridge
   val IFT_ORACLE          = boomParams.iftOracle       // [Task 2.10g] Verilator/OOC: keep the record outputs at the tile
   val ENABLE_IFT          = boomParams.enableIFT       // compile-time gate for DIFT tracking logic
+  // [SPECBPU-REP] (spec-bpu-plan-final section 4.5, owner decision OD-4): how a BTB repair tells a refresh from an
+  // allocation.  true = from an update-side copy of every slot's tag, read at the training's own write (exact: the
+  // slot as it is just before that write, btb.scala cf_btv); false = from the fetch-time hit carried in the BTB meta
+  // (stale when the slot was written between the training's fetch and its write); ENABLE_IFT = the copy in IFT builds
+  // only (IFT-off builds then use the fetch-time hit).  The right-hand side is the OD-4 answer.
+  val CF_BTB_UPD_TAG     = true
+  // [SPECBPU-RLB] (spec-bpu-plan-final section 4.6, owner decision OD-3): relabel of an in-flight resolution update
+  // when its FTQ entry's attacker / secret bit is set after the update left (the label gap of task-reports/
+  // spec-bpu-rev1-tools-20261102.md section 3).  IFT only.  The literal is the OD-3 answer: true = build the relabel,
+  // false = keep RULES C O3 "Accept, host recovers" (no relabel hardware; every [SPECBPU-RLB] term elaborates to 0).
+  val CF_SPEC_RELABEL     = ENABLE_IFT && true
   val ENABLE_RECONF       = boomParams.enableReconf    // compile-time gate for runtime reconfigurability
   val ENABLE_STT                  = boomParams.enableSTT
   val ENABLE_DOPPELGANGER         = boomParams.enableDoppelganger

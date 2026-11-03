@@ -45,7 +45,7 @@ import midas.targetutils.xdc.{XDC, XDCFiles}
 import chisel3.experimental.annotate
 
 import boom.v3.common._
-import boom.v3.ifu.{GlobalHistory, HasBoomFrontendParameters}
+import boom.v3.ifu.{GlobalHistory, HasBoomFrontendParameters, BpuResolveInfo, BpuSquashInfo}
 import boom.v3.exu.FUConstants._
 import boom.v3.util._
 
@@ -240,6 +240,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     for ((n, a) <- brinfos_next zip exe_units.alu_units) {
       n := a.io.brinfo
       n.valid := a.io.brinfo.valid && !rob.io.flush.valid
+      n.jal_res := a.io.brinfo.jal_res && !rob.io.flush.valid   // [SPECBPU] same flush gate as valid
     }
     brinfos := brinfos_next
     val rm_next = brinfos_next.map(x => x.valid << x.uop.br_tag).reduce(_|_)(maxBrCount-1, 0)
@@ -260,6 +261,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   for ((b, a) <- brinfos zip exe_units.alu_units) {
     b := a.io.brinfo
     b.valid := a.io.brinfo.valid && !rob.io.flush.valid
+    b.jal_res := a.io.brinfo.jal_res && !rob.io.flush.valid   // [SPECBPU] same flush gate as valid
   }
   b1.resolve_mask := brinfos.map(x => x.valid << x.uop.br_tag).reduce(_|_)
   b1.mispredict_mask := brinfos.map(x => (x.valid && x.mispredict) << x.uop.br_tag).reduce(_|_)
@@ -281,10 +283,120 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   b2.taken       := oldest_mispredict.taken
   b2.pc_sel      := oldest_mispredict.pc_sel
   b2.uop         := UpdateBrMask(brupdate, oldest_mispredict.uop)
-  b2.jalr_target := RegNext(jmp_unit.io.brinfo.jalr_target)
+  // [SPECBPU] one register for the jump unit's jalr target, shared by b2 and the spec BPU update below
+  // (rev2, review N6a: the brinfos(jl).jalr_target copy of the same D is no longer read; -40 FF).
+  val jmp_jalr_target_q = RegNext(jmp_unit.io.brinfo.jalr_target)
+  b2.jalr_target := jmp_jalr_target_q
   b2.target_offset := oldest_mispredict.target_offset
 
   val oldest_mispredict_ftq_idx = oldest_mispredict.uop.ftq_idx
+
+  // [SPECBPU] (owner 2026-11-02, RULES C 'Speculative TAGE/BTB updates': "At resolution, all paths"; commit training
+  // "Replace it"; "Always speculative"; "New direct path from brupdate"; 'Speculative BPU follow-ups': O1 "(a)
+  // BIM+uBTB too", O2 "Measure first, JAL last").  The TAGE, BTB, BIM and uBTB train once per resolved CFI, when it
+  // resolves here, wrong path included.  Source = the brinfos registers (the per-ALU
+  // resolutions that brupdate.b1/b2 are built from): brupdate.b2 itself carries only the OLDEST MISPREDICT (above),
+  // so a correctly predicted branch never appears in it.  JALs (no branch tag, not in brinfos.valid) come in on
+  // brinfos.jal_res.  Wrong-path coverage: a lane younger than a mispredict resolved in an EARLIER cycle never
+  // reaches brinfos (the ALU kill, IsKilledByBranch); lanes resolved in the same cycle as, or before, that
+  // mispredict do (owner: wrong path included).
+  // One update per cycle (the predictor has one write port per table): the OLDEST mispredicting lane by rob_idx
+  // wins (rev2, review S1: the same lane brupdate.b2 redirects on, so the redirecting branch always trains; its
+  // update carries the TAGE allocation and the BTB target correction; lane order is not age, so a younger
+  // wrong-path mispredict in a lower lane must not win), else the lowest br / jalr lane, else (O2: JAL lanes
+  // lowest, since f3 predecode already corrects a JAL target) the lowest JAL lane; the other lanes of the cycle are
+  // not trained (no queue: a queued wrong-path update could read an FTQ entry the refetch has overwritten; design
+  // note section 6).  The drop rate is measured on the debug build ([SPECBPU-DROP] below).
+  // Levels (flop to flop inside the core; all inputs are flops: brinfos, rob_head / rob_head_lsb):
+  //   L1 + carry: the 6 pairwise rob_idx compares and the 4 rob_idx < head compares (8 b: 1 LUT + 1 CARRY8 each);
+  //   L2: per pair "lane j not mispredicting or lane i older" (valid j, mispredict j, lt, two head bits: 5
+  //       inputs); the JAL-last fallback one-hot (12 flop bits, 2 LUT) runs in parallel and is ready at L2;
+  //   L3: sel(i) = lm(i) & the 3 pair terms | fallback(i) (6 inputs, 1 LUT6);
+  //   L4-L5: 4:1 Mux1H of the payload (2 LUT) -> the spec_bpu flops (about 85 FF).
+  // 5 LUT + 1 CARRY8 (rev1: 4-5 LUT), against the existing b2 select from the same flops (3 serial IsOlder + 2:1
+  // muxes). The flops drive the FTQ read address directly (the same core -> frontend route as get_pc(1).ftq_idx,
+  // which is not registered at all).
+  val spec_bpu_v = RegInit(false.B)
+  val spec_bpu_q = Reg(new BpuResolveInfo)
+  locally {
+    val lv  = VecInit(brinfos.map(b => b.valid || b.jal_res)).asUInt
+    val lm  = VecInit(brinfos.map(b => b.valid && b.mispredict)).asUInt
+    val lb  = VecInit(brinfos.map(_.valid)).asUInt                      // br / jalr lanes
+    val lj  = VecInit(brinfos.map(b => !b.valid && b.jal_res)).asUInt   // JAL lanes (O2: lowest priority)
+    // Oldest mispredicting lane, one-hot (rev2, S1).  rob_idx are distinct among valid lanes, so the pair (i, j)
+    // needs one compare: i older than j = IsOlder(r(i), r(j), head) = (r(i) < r(j)) ^ (r(i) < head) ^ (r(j) < head),
+    // j older than i = its complement.  Each "< head" compare is shared by all pairs of its lane.
+    val nl  = brinfos.length
+    val rix = brinfos.map(_.uop.rob_idx)
+    val rhd = rob.io.rob_head_idx
+    val lth = rix.map(_ < rhd)
+    val older = Array.tabulate(nl, nl) { (i, j) =>
+      if (i < j) Some((rix(i) < rix(j)) ^ lth(i) ^ lth(j)) else None }
+    def olderThan(i: Int, j: Int): Bool = if (i < j) older(i)(j).get else !older(j)(i).get
+    val om  = VecInit((0 until nl).map { i =>
+      ((0 until nl).filter(_ != i).map(j => !lm(j) || olderThan(i, j)) :+ lm(i)).reduce(_ && _) }).asUInt
+    // = Mux(lm.orR, om, fallback): om is 0 without a mispredict and the fallback is masked with one, so an OR is
+    // exact; written as AND-OR so that the fallback (flops only) settles in parallel with the compares (L3 above).
+    val fb  = Mux(lb.orR, PriorityEncoderOH(lb), PriorityEncoderOH(lj)) & Fill(nl, !lm.orR)
+    val sel = om | fb
+    val jl  = exe_units.alu_units.indexWhere(_.hasJmpUnit)   // the only lane that resolves a jalr
+    require(jl >= 0 && jl < brinfos.length, "[SPECBPU] the jump unit must be one of the brinfos lanes")
+    val n = Wire(new BpuResolveInfo)
+    n.ftq_idx       := Mux1H(sel, brinfos.map(_.uop.ftq_idx))
+    n.pc_lob        := Mux1H(sel, brinfos.map(_.uop.pc_lob))
+    n.edge_inst     := Mux1H(sel, brinfos.map(_.uop.edge_inst))
+    n.is_br         := Mux1H(sel, brinfos.map(b => b.valid && b.cfi_type === CFI_BR))
+    n.is_jalr       := Mux1H(sel, brinfos.map(b => b.valid && b.cfi_type === CFI_JALR))
+    n.is_jal        := Mux1H(sel, brinfos.map(b => !b.valid && b.jal_res))
+    n.taken         := Mux1H(sel, brinfos.map(_.taken))
+    n.mispredict    := Mux1H(sel, brinfos.map(b => b.valid && b.mispredict))
+    n.target_offset := Mux1H(sel, brinfos.map(_.target_offset.asUInt)).asSInt   // UInt Mux1H (inferred-width SInt)
+    n.jalr_target   := jmp_jalr_target_q   // = brinfos(jl).jalr_target (same D, jl is the jump unit's lane; N6a)
+    // IFT (RULES A; [SPECBPU-IFT]): the resolving CFI's own condition / target taint.  The FTQ ORs them with the
+    // entry's labels (fetch-target-queue.scala), so the update is labelled as the commit update would have been
+    // for this branch, without waiting for the compactor / [FTQATK] write of the same bits.
+    // A JAL has no register operand: its lane's cond bits are not read (valid = 0 for a JAL).
+    n.cond_secret.foreach(_ := Mux1H(sel, brinfos.map(b => b.valid && b.cond_secret)))
+    n.cond_atk.foreach(_    := Mux1H(sel, brinfos.map(b => b.valid && b.cond_atk)))
+    // [SPECBPU-REP] (spec-bpu-plan-final 6.3) debug printf builds only: the selected lane's op count (BpuResolveInfo.dbg_oc)
+    n.dbg_oc.foreach(_ := Mux1H(sel, brinfos.map(_.uop.cf_op_count_id.get)))
+    spec_bpu_v := lv.orR
+    spec_bpu_q := n
+    // [SPECBPU-DROP] (O2 "Measure first"): debug printf builds only (the IftSquashMerge gate: IFT on, CF debug
+    // printfs on, no IFT bridge; NoLog / FireSim / IFT off elaborate nothing).  Printed in every cycle that drops a
+    // lane: nd / ndj = dropped lanes / dropped JAL lanes in this cycle; res / drop / dropj = running totals from reset
+    // of resolved lanes, dropped lanes and dropped JAL lanes (so the LAST line of a run gives the lane drop rate
+    // drop / res up to that cycle; the [BPDS] count gives the trained lanes).  40-bit debug-only counters.
+    // rev2 (review S1 measurement): ndm / dropm = dropped MISPREDICTING lanes in this cycle / running total (a
+    // younger, wrong-path mispredict that lost to the oldest one; only cycles with more than one bit in mp).
+    // [SPECBPU-SEL] asserts check the S1 select: exactly one lane is selected when any lane resolves, and with a
+    // mispredict it is the lane brupdate.b2 redirects on (same rob_idx as oldest_mispredict).
+    if (ENABLE_IFT && ENABLE_CF_DEBUG_PRINTF && !ENABLE_IFT_BRIDGE) {
+      val cyc   = RegInit(0.U(40.W))
+      val t_res = RegInit(0.U(40.W))
+      val t_drp = RegInit(0.U(40.W))
+      val t_drj = RegInit(0.U(40.W))
+      val t_drm = RegInit(0.U(40.W))
+      val nres  = PopCount(lv)
+      val ndrp  = Mux(lv.orR, nres - 1.U, 0.U)
+      val ndrj  = PopCount(lj & ~sel)
+      val ndrm  = PopCount(lm & ~sel)
+      cyc   := cyc + 1.U
+      t_res := t_res + nres
+      t_drp := t_drp + ndrp
+      t_drj := t_drj + ndrj
+      t_drm := t_drm + ndrm
+      when (nres > 1.U) {
+        printf("[SPECBPU-DROP] cyc=%d lanes=0x%x sel=0x%x mp=0x%x jal=0x%x nd=%d ndj=%d ndm=%d res=%d drop=%d dropj=%d dropm=%d\n",
+          cyc, lv, sel, lm, lj, ndrp, ndrj, ndrm, t_res + nres, t_drp + ndrp, t_drj + ndrj, t_drm + ndrm)
+      }
+      assert(!lv.orR || PopCount(sel) === 1.U, "[SPECBPU-SEL] spec BPU lane select is not one-hot")
+      assert(!lm.orR || Mux1H(sel, rix) === oldest_mispredict.uop.rob_idx,
+        "[SPECBPU-SEL] spec BPU mispredict lane is not the b2 (oldest) mispredict")
+    }
+  }
+  io.ifu.bpu_res.valid := spec_bpu_v
+  io.ifu.bpu_res.bits  := spec_bpu_q
 
 
   assert (!((brupdate.b1.mispredict_mask =/= 0.U || brupdate.b2.mispredict)
@@ -863,6 +975,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   io.ifu.redirect_val                  := false.B
   io.ifu.redirect_flush                := false.B
   io.ifu.redirect_flush_is_mispredict  := false.B
+  // [SPECBPU-REP] (owner 2026-11-02, RULES C 'Speculative BPU repair'): which CFIs of the redirect entry this redirect
+  // squashes, for the FTQ undo log (read only with redirect_val).  Default for the cycles without a redirect.
+  io.ifu.bpu_sq.pc_lob := 0.U
+  io.ifu.bpu_sq.incl   := false.B
 
   // Breakpoint info
   io.ifu.status  := csr.io.status
@@ -915,6 +1031,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
     }
     io.ifu.redirect_ftq_idx := RegNext(rob.io.flush.bits.ftq_idx)
+    // [SPECBPU-REP] the flushing uop's slot.  An exception or refetch flush does not commit that uop, so a CFI in that
+    // very slot is squashed too (incl); eret and flush-on-commit (next) commit it.
+    io.ifu.bpu_sq.pc_lob := RegNext(rob.io.flush.bits.pc_lob)
+    io.ifu.bpu_sq.incl   := flush_typ === FlushTypes.xcpt || flush_typ === FlushTypes.refetch
   } .elsewhen (brupdate.b2.mispredict && !RegNext(rob.io.flush.valid)) {
     val block_pc = AlignPCToBoundary(io.ifu.get_pc(1).pc, icBlockBytes)
     val uop_maybe_pc = block_pc | brupdate.b2.uop.pc_lob
@@ -929,6 +1049,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     io.ifu.redirect_flush                := true.B
     io.ifu.redirect_flush_is_mispredict  := true.B
     io.ifu.redirect_ftq_idx              := brupdate.b2.uop.ftq_idx
+    io.ifu.bpu_sq.pc_lob                 := brupdate.b2.uop.pc_lob   // [SPECBPU-REP] the mispredicted CFI stays
+    io.ifu.bpu_sq.incl                   := false.B
     val use_same_ghist = (brupdate.b2.cfi_type === CFI_BR &&
                           !brupdate.b2.taken &&
                           bankAlign(block_pc) === bankAlign(npc))

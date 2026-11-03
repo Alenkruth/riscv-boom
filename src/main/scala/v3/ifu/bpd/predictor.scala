@@ -101,6 +101,12 @@ class BranchPredictionUpdate(implicit p: Parameters) extends BoomBundle()(p)
   val cf_domain_id  = if (ENABLE_IFT) Some(UInt(1.W)) else None
   // corefuzzing: fetch packet contained a secret-dependent instruction (s_acc or s_prop)
   val cf_is_secret  = if (ENABLE_IFT) Some(Bool()) else None
+  // [SPECBPU-REP] the undo-log record id: the record a resolution update allocated, or the record a repair / relabel
+  // update undoes / relabels (FTQ [SPECBPU-REP]); unused on the commit bus (DontCare there)
+  val cf_log_id     = UInt(cfSpecLogW.W)
+  // [SPECBPU-RLB] a relabel update (it also has is_repair_update = 1): rewrite only the labels of what record
+  // cf_log_id wrote
+  val cf_relabel    = if (CF_SPEC_RELABEL) Some(Bool()) else None
 }
 
 // A branch update to a single bank
@@ -137,6 +143,9 @@ class BranchPredictionBankUpdate(implicit p: Parameters) extends BoomBundle()(p)
   val cf_domain_id     = if (ENABLE_IFT) Some(UInt(1.W)) else None
   // corefuzzing: fetch packet contained a secret-dependent instruction
   val cf_is_secret     = if (ENABLE_IFT) Some(Bool()) else None
+  // [SPECBPU-REP] / [SPECBPU-RLB] see BranchPredictionUpdate
+  val cf_log_id        = UInt(cfSpecLogW.W)
+  val cf_relabel       = if (CF_SPEC_RELABEL) Some(Bool()) else None
 }
 
 class BranchPredictionRequest(implicit p: Parameters) extends BoomBundle()(p)
@@ -178,6 +187,16 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
   // [BTBATK] DF-btbatk: Scala-time flag, true only for the banks that drive f3_btb_sec_pc (BTB,
   // uBTB), so the composer's PC select sees only them (no constant-zero default term).
   def cfDrivesBtbPc: Boolean = false
+  // [SPECBPU] (owner 2026-11-02, RULES C 'Speculative TAGE/BTB updates' + 'Speculative BPU follow-ups' O1 (a)): true
+  // for the components that train at branch resolution (TAGE, BTB, BIM, uBTB): their update stage reads
+  // io.spec_update (the FTQ's resolution-time update, one resolved CFI per update) instead of io.update (the FTQ
+  // commit update + f4 fast repair, now read only by the loop predictor, which writes only on the mispredict /
+  // repair updates of the disabled FTQ repair walk, so it stays inert as before).
+  def trainsAtResolution: Boolean = false
+  // [SPECBPU] the meta bits [specMetaLo, specMetaLo + specMetaW) the resolution update must carry (the composer
+  // overrides it with the slice of its resolution-trained components); the FTQ stores only that slice.
+  def specMetaLo: Int = 0
+  def specMetaW: Int = 0
 
   val mems: Seq[Tuple3[String, Int, Int]]
 
@@ -198,6 +217,8 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
     val f3_fire = Input(Bool())
 
     val update = Input(Valid(new BranchPredictionBankUpdate))
+    // [SPECBPU] the resolution-time update (read by the components with trainsAtResolution)
+    val spec_update = Input(Valid(new BranchPredictionBankUpdate))
 
     // added for the fuzzycore project - AK
     val cf_bpd_tage_to_gshare = Input(Bool()) // signal from the custom CSR to reconfigure to gshare.
@@ -263,9 +284,13 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
   val s0_pc = io.f0_pc
   val s1_pc = RegNext(s0_pc)
 
-  val s0_update     = io.update
-  val s0_update_idx = fetchIdx(io.update.bits.pc)
-  val s0_update_valid = io.update.valid
+  // [SPECBPU] a resolution-trained component (TAGE, BTB, BIM, uBTB) takes its training from the resolution bus; the
+  // update logic below and in the component is unchanged (a resolution update is a one-CFI packet update with
+  // is_commit_update = 1).  The other bus is unread there (its s1 flops are removed by DCE).
+  private val cf_upd_bus = if (trainsAtResolution) io.spec_update else io.update
+  val s0_update     = cf_upd_bus
+  val s0_update_idx = fetchIdx(cf_upd_bus.bits.pc)
+  val s0_update_valid = cf_upd_bus.valid
 
   val s1_update     = RegNext(s0_update)
   val s1_update_idx = RegNext(s0_update_idx)
@@ -299,6 +324,8 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
 
     // Update
     val update = Input(Valid(new BranchPredictionUpdate))
+    // [SPECBPU] the FTQ's resolution-time update (TAGE / BTB / BIM / uBTB)
+    val spec_update = Input(Valid(new BranchPredictionUpdate))
 
     // adding for core fuzzing - AK
     val cf_bpd_tage_to_gshare = Input(Bool())
@@ -328,6 +355,9 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     }
     m
   })
+  // [SPECBPU] the meta slice the FTQ keeps for the resolution update (both banks are built alike)
+  val specMetaLo = banked_predictors(0).specMetaLo
+  val specMetaW  = banked_predictors(0).specMetaW
   bpdStr.append(BoomCoreStringPrefix(f"Total bpd size: ${total_memsize / 1024} KB\n"))
   override def toString: String = bpdStr.toString
 
@@ -517,6 +547,8 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     banked_predictors(i).io.update.bits.cfi_is_jal       := io.update.bits.cfi_is_jal
     banked_predictors(i).io.update.bits.cfi_is_jalr      := io.update.bits.cfi_is_jalr
     banked_predictors(i).io.update.bits.target           := io.update.bits.target
+    banked_predictors(i).io.update.bits.cf_log_id        := io.update.bits.cf_log_id   // [SPECBPU-REP] unused here
+    banked_predictors(i).io.update.bits.cf_relabel.foreach(_ := false.B)                 // [SPECBPU-RLB] never here
 
     banked_lhist_providers(i).io.update.mispredict := io.update.bits.is_mispredict_update
     banked_lhist_providers(i).io.update.repair     := io.update.bits.is_repair_update
@@ -594,6 +626,70 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
       banked_predictors(0).io.update.bits.ghist := io.update.bits.ghist.histories(1)
     }
 
+  }
+
+  // [SPECBPU] the resolution-time bus, split per bank exactly as io.update is above (a one-CFI update: the bank
+  // holding the slot gets it; the other bank gets br_mask 0 / cfi_idx invalid, i.e. no TAGE or BTB write, or no
+  // valid at all).  Levels: the update flops (FTQ, plus its target adder) -> bank(pc) 2:1 mux (1 LUT) -> s1 flops.
+  for (i <- 0 until nBanks) {
+    val d = banked_predictors(i).io.spec_update
+    d.bits.is_mispredict_update := io.spec_update.bits.is_mispredict_update
+    d.bits.is_repair_update     := io.spec_update.bits.is_repair_update
+    d.bits.meta                 := io.spec_update.bits.meta(i)
+    d.bits.lhist                := io.spec_update.bits.lhist(i)
+    d.bits.cfi_idx.bits         := io.spec_update.bits.cfi_idx.bits
+    d.bits.cfi_taken            := io.spec_update.bits.cfi_taken
+    d.bits.cfi_mispredicted     := io.spec_update.bits.cfi_mispredicted
+    d.bits.cfi_is_br            := io.spec_update.bits.cfi_is_br
+    d.bits.cfi_is_jal           := io.spec_update.bits.cfi_is_jal
+    d.bits.cfi_is_jalr          := io.spec_update.bits.cfi_is_jalr
+    d.bits.target               := io.spec_update.bits.target
+    d.bits.cf_log_id            := io.spec_update.bits.cf_log_id                         // [SPECBPU-REP]
+    d.bits.cf_relabel.foreach(_ := io.spec_update.bits.cf_relabel.get)                    // [SPECBPU-RLB]
+    d.bits.cf_domain_id.foreach(_ := io.spec_update.bits.cf_domain_id.getOrElse(0.U(1.W)))
+    d.bits.cf_is_secret.foreach(_ := io.spec_update.bits.cf_is_secret.getOrElse(false.B))
+  }
+  if (nBanks == 1) {
+    val d = banked_predictors(0).io.spec_update
+    d.valid                := io.spec_update.valid
+    d.bits.pc              := bankAlign(io.spec_update.bits.pc)
+    d.bits.br_mask         := io.spec_update.bits.br_mask
+    d.bits.btb_mispredicts := io.spec_update.bits.btb_mispredicts
+    d.bits.cfi_idx.valid   := io.spec_update.bits.cfi_idx.valid
+    d.bits.ghist           := io.spec_update.bits.ghist.histories(0)
+  } else {
+    val u  = io.spec_update
+    val cv = u.bits.cfi_idx.valid
+    val ci = u.bits.cfi_idx.bits
+    val d0 = banked_predictors(0).io.spec_update
+    val d1 = banked_predictors(1).io.spec_update
+    when (bank(u.bits.pc) === 0.U) {
+      d0.valid                := u.valid
+      d1.valid                := u.valid && (!cv || ci >= bankWidth.U)
+      d0.bits.pc              := bankAlign(u.bits.pc)
+      d1.bits.pc              := nextBank(u.bits.pc)
+      d0.bits.br_mask         := u.bits.br_mask
+      d1.bits.br_mask         := u.bits.br_mask >> bankWidth
+      d0.bits.btb_mispredicts := u.bits.btb_mispredicts
+      d1.bits.btb_mispredicts := u.bits.btb_mispredicts >> bankWidth
+      d0.bits.cfi_idx.valid   := cv && ci < bankWidth.U
+      d1.bits.cfi_idx.valid   := cv && ci >= bankWidth.U
+      d0.bits.ghist           := u.bits.ghist.histories(0)
+      d1.bits.ghist           := u.bits.ghist.histories(1)
+    } .otherwise {
+      d1.valid                := u.valid
+      d0.valid                := u.valid && !mayNotBeDualBanked(u.bits.pc) && (!cv || ci >= bankWidth.U)
+      d1.bits.pc              := bankAlign(u.bits.pc)
+      d0.bits.pc              := nextBank(u.bits.pc)
+      d1.bits.br_mask         := u.bits.br_mask
+      d0.bits.br_mask         := u.bits.br_mask >> bankWidth
+      d1.bits.btb_mispredicts := u.bits.btb_mispredicts
+      d0.bits.btb_mispredicts := u.bits.btb_mispredicts >> bankWidth
+      d1.bits.cfi_idx.valid   := cv && ci < bankWidth.U
+      d0.bits.cfi_idx.valid   := cv && ci >= bankWidth.U
+      d1.bits.ghist           := u.bits.ghist.histories(0)
+      d0.bits.ghist           := u.bits.ghist.histories(1)
+    }
   }
 
   // corefuzzing: wire domain to all banked predictors and aggregate mismatch at f3

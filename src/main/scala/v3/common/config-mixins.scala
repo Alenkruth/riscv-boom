@@ -782,7 +782,7 @@ class WithTAGELBPD extends Config((site, here, up) => {
 class WithBoom2BPD extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
     case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
-      bpdMaxMetaLength = 45,
+      bpdMaxMetaLength = 49,   // [SPECBPU-REP] +4: BTB meta hits when CF_BTB_UPD_TAG is false (btb.scala C-BTB-2)
       globalHistoryLength = 16,
       localHistoryLength = 1,
       localHistoryNSets = 0,
@@ -809,7 +809,7 @@ class WithBoom2BPD extends Config((site, here, up) => {
 class WithAlpha21264BPD extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
     case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
-      bpdMaxMetaLength = 64,
+      bpdMaxMetaLength = 68,   // [SPECBPU-REP] +4: BTB meta hits when CF_BTB_UPD_TAG is false (btb.scala C-BTB-2)
       globalHistoryLength = 32,
       localHistoryLength = 32,
       localHistoryNSets = 128,

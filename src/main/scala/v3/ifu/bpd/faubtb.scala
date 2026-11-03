@@ -21,6 +21,11 @@ case class BoomFAMicroBTBParams(
 class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBTBParams())(implicit p: Parameters) extends BranchPredictorBank()(p)
 {
   override def cfDrivesBtbPc: Boolean = ENABLE_IFT   // [BTBATK] composer PC select (predictor.scala)
+  // [SPECBPU] (owner 2026-11-02, RULES C 'Speculative BPU follow-ups' O1 "(a) BIM+uBTB too"): trained once per
+  // resolved CFI at resolution (wrong path included) from io.spec_update; no commit training (predictor.scala
+  // cf_upd_bus).  The meta and target are per-slot registers (no row bypass), so a one-CFI update leaves the
+  // packet-mates' slots untouched; the write way is the fetch-time one carried in the meta, as at commit.
+  override def trainsAtResolution: Boolean = true
   override val nWays         = params.nWays
   val tagSz         = vaddrBitsExtended - log2Ceil(fetchWidth) - 1
   val offsetSz      = params.offsetSz
@@ -151,6 +156,40 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
   val s1_update_meta    = s1_update.bits.meta.asTypeOf(new MicroBTBPredictMeta)
   val s1_update_write_way = s1_update_meta.write_way
 
+  // [SPECBPU-REP] (owner 2026-11-02 'Speculative BPU repair'; spec-bpu-plan-final C-UBTB-2) local undo log, one word per
+  // record id: the slot word that resolution update overwrote (meta {is_br, tag, ctr, labels}, and the offset when it
+  // wrote the target), read from the registers at s1 (64:1 select by way and slot).  A repair writes it back exactly;
+  // a relabel ([SPECBPU-RLB]) rewrites only the slot's domain / secret.
+  class UbtbUndo extends Bundle {
+    val w     = Bool()                       // the update wrote the slot's meta
+    val wb    = Bool()                       // ... and its target
+    val way   = UInt(log2Ceil(nWays).W)
+    val is_br = Bool()
+    val tag   = UInt(tagSz.W)
+    val ctr   = UInt(2.W)
+    val off   = SInt(offsetSz.W)
+    val dom   = if (ENABLE_IFT) Some(UInt(1.W)) else None
+    val sec   = if (ENABLE_IFT) Some(Bool()) else None
+  }
+  val cf_ulog = Mem(cfSpecLogN, new UbtbUndo)
+  val s1_rp   = s1_update.valid && s1_update.bits.is_repair_update && s1_update.bits.cfi_idx.valid
+  val s1_rlb  = s1_rp && s1_update.bits.cf_relabel.getOrElse(false.B)
+  val s1_rst  = s1_rp && !s1_rlb
+  val s1_uu   = cf_ulog.read(s1_update.bits.cf_log_id)
+  when (s1_update.valid && s1_update.bits.is_commit_update && s1_update.bits.cfi_idx.valid) {
+    val wd = Wire(new UbtbUndo)
+    wd.w     := s1_update.bits.br_mask(s1_update_cfi_idx) || s1_update.bits.cfi_taken
+    wd.wb    := s1_update.bits.cfi_taken
+    wd.way   := s1_update_write_way
+    wd.is_br := meta(s1_update_write_way)(s1_update_cfi_idx).is_br
+    wd.tag   := meta(s1_update_write_way)(s1_update_cfi_idx).tag
+    wd.ctr   := meta(s1_update_write_way)(s1_update_cfi_idx).ctr
+    wd.off   := btb(s1_update_write_way)(s1_update_cfi_idx).offset
+    wd.dom.foreach(_ := meta(s1_update_write_way)(s1_update_cfi_idx).domain.get)
+    wd.sec.foreach(_ := meta(s1_update_write_way)(s1_update_cfi_idx).secret.get)
+    cf_ulog.write(s1_update.bits.cf_log_id, wd)
+  }
+
   val max_offset_value = (~(0.U)((offsetSz-1).W)).asSInt
   val min_offset_value = Cat(1.B, (0.U)((offsetSz-1).W)).asSInt
   val new_offset_value = (s1_update.bits.target.asSInt -
@@ -164,12 +203,13 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
   val s1_update_wmeta_mask = ((s1_update_wbtb_mask | s1_update.bits.br_mask) &
     Fill(bankWidth, s1_update.valid && s1_update.bits.is_commit_update))
 
-  // [V3TAP-UBTB] SP-19 (design 5.1 ubtb0/ubtb1 {v, way[3:0]}): the uBTB entry this commit update writes (s1, u+1),
-  // padded one register to the TAGE write cycle u+2.  16 entries, fully associative: entry = way.  Outputs only.
+  // [V3TAP-UBTB] SP-19 (design 5.1 ubtb0/ubtb1 {v, way[3:0]}): the uBTB entry this update writes (s1, u+1; since
+  // [SPECBPU] the resolution update), padded one register to the TAGE write cycle u+2.  16 entries, fully
+  // associative: entry = way.  Outputs only.
   io.cf_st.foreach { s =>
     require(log2Ceil(nWays) == 4, "STATE PRED ubtb {v, way[3:0]}: 16 entries (design 5.1)")
-    s.ubtb_v   := RegNext(s1_update_wmeta_mask =/= 0.U, false.B)
-    s.ubtb_way := RegNext(s1_update_write_way)
+    s.ubtb_v   := RegNext(s1_update_wmeta_mask =/= 0.U || (s1_rst && s1_uu.w), false.B)   // [SPECBPU-REP] + repairs
+    s.ubtb_way := RegNext(Mux(s1_rst, s1_uu.way, s1_update_write_way))
   }
   // Write the BTB with the target
   when (s1_update.valid && s1_update.bits.cfi_taken && s1_update.bits.cfi_idx.valid && s1_update.bits.is_commit_update) {
@@ -206,9 +246,29 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
       )
     }
   }
+  // [SPECBPU-REP] repair: the logged slot word back (meta, and the offset if the update wrote the target)
+  when (s1_rst && s1_uu.w) {
+    meta(s1_uu.way)(s1_update_cfi_idx).is_br := s1_uu.is_br
+    meta(s1_uu.way)(s1_update_cfi_idx).tag   := s1_uu.tag
+    meta(s1_uu.way)(s1_update_cfi_idx).ctr   := s1_uu.ctr
+    meta(s1_uu.way)(s1_update_cfi_idx).domain.foreach(_ := s1_uu.dom.get)
+    meta(s1_uu.way)(s1_update_cfi_idx).secret.foreach(_ := s1_uu.sec.get)
+    when (s1_uu.wb) { btb(s1_uu.way)(s1_update_cfi_idx).offset := s1_uu.off }
+  }
+  // [SPECBPU-RLB] relabel: the slot's labels only, ORed with the slot's current labels (a label a younger training
+  // wrote stays).  One when per register, so every label flop ORs its own value (one more LUT input, no 64:1 read).
+  if (CF_SPEC_RELABEL) {
+    for (w <- 0 until nWays; j <- 0 until bankWidth) {
+      when (s1_rlb && s1_uu.w && s1_uu.way === w.U && s1_update_cfi_idx === j.U) {
+        meta(w)(j).domain.get := s1_update.bits.cf_domain_id.get | meta(w)(j).domain.get
+        meta(w)(j).secret.get := s1_update.bits.cf_is_secret.get || meta(w)(j).secret.get
+      }
+    }
+  }
 
-  // [SINKFACTS86] patch 86 (all-sinks study Q6): every uBTB commit write, debug printf builds only (the
-  // IftSquashMerge gate: IFT on, CF debug printfs on, no IFT bridge; IFT off / NoLog / FireSim elaborate nothing).
+  // [SINKFACTS86] patch 86 (all-sinks study Q6): every uBTB write (since [SPECBPU] the resolution update), debug
+  // printf builds only (the IftSquashMerge gate: IFT on, CF debug printfs on, no IFT bridge; IFT off / NoLog /
+  // FireSim elaborate nothing).
   // pc = the bank-aligned update pc (bank = pc[3], tag = pc >> 4); way = write_way chosen at FETCH time (hit way,
   // else the 4-bit-chunk XOR alloc of the tags held at fetch); hits = the fetch-time slot hits (a written slot with
   // hit = 0 is reset to 3 / 0, else counted); wm / wb = meta / target slot masks; ctr = the way's counters BEFORE
@@ -217,10 +277,12 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
   if (ENABLE_IFT && ENABLE_CF_DEBUG_PRINTF && !ENABLE_IFT_BRIDGE) {
     val cf_sf_cyc = RegInit(0.U(40.W))
     cf_sf_cyc := cf_sf_cyc + 1.U
-    when (s1_update_wmeta_mask =/= 0.U) {
-      printf("[UBTBW] cyc=%d pc=0x%x way=%d hits=0x%x wm=0x%x wb=0x%x brm=0x%x ctr=0x%x\n", cf_sf_cyc,
-        s1_update.bits.pc, s1_update_write_way, s1_update_meta.hits.asUInt, s1_update_wmeta_mask, s1_update_wbtb_mask,
-        s1_update.bits.br_mask, VecInit(meta(s1_update_write_way).map(_.ctr)).asUInt)
+    when (s1_update_wmeta_mask =/= 0.U || (s1_rst && s1_uu.w)) {
+      val pway = Mux(s1_rst, s1_uu.way, s1_update_write_way)                                  // [SPECBPU-REP]
+      printf("[UBTBW] cyc=%d pc=0x%x way=%d hits=0x%x wm=0x%x wb=0x%x brm=0x%x ctr=0x%x k=%d\n", cf_sf_cyc,
+        s1_update.bits.pc, pway, s1_update_meta.hits.asUInt,
+        Mux(s1_rst && s1_uu.w, UIntToOH(s1_update_cfi_idx, bankWidth), s1_update_wmeta_mask), s1_update_wbtb_mask,
+        s1_update.bits.br_mask, VecInit(meta(pway).map(_.ctr)).asUInt, s1_rst)
     }
   }
 
@@ -290,6 +352,12 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
     when (any_disp && upd_is_sec)                  { evf_tag := old_tag8; evf_pc := upd_pc12 }
     when (any_disp && (upd_is_atk || !upd_is_sec)) { eva_v := upd_is_atk }
     when (any_disp && upd_is_atk)                  { eva_tag := old_tag8; eva_pc := upd_pc12 }
+    // [SPECBPU-REP] a restore brings the logged tag back into its way: the [BTBSAMETAG] same-tag clear applies (the
+    // victim of an earlier displacement is resident again); a restore records no displacement of its own
+    when (s1_rst && s1_uu.w && evf_v && evf_tag === s1_uu.tag(tag8W - 1, 0)) { evf_v := false.B }
+    when (s1_rst && s1_uu.w && eva_v && eva_tag === s1_uu.tag(tag8W - 1, 0)) { eva_v := false.B }
+    // [SPECBPU-RLB] a relabel to secret names the record's CFI as the way's trainer
+    if (CF_SPEC_RELABEL) { when (s1_rlb && s1_uu.w && upd_is_sec) { ubtb_spc(s1_uu.way) := upd_pc12 } }
   }
 
 }

@@ -176,6 +176,10 @@ trait HasBoomFrontendParameters extends HasL1ICacheParameters
   val bankBytes = fetchBytes/nBanks
 
   val bankWidth = fetchWidth/nBanks
+  // [SPECBPU-REP] (owner 2026-11-02, RULES C 'Speculative BPU repair': "a 16-record undo log"): undo-log depth and the
+  // record id width, shared by the FTQ log and the predictors' local undo words
+  val cfSpecLogN = 16
+  val cfSpecLogW = log2Ceil(cfSpecLogN)
 
   require(nBanks == 1 || nBanks == 2)
 
@@ -345,6 +349,11 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   val sfence = Valid(new SFenceReq)
 
   val brupdate          = Output(new BrUpdateInfo)
+  // [SPECBPU] (owner 2026-11-02): one resolved CFI per cycle for the resolution-time predictor training (core.scala)
+  val bpu_res           = Output(Valid(new BpuResolveInfo))
+  // [SPECBPU-REP] (owner 2026-11-02 'Speculative BPU repair'): the slot rule of the redirect (core.scala), for the FTQ
+  // undo log's squash test; read by the FTQ only together with redirect_val
+  val bpu_sq            = Output(new BpuSquashInfo)
 
   // Redirects change the PC
   val redirect_flush   = Output(Bool()) // Flush and hang the frontend?
@@ -1225,7 +1234,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val fb  = Module(new FetchBuffer)
   // corefuzzing: drive the fetch-throttle gate Wire now that fb is instantiated
   cf_fetch_throttle_gate := fb.io.fetch_throttle_gate
-  val ftq = Module(new FetchTargetQueue)
+  // [SPECBPU] the FTQ keeps the resolution-trained slice of the predictor meta for the resolution-time update
+  val ftq = Module(new FetchTargetQueue(bpd.specMetaLo, bpd.specMetaW))
   // C3: assigned here (not beside the other f3_fetch_bundle connects at :1009)
   // only because `ftq` is not in Scala scope until this line.  f3_fetch_bundle is a
   // Wire, so the connect resolves regardless of textual position.
@@ -1397,6 +1407,17 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   bpd_update_arbiter.io.in(1) <> f4_btb_corrections.io.deq
   bpd.io.update := bpd_update_arbiter.io.out
   bpd_update_arbiter.io.out.ready := true.B
+  // [SPECBPU] (owner 2026-11-02, RULES C 'Speculative TAGE/BTB updates'): the resolution-time path.  The core's
+  // registered resolved CFI addresses the FTQ; the FTQ's update goes straight to the predictor's second bus, read
+  // by the TAGE, BTB, BIM and uBTB.  The commit update above (arbiter, unchanged) now reaches only the loop
+  // predictor, which writes only on the mispredict / repair updates of the disabled FTQ repair walk (inert, as
+  // before); the f4 fast repair (input 1) reaches no predictor write (it wrote nothing before either: scope P3).
+  ftq.io.bpu_res  := io.cpu.bpu_res
+  ftq.io.bpu_sq   := io.cpu.bpu_sq   // [SPECBPU-REP] the redirect's slot rule (undo-log squash test)
+  // [SPECBPU-REP] debug printf builds only: the config indices for the FTQ's [BPDC] DMI reconfiguration measurement
+  ftq.io.dbg_cfg.foreach(_ := Cat(io.cpu.cf_btb_way_idx, io.cpu.cf_btb_set_idx, io.cpu.cf_bpd_tage_to_gshare,
+                                  io.cpu.cf_tage_count_idx, io.cpu.cf_ftq_idx))
+  bpd.io.spec_update := ftq.io.spec_bpdupdate
   // [V3TAP-RAS] SP-18 (design 5.1 RAS [134:114]): the RAS write port; both writers (the f3 call push and the FTQ top
   // repair below) drive ras.io.write_*, which end at the RAS register write.  Read here (final connected values)
   // and registered once (the RAS tap register, E -> E+1).  Record/STATE builds only.
@@ -1413,32 +1434,43 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     val cf_state_ras_tap = RegNext(t, 0.U.asTypeOf(t))   // the RAS tap register (named cf_state_*: SP-27, review M5)
     cf_state_ras_tap
   } else None
-  // [V3TAP-PRED] SP-19 (design 5.1 PRED [253:135], 5.3): one predictor update at its write stage.  The arbiter output
-  // (cycle u; ends at every bank's s1_update register) is piped u -> u+1 -> u+2; the banks' BTB / uBTB taps arrive
-  // padded to u+2 and the TAGE taps are the decode of the u+2 table-input registers.  All are sampled at E = u+2
-  // (the TAGE table write) by the PRED tap register (E -> E+1), then the SP-18 cut-out register.  An f4 fast repair
-  // (chosen = 1) carries btb_mispredicts in u_brmask and 0 in the cfi / taken / secret fields (DontCare at its
-  // source).  gv_PRED = an update or a BTB re-reset start.  Outputs only.
+  // [V3TAP-PRED] SP-19 (design 5.1 PRED [253:135], 5.3): one predictor update at its write stage.  The update bus
+  // ([SPECBPU]: the FTQ resolution update; cycle u; ends at every bank's s1_update register) is piped u -> u+1 -> u+2;
+  // the banks' BTB / uBTB taps arrive padded to u+2 and the TAGE taps are the decode of the u+2 table-input
+  // registers.  All are sampled at E = u+2 (the TAGE table write) by the PRED tap register (E -> E+1), then the
+  // SP-18 cut-out register.  gv_PRED = an update or a BTB re-reset start.  Outputs only.
   val cf_pred_tap_q = if (ENABLE_IFT_BRIDGE || IFT_ORACLE) Some {
     require(nBanks == 2 && fetchWidth == 8 && (new IftPredTap).getWidth == 120, "STATE PRED: 2 banks, fetchWidth 8 (design 5.1)")
-    val ua = bpd_update_arbiter.io.out
-    val k1 = bpd_update_arbiter.io.chosen === 1.U
+    // [SPECBPU-REC] (owner 2026-11-02, RULES C 'Speculative BPU follow-ups' O1 "(a) BIM+uBTB too"): ONE update stream.
+    // Every predictor write (TAGE, BTB, BIM, uBTB) now comes from the resolution update (bus spec_update), so the
+    // u fields describe that update alone, with the same field meanings as before: one update per record, u_kind = 0
+    // (a training update), u_cfi_v = 1, u_brmask = the branch's slot (0 for jal / jalr), labels and ghist = the
+    // update's own.  The commit arbiter (commit update + f4 fast repair) now reaches only the loop predictor, which
+    // never writes on it (scope report Q1/P3), so it is no longer recorded (u_kind = 1 no longer occurs).  The
+    // update enters the banks at the same stage as the arbiter output did, so the write-stage alignment (u -> u+2)
+    // and the bank taps (btb / ubtb / tg_*) are unchanged.  What changes for the host is the ORDER (resolution order,
+    // wrong path included, one CFI per record): design note rev1 section 4 lists the parser changes.
+    // Levels: the FTQ update bus (as before for the arbiter output) -> u1 flops, no select (the 2:1 is gone).
+    // Record builds only.
+    val sp = ftq.io.spec_bpdupdate
     val u0 = Wire(new IftPredU)
-    u0.v       := ua.valid
-    u0.brmask  := Mux(k1, ua.bits.btb_mispredicts, ua.bits.br_mask)
-    u0.cfi_v   := ua.bits.cfi_idx.valid && !k1
-    u0.cfi_idx := Mux(k1, 0.U, ua.bits.cfi_idx.bits)
-    u0.taken   := ua.bits.cfi_taken && !k1
-    u0.mispred := ua.bits.cfi_mispredicted && !k1
-    u0.isbr    := ua.bits.cfi_is_br && !k1
-    u0.isjal   := ua.bits.cfi_is_jal && !k1
-    u0.sec     := ua.bits.cf_is_secret.get && !k1
-    u0.dom     := ua.bits.cf_domain_id.get(0)
-    u0.kind    := k1
-    u0.pc12    := ua.bits.pc(13, 2)
-    u0.nst     := ua.bits.ghist.new_saw_branch_taken
-    u0.nsnt    := ua.bits.ghist.new_saw_branch_not_taken
-    u0.hist16  := ua.bits.ghist.old_history(15, 0)
+    u0.v       := sp.valid && !sp.bits.is_mispredict_update   // [SPECBPU-REP] a Q2 (a) drop trains nothing: no record
+    u0.brmask  := sp.bits.br_mask
+    u0.cfi_v   := sp.bits.cfi_idx.valid
+    u0.cfi_idx := sp.bits.cfi_idx.bits
+    u0.taken   := sp.bits.cfi_taken
+    u0.mispred := sp.bits.cfi_mispredicted
+    u0.isbr    := sp.bits.cfi_is_br
+    u0.isjal   := sp.bits.cfi_is_jal
+    u0.sec     := sp.bits.cf_is_secret.get
+    u0.dom     := sp.bits.cf_domain_id.get(0)
+    // [SPECBPU-REP] u_kind = 1: a repair (u_isbr or u_isjal = 1, the undone training's own fields) or, [SPECBPU-RLB],
+    // a relabel (u_isbr = u_isjal = 0; u_dom / u_sec = the new label of the training with the same pc12 / slot / history)
+    u0.kind    := sp.bits.is_repair_update
+    u0.pc12    := sp.bits.pc(13, 2)
+    u0.nst     := sp.bits.ghist.new_saw_branch_taken
+    u0.nsnt    := sp.bits.ghist.new_saw_branch_not_taken
+    u0.hist16  := sp.bits.ghist.old_history(15, 0)
     val u1 = RegNext(u0, 0.U.asTypeOf(u0))     // u+1
     val u2 = RegNext(u1, 0.U.asTypeOf(u1))     // u+2 = E
     val bt = bpd.io.cf_st.get                  // per physical bank, already at E
@@ -1481,8 +1513,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     p.g.tg_nsnt        := u2.nsnt
     p.g.tg_hist16      := u2.hist16
     if (ENABLE_CF_DEBUG_PRINTF && ENABLE_IFT) {
-      assert(!(ua.valid && (ua.bits.is_mispredict_update || ua.bits.is_repair_update)),
-             "[V3TAP-PRED] a mispredict/repair predictor update reached the arbiter output (PRED u_kind cannot name it)")
+      // [SPECBPU-REC] the commit arbiter is no longer recorded; a mispredict / repair update there (the disabled
+      // walk) would write the loop predictor unseen by the record, so it stays a hard stop.
+      assert(!(bpd_update_arbiter.io.out.valid && (bpd_update_arbiter.io.out.bits.is_mispredict_update ||
+                                                   bpd_update_arbiter.io.out.bits.is_repair_update)),
+             "[V3TAP-PRED] a mispredict/repair predictor update reached the arbiter output (the loop would write it unrecorded)")
       assert(!(a0 && a1), "[V3TAP-PRED] TAGE allocations in both banks in one update")
       assert(!(d0 && d1), "[V3TAP-PRED] TAGE u-only writes in both banks in one update")
     }
