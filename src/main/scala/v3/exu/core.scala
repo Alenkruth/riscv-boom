@@ -453,6 +453,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   io.lsu.sa_paint_wen.foreach(_  := custom_csrs.sa_paint_wen)
   io.lsu.sa_paint_data.foreach(_ := custom_csrs.sa_paint_data)
   io.lsu.sa_stat.foreach(s => custom_csrs.sa_stat_set(s))
+  // [v5] task T1a (not T0) adds this line directly after the T0 block: ExecutionUnit.io.sa_en exists only after SA-1b
+  mem_units.foreach(u => u.io.sa_en.foreach(_ := RegNext(custom_csrs.sa_ctl_en || custom_csrs.sa_tbi, false.B)))   // [SA-1b]
 
   // getting the rob entries from the CSR
   rob.io.cf_rob_entries := custom_csrs.cf_rob_entries
@@ -1695,6 +1697,32 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     dec_finished_mask := dec_fire.asUInt | dec_finished_mask
   }
 
+  // STT: the root is produced at dispatch (C-TU-1); every earlier uop copy carries a constant 0 (pruned)
+  for (w <- 0 until coreWidth) { dec_uops(w).stt_gr.foreach(_ := 0.U.asTypeOf(new SttRoot)) }
+
+  // [Doppelganger] decode init: the doppelganger uop fields are 0 on every decoded uop (constant through rename: pruned).
+  // The prediction is attached at dispatch (block (c)); the request identity only on the LSU's dg request leg.
+  for (w <- 0 until coreWidth) {
+    dec_uops(w).dg_req.foreach(_ := false.B);  dec_uops(w).dg_tag.foreach(_ := 0.U)
+    dec_uops(w).dg_pv.foreach(_ := false.B);   dec_uops(w).dg_pa.foreach(_ := 0.U)
+    dec_uops(w).dg_psec.foreach(_ := false.B); dec_uops(w).dg_patk.foreach(_ := false.B)
+  }
+  // [Doppelganger] the address predictor (paper Figure 5 A/B): looked up with every decoded load PC (up to coreWidth per cycle),
+  // trained by committed loads (the LSU's commit loop, L13).
+  val dgl_pred = if (ENABLE_DOPPELGANGER) Some(Module(new DglPredictor)) else None
+  dgl_pred.foreach { pr =>
+    pr.io.en  := RegNext(custom_csrs.doppelganger_en, false.B)
+    pr.io.dbg := custom_csrs.cf_debug_lsu_enable && custom_csrs.cf_debug_enable      // same value core.scala:404 drives into the LSU
+    for (w <- 0 until coreWidth) {
+      pr.io.lk_pc(w) := dec_uops(w).debug_pc
+      pr.io.lk_v(w)  := dec_valids(w) && dec_uops(w).uses_ldq && !dec_uops(w).exception &&
+                        dec_uops(w).mem_cmd === dec_uops(w).M_XRD
+    }
+    pr.io.lk_adv := dis_ready && !io.ifu.redirect_flush        // the REN2 register loads this decode group at this edge
+    pr.io.train  := io.lsu.dgl_train.get
+    custom_csrs.doppelganger_stat_set(Cat(0.U(4.W), pr.io.drops, io.lsu.dgl_stat.get))
+  }
+
   //-------------------------------------------------------------
   // Branch Mask Logic
 
@@ -1816,6 +1844,14 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   // Outputs
   dis_uops := rename_stage.io.ren2_uops
+  // [Doppelganger] the prediction of REN2 lane w (looked up while this group was in decode) rides the dispatch uop into the LDQ
+  // entry (the paper's "predicted bit" and predicted address in the load queue).
+  dgl_pred.foreach { pr => for (w <- 0 until coreWidth) {
+    dis_uops(w).dg_pv.get := pr.io.pred(w).v
+    dis_uops(w).dg_pa.get := pr.io.pred(w).addr
+    dis_uops(w).dg_psec.foreach(_ := pr.io.pred(w).sec)
+    dis_uops(w).dg_patk.foreach(_ := pr.io.pred(w).atk)
+  } }
   dis_valids := rename_stage.io.ren2_mask
   ren_stalls := rename_stage.io.ren_stalls
 
@@ -1919,6 +1955,39 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     // Dispatching instructions request load/store queue entries when they can proceed.
     dis_uops(w).ldq_idx := io.lsu.dis_ldq_idx(w)
     dis_uops(w).stq_idx := io.lsu.dis_stq_idx(w)
+  }
+
+  // STT (stt-plan-v4.md C-CORE-1 (b)): runtime class gates, registered once (declared here, before their first use in (d))
+  val stt_g = if (ENABLE_STT) Some(Wire(new SttGates)) else None
+  stt_g.foreach { g =>
+    g.exp := RegNext(custom_csrs.stt_gate_exp, false.B)
+    g.br  := RegNext(custom_csrs.stt_gate_br,  false.B)
+    g.sta := RegNext(custom_csrs.stt_gate_sta, false.B)
+    g.dx  := RegNext(custom_csrs.stt_dx,       false.B)    // [v6] DelayExecute
+    g.fut := RegNext(custom_csrs.stt_fut,      false.B)    // [v6]
+  }
+  // the taint unit on the dispatch group; its gate root replaces dis_uops(w).stt_gr (last connect after the decode copy)
+  val stt_tu = if (ENABLE_STT) Some(Module(new SttTaintUnit)) else None
+  stt_tu.foreach { tu =>
+    for (w <- 0 until coreWidth) {
+      val u = dis_uops(w); val q = tu.io.req(w)
+      q.lrs1 := u.lrs1;  q.lrs2 := u.lrs2;  q.lrs3 := u.lrs3
+      q.lrs1_rtype := u.lrs1_rtype;  q.lrs2_rtype := u.lrs2_rtype;  q.frs3_en := u.frs3_en
+      q.ldst := u.ldst;  q.dst_rtype := u.dst_rtype;  q.ldst_val := u.ldst_val
+      q.is_ld   := u.uses_ldq && !u.exception             // exactly the loads the LSU allocates (lsu.scala:622-625)
+      q.is_mem  := u.uses_ldq || u.uses_stq
+      q.ldq_idx := u.ldq_idx
+      q.br      := u.allocate_brtag
+      q.br_tag  := u.br_tag
+      tu.io.dis_valids(w) := dis_valids(w)
+      tu.io.dis_fire(w)   := dis_fire(w)
+      dis_uops(w).stt_gr.get := tu.io.gr(w)
+    }
+    tu.io.b2_mispredict := brupdate.b2.mispredict
+    tu.io.b2_br_tag     := brupdate.b2.uop.br_tag
+    tu.io.flush         := RegNext(rob.io.flush.valid, false.B)
+    tu.io.ldq_safe      := io.lsu.stt_ldq_safe.get
+    tu.io.ldq_head      := io.lsu.stt_ldq_head.get
   }
 
   //-------------------------------------------------------------
@@ -2428,6 +2497,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   rob.io.enq_valids := dis_fire
   rob.io.enq_uops   := dis_uops
+  for (w <- 0 until coreWidth) { rob.io.enq_uops(w).stt_gr.foreach(_ := 0.U.asTypeOf(new SttRoot)) }   // STT: the ROB keeps none
   // [R117SWEEP] patch 33: the ROB reads the enqueue uop's cf_secret_propagation only as the row's
   // sticky s_prop seed (rob.scala; the rob_uop copy is zeroed and the exception-uop copy is never
   // read), so the dispatch-edge secret summary rides here: no new ROB wire (r98).
@@ -2489,14 +2559,48 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     dispatcher.io.ren_uops(w).bits.cf_attacker_influence.foreach(_ := dis_iq_atk(w))
   }
 
+  // STT C-CORE-1 (d) [v6]: the dispatch-time hold bit of one IQ copy. STT (bit 5 = 0): the gate root's t AND the class.
+  // DelayExecute (bit 5 = 1, A13): the class AND "not yet at its own VP" (4.0b); the root is not consulted. own_vp at
+  // dispatch: no older unresolved branch (the dispatching br_mask; a tag resolving this cycle is cleared by the slot one
+  // cycle later) and, Futuristic [v7, P-F2], the PNR is at the uop (rob_idx == rob_pnr_idx: every older instruction is past
+  // the PNR) and no load has an order failure pending (every load in the LDQ is older than a dispatching uop). Never into
+  // an empty ROB: the PNR register is not updated while the ROB is empty (rob.scala:1882-1899); after an exception
+  // rollback it can name bank b of the head row while lanes < b of the new group are older; the slot clears t a cycle later. [v8: stt-v7-review D1]
+  // With g.dx = 1, g.br = 0 (C-CSR-1), so tx never names a branch or JALR.
+  def sttHoldAtDis(d: MicroOp, tx: Bool): Bool = {
+    val g      = stt_g.get
+    val own_vp = d.br_mask === 0.U && (!g.fut || (d.rob_idx === rob.io.rob_pnr_idx && !rob.io.empty && !io.lsu.stt_fail_rob.get.valid))  // [v8: stt-v7-review D1]
+    Mux(g.dx, tx && !own_vp, d.stt_grv.t && tx)
+  }
+
   var iu_idx = 0
   // Send dispatched uops to correct issue queues
   // Backpressure through dispatcher if necessary
   for (i <- 0 until issueParams.size) {
     if (issueParams(i).iqType == IQT_FP.litValue) {
        fp_pipeline.io.dis_uops <> dispatcher.io.dis_uops(i)
+       // STT C-CORE-1 (d): in the FP IQ only FDIV/FSQRT transmit; an FP store's data half (uopSTA) does not
+       stt_g.foreach { g =>
+         for (w <- 0 until issueParams(i).dispatchWidth) {
+           val d  = dispatcher.io.dis_uops(i)(w).bits
+           val tx = g.exp && d.fu_code_is(FU_FDV)
+           fp_pipeline.io.dis_uops(w).bits.stt_gr.get.t := sttHoldAtDis(d, tx)          // [v6]
+         }
+       }
     } else {
        issue_units(iu_idx).io.dis_uops <> dispatcher.io.dis_uops(i)
+       // STT C-CORE-1 (d): MEM IQ = loads / LR / AMO address (explicit) and store address generation (owner STT-4);
+       // INT IQ = conditional branches and JALR/RET (implicit channels) and DIV/REM (variable latency, A7)
+       stt_g.foreach { g =>
+         for (w <- 0 until issueParams(i).dispatchWidth) {
+           val d  = dispatcher.io.dis_uops(i)(w).bits
+           val tx = if (issueParams(i).iqType == IQT_MEM.litValue)
+                      ((d.uses_ldq || d.is_amo) && g.exp) || (d.uses_stq && !d.is_amo && !d.is_fence && g.sta)
+                    else
+                      (d.allocate_brtag && g.br) || (d.fu_code_is(FU_DIV) && g.exp)
+           issue_units(iu_idx).io.dis_uops(w).bits.stt_gr.get.t := sttHoldAtDis(d, tx)  // [v6]
+         }
+       }
        iu_idx += 1
     }
   }
@@ -2683,6 +2787,39 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   mem_iss_unit.io.cf_pause_mem.foreach(_ := pause_mem)
   issue_units.map(_.io.brupdate := brupdate)
   issue_units.map(_.io.flush_pipeline := RegNext(rob.io.flush.valid))
+
+  // STT C-CORE-1 (e): VP flags and the debug enable to the IQs and the FP pipeline; model / implicit-rule bits to the LSU
+  issue_units.foreach { iu =>
+    iu.io.stt_ldq_safe.foreach(_ := io.lsu.stt_ldq_safe.get)
+    iu.io.stt_dbg.foreach(_ := RegNext(custom_csrs.stt_dbg, false.B))
+    iu.io.stt_dx.foreach(_ := stt_g.get.dx)                     // [v6] DelayExecute (registered in (b))
+    iu.io.stt_fut.foreach(_ := stt_g.get.fut)                   // [v6]
+    iu.io.stt_rob_head.foreach(_ := rob.io.rob_head_idx)        // [v6] ROB registers (Cat(rob_head, rob_head_lsb))
+    iu.io.stt_rob_pnr.foreach(_ := rob.io.rob_pnr_idx)          // [v7] P-F2
+    iu.io.stt_fail_rob.foreach(_ := io.lsu.stt_fail_rob.get)    // [v7] P-F2
+  }
+  if (usingFPU) {
+    fp_pipeline.io.stt_ldq_safe.foreach(_ := io.lsu.stt_ldq_safe.get)
+    fp_pipeline.io.stt_dbg.foreach(_ := RegNext(custom_csrs.stt_dbg, false.B))
+    fp_pipeline.io.stt_dx.foreach(_ := stt_g.get.dx)            // [v6]
+    fp_pipeline.io.stt_fut.foreach(_ := stt_g.get.fut)          // [v6]
+    fp_pipeline.io.stt_rob_head.foreach(_ := rob.io.rob_head_idx)   // [v6]
+    fp_pipeline.io.stt_rob_pnr.foreach(_ := rob.io.rob_pnr_idx)     // [v7] P-F2
+    fp_pipeline.io.stt_fail_rob.foreach(_ := io.lsu.stt_fail_rob.get)   // [v7] P-F2
+  }
+  io.lsu.stt_fut.foreach(_  := RegNext(custom_csrs.stt_fut,  false.B))
+  io.lsu.stt_impl.foreach(_ := RegNext(custom_csrs.stt_impl, false.B))
+  io.lsu.stt_dbg.foreach(_  := RegNext(custom_csrs.stt_dbg,  false.B))
+  rob.io.stt_noret.foreach(_ := io.lsu.stt_noret.get)                     // [amend-T1s] C-ROB-1 retire guard (R1s-a B2)
+  if (ENABLE_STT) {
+    val stt_c_blk = RegInit(0.U(32.W)); val stt_c_stl = RegInit(0.U(32.W))
+    def sat(c: UInt, e: Bool) = Mux(e && c =/= ~0.U(32.W), c + 1.U, c)
+    val any_blk = (issue_units.map(_.io.stt_any_blk.get) ++
+                   (if (usingFPU) Seq(fp_pipeline.io.stt_any_blk.get) else Nil)).reduce(_ || _)
+    stt_c_blk := sat(stt_c_blk, any_blk)
+    stt_c_stl := sat(stt_c_stl, io.lsu.stt_stl_blk.get)
+    custom_csrs.stt_stat_set(Cat(stt_c_stl, stt_c_blk))
+  }
 
   // Load-hit Misspeculations
   require (mem_iss_unit.issueWidth <= 2)

@@ -153,6 +153,14 @@ class CF_PregSecretUpd(implicit p: Parameters) extends BoomBundle with CoreFuzzi
   val is_fp = Bool()
 }
 
+/** STT (stt-plan-v4.md 4.0): a root of taint. t = the value is tainted; idx = LDQ index of its youngest unsafe root load
+ *  (the paper's YRoT, l.709-750, with the LDQ index as the identity). */
+class SttRoot(implicit p: Parameters) extends BoomBundle
+{
+  val t   = Bool()
+  val idx = UInt(ldqAddrSz.W)
+}
+
 /**
  * MicroOp passing through the pipeline
  */
@@ -330,6 +338,22 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   // keeps them apart even for a fused STA+STD issue.  0 for every other uop.
   val cf_dwin_sec  = if (ENABLE_IFT) Some(Bool()) else None   // [R124GATE2]
   val cf_dwin_atk  = if (ENABLE_IFT) Some(Bool()) else None
+  // STT (stt-plan-v4.md C-UOP-1): the gate root of this uop: rs1 (address) root for a memory op, the youngest root over
+  // all sources otherwise (A2). Written by SttTaintUnit at dispatch; ANDed with the transmitter class per IQ (C-CORE-1 (d));
+  // re-checked every cycle in the issue slot (C-IQ-1); the STQ keeps the raw one as the store's address root (C-LSU-1).
+  // None when STT is compiled out.
+  val stt_gr = if (ENABLE_STT) Some(new SttRoot) else None
+  def stt_grv: SttRoot = stt_gr.getOrElse(0.U.asTypeOf(new SttRoot))
+  // [Doppelganger] dgl-plan-v4.md 4.5.  dg_req/dg_tag: identity of a doppelganger D$ request (set only on the LSU dg leg; carried
+  // untouched by the D$; read by the LSU response/nack handlers).  dg_pv/dg_pa/dg_psec/dg_patk: the decode-stage prediction,
+  // attached at dispatch (core P4 c), stored in the LDQ entry's uop (the paper's predicted bit + predicted address); zeroed on
+  // every D$ request (L5 G) so the D$ never carries them.  None without ENABLE_DOPPELGANGER.
+  val dg_req  = if (ENABLE_DOPPELGANGER) Some(Bool()) else None
+  val dg_tag  = if (ENABLE_DOPPELGANGER) Some(UInt(doppelgangerTagBits.W)) else None
+  val dg_pv   = if (ENABLE_DOPPELGANGER) Some(Bool()) else None
+  val dg_pa   = if (ENABLE_DOPPELGANGER) Some(UInt(coreMaxAddrBits.W)) else None
+  val dg_psec = if (ENABLE_DOPPELGANGER && ENABLE_IFT) Some(Bool()) else None
+  val dg_patk = if (ENABLE_DOPPELGANGER && ENABLE_IFT) Some(Bool()) else None
 
   // Do we allocate a branch tag for this?
   // SFB branches don't get a mask, they get a predicate bit

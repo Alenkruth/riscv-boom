@@ -138,6 +138,16 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   // false and the IFU's INFL_ICACHE_STATE injection path dies at the consumer.
   val ENABLE_IFT = tileParams.core.asInstanceOf[BoomCoreParams].enableIFT
   val ENABLE_CEVICHE = tileParams.core.asInstanceOf[BoomCoreParams].enableCeviche
+  // ---- Ceviche I$ (ceviche-plan-v5.md I1-I7, T5c; CevCRF / CevVSU from T1c) ----
+  require(!ENABLE_CEVICHE || (!enableICacheDelay && nWays > 1), "Ceviche I$: not supported with enableICacheDelay or a direct-mapped I$")
+  val cevILines = nSets * nWays                                   // 512
+  val cevILineW = log2Ceil(cevILines)
+  val cev_i_on  = if (ENABLE_CEVICHE) RegInit(false.B) else false.B
+  val cevICrf   = if (ENABLE_CEVICHE) Some(Module(new CevCRF(cevILines, paddrBits - blockOffBits, 1, isI = true,
+                                                             withSec = ENABLE_IFT, expireCycles = 64,
+                                                             withIftDom = ENABLE_IFT))) else None   // [T-IFT v5] I$ IFT domain copy
+  val cevIVsu   = if (ENABLE_CEVICHE) Some(Module(new CevVSU(cevILines, hardDefault = cevILines * 3 / 4, softDefault = cevILines / 2))) else None
+  def pol(d: Bool): UInt = Mux(d, io.cf_ceviche_pol.get(7, 4), io.cf_ceviche_pol.get(3, 0))   // {S, I, W, R}
   val io = IO(new ICacheBundle(outer))
   val (tl_out, edge_out) = outer.masterNode.out(0)
 
@@ -158,6 +168,16 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val s0_vaddr = io.req.bits.addr
 
   val s1_valid = RegNext(s0_valid)
+  // Ceviche I$ s1 CRF search (I2). Key = the VA block address (paging off: VA = PA; the paper's L1 key is the VA tag).
+  val s1_vaddr    = if (ENABLE_CEVICHE) RegNext(s0_vaddr) else s0_vaddr
+  val s1_cev_hit  = if (ENABLE_CEVICHE) Wire(Bool()) else false.B
+  val s1_cev_line = if (ENABLE_CEVICHE) Wire(UInt(cevILineW.W)) else 0.U(cevILineW.W)
+  cevICrf.foreach { c =>
+    val d = io.cf_cev_s1_dom.get
+    c.io.sKey(0) := s1_vaddr.pad(paddrBits)(paddrBits - 1, blockOffBits); c.io.sDom(0) := d; c.io.sShare(0) := pol(d)(3)
+    s1_cev_hit := c.io.sHit(0); s1_cev_line := c.io.sLine(0)
+    c.io.incVec := Mux(cev_i_on && RegNext(s1_valid && !io.s1_kill && c.io.sHit(0)), RegNext(c.io.sMatch(0)), 0.U)
+  }
   val s1_tag_hit = Wire(Vec(nWays, Bool()))
   val s1_hit = s1_tag_hit.reduce(_||_)
   val s2_valid = RegNext(s1_valid && !io.s1_kill)
@@ -228,9 +248,39 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   // Cat(repl_way, refill_idx) into vb_array below, and cf_icache_active_ways is a 4-bit literal
   // vector, so an un-truncated `&` would widen repl_way and index outside the valid-bit vector.
   // `random.LFSR` is qualified because freechips.rocketchip.util._ is also in scope (cf. tage.scala).
-  val repl_way = if (isDM) 0.U else {
+  // Ceviche: the refill's line comes from the VSU (requested at the miss, granted before the first beat is accepted).
+  val cev_refill_line   = if (ENABLE_CEVICHE) Reg(UInt(cevILineW.W)) else 0.U(cevILineW.W)
+  val cev_refill_line_v = if (ENABLE_CEVICHE) RegInit(false.B) else false.B
+  val cev_refill_dom    = if (ENABLE_CEVICHE) RegEnable(io.cf_cev_s1_dom.get, s1_valid && !(refill_valid || s2_miss)) else false.B
+  val cev_refill_rebal  = if (ENABLE_CEVICHE && io.cf_dbg_print.isDefined) Reg(Bool()) else false.B   // [CEVI] only
+  val cev_refill_row    = if (ENABLE_CEVICHE) cev_refill_line(idxBits - 1, 0) else 0.U(idxBits.W)
+  def replWayStock(): UInt = if (isDM) 0.U else {   // [IDOFF] the stock expression, built inside `val repl_way` so the stock names stay
     val repl_way_raw = random.LFSR(16, refill_done)(log2Ceil(nWays) - 1, 0)
     (repl_way_raw & (cf_icache_active_ways - 1.U))(log2Ceil(nWays) - 1, 0)
+  }
+  val repl_way = if (!ENABLE_CEVICHE) replWayStock() else Mux(cev_i_on, cev_refill_line(cevILineW - 1, idxBits), replWayStock())
+  // Row of the data array written by the refill beats (the line's row in Ceviche mode, the address set otherwise).
+  val refill_row = if (!ENABLE_CEVICHE) refill_idx else Mux(cev_i_on, cev_refill_row, refill_idx)
+  cevIVsu.foreach { u =>
+    val c = cevICrf.get
+    u.io.hardCsr := io.cf_ceviche_hard_i.get; u.io.softCsr := io.cf_ceviche_soft_i.get
+    u.io.occ := c.io.occ; u.io.poolEmpty := c.io.poolEmpty; u.io.freeIdx := c.io.freeIdx
+    c.io.cIdx := u.io.cIdx; u.io.cV := c.io.cV; u.io.cDom := c.io.cDom; u.io.cFreq := c.io.cFreq; u.io.cRsv := c.io.cRsv
+    u.io.en := cev_i_on
+    u.io.req.valid := cev_i_on && refill_valid && !cev_refill_line_v
+    u.io.req.bits  := cev_refill_dom
+    u.io.reqId := 0.U                                                   // [T1c v3 F4] one requester (the refill); lock/roundEnd unused
+    when (u.io.req.fire) { cev_refill_line := u.io.grant; cev_refill_line_v := true.B
+                           if (io.cf_dbg_print.isDefined) cev_refill_rebal := u.io.rebal }
+    c.io.rsvSet.valid := u.io.req.fire; c.io.rsvSet.bits := u.io.grant
+    c.io.rsvSetDom := u.io.req.bits                                     // [T1c v2] = cev_refill_dom
+    c.io.rsvHold.valid := false.B; c.io.rsvHold.bits := 0.U            // [R1c B1, T1c v4] the I$ has no upgrade path: tied off
+    c.io.rsvRel.valid  := false.B; c.io.rsvRel.bits  := 0.U
+    when (refill_done) { cev_refill_line_v := false.B }
+    // Hold the D-channel beats until the line is granted. Last connect wins over the stock `tl_out.d.ready := true.B` above
+    // (the plan's in-place replacement would use cev_refill_line_v before its declaration).
+    tl_out.d.ready := !cev_i_on || cev_refill_line_v
+    assert(!(cev_i_on && refill_one_beat && !cev_refill_line_v), "Ceviche I$: refill beat before the line grant")   // D13
   }
 
   // Masked set index for tag/data array reads (s0 stage uses virtual addr)
@@ -264,10 +314,41 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val refill_secret_reg = RegEnable(io.s1_is_secret,  s1_valid && !(refill_valid || s2_miss))
   if (ENABLE_IFT) {
     when (refill_done) {
-      ift_tag_meta.write(refill_idx, VecInit(Seq.fill(nWays)(refill_domain_reg)),
+      // [T-IFT] refill_row = refill_idx in stock mode, the granted CRF line's row (with repl_way = its way) in Ceviche mode.  The read
+      // above stays address-indexed: with cev_i_on its result is not selected (s1_way_domain/secret come from the CRF, I2).
+      ift_tag_meta.write(refill_row, VecInit(Seq.fill(nWays)(refill_domain_reg)),
         Seq.tabulate(nWays)(repl_way === _.U))
-      ift_tag_meta_secret.write(refill_idx, VecInit(Seq.fill(nWays)(refill_secret_reg)),
+      ift_tag_meta_secret.write(refill_row, VecInit(Seq.fill(nWays)(refill_secret_reg)),
         Seq.tabulate(nWays)(repl_way === _.U))
+    }
+  }
+
+  // Ceviche I$ CRF write (I4). The line is keyed at refill_done. [T5c] The first beat of a refill also invalidates the CRF
+  // entry of the line being overwritten (v := 0, rsv kept), as the stock vb_array bit of the victim way is cleared on every
+  // refill beat: a fetch of the old block can no longer hit a half-written row. A valid victim needs no writeback (read-only
+  // cache): the overwrite is its revocation.
+  cevICrf.foreach { c =>
+    val pd = pol(cev_refill_dom)
+    val cev_first_beat = refill_one_beat && refill_cnt === 0.U && !d_done
+    c.io.wr.valid      := cev_i_on && (refill_done || cev_first_beat)
+    c.io.wr.bits.line  := cev_refill_line
+    c.io.wr.bits.key   := refill_paddr >> blockOffBits
+    c.io.wr.bits.v     := refill_done && !invalidated
+    c.io.wr.bits.coh   := 0.U
+    c.io.wr.bits.alloc := refill_done
+    c.io.wr.bits.dom   := cev_refill_dom
+    c.io.wr.bits.s     := pd(3); c.io.wr.bits.inv := pd(2)          // burned from the owner's Fig. 2(b) bits
+    c.io.wr.bits.sec   := refill_secret_reg
+    c.io.wr.bits.idom.foreach(_ := refill_domain_reg)                // [T-IFT v5] the value ift_tag_meta gets for this line
+    // I7 [CEVI] debug record (same gate as [ICFILL]): one line per Ceviche-mode refill, in the cycle the line is keyed.
+    io.cf_dbg_print.foreach { en =>
+      val cevi_cyc = RegInit(0.U(40.W))
+      cevi_cyc := cevi_cyc + 1.U
+      when (en && cev_i_on && refill_done) {
+        printf("[CEVI] c=%d line=%d dom=%d s=%d i=%d occ0=%d occ1=%d rebal=%d pa=0x%x\n", cevi_cyc, cev_refill_line,
+          cev_refill_dom, pd(3), pd(2), c.io.occ(0), c.io.occ(1), cev_refill_rebal,
+          (refill_paddr >> blockOffBits) << blockOffBits)
+      }
     }
   }
 
@@ -282,7 +363,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     val icf_cyc = RegInit(0.U(40.W))
     icf_cyc := icf_cyc + 1.U
     when (en && refill_done) {
-      printf("[ICFILL] c=%d set=%d way=%d dom=%d sec=%d pa=0x%x inv=%d\n", icf_cyc, refill_idx, repl_way,
+      printf("[ICFILL] c=%d set=%d way=%d dom=%d sec=%d pa=0x%x inv=%d\n", icf_cyc, refill_row, repl_way,   // [T-IFT] refill_row = refill_idx in stock mode
         refill_domain_reg, refill_secret_reg, (refill_paddr >> blockOffBits) << blockOffBits, invalidated)
     }
   }
@@ -298,16 +379,28 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     w.g.drop  := refill_done && invalidated
     w.g.dom   := refill_done && refill_domain_reg
     w.g.sec   := refill_done && refill_secret_reg
-    w.g.set   := Mux(refill_done, refill_idx, 0.U)
+    w.g.set   := Mux(refill_done, refill_row, 0.U)   // [T-IFT] the line's row in Ceviche mode (refill_row = refill_idx in stock mode)
     w.g.way   := Mux(refill_done, repl_way, 0.U)
     w.g.hi    := Mux(refill_done, refill_paddr(13, 12), 0.U)
     val cf_state_ic_tap = RegNext(w, 0.U.asTypeOf(w))   // the IC tap register (named cf_state_*: SP-27, review M5)
     t := cf_state_ic_tap
   }
-  when (io.invalidate) {
+  val cev_i_toggle = if (ENABLE_CEVICHE) io.cf_ceviche_en.get =/= cev_i_on else false.B
+  val cev_i_flush  = if (ENABLE_CEVICHE) io.invalidate || cev_i_toggle else io.invalidate
+  when (cev_i_flush) {
     vb_array := 0.U
     invalidated := true.B
     // ift_tag_meta not cleared: vb_array flush prevents any tag hits, so stale domain data is unreachable
+  }
+  if (ENABLE_CEVICHE) {
+    when (cev_i_toggle) { cev_i_on := io.cf_ceviche_en.get }
+    val c = cevICrf.get
+    // fence.i (paper 3e/4: no cross-domain invalidation unless the owner's I bit): revoke the executing domain's
+    // lines and lines whose I bit is set. A debug-mode flush and a mode switch revoke everything.
+    c.io.clearAll       := cev_i_toggle || (io.invalidate && io.cf_cev_dbg_flush.get)
+    c.io.clearDom.valid := cev_i_on && io.invalidate && !io.cf_cev_dbg_flush.get
+    c.io.clearDom.bits  := io.cf_cev_inval_dom.get
+    assert(!cev_i_on || (io.cf_icache_set_conf === 0.U && io.cf_icache_way_conf === 0.U), "Ceviche needs the full I$ geometry")
   }
 
   val s2_dout   = Wire(Vec(nWays, UInt(wordBits.W)))
@@ -320,13 +413,22 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     val s1_vb = vb_array(Cat(i.U, s1_idx))
     val tag = tag_rdata(i)
     // Gate hits for ways beyond the active way count
-    s1_tag_hit(i) := s1_vb && tag === s1_tag && (i.U < cf_icache_active_ways)
+    // Ceviche mode: the hit is the CRF line's way. [T5c] A hit on the way written by a refill beat this cycle is dropped
+    // (the data read of that way is disabled by !wen, see I3); a false miss is replayed by the frontend like any miss.
+    s1_tag_hit(i) := (if (!ENABLE_CEVICHE) s1_vb && tag === s1_tag && (i.U < cf_icache_active_ways)
+                      else Mux(cev_i_on, s1_cev_hit && s1_cev_line(cevILineW - 1, idxBits) === i.U &&
+                                         !(refill_one_beat && !invalidated && repl_way === i.U),
+                               s1_vb && tag === s1_tag && (i.U < cf_icache_active_ways)))
   }
   assert(PopCount(s1_tag_hit) <= 1.U || !s1_valid)
 
   // corefuzzing: mux per-way IFT domain by hit way in s1 (ift_rdata was read from s0 address)
-  val s1_way_domain      = Mux1H(s1_tag_hit, ift_rdata)
-  val s1_way_secret      = Mux1H(s1_tag_hit, ift_rdata_secret)
+  // [T-IFT v5] (amend-TIFT5 I1; owner rule "IFT is never switched off by a defense") Ceviche mode: the hit line's IFT domain is the
+  // CRF copy of the stock ift_tag_meta value (sIftDom, written with refill_domain_reg), not the Ceviche owner domain (sDomOut, PC range
+  // without the [M3ATKWIN] / redirect terms), so ICACHE_STATE compares the same IFT domain as in stock mode.
+  val s1_way_domain      = if (!ENABLE_CEVICHE) Mux1H(s1_tag_hit, ift_rdata)
+                           else Mux(cev_i_on, cevICrf.get.io.sIftDom.map(_(0)).getOrElse(cevICrf.get.io.sDomOut(0)), Mux1H(s1_tag_hit, ift_rdata))
+  val s1_way_secret      = if (!ENABLE_CEVICHE) Mux1H(s1_tag_hit, ift_rdata_secret) else Mux(cev_i_on, cevICrf.get.io.sSec(0),    Mux1H(s1_tag_hit, ift_rdata_secret))
   val s1_domain_mismatch = s1_hit && (s1_way_domain =/= io.s1_domain_id)
   // Secret mismatch: hit way was filled during a secret-range fetch, but current fetch is not secret.
   // Covers the same-domain channel where secret instruction's cache fill affects a non-secret fetch.
@@ -377,15 +479,22 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
 
       val wen = (refill_one_beat && !invalidated) && repl_way === i.U
 
-      val mem_idx = Mux(refill_one_beat, (refill_idx << log2Ceil(refillCycles)) | refill_cnt,
+      val mem_idx = Mux(refill_one_beat, (refill_row << log2Ceil(refillCycles)) | refill_cnt,
                     row(s0_vaddr_msked))
       when (wen) {
         dataArray.write(mem_idx, tl_out.d.bits.data)
       }
       if (enableICacheDelay)
         s2_dout(i) := dataArray.read(RegNext(mem_idx), RegNext(!wen && s0_ren))
-      else
+      else if (!ENABLE_CEVICHE)
         s2_dout(i) := RegNext(dataArray.read(mem_idx, !wen && s0_ren))
+      else {
+        // Ceviche mode: read in s1 at (line row, offset) of way i, raw SRAM output used in s2; stock mode: the stock s0 read + RegNext.
+        val s1_line_addr = Cat(0.U(1.W), s1_cev_line(idxBits - 1, 0), s1_vaddr(blockOffBits - 1, 0))
+        val cev_ren      = s1_valid && s1_cev_hit && s1_cev_line(cevILineW - 1, idxBits) === i.U && !wen
+        val raw = dataArray.read(Mux(cev_i_on, row(s1_line_addr), mem_idx), Mux(cev_i_on, cev_ren, !wen && s0_ren))
+        s2_dout(i) := Mux(RegNext(cev_i_on), raw, RegNext(raw))
+      }
     }
   } else {
     // Use two banks, interleaved.
@@ -420,10 +529,10 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
       if (refillsToOneBank) {
         // write a refill beat across only one beat.
         mem_idx0 =
-          Mux(refill_one_beat, (refill_idx << (log2Ceil(refillCycles)-1)) | (refill_cnt >> 1.U),
+          Mux(refill_one_beat, (refill_row << (log2Ceil(refillCycles)-1)) | (refill_cnt >> 1.U),
           b0Row(s0_vaddr_msked))
         mem_idx1 =
-          Mux(refill_one_beat, (refill_idx << (log2Ceil(refillCycles)-1)) | (refill_cnt >> 1.U),
+          Mux(refill_one_beat, (refill_row << (log2Ceil(refillCycles)-1)) | (refill_cnt >> 1.U),
           b1Row(s0_vaddr_msked))
 
         when (wen && refill_cnt(0) === 0.U) {
@@ -435,10 +544,10 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
       } else {
         // write a refill beat across both banks.
         mem_idx0 =
-          Mux(refill_one_beat, (refill_idx << log2Ceil(refillCycles)) | refill_cnt,
+          Mux(refill_one_beat, (refill_row << log2Ceil(refillCycles)) | refill_cnt,
           b0Row(s0_vaddr_msked))
         mem_idx1 =
-          Mux(refill_one_beat, (refill_idx << log2Ceil(refillCycles)) | refill_cnt,
+          Mux(refill_one_beat, (refill_row << log2Ceil(refillCycles)) | refill_cnt,
           b1Row(s0_vaddr_msked))
 
         when (wen) {
@@ -450,9 +559,17 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
       if (enableICacheDelay) {
         s2_dout(i) := Cat(dataArraysB1(i).read(RegNext(mem_idx1), RegNext(!wen && s0_ren)),
                           dataArraysB0(i).read(RegNext(mem_idx0), RegNext(!wen && s0_ren)))
-      } else {
+      } else if (!ENABLE_CEVICHE) {
         s2_dout(i) := RegNext(Cat(dataArraysB1(i).read(mem_idx1, !wen && s0_ren),
                                   dataArraysB0(i).read(mem_idx0, !wen && s0_ren)))
+      } else {
+        // Ceviche mode: both banks read in s1 at the rows of the line's address (same row functions as the stock s0 read).
+        val s1_line_addr = Cat(0.U(1.W), s1_cev_line(idxBits - 1, 0), s1_vaddr(blockOffBits - 1, 0))
+        val cev_ren      = s1_valid && s1_cev_hit && s1_cev_line(cevILineW - 1, idxBits) === i.U && !wen
+        val ren          = Mux(cev_i_on, cev_ren, !wen && s0_ren)
+        val raw = Cat(dataArraysB1(i).read(Mux(cev_i_on, b1Row(s1_line_addr), mem_idx1), ren),
+                      dataArraysB0(i).read(Mux(cev_i_on, b0Row(s1_line_addr), mem_idx0), ren))
+        s2_dout(i) := Mux(RegNext(cev_i_on), raw, RegNext(raw))
       }
     }
   }

@@ -57,6 +57,15 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
     val debug_wb_wdata   = Output(Vec(numWakeupPorts, UInt((fLen+1).W)))
     // corefuzzing: runtime gates for speculative logging
     val cf_debug_exu_enable = Input(Bool())
+    // STT (stt-plan-v4.md C-FPP-1): VP flags and debug enable into the FP IQ; any held FDIV/FSQRT out (stats)
+    val stt_ldq_safe = if (ENABLE_STT) Some(Input(UInt(numLdqEntries.W))) else None
+    val stt_dbg      = if (ENABLE_STT) Some(Input(Bool())) else None
+    val stt_any_blk  = if (ENABLE_STT) Some(Output(Bool())) else None
+    val stt_dx       = if (ENABLE_STT) Some(Input(Bool())) else None              // [v6] DelayExecute
+    val stt_fut      = if (ENABLE_STT) Some(Input(Bool())) else None              // [v6]
+    val stt_rob_head = if (ENABLE_STT) Some(Input(UInt(robAddrSz.W))) else None   // [v6]
+    val stt_rob_pnr  = if (ENABLE_STT) Some(Input(UInt(robAddrSz.W))) else None   // [v7] P-F2
+    val stt_fail_rob = if (ENABLE_STT) Some(Input(Valid(UInt(robAddrSz.W)))) else None   // [v7] P-F2
     // [WINSHADOW] step 20: window shadow ranges (writeback-time mark) and commit-time set ports
     val wsh_sec          = Input(new WinShadowInfo)
     val wsh_atk          = Input(new WinShadowInfo)
@@ -120,6 +129,14 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
   issue_unit.io.cf_debug_issue_enable := io.cf_debug_issue_enable
   issue_unit.io.cf_iq_idx := io.cf_iq_idx
   issue_unit.io.cf_pause_mem.foreach(_ := false.B)   // [V3PAUSE] SP-20: no LOAD_PAUSE in the FP IQ
+  issue_unit.io.stt_ldq_safe.foreach(_ := io.stt_ldq_safe.get)
+  issue_unit.io.stt_dbg.foreach(_ := io.stt_dbg.get)
+  io.stt_any_blk.foreach(_ := issue_unit.io.stt_any_blk.get)
+  issue_unit.io.stt_dx.foreach(_ := io.stt_dx.get)               // [v6]
+  issue_unit.io.stt_fut.foreach(_ := io.stt_fut.get)             // [v6]
+  issue_unit.io.stt_rob_head.foreach(_ := io.stt_rob_head.get)   // [v6]
+  issue_unit.io.stt_rob_pnr.foreach(_ := io.stt_rob_pnr.get)     // [v7] P-F2
+  issue_unit.io.stt_fail_rob.foreach(_ := io.stt_fail_rob.get)   // [v7] P-F2
   // Don't support ld-hit speculation to FP window.
   for (w <- 0 until memWidth) {
     issue_unit.io.spec_ld_wakeup(w).valid := false.B

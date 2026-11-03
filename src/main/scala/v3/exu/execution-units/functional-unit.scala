@@ -142,6 +142,8 @@ class FuncUnitResp(val dataWidth: Int)(implicit p: Parameters) extends BoomBundl
   val data_taint_atk = Bool()
   // corefuzzing: attacker taint of the RESULT (see FuncUnitReq.rs1_taint_atk).
   val taint_atk   = Bool()
+  // [SA-2] SpecASan pointer key (raw EA bits [59:56]); None when the defense is compiled out.
+  val sa_key = if (SPECASAN) Some(UInt(4.W)) else None
   val fflags = new ValidIO(new FFlagsResp)
   val addr = UInt((vaddrBits+1).W) // only for maddr -> LSU
   val mxcpt = new ValidIO(UInt((freechips.rocketchip.rocket.Causes.all.max+2).W)) //only for maddr->LSU
@@ -747,9 +749,18 @@ class MemAddrCalcUnit(implicit p: Parameters)
 {
   // perform address calculation
   val sum = (io.req.bits.rs1_data.asSInt + io.req.bits.uop.imm_packed(19,8).asSInt).asUInt
-  val ea_sign = Mux(sum(vaddrBits-1), ~sum(63,vaddrBits) === 0.U,
-                                       sum(63,vaddrBits) =/= 0.U)
-  val effective_address = Cat(ea_sign, sum(vaddrBits-1,0)).asUInt
+  // [SA-1] SpecASan (ARM TBI): the key is bits [59:56] of the RAW pointer sum. With the defense enabled the whole
+  // top byte is replaced by the sign of bit 55 BEFORE the canonical check, so a keyed pointer never trips bad_va.
+  // Compiled out: sum_ea is the very same node as sum (no hardware, byte-identical Verilog).
+  val sa_en  = if (SPECASAN) Some(IO(Input(Bool()))) else None      // second IO of this module; driven by SA-1b
+  val sum_ea = if (SPECASAN) Mux(sa_en.get, Cat(Fill(8, sum(55)), sum(55, 0)), sum) else sum
+  val ea_sign = Mux(sum_ea(vaddrBits-1), ~sum_ea(63,vaddrBits) === 0.U,
+                                          sum_ea(63,vaddrBits) =/= 0.U)
+  val effective_address = Cat(ea_sign, sum_ea(vaddrBits-1,0)).asUInt
+  if (SPECASAN) {
+    require(vaddrBits <= 55, "SpecASan: the pointer key [59:56] must lie above vaddrBits (Sv57 unsupported)")
+    io.resp.bits.sa_key.get := sum(59, 56)
+  }
 
   val store_data = io.req.bits.rs2_data
 

@@ -148,6 +148,8 @@ abstract class ExecutionUnit(
 
     // only used by the mem unit
     val lsu_io = if (hasMem) Flipped(new boom.v3.lsu.LSUExeIO) else null
+    // [SA-1b] SpecASan runtime enable for the AGU's top-byte rewrite (mem unit only)
+    val sa_en = if (hasMem && SPECASAN) Some(Input(Bool())) else None
     val bp = if (hasMem) Input(Vec(nBreakpoints, new BP)) else null
     val mcontext = if (hasMem) Input(UInt(coreParams.mcontextWidth.W)) else null
     val scontext = if (hasMem) Input(UInt(coreParams.scontextWidth.W)) else null
@@ -469,6 +471,7 @@ class ALUExeUnit(
     maddrcalc.io.bp         := io.bp
     maddrcalc.io.mcontext   := io.mcontext
     maddrcalc.io.scontext   := io.scontext
+    maddrcalc.sa_en.foreach(_ := io.sa_en.get)   // [SA-1b]
     maddrcalc.io.resp.ready := DontCare
     require(numBypassStages == 0)
 

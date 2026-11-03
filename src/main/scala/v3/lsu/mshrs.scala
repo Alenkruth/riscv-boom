@@ -32,11 +32,45 @@ class BoomDCacheReqInternal(implicit p: Parameters) extends BoomDCacheReq()(p)
   // rather than the miss request's (aliased) address.
   val old_idx   = UInt(idxBits.W)
   val way_en    = UInt(nWays.W)
+  // [Ceviche M1] the line's row (hit / upgrade, replay); written by D5, carried through the rpq to the replay (D3 known-L row)
+  val cev_row   = if (ENABLE_CEVICHE) Some(UInt(idxBits.W)) else None
 
   // Used in the MSHRs
   val sdq_id    = UInt(log2Ceil(cfg.nSDQ).W)
+  // [SA-D1] SpecASan: the four locks of the line this MSHR fills, {valid, lock3, lock2, lock1, lock0}; installed with the line
+  // (SA-D7).  valid = 0: the locks were not known at allocation (store/prefetch miss with a tag-line buffer miss).
+  val sa_lk     = if (SPECASAN) Some(UInt(17.W)) else None
+  // [SA-F1] (specasan-plan-v5-amend-F1F2.md) a checked load whose s2 pass found no buffered tag line (lock unknown; for a miss
+  // this is exactly s2_sa_unk).  As a PRIMARY it allocates a lock-pending fetch: the data miss goes out in parallel with the
+  // tag-line fetch, with no rpq entry and no response (the load itself was nacked and retries).  Never accepted as a secondary,
+  // never clears a parked prefetch: an access whose verdict is unknown touches no existing MSHR.  An s2 flop (1 LUT).
+  val sa_unk    = if (SPECASAN) Some(Bool()) else None
 }
 
+// [SA-F1] a tag line that landed in the SpecASan tag unit this cycle (fill_wr): any data address inside the 1-KiB tag line and
+// the 64 tag bytes (byte 4k+g = lock of granule g of data line k = pa(9,6)).  The MSHRs (and the D$ store-check queue) take
+// the locks of their own line from it.
+class SpecASanLanding(implicit p: Parameters) extends BoomBundle()(p) {
+  val pa  = UInt(paddrBits.W)
+  val buf = Vec(64, UInt(8.W))
+}
+
+
+// [T-IFT v5] (ceviche-plan-v5-amend-TIFT5.md, owner rule "IFT is never switched off by a defense") the Ceviche allocation / eviction
+// event of one MSHR, presented in its M4 read cycle (s_meta_resp_2): the line the VSU granted (row, way), the allocation's STATE R
+// fields (prefetch kind, key, domain, own taint) and the stock eviction-record terms {s, a, r, PC} (the victim's tag and validity come
+// from the meta response in the D$).  Ceviche + IFT builds only.
+class CevM4Rec(val rowBits: Int, val wayBits: Int, val pcBits: Int, val idBits: Int) extends Bundle {
+  val row  = UInt(rowBits.W)
+  val way  = UInt(wayBits.W)
+  val pf   = Bool()              // prefetch allocation (R kind 3; a promoted prefetch keeps it, as its stock s2 record)
+  val key  = UInt(pcBits.W)      // R key: PC[13:2] for a prefetch, else op_count[11:0]
+  val d    = Bool()              // the granted domain (record d, R dom)
+  val osec = Bool(); val oatk = Bool()   // the allocating access's own terms (R sec / atk: the line's new replacement taint)
+  val s    = Bool(); val a = Bool(); val r = Bool()
+  val pc   = UInt(pcBits.W)      // record PC, secret-first, own terms first
+  val mshr = UInt(idBits.W)      // set by the MSHR file
+}
 
 class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   with HasL1HellaCacheParameters
@@ -109,6 +143,26 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     // under the OLD mapping).  ENABLE_RECONF-only consumer; constant-folded away when
     // the gate is not built.
     val state_invalid = Output(Bool())
+    val sa_req_lk     = if (SPECASAN) Some(Output(UInt(17.W))) else None   // [SA-D8] the line locks of this MSHR's request
+    val sa_lnd        = if (SPECASAN) Some(Input(Valid(new SpecASanLanding))) else None   // [SA-F1] tag-line landing (tag unit fill_wr)
+    // [Ceviche M2 (a)] VSU interface of the MSHR (ceviche-plan-v5.md M2, M3)
+    val cev_on     = if (ENABLE_CEVICHE) Some(Input(Bool())) else None
+    val cev_vreq   = if (ENABLE_CEVICHE) Some(Decoupled(Bool())) else None     // to the VSU (bits = domain)
+    val cev_vgrant = if (ENABLE_CEVICHE) Some(Input(UInt(log2Ceil(nSets*nWays).W))) else None
+    val cev_alloc  = if (ENABLE_CEVICHE) Some(Output(Bool())) else None
+    val cev_clr    = if (ENABLE_CEVICHE) Some(Output(Bool())) else None
+    val cev_gdom_o = if (ENABLE_CEVICHE) Some(Output(Bool())) else None        // [R1c B5] domain the VSU granted this MSHR's line for
+    val cev_vbusy  = if (ENABLE_CEVICHE) Some(Output(Bool())) else None        // [R1c B3] holds a victim line past its meta read: probes wait
+    val cev_ppast  = if (ENABLE_CEVICHE) Some(Input(Bool())) else None         // [R1c-p2 N1] the prober is past its MSHR check
+    // [T-IFT v3] Ceviche + IFT builds: the replacement-state taint the VSU decided with (driven by the D$, latched at this MSHR's
+    // grant), this MSHR's own allocation attribution {sec, atk, PC[13:2]} (for the D$ taint update at its grant), and the ift_evf
+    // record of the line its grant really evicts, {row of the victim block, r, s, a, d, victim tag, PC[13:2]} (M4 event).
+    val cev_rt     = if (ENABLE_CEVICHE && ENABLE_IFT) Some(Input(UInt((2 * (1 + inflPcBitsCF)).W))) else None
+    val cev_vattr  = if (ENABLE_CEVICHE && ENABLE_IFT) Some(Output(UInt((2 + inflPcBitsCF).W))) else None
+    // [T-IFT v5] the M4 event (replaces v3/v4's delayed cev_ev record and its N1 hold: see the block below)
+    val cev_m4     = if (ENABLE_CEVICHE && ENABLE_IFT) Some(Output(Valid(new CevM4Rec(idxBits, log2Ceil(nWays), inflPcBitsCF, log2Ceil(cfg.nMSHRs) max 1)))) else None
+    // [T-IFT v5] the CRF line this MSHR owns (granted victim line, or an upgrade's own line): names the MSHR a Ceviche reserved-line nack conflicts with
+    val cev_line_o = if (ENABLE_CEVICHE && ENABLE_IFT) Some(Output(Valid(UInt(log2Ceil(nSets*nWays).W)))) else None
     // corefuzzing: domain of the stored request — valid while MSHR is active, used at meta_write time
     val cf_req_domain   = Output(UInt(1.W))
     val cf_req_op_count = Output(UInt(uopIDCounterWidthCF.W))
@@ -147,13 +201,41 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
 
   val req     = Reg(new BoomDCacheReqInternal)
   val req_idx = req.addr(untagBits-1, blockOffBits)
+  // [Ceviche M2 (b)] the line this MSHR owns: granted by the VSU (primary miss) or the hit line (upgrade); absent when off
+  val cev_on      = io.cev_on.getOrElse(false.B)
+  val cev_line    = if (ENABLE_CEVICHE) Reg(UInt(log2Ceil(nSets*nWays).W)) else 0.U(1.W)
+  val cev_line_v  = if (ENABLE_CEVICHE) RegInit(false.B) else false.B
+  val cev_old_tag = if (ENABLE_CEVICHE) Reg(UInt((paddrBits - blockOffBits).W)) else 0.U(1.W)   // victim block address (M4)
+  val cev_gdom    = if (ENABLE_CEVICHE) Some(Reg(Bool())) else None   // [R1c B5] domain the VSU granted the line for (latched at the grant)
+  // [T-IFT v4, N3] this MSHR was a parked prefetch promoted by a demand secondary: that secondary's address terms (cf_sec_asec / aatk)
+  // caused the eviction the grant makes, so they join the M4 / grant own terms (a primary demand's merged secondaries stay out, as stock).
+  val cev_prom    = if (ENABLE_CEVICHE && ENABLE_IFT) Some(RegInit(false.B)) else None
+  // array index of this MSHR's line: the line's row in Ceviche mode, the address set otherwise
+  val arr_idx     = if (!ENABLE_CEVICHE) req_idx else Mux(cev_on, cev_line(idxBits - 1, 0), req_idx)
+  val cev_tag     = if (ENABLE_CEVICHE) req.addr >> blockOffBits else 0.U(1.W)   // full block address (Ceviche meta tag)
   // [reconf-fix] extended tag: covers every bit above the SMALLEST index (spec 31).
   val req_tag = req.addr >> cfTagLSB
   val req_block_addr = (req.addr >> blockOffBits) << blockOffBits
   val req_needs_wb = RegInit(false.B)
+  // [SA-F1] (specasan-plan-v5-amend-F1F2.md; logic at the lock-learning block below)
+  val sa_pnd = if (SPECASAN) Some(RegInit(false.B)) else None   // lock-pending primary (sa_unk at allocation), verdict not yet known
+  val sa_mis = if (SPECASAN) Some(RegInit(false.B)) else None   // its learned verdict: the primary's key mismatches its granule's lock
+  // [T2b-fix1 v2, N3] sa_nsh = sa_pnd || sa_mis as ONE flop (written with them below): req_sec_rdy gains one flop input, not two
+  val sa_nsh = if (SPECASAN) Some(RegInit(false.B)) else None
+  // [T2b-fix1 v2, B2] the pend primary's load is still live (set at a sa_unk allocation; cleared when that load is killed by a
+  // branch or flushed by an exception; req.uop.br_mask is kept current while set, as the rpq does for its entries)
+  val sa_live = if (SPECASAN) Some(RegInit(false.B)) else None
+  // a former pend primary with a learned MATCH whose load is live: it installs its line (stock BOOM installs a demand miss's
+  // line whenever the refill arrives while the load is live; paper l.297-300 / 402-410 install a matching fill)
+  val sa_prom = if (SPECASAN) Some(sa_live.get && !sa_pnd.get && !sa_mis.get) else None
+  // [T2b-fix1 v2, N1] a secondary refused while the verdict is pending that carries known locks teaches the MSHR (block below);
+  // in s_prefetch it does not drop the parked line (the stock refusal would)
+  val sa_tkeep = if (SPECASAN) Some(sa_pnd.get && io.req_sec_val && io.req.sa_lk.get(16) && !io.clear_prefetch) else None
 
   val new_coh = RegInit(ClientMetadata.onReset)
   val (_, shrink_param, coh_on_clear) = req.old_meta.coh.onCacheControl(M_FLUSH)
+  // [R1c B2] Ceviche mode: the Release param of the line actually evicted (the VSU line, re-read in s_meta_resp_2)
+  val cev_old_coh = if (ENABLE_CEVICHE) Some(Reg(new ClientMetadata)) else None
   val grow_param = new_coh.onAccess(req.uop.mem_cmd)._2
   val coh_on_grant = new_coh.onGrant(req.uop.mem_cmd, io.mem_grant.bits.param)
 
@@ -190,8 +272,11 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   rpq.io.flush  := io.exception
   assert(!(state === s_invalid && !rpq.io.empty))
 
-  rpq.io.enq.valid := ((io.req_pri_val && io.req_pri_rdy) || (io.req_sec_val && io.req_sec_rdy)) && !isPrefetch(io.req.uop.mem_cmd)
+  rpq.io.enq.valid := (if (SPECASAN) ((io.req_pri_val && io.req_pri_rdy) || (io.req_sec_val && io.req_sec_rdy)) && !isPrefetch(io.req.uop.mem_cmd) &&
+                                     !io.req.sa_unk.get   // [SA-F1] a lock-pending primary is a fetch: its load was nacked (no rpq entry)
+                       else          ((io.req_pri_val && io.req_pri_rdy) || (io.req_sec_val && io.req_sec_rdy)) && !isPrefetch(io.req.uop.mem_cmd))
   rpq.io.enq.bits  := io.req
+  rpq.io.enq.bits.cev_row.foreach(_ := 0.U)   // [Ceviche M1] the replay field is driven from arr_idx (M2 (e)); keep it out of the rpq storage
   // IFT LUT optimization (Change 4): zero cf_* fields not needed by MSHR/rpq logic.
   // rpq reads mem_cmd, mem_size, mem_signed; passes uop through io.resp.bits.uop
   // back to wb_resps (same preservation list as FU pipeline Change 2).
@@ -275,9 +360,13 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   // (s_meta_read) or a re-acquire (s_refill_req), whose line this MSHR writes later (an M fill), so not a drop.
   // The terms are the existing next-state enables of `state`; they end here in the D$ tap register.
   io.cf_meta_clr.foreach(_ := state === s_meta_clear)
-  io.cf_pf_drop.foreach(_ := state === s_prefetch &&
+  io.cf_pf_drop.foreach(_ := (if (SPECASAN) state === s_prefetch &&
+    (((io.req_sec_val && !io.req_sec_rdy && !sa_tkeep.get) || io.clear_prefetch) ||   // [T2b-fix1 v2, N1] a teaching refusal keeps the line
+     (!(io.req_sec_val && io.req_sec_rdy) && io.req_pri_val && io.req_pri_rdy) ||
+     sa_mis.get)   // [SA-F1] the learned-mismatch drop (last block of this module) is a drop too
+    else state === s_prefetch &&
     (((io.req_sec_val && !io.req_sec_rdy) || io.clear_prefetch) ||
-     (!(io.req_sec_val && io.req_sec_rdy) && io.req_pri_val && io.req_pri_rdy)))
+     (!(io.req_sec_val && io.req_sec_rdy) && io.req_pri_val && io.req_pri_rdy))))
   // corefuzzing: expose stored request domain for fill-completion tracking in dcache
   io.cf_req_domain   := req.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W))
   io.cf_req_op_count := req.uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
@@ -392,11 +481,134 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
 
   io.meta_write.valid    := false.B
   io.meta_write.bits     := DontCare
+  io.sa_req_lk.foreach(_ := req.sa_lk.get)   // [SA-D8] req := io.req at allocation (:511): the allocating s2 request's locks
+  // [SA-F1] (specasan-plan-v5-amend-F1F2.md) lock-pending fetch and lock learning.  Paper 3.3.1/3.3.4: a miss goes to the lower
+  // level, the tag check happens where the tags are, and the data is delivered only on a match.  Here the miss of a checked load
+  // whose locks are unknown leaves the L1 at once (sa_unk primary: a fetch with no rpq entry; the load was nacked and retries),
+  // the tag line is fetched in parallel (s2 `want`), and the verdict is applied before the line can reach the core or the array:
+  //  - every MSHR whose locks are not valid takes them from a tag line that lands while it is active (any in-window MSHR: the
+  //    line is then installed with its locks, SA-D7, as the paper's Fig. 3 line always carries them);
+  //  - a lock-pending primary that learns a MISMATCH is dropped (parked for one cycle, then the s_prefetch drop at the end of this
+  //    module: no install, no data; v2 N2); a MATCH learned while its load is live installs the line (v2 B2: commit at the drain,
+  //    or self-promotion when parked); a still-unknown verdict, or a match after the load was squashed, parks it as the stock
+  //    prefetch it is, and a parked line reaches a load only through a secondary that was checked with a KNOWN verdict at its own
+  //    s2 pass (unknown ones are refused, MSHR file).
+  // Nothing waits on the tag unit, so no MSHR state and no paint drain depend on a tag fetch (no new deadlock).  The learn is a
+  // flop-to-flop path: 22-bit line compare + 16:1 select of 16 lock bits into req.sa_lk; it is placed before the FSM so that
+  // handle_pri_req's `req := io.req` (the allocation cycle, also a parked MSHR's re-allocation) is the last connect.
+  // (sa_pnd / sa_mis are declared beside req_needs_wb: io.cf_pf_drop above reads sa_mis.)
+  // [T2b-fix1 v2, N1] a second source: a refused secondary that carries KNOWN locks (io.req.sa_lk valid: its own s2 buffer hit)
+  // teaches a still-pending MSHR (a landing in the allocation window, s1/s2 of the pend load, is otherwise missed and the tag
+  // line is then buffered, so no second landing comes).  sec_val is the block match, so io.req's locks are this line's.  The
+  // landing wins when both occur (same tag line).  Flops only (sec_val and io.req are the file's lane-selected request);
+  // nothing here feeds a ready or nack.
+  // [T2b-fix1 v2, B2] sa_live tracking (the kill terms are the rpq's: IsKilledByBranch on the kept br_mask, io.exception).
+  if (SPECASAN) {
+    val l    = io.sa_lnd.get
+    val lk4  = Cat((3 to 0 by -1).map(g => VecInit((0 until 16).map(k => l.bits.buf(4*k + g)(3, 0)))(req.addr(9, 6))))
+    def gmis(lk: UInt): Bool = VecInit((0 until 4).map(k => lk(4*k+3, 4*k)))(req.addr(5, 4)) =/= req.sa_key.get
+    val lnd  = state =/= s_invalid && !req.sa_lk.get(16) && l.valid && l.bits.pa(paddrBits-1, 10) === req.addr(paddrBits-1, 10)
+    val tch  = state =/= s_invalid && sa_pnd.get && io.req_sec_val && io.req.sa_lk.get(16)
+    when (lnd) {
+      req.sa_lk.get := Cat(1.U(1.W), lk4)
+      when (sa_pnd.get) { sa_mis.get := gmis(lk4); sa_nsh.get := gmis(lk4) }
+      sa_pnd.get := false.B
+    } .elsewhen (tch) {
+      req.sa_lk.get := io.req.sa_lk.get
+      sa_mis.get    := gmis(io.req.sa_lk.get(15, 0))
+      sa_nsh.get    := gmis(io.req.sa_lk.get(15, 0))
+      sa_pnd.get    := false.B
+    }
+    when (sa_live.get) {
+      req.uop.br_mask := GetNewBrMask(io.brupdate, req.uop)
+      when (IsKilledByBranch(io.brupdate, req.uop) || io.exception) { sa_live.get := false.B }
+    }
+  }
+  // [Ceviche M2 (d)] fill-event bits (M7) and the VSU request / grant.
+  io.cev_alloc.foreach(_ := !req.tag_match)
+  io.cev_clr.foreach(_   := state === s_meta_clear)
+  if (ENABLE_CEVICHE) {
+    // The request is raised only in s_meta_read (controller call, T3c-report Judgment 1): the first use of the line.  A grant held
+    // earlier would be lost when the MSHR parks as a prefetch (s_prefetch, then clear_prefetch -> s_invalid), and the CRF has no
+    // release for a reservation (rsv clears only at an allocating write), so the line would leak and count against the hard limit.
+    val q = io.cev_vreq.get
+    q.valid := cev_on && state === s_meta_read && !cev_line_v && !req.tag_match
+    q.bits  := req.uop.cf_domain_id.getOrElse(0.U(1.W))(0)
+    when (q.fire) {
+      cev_line_v := true.B
+      cev_line   := io.cev_vgrant.get
+      req.way_en := UIntToOH(io.cev_vgrant.get >> idxBits, nWays)
+      cev_gdom.get := q.bits                                   // [R1c B5] the domain the VSU granted for
+    }
+    io.cev_gdom_o.get := cev_gdom.get                          // [R1c B5]
+    io.cev_vbusy.get  := cev_on && cev_line_v && !req.tag_match && !io.probe_rdy   // [R1c B3] a victim line held past the meta read
+    when (state === s_invalid) { cev_line_v := false.B }   // handle_pri_req (below, last connect) overrides it in the allocation cycle
+    // [Ceviche D13] the meta read (-> s_meta_resp_1) never fires before the line is known
+    assert(!(cev_on && state === s_meta_resp_1 && !cev_line_v && !req.tag_match), "Ceviche MSHR: meta read before the VSU grant")
+  }
+  // [T-IFT v3] (ceviche-plan-v5-amend-TIFT3.md) Ceviche-mode eviction record.  The stock D$ records an eviction at s2 for the
+  // per-set victim; in Ceviche mode the line that leaves is the VSU grant, known here at M4 (s_meta_resp_2 reads its meta:
+  // cev_old_tag / cev_old_coh).  The record has the stock ift_evf meaning and layout, {r, s, a, d, victim tag, PC}, written at
+  // the victim BLOCK's address set (a later miss on that block reads it there, as in stock mode, where the victim's set is the
+  // requester's set):
+  //   own terms (the allocating access): sec = req.cf_addr_sec (the D$ folded cf_fill_sec into it at s2, [FILLSEC]),
+  //   atk = the granted domain (cev_gdom, the domain the VSU searched for) || req.cf_addr_atk ([ONETAGATK]); d = cev_gdom;
+  //   replacement-state terms: cev_rt, the D$'s Ceviche replacement taint latched at the grant (dcache.scala [T-IFT v3]);
+  //   PC secret-first, own terms first; r = the PC names the replacement state ([CEREPL]).
+  // [T-IFT v5] Presented in s_meta_resp_2 itself (io.cev_m4, below; v3/v4 emitted it a cycle later with an N1 hold flop).
+  // req.tag_match = 0 (an upgrade keeps its own line: no eviction).  A free-pool grant (invalid line) evicts nothing, as a stock
+  // invalid victim, but still makes the allocation's STATE R record.  At most one per cycle (one meta read per cycle).  A parked
+  // prefetch never reaches s_meta_read, so every record is a real eviction (the stock [PFPHANTOM] approximation does not arise).
+  if (ENABLE_CEVICHE && ENABLE_IFT) {
+    val P      = inflPcBitsCF
+    val cev_rt = Reg(UInt((2 * (1 + P)).W))
+    when (io.cev_vreq.get.fire) { cev_rt := io.cev_rt.get }
+    // [T-IFT v4, N3] own terms: the primary's, plus (promoted prefetch only) the promoting secondary's address terms.  Flops only (1-2 LUT).
+    val prom     = cev_prom.get
+    val sec_p    = req.cf_addr_sec.get
+    val own_sec  = sec_p || (prom && cf_sec_asec)
+    val sec_pc   = Mux(sec_p, cf_pri_pc12, cf_sec_asec_pc)
+    val atk_g    = io.cev_vreq.get.bits || req.cf_addr_atk.get           // at the grant cycle (the domain presented to the VSU)
+    val atk_m    = cev_gdom.get || req.cf_addr_atk.get                   // from the grant on (the domain the VSU searched for)
+    val atk_q    = prom && cf_sec_aatk
+    val own_atki = atk_m || atk_q
+    val atk_pc   = Mux(atk_m, cf_pri_pc12, cf_sec_aatk_pc)
+    io.cev_vattr.get := Cat(own_sec, atk_g || atk_q, Mux(own_sec, sec_pc, Mux(atk_g, cf_pri_pc12, cf_sec_aatk_pc)))
+    val rs_v = cev_rt(2 * P + 1); val rs_pc = cev_rt(2 * P, P + 1)
+    val ra_v = cev_rt(P);         val ra_pc = cev_rt(P - 1, 0)
+    val ev_s   = own_sec || rs_v
+    val ev_a   = own_atki || ra_v
+    val ev_pc  = Mux(ev_s, Mux(own_sec, sec_pc, rs_pc), Mux(own_atki, atk_pc, ra_pc))
+    val ev_r   = Mux(ev_s, !own_sec, !own_atki)
+    // [T-IFT v5] the event is presented IN the M4 read cycle (s_meta_resp_2), not one cycle later: in that cycle the D$ s2 stage holds
+    // this MSHR's own meta read (the read won the metaReadArb two cycles earlier, so no LSU / prefetch request entered s0 then), so no
+    // s2 lane allocates, hits, or writes ift_evf, and the STATE R slot is free.  The D$ feeds the stock hooks from it (cf_evicts,
+    // cf_evict_sec/atk, ift_evf, STATE R) with the victim tag / validity of the meta response and the prober-nack qualifier
+    // (meta_resp.valid), so a nacked pass records nothing and the retry's pass records once.  No hold, no queue, no stall: v4's N1
+    // conflict (a lane clear in the record cycle) cannot occur.  All fields are flops (req, cev_rt, cev_gdom, cev_prom, arr_idx).
+    val m4 = io.cev_m4.get
+    m4.valid     := cev_on && state === s_meta_resp_2 && !req.tag_match
+    m4.bits.row  := arr_idx
+    m4.bits.way  := OHToUInt(req.way_en)
+    m4.bits.pf   := isPrefetch(req.uop.mem_cmd) || prom
+    m4.bits.key  := Mux(m4.bits.pf, cf_pri_pc12, req.uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))(P - 1, 0))
+    m4.bits.d    := cev_gdom.get
+    m4.bits.osec := own_sec;  m4.bits.oatk := own_atki
+    m4.bits.s    := ev_s;     m4.bits.a    := ev_a;     m4.bits.r := ev_r
+    m4.bits.pc   := ev_pc
+    m4.bits.mshr := 0.U
+    io.cev_line_o.get.valid := cev_line_v; io.cev_line_o.get.bits := cev_line   // [T-IFT v5] flops
+  }
   // [H1T] lean58 (Fable audit H1 (a), owner 2026-10-23): the IFT hold is removed; refill beats and meta writes
   // are never delayed for IFT (dcache.scala drops a colliding IFT metadata write instead).  io.cf_ift_hold is
   // tied false by the D$ and no longer read.
   io.req_pri_rdy         := false.B
-  io.req_sec_rdy         := sec_rdy && rpq.io.enq.ready
+  // [SA-F1] a lock-pending fetch whose verdict is unknown or a mismatch takes no secondary: a checked load must not get, or be
+  // sped up by, a line fetched for an access that may mismatch (paper: no data returns upward on a mismatch).  The secondary is
+  // nacked and retries (in s_prefetch the stock refusal drops the parked line, so the retry misses on its own).  Two flops on
+  // this AND (state decode, command compare already there): 0-1 level.
+  io.req_sec_rdy         := (if (SPECASAN) sec_rdy && rpq.io.enq.ready && !sa_nsh.get   // [T2b-fix1 v2, N3] = !sa_pnd && !sa_mis, one flop
+                             else          sec_rdy && rpq.io.enq.ready)
   io.mem_acquire.valid   := false.B
   io.mem_acquire.bits    := DontCare
   io.refill.valid        := false.B
@@ -469,6 +681,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
       // [RESID] a secondary at a secret-derived address also makes this line's residency secret.
       // [R124GATE] these cf_sec_asec/aatk(_pc) writes are inside the G2 `if (ENABLE_IFT)` above, so
       // IFT off nothing drives the constant wires (no self-referencing when, no comb loop).
+      cev_prom.foreach { pm => when (state === s_prefetch) { pm := true.B } }   // [T-IFT v4, N3] a secondary accepted by a parked prefetch promotes it
       when (io.req.cf_addr_sec.getOrElse(false.B) && !cf_sec_asec) {
         cf_sec_asec    := true.B
         cf_sec_asec_pc := io.req.uop.debug_pc(inflPcBitsCF + 1, 2)
@@ -509,10 +722,23 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
         // [CFNOISE-COMMENTED] isRead(io.req.uop.mem_cmd), isWrite(io.req.uop.mem_cmd))
     }
     req := io.req
+    if (ENABLE_CEVICHE) {   // [Ceviche M2 (c)]
+      cev_line_v := io.req.tag_match                         // an upgrade keeps its line; a miss gets one from the VSU
+      cev_line   := Cat(OHToUInt(io.req.way_en), io.req.cev_row.get)
+    }
+    if (SPECASAN) {   // [SA-F1] a lock-pending primary is a fetch (prefetch command: no rpq entry, no response, parks after refill)
+      sa_pnd.get  := io.req.sa_unk.get
+      sa_mis.get  := false.B
+      sa_nsh.get  := io.req.sa_unk.get   // [T2b-fix1 v2, N3]
+      sa_live.get := io.req.sa_unk.get   // [T2b-fix1 v2, B2] req := io.req above carries the load's br_mask (s2 GetNewBrMask)
+      when (io.req.sa_unk.get) { req.uop.mem_cmd := M_PFR }   // in the MSHR, not at s2: io.req's command (sec_rdy cone) is untouched
+    }
     if (ENABLE_IFT) {   // [R124GATE]
       cf_sec_asec := false.B   // [RESID]
       cf_sec_aatk := false.B   // [ATKRES]
-      cf_first_rp := !isPrefetch(io.req.uop.mem_cmd)
+      cev_prom.foreach(_ := false.B)   // [T-IFT v4, N3]
+      cf_first_rp := (if (SPECASAN) !isPrefetch(io.req.uop.mem_cmd) && !io.req.sa_unk.get   // [SA-F1] no rpq entry of its own
+                      else          !isPrefetch(io.req.uop.mem_cmd))
       // [SACCU] 2026-10-21 (one s_acc definition: the STQ uop bit is now set for a plain in-range store too): the
       // primary's s_acc becomes the refill LINE mark (cf_req_secret, all 8 DWs) only when the primary READS
       // (isRead: load, LR, SC, AMO).  A plain store primary keeps its s_acc on its rpq copy, so its replay marks
@@ -627,10 +853,15 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     when (rpq.io.deq.fire) {
       commit_line   := true.B
     }
-      .elsewhen (rpq.io.empty && !commit_line)
+      .elsewhen (if (!ENABLE_CEVICHE) (if (SPECASAN) rpq.io.empty && !commit_line && !sa_prom.get   // [T2b-fix1 v2, B2] a matched pend fetch
+                                       else          rpq.io.empty && !commit_line)                    // whose load is live commits (branch below)
+                 else (if (SPECASAN) rpq.io.empty && !commit_line && !(cev_on && req.tag_match) && !sa_prom.get
+                       else          rpq.io.empty && !commit_line && !(cev_on && req.tag_match)))   // [R1c B1] a Ceviche upgrade never parks: it commits
     {
       when (!rpq.io.enq.fire) {
         state := s_mem_finish_1
+        // [T2b-fix1 v2, N2] stock: a learned mismatch parks for one cycle and the s_prefetch drop below retires it (cf_pf_drop
+        // records it; req_sec_rdy is 0 while sa_mis, so no load can use the line meanwhile)
         finish_to_prefetch := enablePrefetching.B
       }
     } .elsewhen (rpq.io.empty || (rpq.io.deq.valid && !drain_load)) {
@@ -640,8 +871,12 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
       state := s_meta_read
     }
   } .elsewhen (state === s_meta_read) {
-    io.meta_read.valid := !io.prober_state.valid || !grantack.valid || ((io.prober_state.bits(untagBits-1,blockOffBits) & io.dcache_set_mask) =/= (req_idx & io.dcache_set_mask))
-    io.meta_read.bits.idx := req_idx
+    // [Ceviche M6] Ceviche mode: hold the read while ANY probe is in flight (exact and simple, probes are rare [J]); [Ceviche M2 (f)]
+    // and while the VSU grant is outstanding.  Ceviche off / cev_on = 0: the stock expression.
+    io.meta_read.valid := (if (!ENABLE_CEVICHE) (!io.prober_state.valid || !grantack.valid || ((io.prober_state.bits(untagBits-1,blockOffBits) & io.dcache_set_mask) =/= (req_idx & io.dcache_set_mask)))
+                           else Mux(cev_on, (!io.prober_state.valid || !grantack.valid) && !io.cev_ppast.get && cev_line_v,   // [R1c-p2 N1] a promoted MSHR (GrantAck sent) still waits for a probe that passed its MSHR check
+                                    (!io.prober_state.valid || !grantack.valid || ((io.prober_state.bits(untagBits-1,blockOffBits) & io.dcache_set_mask) =/= (req_idx & io.dcache_set_mask)))))
+    io.meta_read.bits.idx := arr_idx   // [Ceviche M2 (e)]
     io.meta_read.bits.tag := req_tag
     io.meta_read.bits.way_en := req.way_en
     when (io.meta_read.fire) {
@@ -651,13 +886,14 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     state := s_meta_resp_2
   } .elsewhen (state === s_meta_resp_2) {
     val needs_wb = io.meta_resp.bits.coh.onCacheControl(M_FLUSH)._1
+    if (ENABLE_CEVICHE) { when (cev_on) { cev_old_tag := io.meta_resp.bits.tag; cev_old_coh.get := io.meta_resp.bits.coh } }   // [Ceviche M4] the line's current block (D7); [R1c B2] and its state
     state := Mux(!io.meta_resp.valid, s_meta_read, // Prober could have nack'd this read
              Mux(needs_wb, s_meta_clear, s_commit_line))
   } .elsewhen (state === s_meta_clear) {
     io.meta_write.valid         := true.B   // [H1T] (was !cf_hold, [D1FIXA])
-    io.meta_write.bits.idx      := req_idx
+    io.meta_write.bits.idx      := arr_idx   // [Ceviche M2 (e)]
     io.meta_write.bits.data.coh := coh_on_clear
-    io.meta_write.bits.data.tag := req_tag
+    io.meta_write.bits.data.tag := (if (!ENABLE_CEVICHE) req_tag else Mux(cev_on, cev_tag, req_tag))   // [Ceviche M2 (e)]
     io.meta_write.bits.way_en   := req.way_en
 
     when (io.meta_write.fire) {
@@ -671,7 +907,10 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     // so the TL Release address is reconstructed correctly when the evicted block's full_idx
     // differs from the miss request's full_idx (set-masked aliasing).
     io.wb_req.bits.idx       := req.old_idx
+    if (ENABLE_CEVICHE) { when (cev_on) { io.wb_req.bits.idx := arr_idx } }   // [Ceviche M4] data read row = the line's row
+    io.wb_req.bits.cev_blk.foreach(_ := cev_old_tag)                          // [Ceviche M4] Release address (W1)
     io.wb_req.bits.param     := shrink_param
+    cev_old_coh.foreach(c => when (cev_on) { io.wb_req.bits.param := c.onCacheControl(M_FLUSH)._2 })   // [R1c B2] the evicted line's param, not the stock replacement way's
     io.wb_req.bits.way_en    := req.way_en
     io.wb_req.bits.source    := io.id
     io.wb_req.bits.voluntary := true.B
@@ -688,7 +927,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     io.lb_read.bits.offset := refill_ctr
 
     io.refill.valid       := io.lb_read.fire
-    io.refill.bits.addr   := req_block_addr | (refill_ctr << rowOffBits)
+    io.refill.bits.addr   := (if (!ENABLE_CEVICHE) req_block_addr else Mux(cev_on, arr_idx << blockOffBits, req_block_addr)) | (refill_ctr << rowOffBits)   // [Ceviche M2 (e)]
     io.refill.bits.way_en := req.way_en
     io.refill.bits.wmask  := ~(0.U(rowWords.W))
     io.refill.bits.data   := io.lb_resp
@@ -708,6 +947,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     // A replay rides lane 0 (s0_req -> s1_req(0)), whose s1 set is one of the compared slots; the second replay's
     // read-modify-write therefore sees the first one's DW bit, and later replays chain the same way.
     io.replay.bits.way_en    := req.way_en
+    io.replay.bits.cev_row.foreach(_ := arr_idx)   // [Ceviche M2 (e)] the replay's known-L row (the address stays physical)
     if (ENABLE_IFT) {   // [R124GATE] IFT off: the rpq uop's own bits, as before step 17
       io.replay.bits.uop.cf_mem_sec_dataflow.foreach(_ := rpq.io.deq.bits.uop.cf_mem_sec_dataflow.getOrElse(false.B) || cf_rp_vsec)   // [SECDEST]
       io.replay.bits.uop.cf_mem_dataflow_atk.foreach(_ := rpq.io.deq.bits.uop.cf_mem_dataflow_atk.getOrElse(false.B) || cf_rp_vatk)   // [ATKEVICT]
@@ -731,9 +971,9 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     }
   } .elsewhen (state === s_meta_write_req) {
     io.meta_write.valid         := true.B   // [H1T] (was !cf_hold, [D1FIXA])
-    io.meta_write.bits.idx      := req_idx
+    io.meta_write.bits.idx      := arr_idx   // [Ceviche M2 (e)]
     io.meta_write.bits.data.coh := new_coh
-    io.meta_write.bits.data.tag := req_tag
+    io.meta_write.bits.data.tag := (if (!ENABLE_CEVICHE) req_tag else Mux(cev_on, cev_tag, req_tag))   // [Ceviche M2 (e)]
     io.meta_write.bits.way_en   := req.way_en
     when (io.meta_write.fire) {
       state := s_mem_finish_1
@@ -764,6 +1004,28 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     } .elsewhen (io.req_pri_val && io.req_pri_rdy) {
       grant_had_data := false.B
       state := handle_pri_req(state)
+    }
+  }
+  // [SA-F1] parked with an unknown verdict (or, since v2 N2, parked at the drain), then a learned mismatch: drop the line (no data
+  // held for a mismatching access).  Never in a cycle that re-allocates this MSHR (sec_rdy is 0 while sa_mis, so no promotion can
+  // coincide).  [T2b-fix1 v2, B2] parked with an unknown verdict, then a learned MATCH while the load is live: install it as the
+  // stock promotion does (onAccess(M_PFR) on the granted line is a hit -> s_meta_read), unless a request decides this MSHR this
+  // cycle (clear, a secondary, a re-allocation: the stock branches win).  [T2b-fix1 v2, N1] a teaching secondary that is refused
+  // only because the verdict was pending does not drop the line: it stays parked and this block acts on the learned verdict next
+  // cycle (the secondary retries).  Next-state terms only (flops and the existing sec/pri valids); no ready or nack term.  Last connect.
+  if (SPECASAN) {
+    val pri_fire = io.req_pri_val && io.req_pri_rdy
+    val tch_keep = sa_tkeep.get
+    val (pf_hit, _, pf_coh) = new_coh.onAccess(req.uop.mem_cmd)
+    when (state === s_prefetch && !pri_fire) {
+      when (sa_mis.get) {
+        state := s_invalid
+      } .elsewhen (tch_keep) {
+        state := s_prefetch
+      } .elsewhen (sa_prom.get && pf_hit && !io.clear_prefetch && !io.req_sec_val) {
+        new_coh := pf_coh
+        state   := s_meta_read
+      }
     }
   }
 }
@@ -950,6 +1212,24 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     // [reconf-fix] all cacheable MSHRs strictly idle — gate condition for applying a
     // staged D$ geometry change (IOMSHRs excluded: they never touch the cache arrays).
     val cache_idle = Output(Bool())
+    val sa_fill_lk  = if (SPECASAN) Some(Output(UInt(17.W))) else None   // [SA-D8] locks of the MSHR whose meta write fires
+    val sa_all_idle = if (SPECASAN) Some(Output(Bool())) else None        // [SA-D8] every cacheable MSHR invalid (paint drain)
+    val sa_lnd      = if (SPECASAN) Some(Input(Valid(new SpecASanLanding))) else None   // [SA-F1] tag-line landing, to every MSHR
+    // [Ceviche M3] VSU interface of the file: the presented MSHR (round-robin pick, ceviche-plan-v5-amend-T1c.md H.4)
+    val cev_on     = if (ENABLE_CEVICHE) Some(Input(Bool())) else None
+    val cev_vreq   = if (ENABLE_CEVICHE) Some(Decoupled(Bool())) else None
+    val cev_vgrant = if (ENABLE_CEVICHE) Some(Input(UInt(log2Ceil(nSets*nWays).W))) else None
+    val cev_vreqId = if (ENABLE_CEVICHE) Some(Output(UInt((log2Ceil(cfg.nMSHRs) max 1).W))) else None   // [T1c v3 F4] the presented MSHR
+    val cev_ppast  = if (ENABLE_CEVICHE) Some(Input(Bool())) else None   // [R1c-p2 N1] the prober is past its MSHR check
+    val cev_vlock  = if (ENABLE_CEVICHE) Some(Input(Bool())) else None          // [T1c v3 F4] VSU lock.valid: a search runs
+    val cev_vend   = if (ENABLE_CEVICHE) Some(Input(Bool())) else None          // [T1c v3 F4] VSU roundEnd
+    val cev_rt     = if (ENABLE_CEVICHE && ENABLE_IFT) Some(Input(UInt((2 * (1 + inflPcBitsCF)).W))) else None   // [T-IFT v3] to every MSHR
+    val cev_vattr  = if (ENABLE_CEVICHE && ENABLE_IFT) Some(Output(UInt((2 + inflPcBitsCF).W))) else None     // [T-IFT v3] the presented MSHR's
+    val cev_m4     = if (ENABLE_CEVICHE && ENABLE_IFT) Some(Output(Valid(new CevM4Rec(idxBits, log2Ceil(nWays), inflPcBitsCF, log2Ceil(cfg.nMSHRs) max 1)))) else None   // [T-IFT v5]
+    // [T-IFT v5] per lane: the Ceviche nack causes (reserved line hit, upgrade blocked by the VSU) and the CRF hit line; the VSU's requester id
+    val cf_cev_nk  = if (ENABLE_CEVICHE && ENABLE_IFT) Some(Input(Vec(memWidth, new Bundle {
+                       val rsv = Bool(); val upg = Bool(); val line = UInt(log2Ceil(nSets*nWays).W) }))) else None
+    val cev_vid    = if (ENABLE_CEVICHE && ENABLE_IFT) Some(Input(UInt((log2Ceil(cfg.nMSHRs) max 1).W))) else None
     val probe_rdy = Output(Bool())
     // [reconf-fix 2026-08-12] Active set mask (cf_dcache_active_sets-1), driven by the
     // dcache.  The per-set exclusion below MUST compare the PHYSICAL row a line occupies,
@@ -998,7 +1278,10 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
       // is the one being stripped: a fill whose op_count was lost cannot be matched to
       // the op that caused it BY op_count.  The tag identifies the line directly and is
       // independent of every cf_* field.
-      val tag      = UInt(cfTagBits.W)
+      val tag      = UInt(cfMetaTagBits.W)   // [Ceviche D7] = cfTagBits unless Ceviche
+      val cev_alloc = if (ENABLE_CEVICHE) Some(Bool()) else None   // [Ceviche M7] allocating fill (primary miss, not an upgrade)
+      val cev_clr   = if (ENABLE_CEVICHE) Some(Bool()) else None   // [Ceviche M7] the MSHR's victim-clear write (state s_meta_clear)
+      val cev_dom   = if (ENABLE_CEVICHE) Some(Bool()) else None   // [R1c B5] the domain the VSU granted the written line for (CRF owner domain)
     }))
   })
 
@@ -1103,9 +1386,15 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
       // match only blocks a primary alloc or merges a secondary miss that also passes
       // tag_matches, and it restores the one-MSHR-per-row invariant way_matches' Mux1H
       // and the refill path rely on.
+      // [Ceviche M5] no sets: an MSHR conflicts only with a request to its own block (exact: full index and extended tag).  In Ceviche
+      // mode the set mask is all ones (D10 (d)), so the stock compare is the full-index compare and the mode adds only the tag compare
+      // [R1c m2, one level less than a separate 29-bit compare + mux; R1c B7: the stock expression stays unnamed in an off build].
       idx_matches(w)(i) := mshr.io.idx.valid &&
-                           (mshr.io.idx.bits & io.dcache_set_mask) ===
-                           (io.req(w).bits.addr(untagBits-1,blockOffBits) & io.dcache_set_mask)
+                           (if (!ENABLE_CEVICHE) (mshr.io.idx.bits & io.dcache_set_mask) ===
+                                                 (io.req(w).bits.addr(untagBits-1,blockOffBits) & io.dcache_set_mask)
+                            else (((mshr.io.idx.bits & io.dcache_set_mask) ===
+                                   (io.req(w).bits.addr(untagBits-1,blockOffBits) & io.dcache_set_mask)) &&
+                                  (!io.cev_on.get || mshr.io.tag.bits === io.req(w).bits.addr >> cfTagLSB)))
       // [reconf-fix] compare the extended tag (cfTagLSB), matching what the MSHR stores
       tag_matches(w)(i) := mshr.io.tag.valid && mshr.io.tag.bits === io.req(w).bits.addr >> cfTagLSB
       way_matches(w)(i) := mshr.io.way.valid && mshr.io.way.bits === io.req(w).bits.way_en
@@ -1119,15 +1408,21 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
       pri_rdy := mshr.io.req_pri_rdy
     }
 
-    mshr.io.req_sec_val  := req.valid && sdq_rdy && tag_match(req_idx) && idx_matches(req_idx)(i) && cacheable
+    // [SA-F1] a lock-unknown checked load is never a secondary (it would take line-buffer data, or promote / drop a parked line,
+    // without a verdict): sec_val = 0, so sec_rdy and io.req.ready are 0 and s2 nacks it (it is nacked by SpecASan anyway).
+    // sa_unk is an s2 flop through the same 2:1 lane select as addr: one more input on this AND, beside the idx/tag compares.
+    mshr.io.req_sec_val  := (if (SPECASAN) req.valid && sdq_rdy && tag_match(req_idx) && idx_matches(req_idx)(i) && cacheable && !req.bits.sa_unk.get
+                             else          req.valid && sdq_rdy && tag_match(req_idx) && idx_matches(req_idx)(i) && cacheable)
     mshr.io.req          := req.bits
+    mshr.io.sa_lnd.foreach(_ := io.sa_lnd.get)   // [SA-F1]
     mshr.io.req_is_probe := req_is_probe
     mshr.io.req.sdq_id   := sdq_alloc_id
 
     // Clear because of a FENCE, a request to the same idx as a prefetched line,
     // a probe to that prefetched line, all mshrs are in use
     mshr.io.clear_prefetch := ((io.clear_all && !req.valid)||
-      (req.valid && idx_matches(req_idx)(i) && cacheable && !tag_match(req_idx)) ||
+      (if (SPECASAN) req.valid && idx_matches(req_idx)(i) && cacheable && !tag_match(req_idx) && !req.bits.sa_unk.get   // [SA-F1] see sec_val
+       else          req.valid && idx_matches(req_idx)(i) && cacheable && !tag_match(req_idx)) ||
       (req_is_probe && idx_matches(req_idx)(i)) ||
       io.clear_prefetch_all)   // [reconf-fix] staged geometry change: retire parked prefetches
     mshr.io.brupdate       := io.brupdate
@@ -1136,6 +1431,7 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     mshr.io.rob_head_idx := io.rob_head_idx
 
     mshr.io.prober_state := io.prober_state
+    mshr.io.cev_ppast.foreach(_ := io.cev_ppast.get)   // [R1c-p2 N1]
 
     mshr.io.wb_resp      := io.wb_resp
 
@@ -1167,7 +1463,8 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
       io.fence_rdy := false.B
     }
     for (w <- 0 until memWidth) {
-      when (!mshr.io.probe_rdy && idx_matches(w)(i) && io.req_is_probe(w)) {
+      when (if (!ENABLE_CEVICHE) (!mshr.io.probe_rdy && idx_matches(w)(i) && io.req_is_probe(w))
+            else (((!mshr.io.probe_rdy && idx_matches(w)(i)) || mshr.io.cev_vbusy.get) && io.req_is_probe(w))) {   // [R1c B3]
         io.probe_rdy := false.B
       }
     }
@@ -1181,9 +1478,15 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
   // 2026-08-12) forbids.  This simulation check states that invariant: no two live MSHRs share
   // a masked row.  (s_prefetch holds the row too: idx.valid covers it.)
   for (i <- 0 until cfg.nMSHRs; j <- i + 1 until cfg.nMSHRs) {
+    if (!ENABLE_CEVICHE) {   // [IDOFF] the stock assert, verbatim (its first line is the assert message text)
     assert(!(mshrs(i).io.idx.valid && mshrs(j).io.idx.valid &&
              (mshrs(i).io.idx.bits & io.dcache_set_mask) === (mshrs(j).io.idx.bits & io.dcache_set_mask)),
            "D$ MSHR file: two live MSHRs own the same row")
+    } else {                 // [Ceviche M5] Ceviche mode allows several MSHRs per set
+    assert(!(mshrs(i).io.idx.valid && mshrs(j).io.idx.valid &&
+             (mshrs(i).io.idx.bits & io.dcache_set_mask) === (mshrs(j).io.idx.bits & io.dcache_set_mask) && !io.cev_on.get),
+           "D$ MSHR file: two live MSHRs own the same row")
+    }
   }
 
   // [reconf-fix 2026-08-06] Strict all-idle for the D$ config-commit gate.
@@ -1238,6 +1541,9 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
   io.cf_meta_write_fill.bits.tag      := meta_write_arb.io.out.bits.data.tag
   io.cf_meta_write_fill.bits.domain   := Mux1H(UIntToOH(meta_write_arb.io.chosen),
                                            VecInit(mshrs.map(_.io.cf_req_domain)))
+  io.cf_meta_write_fill.bits.cev_alloc.foreach(_ := Mux1H(UIntToOH(meta_write_arb.io.chosen), VecInit(mshrs.map(_.io.cev_alloc.get))))   // [Ceviche M7]
+  io.cf_meta_write_fill.bits.cev_clr.foreach(_   := Mux1H(UIntToOH(meta_write_arb.io.chosen), VecInit(mshrs.map(_.io.cev_clr.get))))
+  io.cf_meta_write_fill.bits.cev_dom.foreach(_   := Mux1H(UIntToOH(meta_write_arb.io.chosen), VecInit(mshrs.map(_.io.cev_gdom_o.get))))   // [R1c B5]
   io.cf_meta_write_fill.bits.op_count := Mux1H(UIntToOH(meta_write_arb.io.chosen),
                                            VecInit(mshrs.map(_.io.cf_req_op_count)))
   io.cf_meta_write_fill.bits.pc12     := Mux1H(UIntToOH(meta_write_arb.io.chosen),
@@ -1250,6 +1556,38 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
                                            VecInit(mshrs.map(_.io.cf_req_addr_atk)))   // [ATKRES]
   io.cf_meta_write_fill.bits.res_pc   := Mux1H(UIntToOH(meta_write_arb.io.chosen),
                                            VecInit(mshrs.map(_.io.cf_req_res_pc)))
+  io.sa_fill_lk.foreach(_  := Mux1H(UIntToOH(meta_write_arb.io.chosen), VecInit(mshrs.map(_.io.sa_req_lk.get))))
+  io.sa_all_idle.foreach(_ := mshrs.map(_.io.state_invalid).reduce(_&&_))
+  if (ENABLE_CEVICHE) {
+    // [T1c v3, owner F4 "Lock to the requester"] one MSHR is presented to the VSU at a time: a registered round-robin pick,
+    // frozen while the VSU searches (cev_vlock), so a search's grant can reach only the MSHR it was started for (the VSU
+    // also checks the id and domain it latched); the pick moves on at every search end (cev_vend) and past an MSHR that is
+    // not requesting (after a free-pool grant the MSHR's cev_line_v drops its request), so no MSHR starves.
+    val nV    = cfg.nMSHRs
+    val vq    = VecInit(mshrs.map(_.io.cev_vreq.get.valid))
+    val vPick = RegInit(0.U((log2Ceil(nV) max 1).W))
+    val above = VecInit((0 until nV).map(i => vq(i) && i.U > vPick)).asUInt
+    val vNext = Mux(above.orR, PriorityEncoder(above), PriorityEncoder(vq.asUInt))
+    when (io.cev_vend.get || (!io.cev_vlock.get && !vq(vPick))) { vPick := vNext }
+    io.cev_vreq.get.valid := vq(vPick)
+    io.cev_vreq.get.bits  := VecInit(mshrs.map(_.io.cev_vreq.get.bits))(vPick)
+    io.cev_vreqId.get     := vPick
+    for ((m, i) <- mshrs.zipWithIndex) {
+      m.io.cev_vreq.get.ready := io.cev_vreq.get.ready && vPick === i.U
+      m.io.cev_on.get := io.cev_on.get; m.io.cev_vgrant.get := io.cev_vgrant.get
+    }
+    if (ENABLE_IFT) {   // [T-IFT v3] grant attribution of the presented MSHR (vPick: a register) and the one M4 eviction record per cycle
+      io.cev_vattr.get := VecInit(mshrs.map(_.io.cev_vattr.get))(vPick)
+      mshrs.foreach(_.io.cev_rt.get := io.cev_rt.get)
+      // [T-IFT v5] one meta read per cycle, so at most one MSHR is in s_meta_resp_2: a one-hot select of flop-sourced fields (8:1, 2 LUT)
+      val m4s = mshrs.map(_.io.cev_m4.get)
+      val m4v = VecInit(m4s.map(_.valid)).asUInt
+      io.cev_m4.get.valid     := m4v.orR
+      io.cev_m4.get.bits      := Mux1H(m4v, m4s.map(_.bits))
+      io.cev_m4.get.bits.mshr := OHToUInt(m4v)
+      assert(PopCount(m4v) <= 1.U, "Ceviche MSHR file: two MSHRs in the M4 read cycle")
+    }
+  }
   // [NACKRES] step 16: nMSHRs-input OR + priority PC select, registered (one cycle old).
   // [NACKPF] DF-m55 (r140): a parked s_prefetch MSHR is not a miss in progress (it is allocatable,
   // req_pri_rdy=1), so it must not hold cf_asec_busy; io.way.valid already excludes s_prefetch.
@@ -1285,8 +1623,22 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     // beside-the-nack AND-OR trees, ending at the LDQ flag / PC flops: 0 on s2_nack and on every endpoint.
     // IFT off: not elaborated (inside if (ENABLE_IFT)).  RECORD CHANGE: fewer DC_NACK slots (non-conflict nacks).
     val cf_full_q = RegNext(!mshrs.map(_.io.req_pri_rdy).reduce(_ || _), false.B)
+    // [T-IFT v5] (amend-TIFT5 D3; owner rule "IFT is never switched off by a defense") the CONFLICTING MSHR of a nack.  Stock: the same-set
+    // MSHR (idx_matches).  Ceviche builds: idx_matches is a same-BLOCK match in Ceviche mode (M5), so a nack on a reserved victim line or an
+    // upgrade blocked by the VSU (the Ceviche twins of the stock victim nack) found no conflicting MSHR and lost its NACKRES / NACKATK record.
+    // The conflict is then the MSHR that owns the hit line (cev_line_o, the line it was granted or holds) or, for an upgrade blocked by a
+    // search / grant, the VSU's requester (cev_vid).  Same-block match first (a secondary), then the line owner, then the VSU requester.
+    // Levels (EST): 8 x 10-bit compares of flops (MSHR line vs the s2 line register) + 8-input OR + 2:1, beside the nack path, ending at the
+    // LDQ flag / PC flops as before.  Cost ~2 x 8 x 4 + ~40 LUT.  Ceviche off: the stock expressions (Scala `if`).
+    val cf_cm = if (!ENABLE_CEVICHE) None else Some(widthMap(w => {
+      val nk = io.cf_cev_nk.get(w)
+      val rs = VecInit(mshrs.map(m => nk.rsv && m.io.cev_line_o.get.valid && m.io.cev_line_o.get.bits === nk.line))
+      val up = VecInit((0 until cfg.nMSHRs).map(i => nk.upg && io.cev_vid.get === i.U))
+      Mux(idx_match(w), idx_matches(w), Mux(rs.asUInt.orR, rs, up)) }))
+    def cfCm(w: Int): Seq[Bool] = cf_cm.map(_(w): Seq[Bool]).getOrElse(idx_matches(w))
+    def cfCh(w: Int): Bool      = cf_cm.map(_(w).asUInt.orR).getOrElse(idx_match(w))
     for (w <- 0 until memWidth) {
-      io.cf_nack_aatk.get(w) := Mux(idx_match(w), (idx_matches(w) zip cf_aatk_q).map { case (m, a) => m && a }.reduce(_ || _),
+      io.cf_nack_aatk.get(w) := Mux(cfCh(w), (cfCm(w) zip cf_aatk_q).map { case (m, a) => m && a }.reduce(_ || _),
                                     cf_full_q && cf_aatk_q.reduce(_ || _))   // [NACKFULL]
     }
     // [NACKCONFSEC] lean58 (M8): the same form for the secret side (patch 68's attacker rule): per-MSHR registered
@@ -1295,7 +1647,7 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     // ending at the LSU's LDQ flag write).  About 2 x (8 AND-OR + 1) LUT.
     val cf_asec_q = cf_asec_live.map(RegNext(_, false.B))
     for (w <- 0 until memWidth) {
-      io.cf_nack_asec.get(w) := Mux(idx_match(w), (idx_matches(w) zip cf_asec_q).map { case (m, a) => m && a }.reduce(_ || _),
+      io.cf_nack_asec.get(w) := Mux(cfCh(w), (cfCm(w) zip cf_asec_q).map { case (m, a) => m && a }.reduce(_ || _),
                                     cf_full_q && cf_asec_q.reduce(_ || _))   // [NACKFULL]
     }
     io.cf_asec_busy.bits  := RegNext(PriorityMux(cf_asec_live ++ cf_aatk_live :+ true.B,
@@ -1313,7 +1665,7 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     // 2 x ~3 x 12 LUT, ~170 LUT.
     val cf_pc_q = (cf_asec_q zip mshrs).map { case (s, m) => Mux(s, m.io.cf_req_res_pc, m.io.cf_req_pc12) }
     for (w <- 0 until memWidth) {
-      io.cf_nack_pc.get(w) := Mux(idx_match(w), Mux1H(idx_matches(w), cf_pc_q), io.cf_asec_busy.bits)
+      io.cf_nack_pc.get(w) := Mux(cfCh(w), Mux1H(cfCm(w), cf_pc_q), io.cf_asec_busy.bits)
     }
   } else {
     io.cf_asec_busy.bits  := RegNext(PriorityMux(cf_asec_live :+ true.B,

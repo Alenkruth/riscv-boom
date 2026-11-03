@@ -62,6 +62,15 @@ class IssueSlotIO(val numWakeupPorts: Int, val numPendPorts: Int = 0)(implicit p
   // [IQHEAD] patch 49 (r174/r175): this slot's attacker-influence bit, read only by the IQ_FULL head
   // attribution (issue-unit-age-ordered.scala).  IFT off None.
   val cf_src_atk     = if (ENABLE_IFT) Some(Output(Bool())) else None
+  // STT (stt-plan-v4.md C-IQ-1): the LSU's per-entry VP flags; this slot holds a tainted transmitter (stats, Doppelganger)
+  val stt_ldq_safe = if (ENABLE_STT) Some(Input(UInt(numLdqEntries.W))) else None
+  val stt_blk      = if (ENABLE_STT) Some(Output(Bool())) else None
+  // [v6] DelayExecute (stt-plan-v6.md 4.0b): mode, model, ROB head and (v7) PNR and failure pair for the slot's own-VP test
+  val stt_dx       = if (ENABLE_STT) Some(Input(Bool())) else None
+  val stt_fut      = if (ENABLE_STT) Some(Input(Bool())) else None
+  val stt_rob_head = if (ENABLE_STT) Some(Input(UInt(robAddrSz.W))) else None
+  val stt_rob_pnr  = if (ENABLE_STT) Some(Input(UInt(robAddrSz.W))) else None            // [v7] P-F2: ROB point of no return
+  val stt_fail_rob = if (ENABLE_STT) Some(Input(Valid(UInt(robAddrSz.W)))) else None     // [v7] P-F2: oldest order-failing load
 
   val wakeup_ports  = Flipped(Vec(numWakeupPorts, Valid(new IqWakeup(maxPregSz, ENABLE_IFT))))
   val pred_wakeup_port = Flipped(Valid(UInt(log2Ceil(ftqSz).W)))
@@ -123,6 +132,27 @@ class IssueSlot(val numWakeupPorts: Int, val numPendPorts: Int = 0, val pendFlt:
 
   val slot_uop = RegInit(NullMicroOp())
   val next_uop = Mux(io.in_uop.valid, io.in_uop.bits, slot_uop)
+
+  // STT: the slot's gate root (t already includes the IQ's class and runtime gate, C-CORE-1 (d)). Held: re-checked
+  // against the VP flags every cycle (the paper's RS check, l.731-735); entering: as computed at dispatch or by the
+  // source slot this cycle. The gate is the root's t, a flop. Scala-gated: STT off leaves p1 / request untouched.
+  // [v6] the clear condition: STT = the root's load is past the VP; DelayExecute = this uop itself is past its VP
+  // (4.0b, A13 (ii)): no unresolved older branch after this cycle's resolve, and in the Futuristic model [v7, P-F2] the PNR
+  // is at or past the uop and no older load has an order failure pending. The mask is the same expression as the slot's next_br_mask (:381), written out here
+  // because next_br_mask is declared later in the class body (a forward reference is null at elaboration, G23).
+  val stt_held: Option[SttRoot] = if (ENABLE_STT) Some({
+    val h      = Wire(new SttRoot)
+    val me      = slot_uop.rob_idx
+    val pnr_at  = me === io.stt_rob_pnr.get || IsOlder(me, io.stt_rob_pnr.get, io.stt_rob_head.get)   // PNR at or past me
+    val no_fail = !io.stt_fail_rob.get.valid || IsOlder(me, io.stt_fail_rob.get.bits, io.stt_rob_head.get)
+    val own_vp  = GetNewBrMask(io.brupdate, slot_uop) === 0.U && (!io.stt_fut.get || (pnr_at && no_fail))
+    val clr    = Mux(io.stt_dx.get, own_vp, io.stt_ldq_safe.get(slot_uop.stt_gr.get.idx))
+    h.t   := slot_uop.stt_gr.get.t && !clr
+    h.idx := slot_uop.stt_gr.get.idx
+    h }) else None
+  val stt_next: Option[SttRoot] = stt_held.map(h => Mux(io.in_uop.valid, io.in_uop.bits.stt_gr.get, h))
+  val blk: Bool = if (ENABLE_STT) slot_uop.stt_gr.get.t else false.B
+  val p1e: Bool = if (ENABLE_STT) p1 && !blk else p1      // "address half ready" of an s_valid_2 slot
 
   // corefuzzing: per-slot ISSUE_CONTENTION accumulation registers.
   // Declared here (before out_uop assignments) so they can be referenced in out_uop.
@@ -217,7 +247,7 @@ class IssueSlot(val numWakeupPorts: Int, val numPendPorts: Int = 0, val pendFlt:
   when (io.kill) {
     next_state := s_invalid
   } .elsewhen ((io.grant && (state === s_valid_1)) ||
-    (io.grant && (state === s_valid_2) && p1 && p2 && ppred)) {
+    (io.grant && (state === s_valid_2) && p1e && p2 && ppred)) {
     // try to issue this uop.
     when (!(io.ldspec_miss && (p1_poisoned || p2_poisoned))) {
       next_state := s_invalid
@@ -225,7 +255,7 @@ class IssueSlot(val numWakeupPorts: Int, val numPendPorts: Int = 0, val pendFlt:
   } .elsewhen (io.grant && (state === s_valid_2)) {
     when (!(io.ldspec_miss && (p1_poisoned || p2_poisoned))) {
       next_state := s_valid_1
-      when (p1) {
+      when (p1e) {
         slot_uop.uopc := uopSTD
         next_uopc := uopSTD
         slot_uop.lrs1_rtype := RT_X
@@ -409,6 +439,11 @@ class IssueSlot(val numWakeupPorts: Int, val numPendPorts: Int = 0, val pendFlt:
   when (!io.in_uop.valid) {
     slot_uop.br_mask := next_br_mask
   }
+  slot_uop.stt_gr.foreach(_ := stt_next.get)      // STT: overrides the whole-uop copy of :241 by last connect
+  io.stt_blk.foreach(_ := is_valid && blk)
+  if (ENABLE_STT && ENABLE_CF_DEBUG_PRINTF) {
+    assert(!(io.grant && state === s_valid_1 && blk), "[STT] held slot granted")
+  }
 
   //-------------------------------------------------------------
   // Request Logic
@@ -417,9 +452,11 @@ class IssueSlot(val numWakeupPorts: Int, val numPendPorts: Int = 0, val pendFlt:
   io.request_hp := io.request && high_priority
 
   when (state === s_valid_1) {
-    io.request := p1 && p2 && p3 && ppred && !io.kill
+    // STT: a held transmitter does not request (for a store whose data half issued first, the remaining half is the
+    // address, whose root is this one)
+    io.request := (if (ENABLE_STT) p1 && p2 && p3 && ppred && !io.kill && !blk else p1 && p2 && p3 && ppred && !io.kill)
   } .elsewhen (state === s_valid_2) {
-    io.request := (p1 || p2) && ppred && !io.kill
+    io.request := (p1e || p2) && ppred && !io.kill
   } .otherwise {
     io.request := false.B
   }
@@ -457,11 +494,12 @@ class IssueSlot(val numWakeupPorts: Int, val numPendPorts: Int = 0, val pendFlt:
   io.uop.iw_p2_poisoned := p2_poisoned
 
   // micro-op will vacate due to grant.
-  val may_vacate = io.grant && ((state === s_valid_1) || (state === s_valid_2) && p1 && p2 && ppred)
+  val may_vacate = io.grant && ((state === s_valid_1) || (state === s_valid_2) && p1e && p2 && ppred)
   val squash_grant = io.ldspec_miss && (p1_poisoned || p2_poisoned)
   io.will_be_valid := is_valid && !(may_vacate && !squash_grant)
 
   io.out_uop            := slot_uop
+  io.out_uop.stt_gr.foreach(_ := stt_held.get)    // STT: a shifting uop carries this cycle's re-check
   io.out_uop.iw_state   := next_state
   io.out_uop.uopc       := next_uopc
   io.out_uop.lrs1_rtype := next_lrs1_rtype
@@ -501,9 +539,9 @@ class IssueSlot(val numWakeupPorts: Int, val numPendPorts: Int = 0, val pendFlt:
   }
 
   when (state === s_valid_2) {
-    when (p1 && p2 && ppred) {
+    when (p1e && p2 && ppred) {
       ; // send out the entire instruction as one uop
-    } .elsewhen (p1 && ppred) {
+    } .elsewhen (p1e && ppred) {
       io.uop.uopc := slot_uop.uopc
       io.uop.lrs2_rtype := RT_X
     } .elsewhen (p2 && ppred) {
@@ -596,7 +634,7 @@ class IssueSlot(val numWakeupPorts: Int, val numPendPorts: Int = 0, val pendFlt:
   // Output: fire when granted AND contention was recorded.
   // Uses registered values — grant and denial are mutually exclusive so registers are final.
   val is_granted = io.grant && ((state === s_valid_1) ||
-    ((state === s_valid_2) && p1 && p2 && ppred))
+    ((state === s_valid_2) && p1e && p2 && ppred))
   io.cf_contend_out.valid                  := is_granted && cf_cntd_valid
   io.cf_contend_out.bits.rob_idx           := slot_uop.rob_idx
   io.cf_contend_out.bits.winner_op_count   := cf_cntd_winner_op

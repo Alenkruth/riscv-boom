@@ -188,17 +188,18 @@ case class BoomCoreParams(
     "dcacheReplPolicy must be 0/2 (PseudoLRU), 1 (TrueLRU) or 3 (LFSR random)")
   require(!enableSTT || !enableSFBOpt, "STT: SFB predication not supported (sfb shadow uops are predicated, not branch-gated)")
   require(!enableDoppelganger || enableSTT, "Doppelganger is an optimization on top of STT")
-  require(isPow2(doppelgangerEntries) && isPow2(doppelgangerWays) && doppelgangerWays >= 2 &&
-          doppelgangerEntries / doppelgangerWays >= 2, "doppelgangerEntries/Ways: powers of 2, >= 2 sets")
-  require(isPow2(decodeWidth) && doppelgangerTrainQueueDepth % decodeWidth == 0 &&
-          isPow2(doppelgangerTrainQueueDepth / decodeWidth), "train queue: decodeWidth banks of a power-of-2 depth")
-  require(doppelgangerConfThreshold >= 0 && doppelgangerConfThreshold <= 3, "doppelgangerConfThreshold is a 2-bit count")
-  require(doppelgangerNackRetries >= 0 && doppelgangerNackRetries <= 3, "doppelgangerNackRetries is a 2-bit count")
-  require(doppelgangerTagBits >= 4 && doppelgangerTagBits <= 16, "doppelgangerTagBits")
-  require(isPow2(specasanTagCacheEntries) && specasanTagCacheEntries >= 16, "SpecASan: tag-line buffer entries must be a power of two >= 16")
-  require(isPow2(specasanTagWindowBytes) && specasanTagWindowBytes >= (BigInt(specasanTagCacheEntries) << 10) &&
-          specasanTagWindowBase % specasanTagWindowBytes == 0, "SpecASan: the tagged window must be a power of two, aligned, and cover the buffer")
-  require(specasanPaintQueue >= 2, "SpecASan: paint queue depth")
+  // [T0-fix1] parameter checks apply only when the defense is built (a defense-off config may have any decodeWidth)
+  require(!enableDoppelganger || (isPow2(doppelgangerEntries) && isPow2(doppelgangerWays) && doppelgangerWays >= 2 &&
+          doppelgangerEntries / doppelgangerWays >= 2), "doppelgangerEntries/Ways: powers of 2, >= 2 sets")
+  require(!enableDoppelganger || (isPow2(decodeWidth) && doppelgangerTrainQueueDepth % decodeWidth == 0 &&
+          isPow2(doppelgangerTrainQueueDepth / decodeWidth)), "train queue: decodeWidth banks of a power-of-2 depth")
+  require(!enableDoppelganger || (doppelgangerConfThreshold >= 0 && doppelgangerConfThreshold <= 3), "doppelgangerConfThreshold is a 2-bit count")
+  require(!enableDoppelganger || (doppelgangerNackRetries >= 0 && doppelgangerNackRetries <= 3), "doppelgangerNackRetries is a 2-bit count")
+  require(!enableDoppelganger || (doppelgangerTagBits >= 4 && doppelgangerTagBits <= 16), "doppelgangerTagBits")
+  require(!enableSpecASan || (isPow2(specasanTagCacheEntries) && specasanTagCacheEntries >= 16), "SpecASan: tag-line buffer entries must be a power of two >= 16")
+  require(!enableSpecASan || (isPow2(specasanTagWindowBytes) && specasanTagWindowBytes >= (BigInt(specasanTagCacheEntries) << 10) &&
+          specasanTagWindowBase % specasanTagWindowBytes == 0), "SpecASan: the tagged window must be a power of two, aligned, and cover the buffer")
+  require(!enableSpecASan || specasanPaintQueue >= 2, "SpecASan: paint queue depth")
   require(!enableCeviche || enableIFT,    "Ceviche uses the IFT domain plumbing (cf_domain_id, fetch domain)")
   require(!enableCeviche || enableReconf, "Ceviche switches the D$ mode through the 2.10f writeback walk (exists only with enableReconf)")
 

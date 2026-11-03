@@ -166,6 +166,16 @@ class IssueUnitIO(
   // [V3PAUSE] SP-20 (design 6.2 LOAD_PAUSE 0x27): the core's pause_mem (the load-saturation pause that zeroes the mem
   // issue port's fu_types for one cycle) into the mem IQ's deny latch; tied false for the other IQs.  IFT only.
   val cf_pause_mem = if (ENABLE_IFT) Some(Input(Bool())) else None
+  // STT (stt-plan-v5.md C-IQ-2): VP flags and debug enable in; any held slot (stats) out
+  val stt_ldq_safe = if (ENABLE_STT) Some(Input(UInt(numLdqEntries.W))) else None
+  val stt_dbg      = if (ENABLE_STT) Some(Input(Bool())) else None
+  val stt_any_blk  = if (ENABLE_STT) Some(Output(Bool())) else None
+  // [v6] DelayExecute (stt-plan-v6.md 4.0b): mode, model, ROB head, fanned out to every slot; [v7] + PNR and failure pair
+  val stt_dx       = if (ENABLE_STT) Some(Input(Bool())) else None
+  val stt_fut      = if (ENABLE_STT) Some(Input(Bool())) else None
+  val stt_rob_head = if (ENABLE_STT) Some(Input(UInt(robAddrSz.W))) else None
+  val stt_rob_pnr  = if (ENABLE_STT) Some(Input(UInt(robAddrSz.W))) else None              // [v7] P-F2
+  val stt_fail_rob = if (ENABLE_STT) Some(Input(Valid(UInt(robAddrSz.W)))) else None       // [v7] P-F2
   val cf_fu_busy       = Input(Valid(new Bundle {
     val op_count = UInt(uopIDCounterWidthCF.W)
     val is_atk   = Bool()
@@ -308,6 +318,29 @@ abstract class IssueUnit(
     // Task 3.4: a dispatch-entry position carries no contention state; the collapsing
     // subclass overrides this beside in_uop.bits for the shifted positions.
     issue_slots(i).in_cntd := 0.U.asTypeOf(new IssueCntdCarry)
+  }
+
+  for (i <- 0 until numIssueSlots) {
+    issue_slots(i).stt_ldq_safe.foreach(_ := io.stt_ldq_safe.get)
+    issue_slots(i).stt_dx.foreach(_ := io.stt_dx.get)               // [v6]
+    issue_slots(i).stt_fut.foreach(_ := io.stt_fut.get)             // [v6]
+    issue_slots(i).stt_rob_head.foreach(_ := io.stt_rob_head.get)   // [v6]
+    issue_slots(i).stt_rob_pnr.foreach(_ := io.stt_rob_pnr.get)     // [v7] P-F2
+    issue_slots(i).stt_fail_rob.foreach(_ := io.stt_fail_rob.get)   // [v7] P-F2
+  }
+  // a valid slot holds a tainted transmitter; registered (stats only)
+  io.stt_any_blk.foreach(_ := RegNext((0 until numIssueSlots).map(i => issue_slots(i).stt_blk.get).reduce(_ || _), false.B))
+
+  // STT C-IQ-3: debug print, one line per hold start
+  if (ENABLE_STT && ENABLE_CF_DEBUG_PRINTF) {
+    for (i <- 0 until numIssueSlots) {
+      val s = issue_slots(i)
+      val blk_q = RegNext(s.stt_blk.get, false.B)
+      when (io.stt_dbg.get && s.stt_blk.get && !blk_q) {     // one line per hold start
+        printf("[STT] c=%d iq=%d slot=%d pc=0x%x root=%d dx=%d rob=%d\n", io.tsc_reg, iqType.U, i.U, s.uop.debug_pc,
+               s.uop.stt_grv.idx, io.stt_dx.get, s.uop.rob_idx)   // [v6] dx = DelayExecute hold (root idx unused then)
+      }
+    }
   }
 
   // Task 3.4 (D18): per-slot hold register for the kill-time contention record, written only

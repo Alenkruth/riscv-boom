@@ -54,6 +54,7 @@ import chisel3.experimental.annotate
 
 import boom.v3.common._
 import boom.v3.exu.{BrUpdateInfo, Exception, FuncUnitResp, CommitSignals, ExeUnitResp, SpecLdWakeup, WinShadowInfo}
+import boom.v3.exu.DglTrainReq
 
 // fore corefuzzing - SpeculativePRintf and Sext
 import boom.v3.util.{BoolToChar, AgePriorityEncoder, IsKilledByBranch, GetNewBrMask, WrapInc, IsOlder, UpdateBrMask, SpeculativePrintf}
@@ -397,9 +398,10 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   val stt_ldq_safe = if (ENABLE_STT) Some(Output(UInt(numLdqEntries.W))) else None   // STT: per-entry VP flags
   val stt_ldq_head = if (ENABLE_STT) Some(Output(UInt(ldqAddrSz.W))) else None       // STT: age reference of the roots
   val stt_fail_rob = if (ENABLE_STT) Some(Output(Valid(UInt(robAddrSz.W)))) else None   // STT: oldest order-failing load (P-F2)   // [v7]
+  val stt_noret    = if (ENABLE_STT) Some(Output(Valid(UInt(robAddrSz.W)))) else None   // STT C-LSU-4: retire guard, oldest load with a deferred squash (registered) [R1s-a B2]
   val dgl_ctl      = if (ENABLE_DOPPELGANGER) Some(Input(Bool())) else None          // Doppelganger: runtime enable
   val dgl_stat     = if (ENABLE_DOPPELGANGER) Some(Output(UInt(48.W))) else None     // Doppelganger: four 12-bit counters
-  // (Doppelganger's T1d inserts `dgl_train` here: its type DglTrainReq is defined in T1d's new file)
+  val dgl_train    = if (ENABLE_DOPPELGANGER) Some(Output(Vec(coreWidth, Valid(new DglTrainReq)))) else None   // Doppelganger: committed-load training pushes
   val sa_ctl_en     = if (SPECASAN) Some(Input(Bool())) else None                     // SpecASan: SPECASAN_CTL[0]
   val sa_paint_wen  = if (SPECASAN) Some(Input(Bool())) else None                     // SpecASan: csrw 0xbd5 pulse
   val sa_paint_data = if (SPECASAN) Some(Input(UInt(64.W))) else None                // SpecASan: the paint word
@@ -444,6 +446,13 @@ class LDQEntry(implicit p: Parameters) extends BoomBundle()(p)
   val addr_is_secret      = if (ENABLE_IFT) Some(Bool()) else None
   // corefuzzing: ATTACKER taint of the address operand.  Same rule, same source.
   val addr_is_atk         = if (ENABLE_IFT) Some(Bool()) else None
+  // [SA-3] SpecASan (the paper's tcs): unsafe = mismatch known while speculative (re-fires only when non-speculative, SA-5A);
+  // stlwait = tagged load held for older store addresses (Spectre-v4); faulted = tag-check fault raised (never re-fire);
+  // key = the pointer key used (retry / wakeup / forwarding).
+  val sa_unsafe  = if (SPECASAN) Some(Bool()) else None
+  val sa_stlwait = if (SPECASAN) Some(Bool()) else None
+  val sa_faulted = if (SPECASAN) Some(Bool()) else None
+  val sa_key     = if (SPECASAN) Some(UInt(4.W)) else None
 
   val executed            = Bool() // load sent to memory, reset by NACKs
   val succeeded           = Bool()
@@ -455,6 +464,25 @@ class LDQEntry(implicit p: Parameters) extends BoomBundle()(p)
 
   val forward_std_val     = Bool()
   val forward_stq_idx     = UInt(stqAddrSz.W) // Which store did we get the store-load forward from?
+  // STT (stt-plan-v4.md C-LSU-4): PendingSquash. stt_of_root = the oldest root among the address roots of the stores that
+  // aliased this executed load (the paper's min YRoT_impSquash), re-checked every cycle (C-LSU-0); stt_of_pend = an alias
+  // is recorded whose effects (retry/wakeup suppression, the ld_xcpt report) wait until that root is safe.
+  val stt_of_root = if (ENABLE_STT) Some(new SttRoot) else None
+  val stt_of_pend = if (ENABLE_STT) Some(Bool()) else None
+  // [Doppelganger] doppelganger state (dgl-plan-v4.md 4.1). The prediction itself lives in uop.dg_pv / uop.dg_pa.
+  val dg_paddr   = if (ENABLE_DOPPELGANGER) Some(UInt(paddrBits.W)) else None   // translation of the prediction (set at issue)
+  val dg_state   = if (ENABLE_DOPPELGANGER) Some(UInt(2.W)) else None           // DGState
+  val dg_tag     = if (ENABLE_DOPPELGANGER) Some(UInt(doppelgangerTagBits.W)) else None
+  val dg_nacks   = if (ENABLE_DOPPELGANGER) Some(UInt(2.W)) else None           // retries used (nack, DTLB miss)
+  val dg_data    = if (ENABLE_DOPPELGANGER) Some(UInt(xLen.W)) else None        // RAW doubleword at dword(dg_paddr)
+  val dg_ovm     = if (ENABLE_DOPPELGANGER) Some(UInt(8.W)) else None           // bytes overridden by older stores (4.4)
+  val dg_wait    = if (ENABLE_DOPPELGANGER) Some(Bool()) else None              // verified, waiting for the dg response
+  val dg_val_sec = if (ENABLE_DOPPELGANGER) Some(Bool()) else None              // value labels of the response (IFT; 0 otherwise)
+  val dg_val_atk = if (ENABLE_DOPPELGANGER) Some(Bool()) else None
+  // [NOOFF] (dgl-plan-v5-amend-NOOFF.md D1; owner 2026-11-01 "IFT is never switched off by a defense"): the D$ edges of the live
+  // doppelganger response (the stock-built list the response carries: CACHE_EVICTION / MEM_DATAFLOW / DC_NACK and the footprint),
+  // held with the value so a HIT release delivers them like a WAIT release.  IFT builds only (IFT off: the release list stays 0).
+  val dg_edges   = if (ENABLE_DOPPELGANGER && ENABLE_IFT) Some(new IftEdgeList) else None
 
   val debug_wb_data       = UInt(xLen.W)
 }
@@ -466,6 +494,8 @@ class STQEntry(implicit p: Parameters) extends BoomBundle()(p)
   // corefuzzing: taint of the ADDRESS operand (rs1) only.  See LDQEntry.
   val addr_is_secret      = if (ENABLE_IFT) Some(Bool()) else None
   val addr_is_atk         = if (ENABLE_IFT) Some(Bool()) else None
+  // [SA-3] SpecASan: the store's pointer key (store-to-load forwarding only on key match, paper 3.4)
+  val sa_key    = if (SPECASAN) Some(UInt(4.W)) else None
   // corefuzzing: taint of the store's DATA operand (rs2) only.  Kept separate from
   // the uop's aggregate cf_secret_propagation, which also carries fetch/observability
   // taint and says nothing about the VALUE being stored.
@@ -493,6 +523,10 @@ class STQEntry(implicit p: Parameters) extends BoomBundle()(p)
   // cf_attacker_influence stays zeroed (Change 8: the commit request and the AMO response read it).
   // Read only by the MEM_ORDER edge (lsu [MEMORDATK] below).  1 FF per entry.
   val cf_dis_atk          = if (ENABLE_IFT) Some(Bool()) else None
+  // STT (stt-plan-v4.md C-LSU-1): root of this store's ADDRESS operand (the paper's store yrot, l.769-773, A2): written at
+  // allocation, re-checked every cycle (C-LSU-0). stt_ataint = "the address operand is still tainted" (Doppelganger reads it).
+  val stt_ar = if (ENABLE_STT) Some(new SttRoot) else None
+  def stt_ataint: Option[Bool] = stt_ar.map(_.t)
   val data                = Valid(UInt(xLen.W))
 
   val committed           = Bool() // committed by ROB
@@ -534,6 +568,44 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val cf_ldq_active = ldqOptionsVec(cf_ldq_idx_applied)
   val cf_stq_active = stqOptionsVec(cf_stq_idx_applied)
 
+  // [Doppelganger] runtime enable, registered locally (CSR flop -> one LSU flop -> consumers)
+  val dgl_en_q = if (ENABLE_DOPPELGANGER) Some(RegNext(io.core.dgl_ctl.get, false.B)) else None
+  val dgl_en   = dgl_en_q.getOrElse(false.B)
+  object DGState { val IDLE = 0.U(2.W); val INFLIGHT = 1.U(2.W); val DONE = 2.U(2.W); val DEAD = 3.U(2.W) }
+  def dglWV(n: Int) = if (ENABLE_DOPPELGANGER) Some(WireInit(VecInit(Seq.fill(n)(false.B)))) else None
+  // per-entry request wires (many writers, one reader block L14); each writer is `when (c) { x.get(i) := true.B }`
+  val dgl_dead_req  = dglWV(numLdqEntries)   // doppelganger dropped
+  val dgl_dead_nk   = dglWV(numLdqEntries)   // [R1d M1] the L12 (D$ nack) subset of dgl_dead_req: the only writer that is off the DTLB output path; read by L7 B noChg / late
+  val dgl_idle_req  = dglWV(numLdqEntries)   // doppelganger to be re-issued (nack / DTLB-miss retry)
+  val dgl_refire    = dglWV(numLdqEntries)   // the real load must re-fire (executed := false)
+  val dgl_wait_set  = dglWV(numLdqEntries)   // L7 B sets dg_wait this cycle (read by L14)
+  val dg_mrg        = dglWV(numLdqEntries)   // L9: the store leaving the STQ merges into this entry's held doubleword
+  val dg_nack_ev    = dglWV(numLdqEntries)
+  val dg_nack_blk   = dg_nack_ev.map(v => { val n1 = RegInit(0.U(numLdqEntries.W)); val n2 = RegInit(0.U(numLdqEntries.W)); n1 := v.asUInt; n2 := n1; (n1 | n2).asBools })   // [elabfix] explicit width: RegNext infers it, asBools needs it at elaboration
+  val dgl_tag_ctr   = if (ENABLE_DOPPELGANGER) Some(RegInit(0.U(doppelgangerTagBits.W))) else None
+  // live doppelganger responses this cycle, per lane (written in the response handler L11, read by L7 B and L10)
+  val dgr_v     = dglWV(memWidth)
+  val dgr_idx   = if (ENABLE_DOPPELGANGER) Some(WireInit(VecInit(Seq.fill(memWidth)(0.U(ldqAddrSz.W))))) else None
+  val dgr_raw   = if (ENABLE_DOPPELGANGER) Some(Wire(Vec(memWidth, UInt(xLen.W)))) else None   // [R1d M2] raw D$ response data, validity is dgr_v (no dg_ok gate on the data path)
+  val dgr_uop   = if (ENABLE_DOPPELGANGER) Some(Wire(Vec(memWidth, new MicroOp))) else None
+  val dgr_sec   = dglWV(memWidth); val dgr_atk = dglWV(memWidth)
+  val dgr_edges = if (ENABLE_DOPPELGANGER) Some(Wire(Vec(memWidth, new IftEdgeList))) else None
+  dgr_raw.foreach(_ := DontCare); dgr_uop.foreach(_ := DontCare); dgr_edges.foreach(_.foreach(_ := 0.U.asTypeOf(new IftEdgeList)))
+  // counters (DOPPELGANGER_STAT), 12-bit saturating
+  def dglSat(r: UInt, n: UInt): Unit = { val s = r +& n; r := Mux(s > 0xFFF.U, 0xFFF.U, s) }
+  val dgl_cnt = if (ENABLE_DOPPELGANGER) Some(RegInit(VecInit(Seq.fill(4)(0.U(12.W))))) else None  // issued, released, dead, mispred
+  val dgl_ev_issued  = dglWV(memWidth)   // L5
+  val dgl_ev_rel     = dglWV(memWidth)   // L7 C
+  val dgl_ev_mispred = dglWV(memWidth)   // L7 A
+  if (ENABLE_DOPPELGANGER) {
+    dglSat(dgl_cnt.get(0), PopCount(dgl_ev_issued.get))
+    dglSat(dgl_cnt.get(1), PopCount(dgl_ev_rel.get))
+    dglSat(dgl_cnt.get(2), dgl_dead_req.get.asUInt.orR.asUInt)   // any number of deaths in one cycle count once
+    dglSat(dgl_cnt.get(3), PopCount(dgl_ev_mispred.get))
+    io.core.dgl_stat.get := Cat(dgl_cnt.get(3), dgl_cnt.get(2), dgl_cnt.get(1), dgl_cnt.get(0))
+    io.core.dgl_train.get.foreach { t => t.valid := false.B; t.bits := DontCare }   // driven in the commit loop (L13)
+  }
+
   val ldq = Reg(Vec(numLdqEntries, Valid(new LDQEntry)))
   val stq = Reg(Vec(numStqEntries, Valid(new STQEntry)))
 
@@ -545,6 +617,46 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val stq_tail         = Reg(UInt(stqAddrSz.W))
   val stq_commit_head  = Reg(UInt(stqAddrSz.W)) // point to next store to commit
   val stq_execute_head = Reg(UInt(stqAddrSz.W)) // point to next store to execute
+  // ----------------------------------------------------------------------------------------------------------------
+  // STT C-LSU-0 (stt-plan-v4.md 4.0): stt_ldq_safe(i) = "LDQ entry i is not an unsafe load" (the paper's VP broadcast).
+  // Spectre VP: no unresolved older branch. Futuristic VP: also the PNR has passed it and no order failure (immediate or
+  // deferred) is pending on it or on an older load. A freed entry reads 1 in the next cycle; an allocated one reads 0.
+  val stt_ldq_safe  = if (ENABLE_STT) Some(RegInit(~0.U(numLdqEntries.W))) else None
+  val stt_ldq_alloc = if (ENABLE_STT) Some(WireInit(VecInit(Seq.fill(numLdqEntries)(false.B)))) else None   // allocation loop
+  val stt_ldq_deq   = if (ENABLE_STT) Some(WireInit(VecInit(Seq.fill(numLdqEntries)(false.B)))) else None   // commit loop
+  def sttSafe(idx: UInt): Bool = stt_ldq_safe.map(_(idx)).getOrElse(true.B)
+  def sttLive(r: SttRoot): Bool = r.t && !sttSafe(r.idx)                         // the root is still tainted this cycle
+  def sttOlderRoot(a: SttRoot, b: SttRoot): SttRoot =                            // the paper's "min" of two roots (A8)
+    Mux(!a.t, b, Mux(!b.t, a, Mux(IsOlder(a.idx, b.idx, ldq_head), a, b)))
+  val stt_impl = io.core.stt_impl.getOrElse(false.B)
+  // [R1s-a B1] per STQ entry: "the address root is still tainted this cycle" (= the D input of stq(j).stt_ar.t). Copies of
+  // a holder (the ST-search record) take this, never the raw t, which lags the flag one cycle (4.0 (ii)).
+  val stt_stq_live = if (ENABLE_STT) Some(VecInit((0 until numStqEntries).map(j => sttLive(stq(j).bits.stt_ar.get)))) else None
+  if (ENABLE_STT) {
+    val rm          = io.core.brupdate.b1.resolve_mask                           // the LSU replica in IFT builds
+    val fut         = io.core.stt_fut.get
+    val fail        = (0 until numLdqEntries).map(i => ldq(i).valid && (ldq(i).bits.order_fail || ldq(i).bits.stt_of_pend.get))
+    val any_fail    = fail.reduce(_ || _)
+    val oldest_fail = AgePriorityEncoder(fail, ldq_head)
+    val nxt = (0 until numLdqEntries).map { i =>
+      val e       = ldq(i)
+      val spec_ok = (e.bits.uop.br_mask & ~rm) === 0.U                                       // Spectre VP (A1)
+      val pnr_ok  = IsOlder(e.bits.uop.rob_idx, io.core.rob_pnr_idx, io.core.rob_head_idx)   // PNR passed it (A6)
+      val fail_ok = !any_fail || IsOlder(i.U(ldqAddrSz.W), oldest_fail, ldq_head)            // older than every failing load
+      val vp      = spec_ok && (!fut || (pnr_ok && fail_ok))
+      val gone    = !e.valid || IsKilledByBranch(io.core.brupdate, e.bits.uop) || io.core.exception || stt_ldq_deq.get(i)
+      !stt_ldq_alloc.get(i) && (gone || vp)
+    }
+    stt_ldq_safe.get := VecInit(nxt).asUInt
+    // [v7] P-F2: oldest failing load, for the DelayExecute Futuristic own-VP test in the slots (combinational from flops)
+    io.core.stt_fail_rob.foreach { f => f.valid := any_fail; f.bits := ldq(oldest_fail).bits.uop.rob_idx }
+    // per-cycle untaint of the LSU's root holders: defaults, overridden later in the file by allocation, the ST-search
+    // alias record and the release (last connect)
+    for (i <- 0 until numStqEntries) { stq(i).bits.stt_ar.get.t := stt_stq_live.get(i) }   // = sttLive(stt_ar) [R1s-a B1]
+    for (i <- 0 until numLdqEntries) { val r = ldq(i).bits.stt_of_root.get; r.t := sttLive(r) }
+  }
+  io.core.stt_ldq_safe.foreach(_ := stt_ldq_safe.get)
+  io.core.stt_ldq_head.foreach(_ := ldq_head)
 
 
   // If we got a mispredict, the tail will be misaligned for 1 extra cycle
@@ -707,13 +819,26 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq(ld_enq_idx).bits.addr.valid      := false.B
       ldq(ld_enq_idx).bits.addr_is_secret.foreach(_ := false.B)
       ldq(ld_enq_idx).bits.addr_is_atk.foreach(_ := false.B)
+      ldq(ld_enq_idx).bits.sa_unsafe.foreach(_ := false.B)    // [SA-3]
+      ldq(ld_enq_idx).bits.sa_stlwait.foreach(_ := false.B)
+      ldq(ld_enq_idx).bits.sa_faulted.foreach(_ := false.B)
+      ldq(ld_enq_idx).bits.sa_key.foreach(_ := 0.U)
       ldq(ld_enq_idx).bits.cf_nack_res_v.foreach(_ := false.B)   // [NACKRES]
       ldq(ld_enq_idx).bits.cf_nack_res_atk.foreach(_ := false.B)   // [NACKATK]
       ldq(ld_enq_idx).bits.executed        := false.B
       ldq(ld_enq_idx).bits.succeeded       := false.B
       ldq(ld_enq_idx).bits.order_fail      := false.B
+      stt_ldq_alloc.foreach(_(ld_enq_idx) := true.B)                                   // STT C-LSU-0
+      ldq(ld_enq_idx).bits.stt_of_root.foreach(_ := 0.U.asTypeOf(new SttRoot))         // STT C-LSU-4
+      ldq(ld_enq_idx).bits.stt_of_pend.foreach(_ := false.B)
+      ldq(ld_enq_idx).bits.uop.stt_gr.foreach(_ := 0.U.asTypeOf(new SttRoot))          // the LDQ uop copy carries none
       ldq(ld_enq_idx).bits.observed        := false.B
       ldq(ld_enq_idx).bits.forward_std_val := false.B
+      ldq(ld_enq_idx).bits.dg_state.foreach(_ := DGState.IDLE)
+      ldq(ld_enq_idx).bits.dg_nacks.foreach(_ := 0.U)
+      ldq(ld_enq_idx).bits.dg_ovm.foreach(_ := 0.U)
+      ldq(ld_enq_idx).bits.dg_wait.foreach(_ := false.B)
+      ldq(ld_enq_idx).bits.dg_val_sec.foreach(_ := false.B); ldq(ld_enq_idx).bits.dg_val_atk.foreach(_ := false.B)
 
       assert (ld_enq_idx === io.core.dis_uops(w).bits.ldq_idx, "[lsu] mismatch enq load tag.")
       assert (!ldq(ld_enq_idx).valid, "[lsu] Enqueuing uop is overwriting ldq entries")
@@ -734,7 +859,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       // Task 3.2 (D16): same as the LDQ above
       stq(st_enq_idx).bits.addr.valid := false.B
       stq(st_enq_idx).bits.addr_is_secret.foreach(_ := false.B)
+      stq(st_enq_idx).bits.stt_ar.foreach(_ := io.core.dis_uops(w).bits.stt_grv)      // STT C-LSU-1: the raw address root
+      stq(st_enq_idx).bits.uop.stt_gr.foreach(_ := 0.U.asTypeOf(new SttRoot))         // the STQ uop copy carries none
       stq(st_enq_idx).bits.addr_is_atk.foreach(_ := false.B)
+      stq(st_enq_idx).bits.sa_key.foreach(_ := 0.U)    // [SA-3]
       stq(st_enq_idx).bits.data_is_secret.foreach(_ := false.B)
       stq(st_enq_idx).bits.data_is_atk.foreach(_ := false.B)
       stq(st_enq_idx).bits.addr_is_wsec.foreach(_ := false.B)   // [WINMEM]
@@ -889,6 +1017,45 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val stq_incoming_idx = widthMap(i => exe_req(i).bits.uop.stq_idx)
   val stq_incoming_e   = widthMap(i => stq(stq_incoming_idx(i)))
 
+  // STT C-LSU-4: order_fail takes effect only once its alias is no longer pending. Scala-gated (stock node when off).
+  def sttOrderFailEff(e: LDQEntry): Bool = if (ENABLE_STT) e.order_fail && !e.stt_of_pend.get else e.order_fail
+  // (SpecASan's SA-4A declaration block is inserted BEFORE the same anchor after this def; order immaterial.)
+  // ---------------- [SA] SpecASan LSU-scope state and lane wires [v4] ----------------
+  // The key/lock check lives in the D$ (SA-D5/D6).  The LSU computes, per lane, the key used, whether the load is
+  // non-speculative (no older unresolved branch AND no older unknown store address: paper "not under another speculation"),
+  // and the Spectre-v4 hold of a keyed load (paper 4.1), and carries them in the D$ request (SA-4D).
+  val sa_block       = if (SPECASAN) Some(WireInit(VecInit(Seq.fill(memWidth)(false.B)))) else None  // this lane's load is an STL-held verify request
+  val sa_key_lane    = if (SPECASAN) Some(WireInit(VecInit(Seq.fill(memWidth)(0.U(4.W))))) else None // key used this cycle
+  val sa_nonspec_lane = if (SPECASAN) Some(WireInit(VecInit(Seq.fill(memWidth)(false.B)))) else None // load is non-speculative
+  val mem_sa_block   = if (SPECASAN) Some(RegNext(sa_block.get, VecInit(Seq.fill(memWidth)(false.B)))) else None
+  val mem_sa_key     = if (SPECASAN) Some(RegNext(sa_key_lane.get, VecInit(Seq.fill(memWidth)(0.U(4.W))))) else None
+  val mem_sa_nonspec = if (SPECASAN) Some(RegNext(sa_nonspec_lane.get, VecInit(Seq.fill(memWidth)(false.B)))) else None
+  // The ONLY SpecASan names other defenses may read (fold to false.B when SpecASan is compiled out).  [v4] memSaBlock(w) =
+  // "last cycle's load on lane w was an STL-held verify request" (never set for a doppelganger lane).  [v5] + saKeyed(w).
+  def saBlock(w: Int): Bool    = sa_block.map(_(w)).getOrElse(false.B)
+  def memSaBlock(w: Int): Bool = mem_sa_block.map(_(w)).getOrElse(false.B)
+  // [v5] (Doppelganger contract CC-2, reconcile-v5.md X12) "the memory op this lane fires this cycle uses a non-zero key while
+  // SpecASan is on".  A doppelganger is checked in the D$ with key 0, so Doppelganger never releases a keyed load from it (dgl L7 A);
+  // such a load is checked with its own key at its own D$ access.  EN-qualified: with EN = 0 (incl. the TBI-only control 0x2) no
+  // check exists and Doppelganger behaves as without SpecASan.
+  def saKeyed(w: Int): Bool    = sa_key_lane.map(k => io.core.sa_ctl_en.get && k(w) =/= 0.U).getOrElse(false.B)
+  // per LDQ entry: "an older store (st_dep_mask) has no physical address yet", registered.  Older stores are allocated
+  // before the load and their addr.valid only rises (a kill clears the load too), so one cycle of staleness is conservative.
+  val sa_stq_unknown  = if (SPECASAN) Some(VecInit(stq.map(e => e.valid && (!e.bits.addr.valid || e.bits.addr_is_virtual))).asUInt) else None
+  val sa_ld_older_unk = if (SPECASAN) Some(RegNext(VecInit(ldq.map(e => (e.bits.st_dep_mask & sa_stq_unknown.get).orR)),
+                                                   VecInit(Seq.fill(numLdqEntries)(false.B)))) else None
+  def saNonSpec(uop: MicroOp, idx: UInt): Bool = uop.br_mask === 0.U && !sa_ld_older_unk.get(idx)
+  // [SA-5B] fault pulses (D$ sa_fault nacks, SA-4E; forwarding-key mismatch of a non-speculative load, SA-6A)
+  val sa_fault_pulse = if (SPECASAN) Some(WireInit(VecInit(Seq.fill(2 * memWidth)(false.B)))) else None
+  val sa_fault_uop   = if (SPECASAN) Some(Wire(Vec(2 * memWidth, new MicroOp))) else None
+  val sa_fault_addr  = if (SPECASAN) Some(Wire(Vec(2 * memWidth, UInt(coreMaxAddrBits.W)))) else None
+  if (SPECASAN) { sa_fault_uop.get := DontCare; sa_fault_addr.get := DontCare }
+  if (SPECASAN) {   // [SA-D2] pass-through to the D$
+    io.dmem.sa_ctl_en.get      := io.core.sa_ctl_en.get
+    io.dmem.sa_paint.get.valid := io.core.sa_paint_wen.get
+    io.dmem.sa_paint.get.bits  := io.core.sa_paint_data.get
+    io.core.sa_stat.get        := io.dmem.sa_stat.get
+  }
   val ldq_retry_idx = RegNext(AgePriorityEncoder((0 until numLdqEntries).map(i => {
     val e = ldq(i).bits
     val block = block_load_mask(i) || p1_block_load_mask(i)
@@ -904,12 +1071,35 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   val stq_commit_e  = stq(stq_execute_head)
 
+  // STT (C-LSU-2/3, paper 6.4.2 implicit branch without prediction): stores whose RESOLVED address is still tainted. All
+  // flops. A committed store's address is architectural (never a hold, G12). With store addresses gated (the default) an
+  // address resolves only after its root is safe, so this vector is 0; it acts when STT_CTL[2] = 1.
+  val stt_stq_ataint = VecInit((0 until numStqEntries).map(i =>
+    stq(i).valid && stq(i).bits.addr.valid && !stq(i).bits.committed && stq(i).bits.stt_ataint.getOrElse(false.B)))
+  // loads whose older-store set meets a tainted resolved address (C-LSU-3; ANDs of two 40-bit flop vectors)
+  val stt_ldq_blk = (0 until numLdqEntries).map(i => stt_impl && (ldq(i).bits.st_dep_mask & stt_stq_ataint.asUInt).orR)
   val ldq_wakeup_idx = RegNext(AgePriorityEncoder((0 until numLdqEntries).map(i=> {
     val e = ldq(i).bits
     val block = block_load_mask(i) || p1_block_load_mask(i)
-    e.addr.valid && !e.executed && !e.succeeded && !e.addr_is_virtual && !block
+    if (ENABLE_STT) e.addr.valid && !e.executed && !e.succeeded && !e.addr_is_virtual && !block && !stt_ldq_blk(i)   // STT C-LSU-3
+    else            e.addr.valid && !e.executed && !e.succeeded && !e.addr_is_virtual && !block
   }), ldq_head))
   val ldq_wakeup_e   = ldq(ldq_wakeup_idx)
+  // [Doppelganger] the oldest (lane memWidth-1) and second-oldest (lane memWidth-2) LDQ entries that may issue a doppelganger
+  // (paper: predicted addresses fill free memory slots). Registered like the wakeup encoder.
+  val dg_elig = if (ENABLE_DOPPELGANGER) Some(VecInit((0 until numLdqEntries).map(i => {
+    val e = ldq(i).bits
+    ldq(i).valid && e.uop.dg_pv.get && e.dg_state.get === DGState.IDLE && !e.addr.valid && !dg_nack_blk.get(i)
+  }))) else None
+  val dg_first  = dg_elig.map(v => AgePriorityEncoder(v, ldq_head))
+  val dg_rest   = dg_elig.map(v => VecInit((v.asUInt & ~UIntToOH(dg_first.get, numLdqEntries)).asBools))
+  val dg_second = dg_rest.map(v => AgePriorityEncoder(v, ldq_head))
+  val dg_issue_idx = if (ENABLE_DOPPELGANGER) Some(widthMap(w =>
+                       RegNext(if (w == memWidth-1) dg_first.get else dg_second.get))) else None
+  val dg_issue_ok  = if (ENABLE_DOPPELGANGER) Some(widthMap(w =>
+                       RegNext(if (w == memWidth-1) dg_elig.get.asUInt.orR else dg_rest.get.asUInt.orR, false.B))) else None
+  val dg_issue_e   = dg_issue_idx.map(v => widthMap(w => ldq(v(w))))
+  val dg_nack_blk_v = dg_nack_blk.map(b => VecInit(b))   // dynamic-index view of dg_nack_blk (the L5 gate indexes by a UInt)
 
   // -----------------------
   // Determine what can fire
@@ -947,7 +1137,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                 RegNext(dtlb.io.miss_rdy)                     &&
                                 !store_needs_order                            &&
                                 (w == memWidth-1).B                           && // TODO: Is this best scheduling?
-                                !ldq_retry_e.bits.order_fail))
+                                !(if (ENABLE_STT) sttOrderFailEff(ldq_retry_e.bits) else ldq_retry_e.bits.order_fail)))   // STT C-LSU-4
 
   // Can we retry a store addrgen that missed in the TLB
   // - Weird edge case when sta_retry and std_incoming for same entry in same cycle. Delay this
@@ -975,13 +1165,30 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   // Can we wakeup a load that was nack'd
   val block_load_wakeup = WireInit(false.B)
-  val can_fire_load_wakeup = widthMap(w =>
+  // I-LSU-WAKE: stock expression verbatim + per-defense conjunct lists (Scala-level; empty when compiled out).
+  //   STT      : stt_wk_term (C-LSU-3), and sttOrderFailEff in place of order_fail (C-LSU-4).
+  //   SpecASan : sa_wk_terms (SA-5A, below, replaced the PLACEHOLDER line; nothing else here changes).
+  //   Doppelganger: nothing (a verified entry is executed = 1 from its mem cycle).
+  // [M2 registered form, owner 2026-10-31] the encoder's own view of stt_ldq_blk, registered with ldq_wakeup_idx: a flop
+  // read by the flop index, like p1_block_load_mask (0 added levels). A block that appears in the fire cycle is held by
+  // the C-LSU-2 search check (stt_blk_srch, combinational) in the search cycle; release is never earlier (amend-T1s v3).
+  val stt_wk_blk_r: Option[Vec[Bool]] = if (ENABLE_STT) Some(RegNext(VecInit(stt_ldq_blk))) else None   // STT C-LSU-3
+  val stt_wk_term: Option[Bool] = stt_wk_blk_r.map(r => !r(ldq_wakeup_idx))                         // STT C-LSU-3
+  // [SA-5A] SpecASan conjuncts of can_fire_load_wakeup (Scala Seq: empty when compiled out, so the stock node is untouched).
+  val sa_wk_terms: Seq[Bool] = if (!SPECASAN) Nil else {
+    val older_unk = sa_ld_older_unk.get(ldq_wakeup_idx)
+    Seq(!ldq_wakeup_e.bits.sa_unsafe.get || (ldq_wakeup_e.bits.uop.br_mask === 0.U && !older_unk),   // unsafe: only once non-speculative
+        !ldq_wakeup_e.bits.sa_faulted.get,                                                        // fault raised: wait for the flush
+        !(ldq_wakeup_e.bits.sa_stlwait.get && older_unk))                                          // keyed, older store address unknown
+  }
+  // [SA-5A] the block above replaced STT's PLACEHOLDER line (reconcile-v5.md X5).
+  val can_fire_load_wakeup = widthMap(w => (stt_wk_term.toSeq ++ sa_wk_terms).foldLeft(
                              ( ldq_wakeup_e.valid                                      &&
                                ldq_wakeup_e.bits.addr.valid                            &&
                               !ldq_wakeup_e.bits.succeeded                             &&
                               !ldq_wakeup_e.bits.addr_is_virtual                       &&
                               !ldq_wakeup_e.bits.executed                              &&
-                              !ldq_wakeup_e.bits.order_fail                            &&
+                              !(if (ENABLE_STT) sttOrderFailEff(ldq_wakeup_e.bits) else ldq_wakeup_e.bits.order_fail) && // STT C-LSU-4
                               !p1_block_load_mask(ldq_wakeup_idx)                      &&
                               !p2_block_load_mask(ldq_wakeup_idx)                      &&
                               !store_needs_order                                       &&
@@ -989,13 +1196,23 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                               (w == memWidth-1).B                                      &&
                               (!ldq_wakeup_e.bits.addr_is_uncacheable || (io.core.commit_load_at_rob_head &&
                                                                           ldq_head === ldq_wakeup_idx &&
-                                                                          ldq_wakeup_e.bits.st_dep_mask.asUInt === 0.U))))
+                                                                          ldq_wakeup_e.bits.st_dep_mask.asUInt === 0.U))))(_ && _))
 
   // Can we fire an incoming hellacache request
   val can_fire_hella_incoming  = WireInit(widthMap(w => false.B)) // This is assigned to in the hellashim ocntroller
 
   // Can we fire a hellacache request that the dcache nack'd
   val can_fire_hella_wakeup    = WireInit(widthMap(w => false.B)) // This is assigned to in the hellashim controller
+
+  // [Doppelganger] a doppelganger may issue on lane w (TLB + DC, lowest priority, no LCAM search: it never forwards)
+  val will_fire_dg = if (ENABLE_DOPPELGANGER) Some(Wire(Vec(memWidth, Bool()))) else None
+  val can_fire_dg  = if (ENABLE_DOPPELGANGER) Some(widthMap(w => {
+    val e = dg_issue_e.get(w); val i = dg_issue_idx.get(w)
+    dgl_en && dg_issue_ok.get(w) && e.valid && e.bits.uop.dg_pv.get && e.bits.dg_state.get === DGState.IDLE &&
+      !e.bits.addr.valid && !dg_nack_blk_v.get(i) && !store_needs_order && !io.core.exception &&
+      !(0 until memWidth).map(k => will_fire_load_incoming(k) && ldq_incoming_idx(k) === i).reduce(_||_)
+  })) else None
+  def dgTagFor(w: Int): UInt = dgl_tag_ctr.get + w.U
 
   //---------------------------------------------------------
   // Controller logic. Arbitrate which request actually fires
@@ -1039,6 +1256,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     will_fire_sta_retry     (w) := lsu_sched(can_fire_sta_retry     (w) , true , false, true , true)  // TLB ,    , LCAM , ROB // TODO: This should be higher priority
     will_fire_load_wakeup   (w) := lsu_sched(can_fire_load_wakeup   (w) , false, true , true , false) //     , DC , LCAM1
     will_fire_store_commit  (w) := lsu_sched(can_fire_store_commit  (w) , false, true , false, false) //     , DC
+    if (ENABLE_DOPPELGANGER) { will_fire_dg.get(w) := lsu_sched(can_fire_dg.get(w), true, true, false, false) } // TLB , DC [Doppelganger] lowest
 
 
     assert(!(exe_req(w).valid && !(will_fire_load_incoming(w) || will_fire_stad_incoming(w) || will_fire_sta_incoming(w) || will_fire_std_incoming(w) || will_fire_sfence(w))))
@@ -1061,6 +1279,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
      !will_fire_store_commit.reduce(_&&_)   &&
      !will_fire_load_wakeup.reduce(_&&_)),
     "Some operations is proceeding down multiple pipes")
+  if (ENABLE_DOPPELGANGER && memWidth == 2) assert(!(will_fire_dg.get(0) && will_fire_dg.get(1) && dg_issue_idx.get(0) === dg_issue_idx.get(1)),
+    "[Doppelganger] one entry on two lanes")
+  if (ENABLE_DOPPELGANGER) when (will_fire_dg.get.reduce(_||_)) { dgl_tag_ctr.get := dgl_tag_ctr.get + memWidth.U }
 
   require(memWidth <= 2)
 
@@ -1070,7 +1291,15 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   assert(!(hella_state =/= h_ready && hella_req.cmd === rocket.M_SFENCE),
     "SFENCE through hella interface not supported")
 
-  val exe_tlb_uop = widthMap(w =>
+  val exe_tlb_uop = widthMap(w => if (ENABLE_DOPPELGANGER) Mux(will_fire_dg.get(w), dg_issue_e.get(w).bits.uop,
+          Mux(will_fire_load_incoming (w) ||
+            will_fire_stad_incoming (w) ||
+            will_fire_sta_incoming  (w) ||
+            will_fire_sfence        (w)  , exe_req(w).bits.uop,
+          Mux(will_fire_load_retry    (w)  , ldq_retry_e.bits.uop,
+          Mux(will_fire_sta_retry     (w)  , stq_retry_e.bits.uop,
+          Mux(will_fire_hella_incoming(w)  , NullMicroOp(),
+                             NullMicroOp()))))) else
           Mux(will_fire_load_incoming (w) ||
             will_fire_stad_incoming (w) ||
             will_fire_sta_incoming  (w) ||
@@ -1080,7 +1309,15 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           Mux(will_fire_hella_incoming(w)  , NullMicroOp(),
                              NullMicroOp())))))
 
-  val exe_tlb_vaddr = widthMap(w =>
+  val exe_tlb_vaddr = widthMap(w => if (ENABLE_DOPPELGANGER) Mux(will_fire_dg.get(w), dg_issue_e.get(w).bits.uop.dg_pa.get,
+                    Mux(will_fire_load_incoming (w) ||
+                        will_fire_stad_incoming (w) ||
+                        will_fire_sta_incoming  (w)  , exe_req(w).bits.addr,
+                    Mux(will_fire_sfence        (w)  , exe_req(w).bits.sfence.bits.addr,
+                    Mux(will_fire_load_retry    (w)  , ldq_retry_e.bits.addr.bits,
+                    Mux(will_fire_sta_retry     (w)  , stq_retry_e.bits.addr.bits,
+                    Mux(will_fire_hella_incoming(w)  , hella_req.addr,
+                                                       0.U)))))) else
                     Mux(will_fire_load_incoming (w) ||
                         will_fire_stad_incoming (w) ||
                         will_fire_sta_incoming  (w)  , exe_req(w).bits.addr,
@@ -1097,7 +1334,15 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     }
   }
 
-  val exe_size   = widthMap(w =>
+  val exe_size   = widthMap(w => if (ENABLE_DOPPELGANGER) Mux(will_fire_dg.get(w), exe_tlb_uop(w).mem_size,
+                   Mux(will_fire_load_incoming (w) ||
+                       will_fire_stad_incoming (w) ||
+                       will_fire_sta_incoming  (w) ||
+                       will_fire_sfence        (w) ||
+                       will_fire_load_retry    (w) ||
+                       will_fire_sta_retry     (w)  , exe_tlb_uop(w).mem_size,
+                   Mux(will_fire_hella_incoming(w)  , hella_req.size,
+                                                      0.U))) else
                    Mux(will_fire_load_incoming (w) ||
                        will_fire_stad_incoming (w) ||
                        will_fire_sta_incoming  (w) ||
@@ -1106,7 +1351,15 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                        will_fire_sta_retry     (w)  , exe_tlb_uop(w).mem_size,
                    Mux(will_fire_hella_incoming(w)  , hella_req.size,
                                                       0.U)))
-  val exe_cmd    = widthMap(w =>
+  val exe_cmd    = widthMap(w => if (ENABLE_DOPPELGANGER) Mux(will_fire_dg.get(w), exe_tlb_uop(w).mem_cmd,
+                   Mux(will_fire_load_incoming (w) ||
+                       will_fire_stad_incoming (w) ||
+                       will_fire_sta_incoming  (w) ||
+                       will_fire_sfence        (w) ||
+                       will_fire_load_retry    (w) ||
+                       will_fire_sta_retry     (w)  , exe_tlb_uop(w).mem_cmd,
+                   Mux(will_fire_hella_incoming(w)  , hella_req.cmd,
+                                                      0.U))) else
                    Mux(will_fire_load_incoming (w) ||
                        will_fire_stad_incoming (w) ||
                        will_fire_sta_incoming  (w) ||
@@ -1157,7 +1410,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val ae_st = widthMap(w => dtlb.io.req(w).valid && dtlb.io.resp(w).ae.st && exe_tlb_uop(w).uses_stq)
 
   // TODO check for xcpt_if and verify that never happens on non-speculative instructions.
-  val mem_xcpt_valids = RegNext(widthMap(w =>
+  val mem_xcpt_valids = RegNext(widthMap(w => if (ENABLE_DOPPELGANGER)
+                     ((pf_ld(w) || pf_st(w) || ae_ld(w) || ae_st(w) || ma_ld(w) || ma_st(w)) &&
+                      !io.core.exception &&
+                      !IsKilledByBranch(io.core.brupdate, exe_tlb_uop(w)) && !will_fire_dg.get(w))   // [Doppelganger] a dg's TLB fault is never the load's exception
+                   else
                      (pf_ld(w) || pf_st(w) || ae_ld(w) || ae_st(w) || ma_ld(w) || ma_st(w)) &&
                      !io.core.exception &&
                      !IsKilledByBranch(io.core.brupdate, exe_tlb_uop(w))))
@@ -1203,6 +1460,26 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                         exe_tlb_vaddr(w)(corePgIdxBits-1,0)))
   val exe_tlb_uncacheable = widthMap(w => !(dtlb.io.resp(w).cacheable))
 
+  // [Doppelganger] verification: the real load's physical address against its doppelganger's translation (paper 5, E).
+  // HIT (DONE) / WAIT (INFLIGHT) on equality; otherwise an issued doppelganger is dropped and the load proceeds as stock.
+  val exe_dg_hit  = if (ENABLE_DOPPELGANGER) Some(Wire(Vec(memWidth, Bool()))) else None
+  val exe_dg_wait = if (ENABLE_DOPPELGANGER) Some(Wire(Vec(memWidth, Bool()))) else None
+  if (ENABLE_DOPPELGANGER) for (w <- 0 until memWidth) {
+    val inc = will_fire_load_incoming(w); val rty = will_fire_load_retry(w); val wku = will_fire_load_wakeup(w)
+    val sel_e = Mux(inc, ldq_incoming_e(w), Mux(rty, ldq_retry_e, ldq_wakeup_e))
+    val idx   = Mux(inc, ldq_incoming_idx(w), Mux(rty, ldq_retry_idx, ldq_wakeup_idx))
+    val pa    = Mux(wku, ldq_wakeup_e.bits.addr.bits, exe_tlb_paddr(w))(paddrBits-1, 0)
+    val known = (inc || rty || wku) && (wku || !exe_tlb_miss(w))
+    val st    = sel_e.bits.dg_state.get
+    val act   = st === DGState.DONE || st === DGState.INFLIGHT
+    val eq    = pa === sel_e.bits.dg_paddr.get
+    val ok    = dgl_en && known && eq && !saKeyed(w) && !io.core.exception      // a keyed load is checked by SpecASan's D$ itself (CC-2)
+    exe_dg_hit.get(w)  := ok && st === DGState.DONE
+    exe_dg_wait.get(w) := ok && st === DGState.INFLIGHT
+    when (known && act && !ok) { dgl_dead_req.get(idx) := true.B }              // (ungated) drop; the real load proceeds
+    dgl_ev_mispred.get(w) := known && act && !eq
+  }
+
   // corefuzzing: uop copies with dtlbTagCF bit set and cf_secret_access detected via physical address
   // Two-stage wire pattern avoids combinational cycle: Stage 1 = base mods, Stage 2 = influencer.
   val exe_tlb_uop_cf = Wire(Vec(memWidth, new MicroOp()))
@@ -1240,6 +1517,43 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     val in_secret = secret_range_valid &&
                     (exe_tlb_vaddr(w) >= io.core.cf_secret_start_addr) &&
                     (exe_tlb_vaddr(w) < io.core.cf_secret_end_addr)
+    // [SA-4A] SpecASan lane block [v4]: key and speculation state of the memory op this lane fires, the Spectre-v4 hold, the
+    // STQ key write.  Loads: incoming, retry, wakeup (the wakeup entry holds a PHYSICAL address and has no TLB pass).
+    // Stores: sta/stad incoming, sta retry.  No key/lock verdict here (D$).
+    if (SPECASAN) {
+      val sa_en     = io.core.sa_ctl_en.get
+      val sa_is_wk  = will_fire_load_wakeup(w)
+      val sa_is_ld  = will_fire_load_incoming(w) || will_fire_load_retry(w) || sa_is_wk
+      val sa_is_st  = will_fire_sta_incoming(w) || will_fire_stad_incoming(w) || will_fire_sta_retry(w)
+      val sa_key_w  = Mux(will_fire_load_incoming(w) || will_fire_stad_incoming(w) || will_fire_sta_incoming(w),
+                          exe_req(w).bits.sa_key.get,
+                      Mux(will_fire_load_retry(w), ldq_retry_e.bits.sa_key.get,
+                      Mux(will_fire_sta_retry(w),  stq_retry_e.bits.sa_key.get,
+                      Mux(sa_is_wk,                ldq_wakeup_e.bits.sa_key.get, 0.U(4.W)))))
+      val sa_addrok = sa_is_wk || !exe_tlb_miss(w)      // physical address valid this cycle (TLB miss: retry re-evaluates)
+      // one-hot select AFTER three parallel reads (flop/flop-like indices): one AND-OR level after will_fire
+      val sa_ou_wk  = sa_ld_older_unk.get(ldq_wakeup_idx)
+      val sa_ou_in  = sa_ld_older_unk.get(ldq_incoming_idx(w))
+      val sa_ou_rt  = sa_ld_older_unk.get(ldq_retry_idx)
+      val sa_older_unk = (sa_is_wk && sa_ou_wk) || (will_fire_load_incoming(w) && sa_ou_in) || (will_fire_load_retry(w) && sa_ou_rt)
+      val sa_br0    = (sa_is_wk && ldq_wakeup_e.bits.uop.br_mask === 0.U) ||
+                      (will_fire_load_incoming(w) && exe_req(w).bits.uop.br_mask === 0.U) ||
+                      (will_fire_load_retry(w)    && ldq_retry_e.bits.uop.br_mask === 0.U)
+      // paper 4.1: a TAGGED (keyed) load is delayed while an older store address is unknown; its request is sent as a
+      // verify request (tag check + fill, no data).  A key-0 load to a painted granule mismatches in the D$ instead.
+      val sa_stl_hold = sa_en && sa_is_ld && sa_addrok && (sa_key_w =/= 0.U) && sa_older_unk
+      sa_block.get(w)        := sa_stl_hold
+      if (ENABLE_CF_DEBUG_PRINTF) {                    // [SA-10] debug only, no FPGA logic
+        when (sa_stl_hold && io.core.cf_debug_lsu_enable) { printf("[SA-STL] w=%d pc=0x%x key=%d hold=1\n", w.U, Mux(sa_is_wk, ldq_wakeup_e.bits.uop.debug_pc, exe_tlb_uop(w).debug_pc), sa_key_w) }
+      }
+      sa_key_lane.get(w)     := sa_key_w
+      sa_nonspec_lane.get(w) := sa_br0 && !sa_older_unk
+      when (sa_is_wk) { ldq(ldq_wakeup_idx).bits.sa_stlwait.get := sa_stl_hold }   // incoming/retry: written in SA-4C
+      when (sa_is_st) {
+        val sidx = Mux(will_fire_sta_incoming(w) || will_fire_stad_incoming(w), stq_incoming_idx(w), stq_retry_idx)
+        stq(sidx).bits.sa_key.get := sa_key_w
+      }
+    }
     // s_acc = reading secret data FROM memory into a register (loads only).
     // Stores write TO the secret range but do not produce secret-tagged register values.
     val is_secret_load = in_secret && exe_tlb_uop(w).uses_ldq
@@ -1350,7 +1664,15 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     // The address operand's own taint is on exe_req.bits.secret (the AGU forwards
     // rs1_secret); retries do not read exe_req, so they take the bit stored with the
     // address in their queue entry.  Structure mirrors exe_tlb_vaddr above.
-    val addr_reg_secret  = Mux(will_fire_load_incoming(w) || will_fire_stad_incoming(w) ||
+    val addr_reg_secret  = if (ENABLE_DOPPELGANGER)
+                           Mux(will_fire_dg.get(w),       dg_issue_e.get(w).bits.uop.dg_psec.getOrElse(false.B),   // [Doppelganger] the prediction's label
+                           Mux(will_fire_load_incoming(w) || will_fire_stad_incoming(w) ||
+                               will_fire_sta_incoming(w), exe_req(w).bits.secret,
+                           Mux(will_fire_load_retry(w),   ldq_retry_e.bits.addr_is_secret.getOrElse(false.B),
+                           Mux(will_fire_sta_retry(w),    stq_retry_e.bits.addr_is_secret.getOrElse(false.B),
+                                                          false.B))))
+                           else
+                           Mux(will_fire_load_incoming(w) || will_fire_stad_incoming(w) ||
                                will_fire_sta_incoming(w), exe_req(w).bits.secret,
                            Mux(will_fire_load_retry(w),   ldq_retry_e.bits.addr_is_secret.getOrElse(false.B),
                            Mux(will_fire_sta_retry(w),    stq_retry_e.bits.addr_is_secret.getOrElse(false.B),
@@ -1369,11 +1691,19 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     val is_secret_addr_load = (exe_tlb_uop(w).uses_ldq || exe_tlb_uop(w).is_amo) && addr_reg_secret
     exe_tlb_addr_sec(w) := addr_reg_secret   // [RESID] not range-gated: residency is observable either way
     // [ATKRES] step 17: the attacker twin, same source mux as addr_reg_secret (same select terms)
-    exe_tlb_addr_atk(w) := Mux(will_fire_load_incoming(w) || will_fire_stad_incoming(w) ||
+    exe_tlb_addr_atk(w) := (if (ENABLE_DOPPELGANGER)
+                           Mux(will_fire_dg.get(w),       dg_issue_e.get(w).bits.uop.dg_patk.getOrElse(false.B),   // [Doppelganger] the prediction's label
+                           Mux(will_fire_load_incoming(w) || will_fire_stad_incoming(w) ||
                                will_fire_sta_incoming(w), exe_req(w).bits.taint_atk,
                            Mux(will_fire_load_retry(w),   ldq_retry_e.bits.addr_is_atk.getOrElse(false.B),
                            Mux(will_fire_sta_retry(w),    stq_retry_e.bits.addr_is_atk.getOrElse(false.B),
-                                                          false.B)))
+                                                          false.B))))
+                           else
+                           Mux(will_fire_load_incoming(w) || will_fire_stad_incoming(w) ||
+                               will_fire_sta_incoming(w), exe_req(w).bits.taint_atk,
+                           Mux(will_fire_load_retry(w),   ldq_retry_e.bits.addr_is_atk.getOrElse(false.B),
+                           Mux(will_fire_sta_retry(w),    stq_retry_e.bits.addr_is_atk.getOrElse(false.B),
+                                                          false.B))))
     // is_secret_bearing_store REMOVED here: it was computed from the aggregate and the
     // store's data is not knowable at TLB time.  The store's s_tx is now raised at
     // clr_bsy (Case A above).  Leaving it here would let the aggregate back in via
@@ -1484,6 +1814,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     dmem_req(w).bits.addr  := 0.U
     dmem_req(w).bits.data  := 0.U
     dmem_req(w).bits.is_hella := false.B
+    // [SA-4D] SpecASan request fields.  sa_unsafe / sa_fault are set by the D$ on the nack echo; the LSU drives 0.
+    dmem_req(w).bits.sa_key.foreach(_     := 0.U)
+    dmem_req(w).bits.sa_nonspec.foreach(_ := false.B)
+    dmem_req(w).bits.sa_verify.foreach(_  := false.B)
+    dmem_req(w).bits.sa_unsafe.foreach(_  := false.B)
+    dmem_req(w).bits.sa_fault.foreach(_   := false.B)
     // [RESID] step 15 defaults; overridden by the four LSU-op sources below (hella stays 0).
     dmem_req(w).bits.cf_addr_sec.foreach(_ := false.B)
     dmem_req(w).bits.cf_addr_atk.foreach(_ := false.B)   // [ATKRES]
@@ -1493,6 +1829,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     dmem_req(w).bits.cf_res_repl.foreach(_ := false.B)   // [CEREPL] D$-internal (a nack edge is never replacement-state)
     dmem_req(w).bits.cf_res_nack.foreach(_ := false.B)   // [RECV3] D$-internal (an LSU request's edge is known by s2_type)
     dmem_req(w).bits.cf_res_pc.foreach(_ := 0.U)
+    dmem_req(w).bits.uop.dg_req.foreach(_ := false.B); dmem_req(w).bits.uop.dg_tag.foreach(_ := 0.U)   // [Doppelganger]
 
     io.dmem.s1_kill(w) := false.B
 
@@ -1501,6 +1838,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w)
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
       dmem_req(w).bits.uop   := exe_tlb_uop_cf(w) // corefuzzing: use IFT-tagged uop
+      dmem_req(w).bits.sa_key.foreach(_     := sa_key_lane.get(w))       // [SA-4D]
+      dmem_req(w).bits.sa_nonspec.foreach(_ := sa_nonspec_lane.get(w))   // no older unresolved branch, no older unknown store address
+      dmem_req(w).bits.sa_verify.foreach(_  := sa_block.get(w))           // STL-held: check + fill only, never data
       dmem_req(w).bits.uop.cf_secret_propagation.foreach(_ := cfLdSprop(exe_tlb_uop_cf(w)))   // [FILLSEC]
       dmem_req(w).bits.uop.cf_attacker_influence.foreach(_ := cfLdAtk(exe_tlb_uop_cf(w)))      // [ONETAGATK]
       dmem_req(w).bits.cf_addr_sec.foreach(_ := exe_tlb_addr_sec(w))   // [RESID]
@@ -1513,6 +1853,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w)
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
       dmem_req(w).bits.uop   := exe_tlb_uop_cf(w) // corefuzzing: use IFT-tagged uop
+      dmem_req(w).bits.sa_key.foreach(_     := sa_key_lane.get(w))       // [SA-4D]
+      dmem_req(w).bits.sa_nonspec.foreach(_ := sa_nonspec_lane.get(w))   // no older unresolved branch, no older unknown store address
+      dmem_req(w).bits.sa_verify.foreach(_  := sa_block.get(w))           // STL-held: check + fill only, never data
       dmem_req(w).bits.uop.cf_secret_propagation.foreach(_ := cfLdSprop(exe_tlb_uop_cf(w)))   // [FILLSEC]
       dmem_req(w).bits.uop.cf_attacker_influence.foreach(_ := cfLdAtk(exe_tlb_uop_cf(w)))      // [ONETAGATK]
       dmem_req(w).bits.cf_addr_sec.foreach(_ := exe_tlb_addr_sec(w))   // [RESID]
@@ -1534,6 +1877,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                     stq_commit_e.bits.data.bits,
                                     coreDataBytes)).data
       dmem_req(w).bits.uop      := stq_commit_e.bits.uop
+      dmem_req(w).bits.sa_key.foreach(_     := stq_commit_e.bits.sa_key.get)   // [SA-4D] committed store/AMO
+      dmem_req(w).bits.sa_nonspec.foreach(_ := true.B)
       // The line tag records "is this line's content attacker-influenced".  The storing
       // uop's DOMAIN answers that only for a direct attacker store; a victim storing
       // attacker-DERIVED data is equally influence.  data_is_atk is the value's own taint,
@@ -1592,6 +1937,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       dmem_req(w).valid      := true.B
       dmem_req(w).bits.addr  := ldq_wakeup_e.bits.addr.bits
       dmem_req(w).bits.uop   := ldq_wakeup_e.bits.uop
+      dmem_req(w).bits.sa_key.foreach(_     := sa_key_lane.get(w))       // [SA-4D]
+      dmem_req(w).bits.sa_nonspec.foreach(_ := sa_nonspec_lane.get(w))   // no older unresolved branch, no older unknown store address
+      dmem_req(w).bits.sa_verify.foreach(_  := sa_block.get(w))           // STL-held: check + fill only, never data
       dmem_req(w).bits.uop.cf_secret_propagation.foreach(_ := cfLdSprop(ldq_wakeup_e.bits.uop))   // [FILLSEC]
       dmem_req(w).bits.uop.cf_attacker_influence.foreach(_ := cfLdAtk(ldq_wakeup_e.bits.uop))      // [ONETAGATK]
       dmem_req(w).bits.cf_addr_sec.foreach(_ := ldq_wakeup_e.bits.addr_is_secret.getOrElse(false.B))   // [RESID]
@@ -1636,6 +1984,40 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       dmem_req(w).bits.is_hella       := true.B
     }
 
+    if (ENABLE_DOPPELGANGER) {   // [Doppelganger] the request leg (exclusive with every DC user of the lane by lsu_sched)
+      when (will_fire_dg.get(w)) {
+        val e   = dg_issue_e.get(w); val i = dg_issue_idx.get(w)
+        val bad = dtlb.io.resp(w).ae.ld || dtlb.io.resp(w).pf.ld || dtlb.io.resp(w).ma.ld || exe_tlb_uncacheable(w)
+        dmem_req(w).valid     := !exe_tlb_miss(w) && !bad                        // [SpecASan] sa_key = 0, sa_nonspec = 0 (SA-4D defaults)
+        dmem_req(w).bits.addr := Cat(exe_tlb_paddr(w)(paddrBits-1, 3), 0.U(3.W))  // the doubleword holding the predicted bytes
+        dmem_req(w).bits.uop  := exe_tlb_uop_cf(w)                                // the load's uop with this TLB stage's IFT bits
+        dmem_req(w).bits.uop.mem_size   := 3.U                                    // raw doubleword (formatted at release, L7)
+        dmem_req(w).bits.uop.mem_signed := false.B
+        dmem_req(w).bits.uop.dg_req.get := true.B
+        dmem_req(w).bits.uop.dg_tag.get := dgTagFor(w)
+        dmem_req(w).bits.uop.cf_secret_propagation.foreach(_ := cfLdSprop(exe_tlb_uop_cf(w)))   // [FILLSEC] as load retry
+        dmem_req(w).bits.uop.cf_attacker_influence.foreach(_ := cfLdAtk(exe_tlb_uop_cf(w)))      // [ONETAGATK]
+        dmem_req(w).bits.cf_addr_sec.foreach(_ := exe_tlb_addr_sec(w))                           // [RESID] the prediction's label
+        dmem_req(w).bits.cf_addr_atk.foreach(_ := exe_tlb_addr_atk(w))
+        // s0_executing_loads / block_load_mask are NOT set: a doppelganger is not an executed load
+        when (dmem_req_fire(w)) {
+          ldq(i).bits.dg_state.get := DGState.INFLIGHT
+          ldq(i).bits.dg_tag.get   := dgTagFor(w)
+          ldq(i).bits.dg_paddr.get := exe_tlb_paddr(w)
+          dgl_ev_issued.get(w)     := true.B
+        } .elsewhen (exe_tlb_miss(w)) {                                          // no translation this cycle (paging off: never)
+          when (e.bits.dg_nacks.get < doppelgangerNackRetries.U) {
+            ldq(i).bits.dg_nacks.get := e.bits.dg_nacks.get + 1.U; dg_nack_ev.get(i) := true.B
+          } .otherwise { dgl_dead_req.get(i) := true.B }
+        } .elsewhen (bad) { dgl_dead_req.get(i) := true.B }                      // no doppelganger to uncacheable/faulting bytes
+        // valid but not accepted by the D$: stays IDLE and is re-selected
+        assert(e.bits.dg_state.get === DGState.IDLE && !e.bits.executed && !e.bits.addr.valid, "[Doppelganger] dg fire on a wrong entry")
+      }
+      // the prediction fields of an LDQ uop never travel through the D$ (constant 0 there: pruned)
+      dmem_req(w).bits.uop.dg_pv.get := false.B; dmem_req(w).bits.uop.dg_pa.get := 0.U
+      dmem_req(w).bits.uop.dg_psec.foreach(_ := false.B); dmem_req(w).bits.uop.dg_patk.foreach(_ := false.B)
+    }
+
     // [DREQPROBE] every D$ request that actually fires, with its op identity.
     // A line's IFT tag is written from THIS uop (dcache -> mshrs req.uop -> cf_req_*),
     // so a request with src=N and domain=0/oc=0 names the exact path that drops it.
@@ -1654,6 +2036,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     {
       val ldq_idx = Mux(will_fire_load_incoming(w), ldq_incoming_idx(w), ldq_retry_idx)
       ldq(ldq_idx).bits.addr.valid          := true.B
+      // [SA-4C] SpecASan: the Spectre-v4 hold of this lane (TLB miss: 0; re-evaluated on retry) and the key for later passes
+      ldq(ldq_idx).bits.sa_stlwait.foreach(_ := sa_block.get(w))
+      ldq(ldq_idx).bits.sa_key.foreach(_     := sa_key_lane.get(w))
       ldq(ldq_idx).bits.addr.bits           := Mux(exe_tlb_miss(w), exe_tlb_vaddr(w), exe_tlb_paddr(w))
       ldq(ldq_idx).bits.uop.pdst            := exe_tlb_uop(w).pdst
       ldq(ldq_idx).bits.addr_is_virtual     := exe_tlb_miss(w)
@@ -2189,6 +2574,14 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val can_forward = WireInit(widthMap(w =>
     Mux(fired_load_incoming(w) || fired_load_retry(w), !mem_tlb_uncacheable(w),
       !ldq(lcam_ldq_idx(w)).bits.addr_is_uncacheable)))
+  // STT (stt-plan-v4.md C-LSU-2): the forwarding predicate of this load is tainted if any OLDER store in its st_dep_mask
+  // has a resolved address with a live root. Then the load neither reads memory nor forwards, whatever the address compare
+  // says: held like a partial overlap (D$ request killed at s1, stays !executed, retried by ldq_wakeup when clear, C-LSU-3).
+  val stt_blk_srch = widthMap(w => stt_impl && do_ld_search(w) && (lcam_st_dep_mask(w) & stt_stq_ataint.asUInt).orR)
+  for (w <- 0 until memWidth) {
+    when (stt_blk_srch(w)) { can_forward(w) := false.B }
+  }
+  io.core.stt_stl_blk.foreach(_ := RegNext(stt_blk_srch.reduce(_ || _), false.B))
 
   // Mask of stores which we conflict on address with
   val ldst_addr_matches    = WireInit(widthMap(w => VecInit((0 until numStqEntries).map(x=>false.B))))
@@ -2235,6 +2628,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // only by the [RDEDGE] STL_PARTIAL edge (names that load as the producer).  A copy of the kill term into new
   // wires: 0 levels on the kill / can_forward path.  IFT off: None (not elaborated).
   val cf_ld_blk = if (ENABLE_IFT) Some(WireInit(widthMap(w => VecInit((0 until numLdqEntries).map(x => false.B))))) else None
+  val ld_srch_killed = if (ENABLE_DOPPELGANGER) Some(WireInit(VecInit(Seq.fill(memWidth)(false.B)))) else None   // [Doppelganger] an older load killed this lane's load search
   val failed_loads     = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B))) // Loads which we will report as failures (throws a mini-exception)
   val nacking_loads    = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B))) // Loads which are being nacked by dcache in the next stage
 
@@ -2291,7 +2685,20 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         when (!l_bits.forward_std_val || // If the load wasn't forwarded, it definitely failed
           ((l_forward_stq_idx =/= lcam_stq_idx(w)) && forwarded_is_older)) { // If the load forwarded from us, we might be ok
           ldq(i).bits.order_fail := true.B
-          failed_loads(i)        := true.B
+          // STT C-LSU-4: the aliasing store's address root (a flop, re-checked every cycle); live -> record only.
+          // Scala-gated: the STT-off build keeps the stock `failed_loads(i) := true.B` verbatim.
+          if (ENABLE_STT) {
+            val st_r      = stq(lcam_stq_idx(w)).bits.stt_ar.get
+            // [R1s-a B1] live, not the raw flop: a holder's t lags the flag one cycle, and a copy made in that cycle could
+            // name an index re-allocated at the same edge (4.0 (ii) covers holders; a copy of a holder takes live)
+            val stt_defer = stt_impl && stt_stq_live.get(lcam_stq_idx(w))
+            when (!stt_defer) { failed_loads(i) := true.B }
+            when (stt_defer) {
+              ldq(i).bits.stt_of_pend.get := true.B
+              ldq(i).bits.stt_of_root.get := Mux(l_bits.stt_of_pend.get && sttLive(l_bits.stt_of_root.get),
+                                                 sttOlderRoot(l_bits.stt_of_root.get, st_r), st_r)
+            }
+          } else { failed_loads(i) := true.B }
           // corefuzzing: memory ordering violation (cross-domain OR secret-tainted store)
           // [MEMORDATK] ...OR attacker-influenced store (ssbx: a victim store whose address the attacker delayed)
           val st_atk_infl = st_atk_sel(w)
@@ -2357,6 +2764,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
             io.dmem.s1_kill(w)                 := RegNext(dmem_req_fire(w))
             can_forward(w)                     := false.B
             cf_ld_blk.foreach(_(w)(i)          := true.B)   // [B60LDB]
+            if (ENABLE_DOPPELGANGER) { ld_srch_killed.get(w) := true.B }   // [Doppelganger] L8
           }
         }
       }
@@ -2376,7 +2784,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         when (((lcam_mask(w) & write_mask) === lcam_mask(w)) && !s_uop.is_fence && !s_uop.is_amo && dword_addr_matches(w) && can_forward(w))
         {
           ldst_addr_matches(w)(i)            := true.B
-          ldst_forward_matches(w)(i)         := true.B
+          ldst_forward_matches(w)(i)         := (if (SPECASAN) !(io.core.sa_ctl_en.get && mem_sa_key.get(w) =/= stq(i).bits.sa_key.get) else true.B)   // [SA-6A]
           io.dmem.s1_kill(w)                 := RegNext(dmem_req_fire(w))
           s1_set_execute(lcam_ldq_idx(w))    := false.B
         }
@@ -2396,6 +2804,156 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     }
   }
 
+  if (ENABLE_STT) for (w <- 0 until memWidth) {                   // STT C-LSU-2: the partial-overlap kill form (:2350-2351); [IDOFF] Scala-gated: no RegNext without STT
+    when (stt_blk_srch(w)) {
+      io.dmem.s1_kill(w)                 := RegNext(dmem_req_fire(w))
+      s1_set_execute(lcam_ldq_idx(w))    := false.B
+    }
+  }
+  if (ENABLE_STT) {
+    for (i <- 0 until numLdqEntries) {
+      val e   = ldq(i).bits
+      val rel = ldq(i).valid && e.stt_of_pend.get && !sttLive(e.stt_of_root.get)     // the oldest aliasing root is safe now
+      // G15: an older memory exception reported this cycle wins the age arbitration (:2809); keep pending, pulse again
+      val older_mem_xcpt = mem_xcpt_valid && IsOlder(mem_xcpt_uop.rob_idx, e.uop.rob_idx, io.core.rob_head_idx)
+      when (rel) {
+        failed_loads(i) := true.B                                                  // the stock report, deferred
+        when (!older_mem_xcpt) { e.stt_of_pend.get := false.B }
+      }
+      if (ENABLE_CF_DEBUG_PRINTF) {
+        when (io.core.stt_dbg.get && rel) { printf("[STT] c=%d pendsq release ldq=%d rob=%d\n", io.core.tsc_reg, i.U, e.uop.rob_idx) }
+      }
+    }
+    // [R1s-a B2] retire guard: the oldest load whose squash is deferred may not commit until its report is in the ROB.
+    // Registered: pend set at edge s+1 (search in s) is seen from s+2, the first cycle the load can commit (the store's
+    // clr_bsy is registered); after a release in c the export still shows pend in c+1, and rob_exception blocks from c+2.
+    val noret = (0 until numLdqEntries).map(i => ldq(i).valid && ldq(i).bits.stt_of_pend.get)
+    io.core.stt_noret.get.valid := RegNext(noret.reduce(_ || _), false.B)
+    io.core.stt_noret.get.bits  := RegNext(ldq(AgePriorityEncoder(noret, ldq_head)).bits.uop.rob_idx)
+  }
+  // [SA-4B] SpecASan: a load held at the TLB stage (Spectre-v4: keyed load, older store address unknown) gets no
+  // forwarded value (its value must come after the older store addresses are known).  Its D$ request is NOT killed: it is
+  // the paper's verifying request (SA-4D sa_verify); the D$ nacks it whenever it checks it (EN, in the tagged
+  // window; an unchecked one is served like a stock MDU-window load: data returns, no forwarding, stock MEM_ORDER replay),
+  // which clears executed through the stock nack path, and the load re-fires once its older stores are known (SA-5A).  If the stock search kills
+  // the request (address match without forward), nothing is lost: the load simply re-fires later.
+  if (SPECASAN) {
+    for (w <- 0 until memWidth) {
+      when (mem_sa_block.get(w) && (fired_load_incoming(w) || fired_load_retry(w) || fired_load_wakeup(w))) {
+        can_forward(w) := false.B
+      }
+    }
+  }
+  // [SA-6A] SpecASan: an address-matching older store whose key differs from the load's key.  Stock already kills and
+  // replays the load (ldst_addr_matches without forward).  Paper Fig. 4 steps 5-7: the load is unsafe while speculative
+  // and raises the tag-check fault once it is not under another speculation.
+  if (SPECASAN) {
+    for (w <- 0 until memWidth) {
+      val sa_fwd_mis = (0 until numStqEntries).map(i =>
+        ldst_addr_matches(w)(i) && stq(i).valid && stq(i).bits.sa_key.get =/= mem_sa_key.get(w)).reduce(_||_)
+      val fired_ld = fired_load_incoming(w) || fired_load_retry(w) || fired_load_wakeup(w)
+      when (io.core.sa_ctl_en.get && sa_fwd_mis && fired_ld) {
+        when (mem_sa_nonspec.get(w)) {
+          sa_fault_pulse.get(memWidth + w) := true.B
+          sa_fault_uop.get(memWidth + w)   := ldq(lcam_ldq_idx(w)).bits.uop
+          sa_fault_addr.get(memWidth + w)  := lcam_addr(w)
+        } .otherwise {
+          ldq(lcam_ldq_idx(w)).bits.sa_unsafe.get := true.B
+        }
+      }
+    }
+  }
+  // [Doppelganger] mem stage of a verified load: kill the real request; release from the held doubleword (DONE) or from the
+  // doppelganger response arriving now; wait for a doppelganger still in flight; replay if it died meanwhile.  Also loads the
+  // release registers for a waiting load whose doppelganger response arrives on this lane (WAIT completion).
+  val mem_dg_hit  = if (ENABLE_DOPPELGANGER) Some(widthMap(w => RegNext(exe_dg_hit.get(w),  false.B))) else None
+  val mem_dg_wait = if (ENABLE_DOPPELGANGER) Some(widthMap(w => RegNext(exe_dg_wait.get(w), false.B))) else None
+  val wb_dg_vf    = if (ENABLE_DOPPELGANGER) Some(RegInit(VecInit(Seq.fill(memWidth)(false.B)))) else None
+  val wb_dgr_idx  = if (ENABLE_DOPPELGANGER) Some(Reg(Vec(memWidth, UInt(ldqAddrSz.W)))) else None
+  val wb_dg_uop   = if (ENABLE_DOPPELGANGER) Some(Reg(Vec(memWidth, new MicroOp))) else None
+  val wb_dg_data  = if (ENABLE_DOPPELGANGER) Some(Reg(Vec(memWidth, UInt(xLen.W)))) else None
+  val wb_dg_sec   = if (ENABLE_DOPPELGANGER) Some(Reg(Vec(memWidth, Bool()))) else None
+  val wb_dg_atk   = if (ENABLE_DOPPELGANGER) Some(Reg(Vec(memWidth, Bool()))) else None
+  val wb_dg_edges = if (ENABLE_DOPPELGANGER) Some(Reg(Vec(memWidth, new IftEdgeList))) else None
+  def dgMerge(raw: UInt, held: UInt, ovm: UInt): UInt =                       // bytes in ovm keep the store-merged held bytes
+    VecInit((0 until 8).map(b => Mux(ovm(b), held(8*b+7, 8*b), raw(8*b+7, 8*b)))).asUInt
+  def dgFmt(u: MicroOp, pa: UInt, dw: UInt): UInt =                            // the D$'s own load formatting (dcache.scala:1944)
+    new freechips.rocketchip.rocket.LoadGen(u.mem_size, u.mem_signed, pa, dw, false.B, coreDataBytes).data
+  if (ENABLE_DOPPELGANGER) for (w <- 0 until memWidth) {
+    val idx  = lcam_ldq_idx(w)
+    val cur  = ldq(idx).bits                                                    // live entry (TLB-stage writes and merges landed)
+    val memE = mem_ldq_e(w).bits                                                // registered copy (the release uop base, as v3)
+    val conf = ldst_addr_matches(w).asUInt.orR || ld_srch_killed.get(w) || stt_blk_srch(w) || memSaBlock(w)
+    // [R1d B1] the verifying fire survived its exe-cycle branch kill (fired_load_* are kill-qualified; lcam_ldq_idx is valid only then)
+    val mfired = fired_load_incoming(w) || fired_load_retry(w) || fired_load_wakeup(w)
+    val mvfy   = (mem_dg_hit.get(w) || mem_dg_wait.get(w)) && mfired
+    val vfy  = mvfy && !conf && !io.core.exception
+    when (mvfy) { io.dmem.s1_kill(w) := RegNext(dmem_req_fire(w)) }   // never true.B (dcache.scala:970)
+    val noChg   = !dg_mrg.get(idx) && !dgl_dead_nk.get(idx) && !dgl_idle_req.get(idx)
+    val rsp_hit = (0 until memWidth).map(r => dgr_v.get(r) && dgr_idx.get(r) === idx)
+    val r_sel   = PriorityEncoder(rsp_hit)
+    val use_rsp   = vfy && mem_dg_wait.get(w) && rsp_hit.reduce(_||_) && noChg
+    val use_entry = vfy && !rsp_hit.reduce(_||_) && cur.dg_state.get === DGState.DONE && noChg
+    val wait_late = vfy && !rsp_hit.reduce(_||_) && cur.dg_state.get === DGState.INFLIGHT && noChg
+    val lost      = vfy && !use_rsp && !use_entry && !wait_late
+    when (use_rsp || use_entry) { s1_set_execute(idx) := true.B }              // executed; value delivered at wb (L7 C)
+    when (wait_late) { ldq(idx).bits.dg_wait.get := s1_executing_loads(idx); dgl_wait_set.get(idx) := s1_executing_loads(idx) }
+    when (lost)      { s1_set_execute(idx) := false.B }                          // the doppelganger changed meanwhile: replay
+    // the HIT uop: registered entry copy patched with this load's TLB-stage writes (v3 L7 B)
+    val u = WireInit(memE.uop)
+    when (fired_load_incoming(w)) { u.pdst := mem_incoming_uop(w).pdst }
+    u.cf_secret_access.foreach(_ := cur.uop.cf_secret_access.get)
+    u.cf_secret_propagation.foreach(_ := cur.uop.cf_secret_propagation.get)
+    u.cf_secret_transmission.foreach(_ := cur.uop.cf_secret_transmission.get)
+    u.cf_attacker_influence.foreach(_ := cur.uop.cf_attacker_influence.get)
+    u.cf_fu_bitmap.foreach(_ := cur.uop.cf_fu_bitmap.get | (1 << UNIT_DC).U(numModules.W))      // the value came through the D$
+    // WAIT completion on this lane: a live dg response for an entry that is waiting (and not changing this cycle)
+    val lidx  = dgr_idx.get(w)
+    val le    = ldq(lidx).bits
+    val late  = dgr_v.get(w) && le.dg_wait.get && le.dg_ovm.get === 0.U &&
+                !dg_mrg.get(lidx) && !dgl_dead_nk.get(lidx) && !dgl_idle_req.get(lidx)
+    val lateLost = dgr_v.get(w) && le.dg_wait.get && (!late || use_rsp || use_entry)   // cannot deliver on this lane now
+    when (lateLost) { dgl_refire.get(lidx) := true.B }                          // replay -> re-verify against DONE (HIT)
+    wb_dg_vf.get(w) := ((use_rsp || use_entry) || (late && !use_rsp && !use_entry)) && !io.core.exception
+    // [NOOFF] (amend-NOOFF D1/D3) a release is this load's response: it carries the D$ edges of the doppelganger access that supplied
+    // the value (WAIT: the arriving response's list; HIT: the list held at the response, dg_edges) and, as a stock response does, the
+    // entry's pending nack-residency record as the DC_NACK edge the D$ builds for an LSU hit (dcache [NACKRES]: key = the record PC,
+    // is_atk = the attacker record, is_secret = !atk || sec).  The record is consumed at the release (L7 C).  Without IFT: the old lists.
+    def dgRel(base: IftEdgeList, e: LDQEntry): IftEdgeList = if (!ENABLE_IFT) base else {
+      val rv = e.cf_nack_res_v.get; val ra = e.cf_nack_res_atk.get
+      addInfluencerBatchList(base, e.uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)),
+        Seq(InfluencerCandidate(rv || ra, e.cf_nack_res_pc.get, INFL_DC_NACK, ra, !ra || rv)))._1
+    }
+    def dgRelUop(x: MicroOp, l: IftEdgeList): MicroOp = {        // [RSTICKY] the edges' sticky bits, as merged_base_cf
+      val y = WireInit(x)
+      when (respEdgeAtk(l)) { y.cf_attacker_influence.foreach(_ := true.B) }
+      when (respEdgeSec(l)) { y.cf_secret_propagation.foreach(_ := true.B) }
+      y
+    }
+    val rel_rsp   = dgRel(dgr_edges.get(r_sel), cur)
+    val rel_entry = dgRel(cur.dg_edges.getOrElse(0.U.asTypeOf(new IftEdgeList)), cur)
+    val rel_late  = dgRel(dgr_edges.get(w), le)
+    when (use_rsp) {
+      wb_dgr_idx.get(w)  := idx
+      wb_dg_uop.get(w)   := UpdateBrMask(io.core.brupdate, dgRelUop(dgr_uop.get(r_sel), rel_rsp))
+      wb_dg_data.get(w)  := dgFmt(cur.uop, cur.dg_paddr.get, dgMerge(dgr_raw.get(r_sel), cur.dg_data.get, cur.dg_ovm.get))
+      wb_dg_sec.get(w)   := dgr_sec.get(r_sel);  wb_dg_atk.get(w) := dgr_atk.get(r_sel)
+      wb_dg_edges.get(w) := rel_rsp
+    } .elsewhen (use_entry) {
+      wb_dgr_idx.get(w)  := idx
+      wb_dg_uop.get(w)   := UpdateBrMask(io.core.brupdate, dgRelUop(u, rel_entry))
+      wb_dg_data.get(w)  := dgFmt(cur.uop, cur.dg_paddr.get, cur.dg_data.get)
+      wb_dg_sec.get(w)   := cur.uop.cf_secret_access.getOrElse(false.B) || cur.dg_val_sec.get || cur.addr_is_secret.getOrElse(false.B)  // [SECDEST]
+      wb_dg_atk.get(w)   := cur.addr_is_atk.getOrElse(false.B) || cur.dg_val_atk.get                                                  // [R1d]
+      wb_dg_edges.get(w) := rel_entry                                    // [NOOFF] D1 (was 0: DGL-5 (a), superseded by the owner rule)
+    } .elsewhen (late) {
+      wb_dgr_idx.get(w)  := lidx
+      wb_dg_uop.get(w)   := UpdateBrMask(io.core.brupdate, dgRelUop(dgr_uop.get(w), rel_late))
+      wb_dg_data.get(w)  := dgFmt(dgr_uop.get(w), le.dg_paddr.get, dgr_raw.get(w))       // dg_ovm = 0 checked above
+      wb_dg_sec.get(w)   := dgr_sec.get(w); wb_dg_atk.get(w) := dgr_atk.get(w)
+      wb_dg_edges.get(w) := rel_late
+    }
+  }
   // Set execute bit in LDQ
   for (i <- 0 until numLdqEntries) {
     when (s1_set_execute(i)) { ldq(i).bits.executed := true.B }
@@ -2413,7 +2971,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   mem_forward_valid       := widthMap(w =>
                                   (ldst_forward_matches(w)(forwarding_idx(w))        &&
                                  !IsKilledByBranch(io.core.brupdate, lcam_uop(w))    &&
-                                 !io.core.exception && !RegNext(io.core.exception)))
+                                 !io.core.exception && !RegNext(io.core.exception) && !stt_blk_srch(w)))
   mem_forward_stq_idx     := forwarding_idx
 
   // Avoid deadlock with a 1-w LSU prioritizing load wakeups > store commits
@@ -2853,6 +3411,29 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   r_xcpt.uop.br_mask := GetNewBrMask(io.core.brupdate, xcpt_uop)
   r_xcpt.cause       := Mux(use_mem_xcpt, mem_xcpt_cause, MINI_EXCEPTION_MEM_ORDERING)
   r_xcpt.badvaddr    := mem_xcpt_vaddr // TODO is there another register we can use instead?
+  // [SA-5B] SpecASan tag-check fault (paper: correct-path unsafe access -> fault).  Sources: D$ sa_fault nacks (lanes 0..m-1,
+  // SA-4E) and non-speculative forwarding-key mismatches (lanes m..2m-1, SA-6A).  The first pulse is registered; it is raised
+  // only when no stock exception is being reported this cycle, and only then is its LDQ entry marked sa_faulted (so it stops
+  // re-firing).  An unraised pulse is simply forgotten: that load is !executed and !faulted, re-fires and faults again, so no
+  // fault is lost and the oldest one is eventually raised.  The load is non-speculative, so it is not branch-killable.
+  if (SPECASAN) {
+    val p     = sa_fault_pulse.get
+    val sel   = PriorityEncoderOH(p.asUInt)
+    val sa_fv   = RegNext(p.asUInt.orR && !io.core.exception, false.B)
+    val sa_fuop = RegNext(Mux1H(sel, sa_fault_uop.get))
+    val sa_fpa  = RegNext(Mux1H(sel, sa_fault_addr.get))
+    when (sa_fv && !(ld_xcpt_valid || mem_xcpt_valid) && !io.core.exception) {
+      r_xcpt_valid       := true.B
+      r_xcpt.uop         := sa_fuop
+      r_xcpt.uop.br_mask := GetNewBrMask(io.core.brupdate, sa_fuop)
+      r_xcpt.cause       := rocket.Causes.load_access.U        // decision SA-3 (a): reuse 0x5
+      r_xcpt.badvaddr    := sa_fpa                             // paging off: paddr == vaddr
+      ldq(sa_fuop.ldq_idx).bits.sa_faulted.get := true.B
+      if (ENABLE_CF_DEBUG_PRINTF) {                            // [SA-10] debug only, no FPGA logic
+        when (io.core.cf_debug_lsu_enable) { printf("[SA-FAULT] pc=0x%x pa=0x%x\n", sa_fuop.debug_pc, sa_fpa) }
+      }
+    }
+  }
 
   io.core.lxcpt.valid := r_xcpt_valid && !io.core.exception && !IsKilledByBranch(io.core.brupdate, r_xcpt.uop)
   io.core.lxcpt.bits  := r_xcpt
@@ -2927,45 +3508,81 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       }
         .elsewhen (io.dmem.nack(w).bits.uop.uses_ldq)
       {
-        assert(ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.executed)
-        ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.executed  := false.B
-        nacking_loads(io.dmem.nack(w).bits.uop.ldq_idx) := true.B
-        // [NACKRES] step 16: nacked while a secret-address miss holds an MSHR -> tag the load
-        // [NACKSECQ] lean58 A7 (DF-nack-secqual, ledger 752; RULES D1 "MSHR/WB nack"): only a nack whose CAUSE is
-        // the MSHR/WB side (MSHR full / same set / no free way, victim line, same-set writeback) is that edge, as on
-        // the attacker side since patch 44: a probe or data-bank-conflict nack taken while some secret MSHR is live
-        // no longer raises a secret nack edge (secret over-taint removed).  cf_nack_mshr is a register-only term
-        // (dcache.scala, 0 levels); one more input on the existing write-enable LUT.  A nack with an MSHR cause AND
-        // a probe/bank cause in the same cycle records nothing (the attacker side's existing under-taint corner).
-        // [NACKCONFSEC] lean58 (Fable audit M8, owner 2026-10-23): ...and only when the CONFLICTING MSHR holds the
-        // secret request (patch 68's attacker rule, now both sides): an unrelated probe nacked on full MSHRs or
-        // another set while the victim's secret miss is live no longer gets a secret register.  The PC is still
-        // cf_asec_busy.bits (the lowest live secret MSHR's), which names the conflicting one whenever only one
-        // secret MSHR is live (residual: several live secret MSHRs may name another one).  RECORD CHANGE.
-        if (ENABLE_IFT) {
-          val nk_sec = io.dmem.cf_nack_asec.get(w) && io.dmem.cf_nack_mshr.get(w)
-          when (nk_sec) {
-            ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.cf_nack_res_v.foreach(_ := true.B)
-            ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.cf_nack_res_pc.foreach(_ := io.dmem.cf_nack_pc.get(w))   // [NACKPC] D6
+        // [Doppelganger] the stock body is a local def so a doppelganger nack can bypass it (L12)
+        def nack_real_load(): Unit = {
+          assert(ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.executed)
+          ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.executed  := false.B
+          nacking_loads(io.dmem.nack(w).bits.uop.ldq_idx) := true.B
+          // [SA-4E] SpecASan: the D$ answered a key/lock mismatch with a NACK (paper: "the load does not return data; only a
+          // response containing the tag-checking outcome returns to the LSQ").  Speculative -> unsafe (re-fires only when
+          // non-speculative, SA-5A); non-speculative -> fault pulse (SA-5B decides and sets sa_faulted).
+          if (SPECASAN) {
+            val n = io.dmem.nack(w).bits
+            when (n.sa_unsafe.get) { ldq(n.uop.ldq_idx).bits.sa_unsafe.get := true.B }
+            sa_fault_pulse.get(w) := n.sa_fault.get
+            sa_fault_uop.get(w)   := n.uop
+            sa_fault_addr.get(w)  := n.addr
           }
-          // [NACKATK] patch 44 (r111 extended, r173 (3)): a VICTIM load nacked by an MSHR/WB conflict
-          // while a valid MSHR holds an attacker-influenced request.  Edge only (no value taint).
-          // The PC (cf_asec_busy.bits: the secret MSHR's when one is valid, else the attacker
-          // MSHR's) is written only if no secret nack is recorded (secret-first, per entry: no
-          // LDQ read mux).  The data input is the same register as the secret write's.
-          // [NACKCONF] patch 68 (V12): the conflicting MSHR, not any valid MSHR (was cf_aatk_busy)
-          val nk_atk = io.dmem.cf_nack_aatk.get(w) && io.dmem.cf_nack_mshr.get(w) &&
-                       io.dmem.nack(w).bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U
-          when (nk_atk) {
-            ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.cf_nack_res_atk.foreach(_ := true.B)
-          }
-          for (i <- 0 until numLdqEntries) {
-            when (nk_atk && !nk_sec && io.dmem.nack(w).bits.uop.ldq_idx === i.U &&   // [NACKCONFSEC] (was !cf_asec_busy.valid)
-                  !ldq(i).bits.cf_nack_res_v.get) {
-              ldq(i).bits.cf_nack_res_pc.foreach(_ := io.dmem.cf_nack_pc.get(w))   // [NACKPC] D6: the conflicting MSHR's PC
+          // [NACKRES] step 16: nacked while a secret-address miss holds an MSHR -> tag the load
+          // [NACKSECQ] lean58 A7 (DF-nack-secqual, ledger 752; RULES D1 "MSHR/WB nack"): only a nack whose CAUSE is
+          // the MSHR/WB side (MSHR full / same set / no free way, victim line, same-set writeback) is that edge, as on
+          // the attacker side since patch 44: a probe or data-bank-conflict nack taken while some secret MSHR is live
+          // no longer raises a secret nack edge (secret over-taint removed).  cf_nack_mshr is a register-only term
+          // (dcache.scala, 0 levels); one more input on the existing write-enable LUT.  A nack with an MSHR cause AND
+          // a probe/bank cause in the same cycle records nothing (the attacker side's existing under-taint corner).
+          // [NACKCONFSEC] lean58 (Fable audit M8, owner 2026-10-23): ...and only when the CONFLICTING MSHR holds the
+          // secret request (patch 68's attacker rule, now both sides): an unrelated probe nacked on full MSHRs or
+          // another set while the victim's secret miss is live no longer gets a secret register.  The PC is still
+          // cf_asec_busy.bits (the lowest live secret MSHR's), which names the conflicting one whenever only one
+          // secret MSHR is live (residual: several live secret MSHRs may name another one).  RECORD CHANGE.
+          nack_ift_record()
+        }
+        // [NOOFF] (amend-NOOFF D2) the IFT part of the stock nack handler, unchanged; also run for a LIVE doppelganger nack (L12): that D$
+        // request is this load's access and its MSHR/WB-conflict nack delays the value the load receives, so the stock record is made on the
+        // entry and delivered at the release (D3) or, if the doppelganger dies, by the real load's own response (stock).
+        def nack_ift_record(): Unit = {
+          if (ENABLE_IFT) {
+            val nk_sec = io.dmem.cf_nack_asec.get(w) && io.dmem.cf_nack_mshr.get(w)
+            when (nk_sec) {
+              ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.cf_nack_res_v.foreach(_ := true.B)
+              ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.cf_nack_res_pc.foreach(_ := io.dmem.cf_nack_pc.get(w))   // [NACKPC] D6
+            }
+            // [NACKATK] patch 44 (r111 extended, r173 (3)): a VICTIM load nacked by an MSHR/WB conflict
+            // while a valid MSHR holds an attacker-influenced request.  Edge only (no value taint).
+            // The PC (cf_asec_busy.bits: the secret MSHR's when one is valid, else the attacker
+            // MSHR's) is written only if no secret nack is recorded (secret-first, per entry: no
+            // LDQ read mux).  The data input is the same register as the secret write's.
+            // [NACKCONF] patch 68 (V12): the conflicting MSHR, not any valid MSHR (was cf_aatk_busy)
+            val nk_atk = io.dmem.cf_nack_aatk.get(w) && io.dmem.cf_nack_mshr.get(w) &&
+                         io.dmem.nack(w).bits.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U
+            when (nk_atk) {
+              ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.cf_nack_res_atk.foreach(_ := true.B)
+            }
+            for (i <- 0 until numLdqEntries) {
+              when (nk_atk && !nk_sec && io.dmem.nack(w).bits.uop.ldq_idx === i.U &&   // [NACKCONFSEC] (was !cf_asec_busy.valid)
+                    !ldq(i).bits.cf_nack_res_v.get) {
+                ldq(i).bits.cf_nack_res_pc.foreach(_ := io.dmem.cf_nack_pc.get(w))   // [NACKPC] D6: the conflicting MSHR's PC
+              }
             }
           }
         }
+        val nk_idx = io.dmem.nack(w).bits.uop.ldq_idx
+        if (ENABLE_DOPPELGANGER) {
+          val nk = io.dmem.nack(w).bits
+          val e  = ldq(nk_idx).bits
+          when (nk.uop.dg_req.get) {   // (ungated) a doppelganger was nacked; stale ones change nothing
+            when (e.dg_state.get === DGState.INFLIGHT && nk.uop.dg_tag.get === e.dg_tag.get) {
+              nack_ift_record()                                            // [NOOFF] D2
+              val sa_bad = nk.sa_unsafe.getOrElse(false.B) || nk.sa_fault.getOrElse(false.B)   // SpecASan: blocked, never retried
+              when (sa_bad || e.dg_nacks.get >= doppelgangerNackRetries.U) { dgl_dead_req.get(nk_idx) := true.B; dgl_dead_nk.get(nk_idx) := true.B }
+              .otherwise {
+                dgl_idle_req.get(nk_idx)   := true.B
+                ldq(nk_idx).bits.dg_nacks.get := e.dg_nacks.get + 1.U
+                dg_nack_ev.get(nk_idx)     := true.B                     // two-cycle spacing before the re-issue
+              }
+            }
+          } .otherwise { nack_real_load() }
+        } else { nack_real_load() }
       }
         .otherwise
       {
@@ -2982,15 +3599,21 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       {
         assert(!io.dmem.resp(w).bits.is_hella)
         val ldq_idx = io.dmem.resp(w).bits.uop.ldq_idx
-        val send_iresp = ldq(ldq_idx).bits.uop.dst_rtype === RT_FIX
-        ldq(ldq_idx).bits.cf_nack_res_v.foreach(_ := false.B)   // [NACKRES] consumed: the D$ built the edge
-        ldq(ldq_idx).bits.cf_nack_res_atk.foreach(_ := false.B)   // [NACKATK]
-        val send_fresp = ldq(ldq_idx).bits.uop.dst_rtype === RT_FLT
+        val is_dg_resp: Option[Bool] = io.dmem.resp(w).bits.uop.dg_req     // [Doppelganger] (ungated) None when off
+        val send_iresp = is_dg_resp.map(d => (ldq(ldq_idx).bits.uop.dst_rtype === RT_FIX) && !d).getOrElse(ldq(ldq_idx).bits.uop.dst_rtype === RT_FIX)
+        def nackres_clear(): Unit = {
+          ldq(ldq_idx).bits.cf_nack_res_v.foreach(_ := false.B)   // [NACKRES] consumed: the D$ built the edge
+          ldq(ldq_idx).bits.cf_nack_res_atk.foreach(_ := false.B)   // [NACKATK]
+        }
+        if (ENABLE_DOPPELGANGER) { when (!is_dg_resp.get) { nackres_clear() } } else { nackres_clear() }   // [R1d M3] a dg response consumes no residency record (no hold connect)
+        val send_fresp = is_dg_resp.map(d => (ldq(ldq_idx).bits.uop.dst_rtype === RT_FLT) && !d).getOrElse(ldq(ldq_idx).bits.uop.dst_rtype === RT_FLT)
 
         // corefuzzing: merge CF fields from response UOP (which went through TLB+dcache pipeline
         // accumulating INFL_DTLB_STATE and INFL_CACHE_EVICTION) into the canonical LDQ base UOP.
         val ldq_base_cf = ldq(ldq_idx).bits.uop
         val resp_cf     = io.dmem.resp(w).bits.uop
+        val dg_ok: Option[Bool] = is_dg_resp.map(d => d && ldq(ldq_idx).bits.dg_state.get === DGState.INFLIGHT &&   // [Doppelganger]
+                                                  io.dmem.resp(w).bits.uop.dg_tag.get === ldq(ldq_idx).bits.dg_tag.get)
         val merged_base_cf = WireInit(ldq_base_cf)
         // [F7FUBMAP] lean58 timing F7 (timing-audit-20261023 section 6): the LSU sets dcacheTagCF itself and no longer
         // reads the D$ response's 24-bit cf_fu_bitmap, so the copies the D$ carries for it (s1/s2 request registers,
@@ -3079,12 +3702,29 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                            dmem_resp_uop_cf.cf_mem_sec_dataflow.getOrElse(false.B) || cf_ld_asec   // [SECDEST]
         io.core.exe(w).fresp.bits.taint_atk := ldq(io.dmem.resp(w).bits.uop.ldq_idx).bits.addr_is_atk.getOrElse(false.B) ||
                                               dmem_resp_uop_cf.cf_mem_dataflow_atk.getOrElse(false.B)   // [R1d] see iresp
+        if (ENABLE_DOPPELGANGER) dgr_raw.get(w) := io.dmem.resp(w).bits.data   // [R1d M2] raw doubleword (the request was size 3, unsigned); consumers qualify with dgr_v
+        if (ENABLE_DOPPELGANGER) when (dg_ok.get) {           // [Doppelganger] the stock-built response view, for the release registers (L7 B)
+          dgr_v.get(w)     := true.B
+          dgr_idx.get(w)   := ldq_idx
+          dgr_uop.get(w)   := dmem_resp_uop_cf
+          dgr_sec.get(w)   := dmem_resp_uop_cf.cf_secret_access.getOrElse(false.B) ||
+                              dmem_resp_uop_cf.cf_mem_sec_dataflow.getOrElse(false.B) || cf_ld_asec
+          dgr_atk.get(w)   := ldq(ldq_idx).bits.addr_is_atk.getOrElse(false.B) || dmem_resp_uop_cf.cf_mem_dataflow_atk.getOrElse(false.B)
+          dgr_edges.get(w) := io.dmem.resp(w).bits.edges
+        }
 
+        if (ENABLE_DOPPELGANGER) { assert(is_dg_resp.get || (send_iresp ^ send_fresp)) } else {   // [IDOFF] stock assert line below kept verbatim (its text is the message)
         assert(send_iresp ^ send_fresp)
-        dmem_resp_fired(w) := true.B
+        }
+        dmem_resp_fired(w) := (if (ENABLE_DOPPELGANGER) !is_dg_resp.get else true.B)
 
-        ldq(ldq_idx).bits.succeeded      := io.core.exe(w).iresp.valid || io.core.exe(w).fresp.valid
-        ldq(ldq_idx).bits.debug_wb_data  := io.dmem.resp(w).bits.data
+        def done_write(): Unit = {
+          ldq(ldq_idx).bits.succeeded      := io.core.exe(w).iresp.valid || io.core.exe(w).fresp.valid
+          ldq(ldq_idx).bits.debug_wb_data  := io.dmem.resp(w).bits.data
+        }
+        // [Doppelganger] a dg response (live or stale) must not touch the real load's completion state (controller call; [R1d M3]
+        // gated instead of a hold connect, so a same-cycle real-response write to this entry from a lower lane cannot be cancelled).
+        if (ENABLE_DOPPELGANGER) { when (!is_dg_resp.get) { done_write() } } else { done_write() }
         // [LDQRESP] stall-edge audit D1 (owner 2026-10-26): the response-time record labels (the D$ edges' sec / atk,
         // the secret-marked DW (cf_mem_sec_dataflow) and the attacker line value (cf_mem_dataflow_atk)) also land on
         // the LDQ entry, so the LDQ head (LDQ_FULL / C5 / MEM_HOL), the LD-LD MEM_ORDER searcher and the [B60LDB]
@@ -3093,10 +3733,20 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         // these bits can be lost; the responded entry makes no later D$ request.  Conditions use only response-bus
         // terms (no LDQ read mux), into the same ldq_idx decode as `succeeded`: 0 FF, ~2 x 40 LUT, 0 levels.
         if (ENABLE_IFT) {
-          when (respEdgeSec(io.dmem.resp(w).bits.edges) || resp_cf.cf_mem_sec_dataflow.getOrElse(false.B)) {
-            ldq(ldq_idx).bits.uop.cf_secret_propagation.foreach(_ := true.B) }
-          when (respEdgeAtk(io.dmem.resp(w).bits.edges) || resp_cf.cf_mem_dataflow_atk.getOrElse(false.B)) {
-            ldq(ldq_idx).bits.uop.cf_attacker_influence.foreach(_ := true.B) }
+          def ldqresp_sticky(): Unit = {
+            when (respEdgeSec(io.dmem.resp(w).bits.edges) || resp_cf.cf_mem_sec_dataflow.getOrElse(false.B)) {
+              ldq(ldq_idx).bits.uop.cf_secret_propagation.foreach(_ := true.B) }
+            when (respEdgeAtk(io.dmem.resp(w).bits.edges) || resp_cf.cf_mem_dataflow_atk.getOrElse(false.B)) {
+              ldq(ldq_idx).bits.uop.cf_attacker_influence.foreach(_ := true.B) }
+          }
+          if (ENABLE_DOPPELGANGER) { when (!is_dg_resp.get || dg_ok.get) { ldqresp_sticky() } } else { ldqresp_sticky() }   // [Doppelganger]
+        }
+        if (ENABLE_DOPPELGANGER) when (dg_ok.get) {                     // [Doppelganger] data is written by L10; state and labels here
+          ldq(ldq_idx).bits.dg_edges.foreach(_ := io.dmem.resp(w).bits.edges)   // [NOOFF] D1: held for a HIT release
+          ldq(ldq_idx).bits.dg_val_sec.get := resp_cf.cf_mem_sec_dataflow.getOrElse(false.B)
+          ldq(ldq_idx).bits.dg_val_atk.get := resp_cf.cf_mem_dataflow_atk.getOrElse(false.B)
+          ldq(ldq_idx).bits.dg_state.get   := DGState.DONE                // L14 may override (DEAD / IDLE)
+          ldq(ldq_idx).bits.dg_wait.get    := false.B                     // a waiting load is released by L7 B or replayed
         }
       }
         .elsewhen (io.dmem.resp(w).bits.uop.uses_stq)
@@ -3322,6 +3972,58 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     }
   }
 
+  // [Doppelganger] release: deliver the held/arriving value on this lane in the cycle a D$ hit would respond (spec_ld_succeed
+  // holds for an incoming load), or replay through the stock wakeup path when the lane is busy.
+  if (ENABLE_DOPPELGANGER) for (w <- 0 until memWidth) {
+    val idx  = wb_dgr_idx.get(w)
+    val u    = wb_dg_uop.get(w)
+    val live = !IsKilledByBranch(io.core.brupdate, u) && ldq(idx).valid
+    val go   = wb_dg_vf.get(w) && !dmem_resp_fired(w) && !wb_forward_valid(w) && live && !io.core.exception
+    when (go) {
+      val uo = WireInit(u); uo.br_mask := GetNewBrMask(io.core.brupdate, u)
+      io.core.exe(w).iresp.valid          := uo.dst_rtype === RT_FIX
+      io.core.exe(w).fresp.valid          := uo.dst_rtype === RT_FLT
+      io.core.exe(w).iresp.bits.uop       := uo;                io.core.exe(w).fresp.bits.uop       := uo
+      io.core.exe(w).iresp.bits.data      := wb_dg_data.get(w); io.core.exe(w).fresp.bits.data      := wb_dg_data.get(w)
+      io.core.exe(w).iresp.bits.secret    := wb_dg_sec.get(w);  io.core.exe(w).fresp.bits.secret    := wb_dg_sec.get(w)
+      io.core.exe(w).iresp.bits.taint_atk := wb_dg_atk.get(w);  io.core.exe(w).fresp.bits.taint_atk := wb_dg_atk.get(w)
+      io.core.exe(w).iresp.bits.edges     := wb_dg_edges.get(w); io.core.exe(w).fresp.bits.edges    := wb_dg_edges.get(w)
+      cfRespWin(w, uo)                                                         // [F1WSH]
+      ldq(idx).bits.succeeded     := true.B
+      ldq(idx).bits.executed      := true.B
+      ldq(idx).bits.debug_wb_data := wb_dg_data.get(w)
+      ldq(idx).bits.cf_nack_res_v.foreach(_ := false.B)              // [NOOFF] D3: consumed (the release list carries the DC_NACK edge)
+      ldq(idx).bits.cf_nack_res_atk.foreach(_ := false.B)
+      dgl_ev_rel.get(w)           := true.B
+    } .elsewhen (wb_dg_vf.get(w)) { dgl_refire.get(idx) := true.B }             // lane busy / killed / exception: replay
+    assert(!(go && (dmem_resp_fired(w) || wb_forward_valid(w))), "[Doppelganger] release on a busy lane")
+    assert(!(dgl_ev_rel.get(w) && !ldq(idx).valid), "[Doppelganger] release into a free LDQ entry")
+    if (ENABLE_CF_DEBUG_PRINTF) {                                              // L15: RELEASE / FALLBACK
+      val ue = ldq(idx).bits.uop
+      when (io.core.cf_debug_lsu_enable && go) {
+        printf("[Doppelganger] RELEASE cyc=%d ldq=%d rob=%d oc=%d pc=0x%x addr=0x%x\n", io.core.tsc_reg, idx, ue.rob_idx,
+               ue.cf_op_count_id.getOrElse(0.U), ue.debug_pc, ldq(idx).bits.dg_paddr.get)
+      }
+      when (io.core.cf_debug_lsu_enable && !go && wb_dg_vf.get(w)) {
+        printf("[Doppelganger] FALLBACK cyc=%d ldq=%d rob=%d oc=%d pc=0x%x addr=0x%x\n", io.core.tsc_reg, idx, ue.rob_idx,
+               ue.cf_op_count_id.getOrElse(0.U), ue.debug_pc, ldq(idx).bits.dg_paddr.get)
+      }
+    }
+  }
+
+  // [Doppelganger] DEAD / IDLE requests and the real-load replay.  A load that is (or becomes this cycle) verified and waiting
+  // cannot wait for a dropped or re-issued doppelganger: it is replayed instead (it reads memory itself, same address).
+  if (ENABLE_DOPPELGANGER) for (i <- 0 until numLdqEntries) {
+    val waiting = ldq(i).bits.dg_wait.get || dgl_wait_set.get(i)
+    when (dgl_dead_req.get(i) || dgl_idle_req.get(i)) {
+      when (waiting) {
+        ldq(i).bits.dg_state.get := DGState.DEAD; ldq(i).bits.dg_wait.get := false.B; ldq(i).bits.executed := false.B
+      } .elsewhen (dgl_dead_req.get(i)) { ldq(i).bits.dg_state.get := DGState.DEAD }
+        .otherwise                      { ldq(i).bits.dg_state.get := DGState.IDLE }
+    }
+    when (dgl_refire.get(i)) { ldq(i).bits.executed := false.B; ldq(i).bits.dg_wait.get := false.B }
+  }
+
   // Initially assume the speculative load wakeup failed
   io.core.ld_miss         := RegNext(io.core.spec_ld_wakeup.map(_.valid).reduce(_||_))
   val spec_ld_succeed = widthMap(w =>
@@ -3413,6 +4115,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         // END speculative flush logging
         ldq(i).valid           := false.B
         ldq(i).bits.addr.valid := false.B
+        ldq(i).bits.dg_state.foreach(_ := DGState.IDLE); ldq(i).bits.dg_wait.foreach(_ := false.B)   // [Doppelganger] L2
       }
     }
   }
@@ -3460,7 +4163,22 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq(idx).bits.executed         := false.B
       ldq(idx).bits.succeeded        := false.B
       ldq(idx).bits.order_fail       := false.B
+      stt_ldq_deq.foreach(_(idx) := true.B)                                            // STT C-LSU-0
+      ldq(idx).bits.stt_of_pend.foreach(_ := false.B)                                  // STT C-LSU-4
+      if (ENABLE_STT && ENABLE_CF_DEBUG_PRINTF) {                                      // [R1s-a B2] the guard makes this unreachable
+        assert(!ldq(idx).bits.stt_of_pend.get, "[STT] load committed with a deferred squash pending")
+      }
       ldq(idx).bits.forward_std_val  := false.B
+      ldq(idx).bits.dg_state.foreach(_ := DGState.IDLE); ldq(idx).bits.dg_wait.foreach(_ := false.B)   // [Doppelganger] L2
+      if (ENABLE_DOPPELGANGER) {   // [Doppelganger] L13: train the predictor with the committed load (paper: strictly committed loads)
+        io.core.dgl_train.get(w).valid     := dgl_en && io.core.commit.arch_valids(w) && !ldq(idx).bits.addr_is_uncacheable &&
+                                              !ldq(idx).bits.addr_is_virtual && !ldq(idx).bits.uop.exception &&
+                                              ldq(idx).bits.uop.mem_cmd === ldq(idx).bits.uop.M_XRD
+        io.core.dgl_train.get(w).bits.pc   := ldq(idx).bits.uop.debug_pc(coreMaxAddrBits-1, 1)
+        io.core.dgl_train.get(w).bits.addr := ldq(idx).bits.addr.bits
+        io.core.dgl_train.get(w).bits.sec  := ldq(idx).bits.addr_is_secret.getOrElse(false.B)
+        io.core.dgl_train.get(w).bits.atk  := ldq(idx).bits.addr_is_atk.getOrElse(false.B)
+      }
 
     }
 
@@ -3509,6 +4227,69 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     when (stq(stq_head).bits.uop.is_fence)
     {
       stq_execute_head := WrapInc(stq_execute_head, cf_stq_active)
+    }
+  }
+
+  // [Doppelganger] paper 4.4: an older store that leaves the STQ (its D$ write is done: a later read sees it) after a doppelganger
+  // read the same doubleword overrides the preloaded bytes.  Program order (STQ exit order), exact.  Stores still in the STQ are seen
+  // by the real load's own search at verification.  Fences carry no data; AMO/SC are is_unique + flush_on_commit, so no younger
+  // load can hold a doppelganger read from before their write (asserted).  (ungated: acts only on INFLIGHT/DONE entries)
+  val dg_st_mask = if (ENABLE_DOPPELGANGER) Some(GenByteMask(stq(stq_head).bits.addr.bits, stq(stq_head).bits.uop.mem_size)) else None
+  val dg_st_data = if (ENABLE_DOPPELGANGER) Some(new freechips.rocketchip.rocket.StoreGen(stq(stq_head).bits.uop.mem_size, 0.U,
+                                                   stq(stq_head).bits.data.bits, coreDataBytes).data) else None
+  if (ENABLE_DOPPELGANGER) {
+    val cs  = stq(stq_head).bits
+    val clr = clear_store && !cs.uop.is_fence && !cs.uop.is_amo
+    for (i <- 0 until numLdqEntries) {
+      val e   = ldq(i).bits
+      val act = ldq(i).valid && (e.dg_state.get === DGState.INFLIGHT || e.dg_state.get === DGState.DONE) && e.st_dep_mask(stq_head)
+      val dw  = cs.addr.bits(paddrBits-1, 3) === e.dg_paddr.get(paddrBits-1, 3)
+      when (clr && act && dw) { dg_mrg.get(i) := true.B }
+      assert(!(clear_store && cs.uop.is_amo && act && dw), "[Doppelganger] AMO/SC leaving the STQ under a live doppelganger")
+    }
+  }
+
+  // [Doppelganger] the only writer of dg_data / dg_ovm.  Per byte: an overriding store byte wins; else a live doppelganger response
+  // byte not yet overridden; else the old byte.  dg_ovm accumulates the overridden bytes so a later response cannot undo them.
+  if (ENABLE_DOPPELGANGER) for (i <- 0 until numLdqEntries) {
+    val rs  = (0 until memWidth).map(r => dgr_v.get(r) && dgr_idx.get(r) === i.U)
+    val rsp = rs.reduce(_||_)
+    val rd  = Mux1H(rs, dgr_raw.get)
+    val mg  = dg_mrg.get(i)
+    val old = ldq(i).bits.dg_data.get; val ovm = ldq(i).bits.dg_ovm.get
+    val nxt = VecInit((0 until 8).map(b =>
+                Mux(mg && dg_st_mask.get(b), dg_st_data.get(8*b+7, 8*b),
+                Mux(rsp && !ovm(b),          rd(8*b+7, 8*b), old(8*b+7, 8*b))))).asUInt
+    when (mg || rsp) { ldq(i).bits.dg_data.get := nxt }
+    when (mg)        { ldq(i).bits.dg_ovm.get  := ovm | dg_st_mask.get }
+    assert(PopCount(rs) <= 1.U, "[Doppelganger] two live responses for one entry")
+  }
+
+  // [Doppelganger] L15 event lines (simulation only): one line per event,
+  // "[Doppelganger] <event> cyc=%d ldq=%d rob=%d oc=%d pc=0x%x addr=0x%x".  RELEASE / FALLBACK are printed inside L7 C.
+  if (ENABLE_DOPPELGANGER && ENABLE_CF_DEBUG_PRINTF) {
+    def dgp(ev: String, c: Bool, idx: UInt, addr: UInt): Unit = {
+      val u = ldq(idx).bits.uop
+      when (c && io.core.cf_debug_lsu_enable) {
+        printf(s"[Doppelganger] $ev cyc=%d ldq=%d rob=%d oc=%d pc=0x%x addr=0x%x\n", io.core.tsc_reg, idx, u.rob_idx,
+               u.cf_op_count_id.getOrElse(0.U), u.debug_pc, addr)
+      }
+    }
+    for (w <- 0 until memWidth) {
+      val dreq = dmem_req_fire(w) && dmem_req(w).bits.uop.dg_req.get
+      dgp("ISSUE", dreq, dmem_req(w).bits.uop.ldq_idx, dmem_req(w).bits.addr)
+      dgp("RESP",  dgr_v.get(w), dgr_idx.get(w), ldq(dgr_idx.get(w)).bits.dg_paddr.get)
+      dgp("HIT",   mem_dg_hit.get(w) && (fired_load_incoming(w) || fired_load_retry(w) || fired_load_wakeup(w)),  lcam_ldq_idx(w), ldq(lcam_ldq_idx(w)).bits.dg_paddr.get)
+      dgp("WAIT",  mem_dg_wait.get(w) && (fired_load_incoming(w) || fired_load_retry(w) || fired_load_wakeup(w)), lcam_ldq_idx(w), ldq(lcam_ldq_idx(w)).bits.dg_paddr.get)
+      val xi = Mux(will_fire_load_incoming(w), ldq_incoming_idx(w), Mux(will_fire_load_retry(w), ldq_retry_idx, ldq_wakeup_idx))
+      dgp("MISS",  dgl_ev_mispred.get(w), xi, ldq(xi).bits.dg_paddr.get)
+    }
+    for (i <- 0 until numLdqEntries) {
+      val pa = ldq(i).bits.dg_paddr.get
+      dgp("NACK",   dg_nack_ev.get(i),   i.U, pa)
+      dgp("MERGE",  dg_mrg.get(i),       i.U, pa)
+      dgp("DEAD",   dgl_dead_req.get(i), i.U, pa)
+      dgp("REPLAY", dgl_refire.get(i),   i.U, pa)
     }
   }
 
@@ -3636,6 +4417,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq(i).valid           := false.B
       ldq(i).bits.addr.valid := false.B
       ldq(i).bits.executed   := false.B
+      ldq(i).bits.dg_state.foreach(_ := DGState.IDLE); ldq(i).bits.dg_wait.foreach(_ := false.B)   // [Doppelganger] L2
     }
   }
 

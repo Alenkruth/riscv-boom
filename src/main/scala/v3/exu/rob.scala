@@ -156,6 +156,7 @@ class RobIo(
   val fflags = Flipped(Vec(numFpuPorts, new ValidIO(new FFlagsResp())))
   val lxcpt = Input(Valid(new Exception())) // LSU
   val csr_replay = Input(Valid(new Exception()))
+  val stt_noret  = if (ENABLE_STT) Some(Input(Valid(UInt(robAddrSz.W)))) else None   // STT C-ROB-1: LSU retire guard (registered), C-LSU-4 [R1s-a B2]
 
   // Commit stage (free resources; also used for rollback).
   val commit = Output(new CommitSignals())
@@ -1543,7 +1544,14 @@ class Rob(
     }
 
     // Read unsafe status of PNR row.
-    rob_pnr_unsafe(w) := rob_val(rob_pnr) && (rob_unsafe(rob_pnr) || rob_exception(rob_pnr))
+    // [T3s-fix1] STT C-ROB-1: the load named by the LSU retire guard (oldest load with a deferred C-LSU-4 squash) is unsafe for
+    // the PNR too. Its rob_unsafe cleared at writeback and its MEM_ORDERING report is deferred, so without this term the PNR
+    // passes it and the later rollback takes the tail below the PNR (rob.scala:1910 assert, stt_t04_stl 0x5 AL). Same
+    // registered input and timing as the commit guard below (pend seen from s+2, rob_exception from c+2); one compare per bank.
+    val stt_noret_pnr_w = io.stt_noret.map(n => n.valid &&
+      n.bits === (if (coreWidth == 1) rob_pnr else Cat(rob_pnr, w.U(log2Ceil(coreWidth).W))))
+    rob_pnr_unsafe(w) := (if (ENABLE_STT) rob_val(rob_pnr) && (rob_unsafe(rob_pnr) || rob_exception(rob_pnr) || stt_noret_pnr_w.get)
+                          else          rob_val(rob_pnr) && (rob_unsafe(rob_pnr) || rob_exception(rob_pnr)))
 
     // -----------------------------------------------
     // debugging write ports that should not be synthesized
@@ -1675,11 +1683,15 @@ class Rob(
   var block_xcpt   = false.B
 
   for (w <- 0 until coreWidth) {
+    // [R1s-a B2] STT retire guard: block the pending load (and, through block_commit, everything younger); it may still throw
+    val stt_noret_w = io.stt_noret.map(n => n.valid &&
+      n.bits === (if (coreWidth == 1) rob_head else Cat(rob_head, w.U(log2Ceil(coreWidth).W))))
     will_throw_exception = (can_throw_exception(w) && !block_commit && !block_xcpt) || will_throw_exception
 
-    will_commit(w)       := can_commit(w) && !can_throw_exception(w) && !block_commit
-    block_commit         = (rob_head_vals(w) &&
-                           (!can_commit(w) || can_throw_exception(w))) || block_commit
+    will_commit(w)       := (if (ENABLE_STT) can_commit(w) && !can_throw_exception(w) && !block_commit && !stt_noret_w.get
+                             else          can_commit(w) && !can_throw_exception(w) && !block_commit)
+    block_commit         = (if (ENABLE_STT) (rob_head_vals(w) && (!can_commit(w) || can_throw_exception(w) || stt_noret_w.get))
+                             else          (rob_head_vals(w) && (!can_commit(w) || can_throw_exception(w)))) || block_commit
     block_xcpt           = will_commit(w)
   }
 
