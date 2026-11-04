@@ -83,6 +83,7 @@ class FFlagsResp(implicit p: Parameters) extends BoomBundle
  * @param hasFpu does the exe unit have a fpu
  * @param hasMul does the exe unit have a multiplier
  * @param hasDiv does the exe unit have a divider
+ * @param hasDiv2 [DIV2] does the exe unit have the second (reconfigurable) integer divider
  * @param hasFdiv does the exe unit have a FP divider
  * @param hasIfpu does the exe unit have a int to FP unit
  * @param hasFpiu does the exe unit have a FP to int unit
@@ -105,6 +106,7 @@ abstract class ExecutionUnit(
   val hasFpu           : Boolean       = false,
   val hasMul           : Boolean       = false,
   val hasDiv           : Boolean       = false,
+  val hasDiv2          : Boolean       = false,
   val hasFdiv          : Boolean       = false,
   val hasIfpu          : Boolean       = false,
   val hasFpiu          : Boolean       = false,
@@ -158,6 +160,8 @@ abstract class ExecutionUnit(
     val com_exception = if (hasMem || hasRocc) Input(Bool()) else null
     // corefuzzing: gate to enable speculative prints inside functional units
     val cf_debug_exu_enable = Input(Bool())
+    // [DIV2] DIV_CTL bit 0 (raw CSR value; registered inside the unit, next to its only consumer)
+    val cf_div2_en = if (hasDiv2) Some(Input(Bool())) else None
   })
 
   io.req.ready := false.B
@@ -231,6 +235,7 @@ abstract class ExecutionUnit(
  * @param hasAlu does the exe unit have a alu
  * @param hasMul does the exe unit have a multiplier
  * @param hasDiv does the exe unit have a divider
+ * @param hasDiv2 [DIV2] does the exe unit have the second (DIV_CTL-enabled) divider
  * @param hasIfpu does the exe unit have a int to FP unit
  * @param hasMem does the exe unit have a MemAddrCalcUnit
  */
@@ -240,13 +245,14 @@ class ALUExeUnit(
   hasAlu         : Boolean = true,
   hasMul         : Boolean = false,
   hasDiv         : Boolean = false,
+  hasDiv2        : Boolean = false,
   hasIfpu        : Boolean = false,
   hasMem         : Boolean = false,
   hasRocc        : Boolean = false)
   (implicit p: Parameters)
   extends ExecutionUnit(
     readsIrf         = true,
-    writesIrf        = hasAlu || hasMul || hasDiv,
+    writesIrf        = hasAlu || hasMul || hasDiv || hasDiv2,
     writesLlIrf      = hasMem || hasRocc,
     writesLlFrf      = (hasIfpu || hasMem) && p(tile.TileKey).core.fpu != None,
     numBypassStages  =
@@ -260,6 +266,7 @@ class ALUExeUnit(
     hasAlu           = hasAlu,
     hasMul           = hasMul,
     hasDiv           = hasDiv,
+    hasDiv2          = hasDiv2,
     hasIfpu          = hasIfpu,
     hasMem           = hasMem,
     hasRocc          = hasRocc)
@@ -271,12 +278,14 @@ class ALUExeUnit(
     "We do not support execution unit with both Mem and Rocc writebacks")
   require(!(hasMem && hasIfpu),
     "TODO. Currently do not support AluMemExeUnit with FP")
+  require(!(hasDiv2 && (hasDiv || !hasMul)), "[DIV2] the second divider sits beside the pipelined multiplier and is not combined with the first divider")
 
   val out_str =
     BoomCoreStringPrefix("==ExeUnit==") +
     (if (hasAlu)  BoomCoreStringPrefix(" - ALU") else "") +
     (if (hasMul)  BoomCoreStringPrefix(" - Mul") else "") +
     (if (hasDiv)  BoomCoreStringPrefix(" - Div") else "") +
+    (if (hasDiv2) BoomCoreStringPrefix(" - Div2") else "") +
     (if (hasIfpu) BoomCoreStringPrefix(" - IFPU") else "") +
     (if (hasMem)  BoomCoreStringPrefix(" - Mem") else "") +
     (if (hasRocc) BoomCoreStringPrefix(" - RoCC") else "")
@@ -284,6 +293,14 @@ class ALUExeUnit(
   override def toString: String = out_str.toString
 
   val div_busy  = WireInit(false.B)
+  val div2_busy = WireInit(false.B)   // [DIV2]
+  // [DIV2] registered copy of DIV_CTL bit 0: a flop with reset 0 and a plain `:=` (not RegNext(next, init)).
+  // It gates only the FU_DIV OFFER below; the request path has no enable term, so an accepted divide always completes.
+  val div2_en_q: Bool = if (hasDiv2) {
+    val r = RegInit(false.B)
+    r := io.cf_div2_en.get
+    r
+  } else false.B
   val ifpu_busy = WireInit(false.B)
 
   // The Functional Units --------------------
@@ -293,6 +310,7 @@ class ALUExeUnit(
   io.fu_types := Mux(hasAlu.B, FU_ALU, 0.U) |
                  Mux(hasMul.B, FU_MUL, 0.U) |
                  Mux(!div_busy && hasDiv.B, FU_DIV, 0.U) |
+                 Mux(div2_en_q && !div2_busy && hasDiv2.B, FU_DIV, 0.U) |   // [DIV2]
                  Mux(hasCSR.B, FU_CSR, 0.U) |
                  Mux(hasJmpUnit.B, FU_JMP, 0.U) |
                  Mux(!ifpu_busy && hasIfpu.B, FU_I2F, 0.U) |
@@ -456,6 +474,39 @@ class ALUExeUnit(
                     (io.req.valid && io.req.bits.uop.fu_code_is(FU_DIV))
 
     iresp_fu_units += div
+  }
+
+  // [DIV2] Second Div/Rem Unit (unit 2, beside the pipelined MUL) -------------
+  // Same DivUnit as above.  Its response is added after the ALU and MUL responses, so the existing
+  // `resp.ready` rule (the pipelined units win the shared IRF port, the divide waits) applies unchanged.
+  // IFT: cf_fu_bitmap stamps UNIT_DIV (bit 8) exactly like the first divider (owner 2026-11-03, no record-format change).
+  var div2: DivUnit = null
+  if (hasDiv2) {
+    div2 = Module(new DivUnit(xLen))
+    io.cf_fu_busy := div2.io.cf_fu_busy
+    div2.io <> DontCare
+    div2.io.req.valid           := io.req.valid && io.req.bits.uop.fu_code_is(FU_DIV)   // no enable term: see div2_en_q
+    div2.io.req.bits.uop        := io.req.bits.uop
+    div2.io.req.bits.rs1_data   := io.req.bits.rs1_data
+    div2.io.req.bits.rs2_data   := io.req.bits.rs2_data
+    div2.io.req.bits.rs1_secret    := io.req.bits.rs1_secret
+    div2.io.req.bits.rs2_secret    := io.req.bits.rs2_secret
+    div2.io.req.bits.rs1_taint_atk := io.req.bits.rs1_taint_atk
+    div2.io.req.bits.rs2_taint_atk := io.req.bits.rs2_taint_atk
+    div2.io.req.bits.rs3_secret    := io.req.bits.rs3_secret
+    div2.io.req.bits.rs3_taint_atk := io.req.bits.rs3_taint_atk
+    div2.io.brupdate            := io.brupdate
+    div2.io.cf_debug_exu_enable := io.cf_debug_exu_enable
+    div2.io.req.bits.kill       := io.req.bits.kill
+
+    // share write port with the pipelined units
+    div2.io.resp.ready := !(iresp_fu_units.map(_.io.resp.valid).reduce(_|_))
+
+    div_resp_val := div2.io.resp.valid
+    div2_busy    := !div2.io.req.ready ||
+                    (io.req.valid && io.req.bits.uop.fu_code_is(FU_DIV))
+
+    iresp_fu_units += div2
   }
 
   // Mem Unit --------------------------

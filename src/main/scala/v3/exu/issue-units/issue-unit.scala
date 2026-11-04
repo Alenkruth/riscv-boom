@@ -184,6 +184,11 @@ class IssueUnitIO(
     // denial is charged to the busy unit only when the slot needs that unit.  Constant per
     // unit, OR-ed over the busy ones by the aggregators (core.scala, fp-pipeline.scala).
     val fu_code  = UInt(FUC_SZ.W)
+    // [DIV2] more than one busy occupant (two integer dividers both busy) and the OR of their labels.
+    // Names stay the lower-index occupant's (op_count/is_atk/is_sec above); no age compare.
+    val multi    = Bool()
+    val any_atk  = Bool()
+    val any_sec  = Bool()
   }))
 
   val brupdate         = Input(new BrUpdateInfo())

@@ -145,6 +145,7 @@ case class BoomCoreParams(
   specasanTagCacheEntries: Int = 64,                        // tag-line buffer lines of 64 tag bytes
   specasanPaintQueue: Int = 8,                              // outstanding csrw SPECASAN_PAINT writes
   enableCeviche: Boolean = false,                           // Ceviche: CRF in L1-D and L1-I (ceviche-plan-v5.md)
+  hasDiv2: Boolean = false,                                 // [DIV2] second integer divider on exe unit 2 (the MUL unit); enable = DIV_CTL (0xbcf) bit 0, reset 0; built only when div2Built
 
   /* [r147/r149] D$ replacement policy DESIGN DEFAULT, the single source of truth for every
    * BOOM v3 config (stock and reconfig).  Codes (= 0xbc1 bits [5:4], ruling 149):
@@ -202,6 +203,12 @@ case class BoomCoreParams(
   require(!enableSpecASan || specasanPaintQueue >= 2, "SpecASan: paint queue depth")
   require(!enableCeviche || enableIFT,    "Ceviche uses the IFT domain plumbing (cf_domain_id, fetch domain)")
   require(!enableCeviche || enableReconf, "Ceviche switches the D$ mode through the 2.10f writeback walk (exists only with enableReconf)")
+  // [DIV2] r1: the ONE flag every consumer reads (execution-units.scala unit 2, DIV_CTL CSR decl).  hasDiv2 alone is not enough:
+  // WithFuzzingBoom is also the base of BaselineBoom*/IFTOnly/power-cal/OOC configs (no reconfiguration; some at INT issue
+  // width 2 or 1, where unit 2 is not the MUL unit).  DIV_CTL is a reconfiguration CSR, so the unit exists only with
+  // enableReconf and an INT issue width >= 4 (unit 2 = MUL, unit 3 = first divider); otherwise no unit, no CSR, today's RTL.
+  def div2Built: Boolean = hasDiv2 && enableReconf &&
+    issueParams.exists(ip => ip.iqType == IQT_INT.litValue && ip.issueWidth >= 4)
 
   override def traceCustom = Some(new BoomTraceBundle)
   val xLen = 64
@@ -397,6 +404,7 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   private def cfDoppelgangerEnabled: Boolean = bp.enableDoppelganger
   private def cfSpecASanEnabled:     Boolean = bp.enableSpecASan
   private def cfCevicheEnabled:      Boolean = bp.enableCeviche
+  private def cfDiv2Enabled:         Boolean = bp.div2Built   // [DIV2] r1: same flag as the unit (execution-units.scala)
   private def FULL64 = BigInt("ffffffffffffffff", 16)
   // Hardware-written read-only CSR: set every cycle; a software write is overwritten the next cycle.  The mask must be all ones:
   // CSRFile.setCustomCSR writes (sdata & mask) | (reg & ~mask) (rocket CSR.scala:1529-1533).  [v5] SPECASAN_STAT used mask 0.
@@ -439,6 +447,9 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   def cf_ceviche_soft_d = getOrElse(cevicheCtlCSRCF, _.value(30,20),  0.U(11.W))   // lines; 0 -> 512 (50 %)
   def cf_ceviche_hard_i = getOrElse(cevicheCtlCSRCF, _.value(40,31),  0.U(10.W))   // lines; 0 -> 384
   def cf_ceviche_soft_i = getOrElse(cevicheCtlCSRCF, _.value(50,41),  0.U(10.W))   // lines; 0 -> 256
+  // ---- [DIV2] second integer divider (second-divider-plan-20261103.md section 3) ----
+  override def divCtlCSRCF = if (cfDiv2Enabled) Some(CustomCSR(divCtlCSRIdCF, BigInt(0x1), Some(BigInt(0)))) else None
+  def cf_div2_en        = getOrElse(divCtlCSRCF, _.value(0), false.B)
   
   // Debug-log enable CSR: controls IFT-specific debug printfs throughout the core.
   // Gated on ENABLE_IFT because all consumers are inside IFT logic blocks.

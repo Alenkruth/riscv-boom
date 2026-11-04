@@ -870,6 +870,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // Drive EXU debug enable into all execution units from CSRs
   for (eu <- exe_units) {
     eu.io.cf_debug_exu_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_core_enable
+    eu.io.cf_div2_en.foreach(_ := custom_csrs.cf_div2_en)   // [DIV2] registered inside the unit
   }
 
     // corefuzzing
@@ -2951,7 +2952,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // fdivsqrt ever assert cf_fu_busy (pipelined units leave it invalid by construction),
   // so this is a small OR, not a per-port network.
   {
-    val busy_units = (0 until exe_units.length).map(exe_units(_)).filter(u => u.hasDiv || u.hasFdiv)
+    val busy_units = (0 until exe_units.length).map(exe_units(_)).filter(u => u.hasDiv || u.hasDiv2 || u.hasFdiv)
     val any_busy   = if (busy_units.isEmpty) false.B
                      else busy_units.map(_.io.cf_fu_busy.valid).reduce(_||_)
     val busy_sel   = if (busy_units.isEmpty) 0.U
@@ -2963,13 +2964,28 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
         iu.io.cf_fu_busy.bits.is_atk := false.B
         iu.io.cf_fu_busy.bits.is_sec := false.B
         iu.io.cf_fu_busy.bits.fu_code := 0.U   // [I2BUSYFU]
+        iu.io.cf_fu_busy.bits.multi   := false.B   // [DIV2]
+        iu.io.cf_fu_busy.bits.any_atk := false.B
+        iu.io.cf_fu_busy.bits.any_sec := false.B
       } else {
         // [I2BUSYFU] (ruling 100, I-2) the FU class mask of the units that are busy
         iu.io.cf_fu_busy.bits.fu_code  := busy_units.map(u => Mux(u.io.cf_fu_busy.valid,
-          (if (u.hasDiv) FU_DIV else 0.U(FUC_SZ.W)) | (if (u.hasFdiv) FU_FDV else 0.U(FUC_SZ.W)), 0.U(FUC_SZ.W))).reduce(_|_)
+          (if (u.hasDiv || u.hasDiv2) FU_DIV else 0.U(FUC_SZ.W)) | (if (u.hasFdiv) FU_FDV else 0.U(FUC_SZ.W)), 0.U(FUC_SZ.W))).reduce(_|_)
         iu.io.cf_fu_busy.bits.op_count := Mux1H(busy_sel, busy_units.map(_.io.cf_fu_busy.bits.op_count))
         iu.io.cf_fu_busy.bits.is_atk   := Mux1H(busy_sel, busy_units.map(_.io.cf_fu_busy.bits.is_atk))
         iu.io.cf_fu_busy.bits.is_sec   := Mux1H(busy_sel, busy_units.map(_.io.cf_fu_busy.bits.is_sec))
+        // [DIV2] (owner 2026-11-03, no age compare) with two dividers the winner key above names the LOWER-INDEX busy
+        // occupant (PriorityEncoderOH: unit 2 before unit 3); `multi` says a second occupant exists, and any_atk/any_sec
+        // OR the labels over both.  One busy divider: multi = 0, any_* = the single occupant's label (today's values).
+        if (busy_units.length > 1) {
+          iu.io.cf_fu_busy.bits.multi   := PopCount(busy_units.map(_.io.cf_fu_busy.valid)) > 1.U
+          iu.io.cf_fu_busy.bits.any_atk := busy_units.map(u => u.io.cf_fu_busy.valid && u.io.cf_fu_busy.bits.is_atk).reduce(_||_)
+          iu.io.cf_fu_busy.bits.any_sec := busy_units.map(u => u.io.cf_fu_busy.valid && u.io.cf_fu_busy.bits.is_sec).reduce(_||_)
+        } else {
+          iu.io.cf_fu_busy.bits.multi   := false.B
+          iu.io.cf_fu_busy.bits.any_atk := Mux1H(busy_sel, busy_units.map(_.io.cf_fu_busy.bits.is_atk))
+          iu.io.cf_fu_busy.bits.any_sec := Mux1H(busy_sel, busy_units.map(_.io.cf_fu_busy.bits.is_sec))
+        }
       }
     }
   }

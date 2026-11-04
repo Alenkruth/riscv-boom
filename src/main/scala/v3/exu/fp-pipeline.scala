@@ -225,6 +225,9 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
       issue_unit.io.cf_fu_busy.bits.is_atk := false.B
       issue_unit.io.cf_fu_busy.bits.is_sec := false.B
       issue_unit.io.cf_fu_busy.bits.fu_code := 0.U   // [I2BUSYFU]
+      issue_unit.io.cf_fu_busy.bits.multi   := false.B   // [DIV2]
+      issue_unit.io.cf_fu_busy.bits.any_atk := false.B
+      issue_unit.io.cf_fu_busy.bits.any_sec := false.B
     } else {
       // [I2BUSYFU] (ruling 100, I-2) FU class mask of the busy FP divider(s)
       issue_unit.io.cf_fu_busy.bits.fu_code   := fbusy.map(u => Mux(u.io.cf_fu_busy.valid, FU_FDV, 0.U(FUC_SZ.W))).reduce(_|_)
@@ -233,6 +236,9 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
       issue_unit.io.cf_fu_busy.bits.op_count  := Mux1H(sel, fbusy.map(_.io.cf_fu_busy.bits.op_count))
       issue_unit.io.cf_fu_busy.bits.is_atk    := Mux1H(sel, fbusy.map(_.io.cf_fu_busy.bits.is_atk))
       issue_unit.io.cf_fu_busy.bits.is_sec    := Mux1H(sel, fbusy.map(_.io.cf_fu_busy.bits.is_sec))
+      issue_unit.io.cf_fu_busy.bits.multi     := false.B   // [DIV2] FP: one divider, one occupant (the single-occupant values)
+      issue_unit.io.cf_fu_busy.bits.any_atk   := Mux1H(sel, fbusy.map(_.io.cf_fu_busy.bits.is_atk))
+      issue_unit.io.cf_fu_busy.bits.any_sec   := Mux1H(sel, fbusy.map(_.io.cf_fu_busy.bits.is_sec))
     }
   }
   issue_unit.io.pred_wakeup_port.valid := false.B

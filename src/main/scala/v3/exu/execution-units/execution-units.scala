@@ -122,6 +122,7 @@ class ExecutionUnits(val fpu: Boolean)(implicit val p: Parameters) extends HasBo
         hasRocc        = is_nth(1) && usingRoCC,
         hasMul         = is_nth(2),
         hasDiv         = is_nth(3),
+        hasDiv2        = is_nth(2) && boomParams.div2Built,   // [DIV2] separate flag: hasDiv keeps meaning "the first divider"; r1: div2Built (reconf + INT width >= 4)
         hasIfpu        = is_nth(4) && usingFPU))
   exe_units += alu_exe_unit
     }

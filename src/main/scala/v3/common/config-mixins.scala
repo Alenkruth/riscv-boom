@@ -606,6 +606,7 @@ class WithFuzzingBoom(n: Int = 1, overrideIdOffset: Option[Int] = None) extends 
               enablePrefetching = true,
               numDCacheBanks = 1,
               ftq = FtqParameters(nEntries=32), // max(ftQueueEntryOptions) = 32
+              hasDiv2 = true,   // [DIV2] second integer divider on exe unit 2; off at reset (DIV_CTL 0xbcf bit 0 = 0); built only with WithReconf (BoomCoreParams.div2Built)
               nPerfCounters = 0,
               fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true))
             ),

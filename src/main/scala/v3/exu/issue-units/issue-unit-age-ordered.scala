@@ -344,9 +344,11 @@ class IssueUnitCollapsing(
         issue_slots(i).cf_contend_in.bits.winner_is_atk   := fu_atk_i
         issue_slots(i).cf_contend_in.bits.winner_is_sec   := io.cf_fu_busy.bits.is_sec
         issue_slots(i).cf_contend_in.bits.infl_type       := INFL_FU_BUSY.U
-        issue_slots(i).cf_contend_in.bits.multi           := false.B                  // [FIFO10] one occupant
-        issue_slots(i).cf_contend_in.bits.any_atk         := fu_atk_i                 // [FIFO10] [ATKVIC]
-        issue_slots(i).cf_contend_in.bits.any_sec.foreach(_ := io.cf_fu_busy.bits.is_sec) // [R117SWEEP]
+        // [DIV2] [FIFO10] with two integer dividers both busy: multi + the labels OR-ed over both occupants (one divider: 0 / same as above)
+        val fu_any_atk_i = io.cf_fu_busy.bits.any_atk && issue_slots(i).uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U   // [ATKVIC]
+        issue_slots(i).cf_contend_in.bits.multi           := io.cf_fu_busy.bits.multi
+        issue_slots(i).cf_contend_in.bits.any_atk         := fu_any_atk_i
+        issue_slots(i).cf_contend_in.bits.any_sec.foreach(_ := io.cf_fu_busy.bits.any_sec) // [R117SWEEP]
       }
     }
   }
