@@ -36,7 +36,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   // tag, set and tag together hold every index bit at every set option.  Without ENABLE_RECONF the BTB CSR does not
   // exist and cf_btb_set_idx is 0, so nSets sets are active at all times, no alias exists and the tag stays
   // idx >> log2(nSets) (cfTagLo = 0: the tagged tree's widths).  cfTagLo = the low bits this tag adds below the old
-  // one (2 for 128 / 32); the old tag is tag(tagSz-1, cfTagLo), which the replacement hash and the tagh records keep
+  // one (2 for 128 / 32); the old tag is tag(tagSz-1, cfTagLo), which the replacement hash and the IFT displacement records keep
   // using (unchanged behaviour).  Cost (ENABLE_RECONF builds): +cfTagLo bits per slot in the meta memories and in
   // cf_btv; the fetch and update tag compares grow from 29 to 31 bits in the same 3-LUT equality tree (+0 levels).
   val cfMinSetsLg   = if (ENABLE_RECONF) log2Ceil(btbSetOptions.map(_ min nSets).min) else log2Ceil(nSets)
@@ -289,7 +289,8 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   // instruction itself (the f3 predecode corrects a wrong BTB target before execute; the branch unit flags only
   // direction mispredicts for a br; a JAL never mispredicts there) and tv = 1 says the data already holds it; its
   // repair writes back only the slot's label from just before the write (read at update time, so a committed
-  // training in between keeps its label).  Every restore also writes back the way's tagh word (IFT).  "Held the tag"
+  // training in between keeps its label).  [BTBDSLOT] IFT: the displacement records read the slot state from cf_btv /
+  // cf_bvv, which every repair write keeps exact (no separate tag word to restore).  "Held the tag"
   // is read at the write from the update-side tag copy when CF_BTB_UPD_TAG (owner decision OD-4: exact), else taken
   // from the fetch-time hit in the meta (stale when the slot was written between this update's fetch and its write).
   // Left and counted ([BTBRP]): the ebtb far target (one per set) and the entry an allocation displaced.
@@ -328,9 +329,16 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   val cfBtvW     = 1 + (if (CF_BTB_UPD_TAG) tagSz else 0)
   val cf_btv     = Seq.fill(nWays) { Mem(nSets, Vec(bankWidth, UInt(cfBtvW.W))) }
   val cf_blb     = if (ENABLE_IFT) Some(Seq.fill(nWays) { Mem(nSets, Vec(bankWidth, UInt(2.W))) }) else None
+  // [BTBDSLOT] (IFT) cf_bvv = the slot holds an entry: 1 for a training's meta write, 0 for the reset sweep, a repair
+  // invalidation and a btb_mispredicts write (the writes whose meta tag is 0).  Written by exactly the cf_btv writes
+  // (same way, address and mask, below), read with it at cf_bu_wa.  With cf_btv's tag it gives the IFT displacement
+  // records (end of this module) the exact old entry of the trained slot.  Per bank 2 ways x 4 slots x 128 x 1 b,
+  // single-port LUTRAM (8 x RAM128X1S, about 16 LUT); no fetch read.
+  val cf_bvv     = if (ENABLE_IFT) Some(Seq.fill(nWays) { Mem(nSets, Vec(bankWidth, Bool())) }) else None
   val cf_bu_wa   = Mux(doing_reset, reset_idx, s1_update_idx_masked)
   val s1_btv     = VecInit(cf_btv.map(_.read(cf_bu_wa)))
   val s1_blb     = cf_blb.map(m => VecInit(m.map(_.read(cf_bu_wa))))
+  val s1_bvv     = cf_bvv.map(m => VecInit(m.map(_.read(cf_bu_wa))))         // [BTBDSLOT]
   val s1_upd_tag = (s1_update_idx >> cfMinSetsLg)(tagSz - 1, 0)                         // the tag this update writes
   val s1_bw_tv   = VecInit((0 until bankWidth).map(j => s1_btv(s1_update_meta.write_way)(j)(0)))  // before its write
   val s1_bw_hit  = if (CF_BTB_UPD_TAG) VecInit((0 until bankWidth).map(j =>
@@ -400,6 +408,9 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
       cf_blb.foreach(_(w).write(cf_bu_wa,
         VecInit(Seq.fill(bankWidth)(Mux(doing_reset, 0.U(2.W), Cat(s1_lbl_sec.get, s1_lbl_dom.get)))),
         VecInit((0 until bankWidth).map(j => doing_reset || s1_wlbl_mask(j)))))
+      cf_bvv.foreach(_(w).write(cf_bu_wa,                                        // [BTBDSLOT] the cf_btv write
+        VecInit((0 until bankWidth).map(j => !doing_reset && !s1_rp_inv && !s1_update.bits.btb_mispredicts(j))),
+        cf_btv_wm))
     }
   }
   val s1_update_wmeta_data = Wire(Vec(bankWidth, new BTBMeta))
@@ -556,11 +567,17 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
 
   // [BTBDISP 2026-10-13, series-r step 16, owner ruling 110] BTB displacement residue, tracked
   // like the step-15 D$ eviction filter (dcache.scala ift_evf):
-  //  * ift_btb_tagh (per way, per set, {v, tag[7:0]}): the low tag bits of the entry last
-  //    written into (set, way).  Read at the update's s0 index, so at s1 the update knows
-  //    which tag its write displaces.
-  //  * [BTBATK] DF-btbatk: TWO displacement records per set, each {v, victim tag[7:0], pc[13:2]}
-  //    (pc = the displacing allocator):
+  //  * [BTBDSLOT] (2026-11-04, RULES C 'uBTB displacement slot fix': "Stage the btb.scala fix"; the
+  //    faubtb [UBTBSLOT] twin, diffs/btb-disp-slot-20261104/DESIGN.md) the displaced entry is ONE
+  //    (way, slot): a training writes only its cfi_idx slot (fetch-target-queue.scala spec update:
+  //    br_mask = OH(slot), target mask = OH(cfi_idx)), and the meta keeps a tag per slot.  The old
+  //    entry is read at s1 from the exact per-slot copies cf_btv (tag) and cf_bvv (valid) at the
+  //    write way and cfi_idx.  This replaces ift_btb_tagh, ONE {v, tag[7:0]} per (set, way) for all
+  //    slots (rewritten by every training of the way), which named the way's last-written tag: a
+  //    training into an empty slot, or into a slot of another tag, "displaced" a tag whose entries
+  //    survive (false edge, the t83 class), and the tag really displaced was missed or misnamed.
+  //  * [BTBATK] DF-btbatk: TWO displacement records per set, each {v, victim tag[7:0], victim slot,
+  //    pc[13:2]} (pc = the displacing allocator; slot: [BTBDSLOT]):
   //      ift_btb_evf  SECRET record   -- rewritten by a displacement whose update is secret
   //                                      (cf_is_secret);
   //      ift_btb_eva  ATTACKER record -- rewritten by a displacement whose update is
@@ -570,15 +587,20 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   //    neither secret nor attacker clears both v bits.  A secret-only one leaves the attacker
   //    record alone and an attacker-only one leaves the secret record alone (DF-btbatk (B): in
   //    patch 22 an attacker non-secret displacement cleared a pending secret record).
-  //    A displacement = a commit allocation (s1_upd_alloc) over a valid (set, way) whose tagh
-  //    holds a different tag.  [BTBEVFLAST] DF-m60 (r140, the D$ [EVFLAST] rule): a fetch lookup
+  //    A displacement = a commit allocation (s1_upd_alloc) over a valid slot whose tag[7:0]
+  //    differs ([BTBDSLOT]; 8-bit inequality as before, so a record never names the new tag and the
+  //    reduced-set alias of OD-5 is unchanged).  A fetch hits a record only when the record's slot
+  //    is in the fetched packet (s1_mask, the [BPDMASK] / [ATKDMMASK] rule of the hit edges).  An
+  //    own-kind displacement of the record's own victim tag keeps the HIGHER slot (faubtb
+  //    [UBTBSLOT-MAX]): a bank's fetch mask is a suffix, so s1_mask(max) = "some displaced slot of
+  //    that tag is in the packet".  [BTBEVFLAST] DF-m60 (r140, the D$ [EVFLAST] rule): a fetch lookup
   //    never consumes either record (every fetch of the victim tag in that set carries the edge,
   //    wrong path included) until a later write of that record (below).
   //    [BTBSAMETAG] ruling 146 (iii), C1-(c), latest event wins: EVERY commit allocation
   //    (s1_upd_alloc: displacing, cold-way or same-tag re-allocation, any kind) clears a record of
   //    either kind whose victim tag[7:0] equals the newly allocated tag[7:0] (the victim is back in
   //    the BTB; its re-allocation is the latest event for that tag).  Each record therefore has a
-  //    second read port at the update index (s0_update_idx, read with tagh).  This also ends the
+  //    second read port at the update index (s0_update_idx).  This also ends the
   //    DF-m60 cold-way over-taint: a re-allocation of the victim tag into a never-written way is
   //    not a displacement, but it now clears the record naming that tag.
   //    Record write priority: reset sweep (v=0); else a displacement of the record's own kind
@@ -607,21 +629,24 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   // No value taint for the displacement edges (timing residue); r117 sticky s_prop / atk come
   // from the edge's sec / atk bits at dispatch / ROB enqueue.
   // Approximations (documented in the triage): 8-bit partial tag (aliases 1/256); one victim
-  // per set per kind (the newest wins); tagh tracks commit writes only (a mispredict
-  // invalidation leaves it valid); back-to-back updates of one set may read the tagh or record
-  // word from before or after the previous update's write (SyncReadMem read-under-write is
-  // undefined, see above); the hit PC is per (set, way), not per slot.
-  // FPGA: tagh 2x128x9 b, spc 2x128x12 b, evf + eva 2x128x21 b LUTRAM, the records with a second
-  // read port at the update index (2R1W: one more LUTRAM copy each); 0 FF (no valid flops);
-  // read side = two 8-b compares beside the existing tag compare off the registered LUTRAM
-  // outputs, a 3:1 PC select (one LUT6 per bit) into f2 flops; update side = the displacement
-  // compare (tagh mux + 8-b) and, in parallel, two same-tag 8-b compares off the update-port
-  // record reads, all into the two LUTRAM write enables (0 levels added).
+  // tag per set per kind (the newest wins; for one victim tag, the highest displaced slot);
+  // the same-tag clear is tag-only (RULES D1 l.49); the record words are forwarded on a same-set
+  // read-during-write (see [RUWBTB]); the hit PC is per (set, way), not per slot.
+  // FPGA: spc 2x128x12 b, evf + eva 128x23 b LUTRAM, the records with a second read port at the
+  // update index (2R1W: one more LUTRAM copy each); 0 FF (no valid flops); read side = two 8-b
+  // compares beside the existing tag compare off the registered LUTRAM outputs, each ANDed with a
+  // 4:1 select of s1_mask by the record slot (flops; +<=1 LUT), a 3:1 PC select (one LUT6 per bit)
+  // into f2 flops; update side ([BTBDSLOT]) = an 8:1 (way, slot) select of the cf_btv tag[7:0] and
+  // cf_bvv bit off their s1 reads, the 8-b displacement compare and, in parallel, the same-tag and
+  // max-slot compares off the update-port record reads, into the two LUTRAM write ports; the same
+  // depth as the existing cf_btv -> s1_bw_hit -> cf_tlog / cf_btv write path of this bank.
   if (ENABLE_IFT) {
     val tag8W  = 8
     val setW   = log2Ceil(nSets)
-    val recW   = 1 + tag8W + inflPcBitsCF                 // {v, victim tag[7:0], pc[13:2]}
-    // [RUWBTB] patch 32 (DF-ruw-parity): tagh, evf and eva are combinational-read Mems with an
+    val slotW  = log2Ceil(bankWidth) max 1                // [BTBDSLOT]
+    val recW   = 1 + tag8W + slotW + inflPcBitsCF         // {v, victim tag[7:0], victim slot, pc[13:2]}
+    require(CF_BTB_UPD_TAG, "[BTBDSLOT] the BTB displacement records read the per-slot tag copy cf_btv")
+    // [RUWBTB] patch 32 (DF-ruw-parity): evf and eva (and the removed tagh) are combinational-read Mems with an
     // explicit write-first s0->s1 data register (cfFwdRead), the D$ [REPLBYP] form.  As
     // SyncReadMems the FireSim SV returned the OLD word to a same-set read issued in the write
     // cycle and the Verilator model the NEW one.  Reachable on the update port: commit update
@@ -635,16 +660,12 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
     // btb_secret/btb data have the same lowering, so each flow names the trainer of the
     // prediction it actually used.
     // FPGA: LUTRAM async read -> forward mux (1 LUT) -> the existing s1 data FF; 0 levels after
-    // the FF.  The select (write enable + 7-bit compare) ends at that FF.  About 22 LUT (tagh) +
-    // 2 x 2 x 21 (evf/eva, update + fetch ports) LUT, 0 FF.
-    val ift_btb_tagh  = Seq.fill(nWays) { Mem(nSets, UInt((tag8W + 1).W)) }
+    // the FF.  The select (write enable + 7-bit compare) ends at that FF.  About
+    // 2 x 2 x 23 (evf/eva, update + fetch ports) LUT, 0 FF.
     val ift_btb_spc   = Seq.fill(nWays) { SyncReadMem(nSets, UInt(inflPcBitsCF.W)) }
     val ift_btb_evf   = Mem(nSets, UInt(recW.W))  // secret record
     val ift_btb_eva   = Mem(nSets, UInt(recW.W))  // [BTBATK] attacker record
     // one write bus per memory (driven in the update block below)
-    val tagh_we  = Wire(Vec(nWays, Bool()))
-    val tagh_wa  = Wire(UInt())
-    val tagh_wd  = Wire(UInt((tag8W + 1).W))
     val evf_we   = Wire(Bool())
     val eva_we   = Wire(Bool())
     val rec_wa   = Wire(UInt())
@@ -652,13 +673,18 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
     val eva_wd   = Wire(UInt(recW.W))
     def cfFwdRead(m: Mem[UInt], we: Bool, wa: UInt, wd: UInt, ra: UInt, en: Bool): UInt =
       RegEnable(Mux(we && wa === ra, wd, m.read(ra)), en)
+    def recTag(r: UInt): UInt  = r(recW - 2, slotW + inflPcBitsCF)                      // victim tag [7:0]
+    def recSlot(r: UInt): UInt = r(slotW + inflPcBitsCF - 1, inflPcBitsCF)              // [BTBDSLOT]
 
     // ---- fetch side (s0 read, s1 use) ----
     val s1_ift_spc  = VecInit(ift_btb_spc.map(_.read(s0_idx_masked, s0_valid)))
     val s1_ift_evf  = cfFwdRead(ift_btb_evf, evf_we, rec_wa, evf_wd, s0_idx_masked, s0_valid)
     val s1_ift_eva  = cfFwdRead(ift_btb_eva, eva_we, rec_wa, eva_wd, s0_idx_masked, s0_valid)
+    // [BTBDSLOT] && s1_mask(slot): a fetch that starts past the displaced slot does not depend on it (t83: the faubtb
+    // twin gave main's `jal s114` a false atk edge).  4:1 select of flops by flops (1 LUT) beside the 8-b compare.
     def recHit(r: UInt): Bool = s1_valid && !doing_reset && r(recW - 1) &&
-                                r(recW - 2, inflPcBitsCF) === s1_req_tag(cfTagLo + tag8W - 1, cfTagLo)   // old tag [7:0]
+                                recTag(r) === s1_req_tag(cfTagLo + tag8W - 1, cfTagLo) &&   // old tag [7:0]
+                                s1_mask(recSlot(r))
     val s1_evf_hit  = recHit(s1_ift_evf)
     val s1_eva_hit  = recHit(s1_ift_eva)
     val s1_sec_slot = (0 until bankWidth).map(w => s1_btb_sec_slot(w))   // [BPDMASK] same terms as the flag
@@ -675,36 +701,27 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
 
     // ---- update side (s0 read, s1 write) ----
     val s0_update_idx_masked = s0_update_idx & (cf_btb_active_sets - 1.U)
-    val s1_upd_tagh   = VecInit((0 until nWays).map(w =>
-                          cfFwdRead(ift_btb_tagh(w), tagh_we(w), tagh_wa, tagh_wd, s0_update_idx_masked, s0_update_valid)))
     val s1_upd_alloc  = s1_update.valid && s1_update.bits.is_commit_update && s1_update_wmeta_mask =/= 0.U && !doing_reset
     val s1_upd_new8   = (s1_update_idx >> log2Ceil(nSets))(tag8W - 1, 0)
-    val s1_upd_old    = s1_upd_tagh(s1_update_meta.write_way)
+    // [BTBDSLOT] the trained slot's entry just before this write, from the exact per-slot copies (s1 reads at the write
+    // address, the previous update's write already in: no forward).  tag[7:0] = (idx >> log2(nSets))[7:0], the bits
+    // of s1_upd_new8 and of the fetch compare.  This replaces the per-way ift_btb_tagh and its [SPECBPU-REP] restore
+    // log cf_thlog: a repair writes cf_btv / cf_bvv like the meta (invalidation: slot invalid; label restore: no meta
+    // write), so after any repair they already hold the slot as the BTB does.
+    val s1_dslot      = s1_update_cfi_idx
+    val s1_upd_old8   = s1_btv(s1_update_meta.write_way)(s1_dslot)(cfBtvW - 1, 1)(cfTagLo + tag8W - 1, cfTagLo)
+    val s1_upd_oldv   = s1_bvv.get(s1_update_meta.write_way)(s1_dslot)
     val s1_upd_pc12   = (s1_update.bits.pc + (s1_update_cfi_idx << 1))(inflPcBitsCF + 1, 2)
     val s1_upd_sec    = s1_update.bits.cf_is_secret.getOrElse(false.B)
     val s1_upd_atk    = s1_update.bits.cf_domain_id.getOrElse(0.U(1.W)) === 1.U
-    val s1_any_disp   = s1_upd_alloc && s1_upd_old(tag8W) && s1_upd_old(tag8W - 1, 0) =/= s1_upd_new8
-    tagh_wa := Mux(doing_reset, reset_idx, s1_update_idx_masked)
-    // [SPECBPU-REP] (spec-bpu-plan-final 4.5) tagh keeps ONE tag per (set, way) for all the way's slots, and every
-    // training that writes meta rewrites it (s1_upd_alloc is true for a refresh too).  Each training logs the way's
-    // tagh word from before its write (s1_upd_old: forwarded read, so exactly that value) and every restore of a
-    // training that wrote the slot (invalidation or label restore) writes it back: after an allocation undo the
-    // displaced tag, still resident in the way's other slots, keeps its displacement detection; after a hit undo the
-    // way's word is again the one before the squashed write.  IFT only.
-    val cf_thlog  = Mem(cfSpecLogN, UInt((tag8W + 1).W))
-    when (!doing_reset && s1_update.valid && s1_update.bits.is_commit_update && s1_update.bits.cfi_idx.valid) {
-      cf_thlog.write(s1_update.bits.cf_log_id, s1_upd_old)
+    val s1_any_disp   = s1_upd_alloc && s1_upd_oldv && s1_upd_old8 =/= s1_upd_new8
+    if (ENABLE_CF_DEBUG_PRINTF) {   // Verilator shadow check of the one-slot premise (never in a FireSim/NoLog build)
+      assert(!s1_upd_alloc || s1_update_wmeta_mask === UIntToOH(s1_dslot, bankWidth),
+             "[BTBDSLOT] a BTB training writes exactly its cfi_idx slot")
     }
-    val s1_th_rst = s1_rst && s1_tu.w                                     // every restore of a training that wrote
-    tagh_wd := Mux(doing_reset, 0.U((tag8W + 1).W),
-                 Mux(s1_th_rst, cf_thlog.read(s1_update.bits.cf_log_id), Cat(true.B, s1_upd_new8)))
     for (w <- 0 until nWays) {
       val wsel = s1_update_meta.write_way === w.U || (nWays == 1).B
       val rsel = s1_tu.way === w.U || (nWays == 1).B                                     // [SPECBPU-REP]
-      tagh_we(w) := doing_reset || (s1_upd_alloc && wsel) || (s1_th_rst && rsel)
-      when (tagh_we(w)) {
-        ift_btb_tagh(w).write(tagh_wa, tagh_wd)
-      }
       // [SPECBPU-RLB] a relabel to secret names the record's CFI as the trainer (one write port: merged condition)
       when ((s1_upd_alloc && wsel && s1_upd_sec) || (s1_rl_w && rsel && s1_upd_sec)) {
         ift_btb_spc(w).write(s1_update_idx_masked, s1_upd_pc12)
@@ -713,19 +730,26 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
     // [BTBATK] record writes: reset sweep (v=0), else a displacement of the record's own kind
     // (v=1, rewrite) or a clean displacement (v=0, clear).  No lookup write.
     // [BTBSAMETAG] ruling 146 (iii): any commit allocation also clears (v=0) a record of either
-    // kind that names the newly allocated tag.  Update-port reads at the update index, same
-    // index/enable as tagh.
+    // kind that names the newly allocated tag.  Update-port reads at the update index
+    // (s0_update_idx_masked, enable s0_update_valid).
     val s1_upd_evf   = cfFwdRead(ift_btb_evf, evf_we, rec_wa, evf_wd, s0_update_idx_masked, s0_update_valid)
     val s1_upd_eva   = cfFwdRead(ift_btb_eva, eva_we, rec_wa, eva_wd, s0_update_idx_masked, s0_update_valid)
-    def recNames(r: UInt): Bool = r(recW - 1) && r(recW - 2, inflPcBitsCF) === s1_upd_new8
+    def recNames(r: UInt): Bool = r(recW - 1) && recTag(r) === s1_upd_new8
     val evf_same     = s1_upd_alloc && recNames(s1_upd_evf)
     val eva_same     = s1_upd_alloc && recNames(s1_upd_eva)
-    val rec_body = Cat(s1_upd_old(tag8W - 1, 0), s1_upd_pc12)
+    // [BTBDSLOT] the slot an own-kind rewrite stores: the HIGHER of the record's slot and this one when the record is
+    // valid and names the same victim tag (an earlier slot of that tag displaced and not re-allocated, else
+    // [BTBSAMETAG] had cleared it); else this slot.  Only read when the write is an own-kind displacement.  One 8-b
+    // compare beside the displacement compare (record word: flops), 2-b max + select: one LUT6 per slot bit.
+    def recSlotD(r: UInt): UInt =
+      Mux(r(recW - 1) && recTag(r) === s1_upd_old8 && recSlot(r) > s1_dslot, recSlot(r), s1_dslot.pad(slotW))
     rec_wa := Mux(doing_reset, reset_idx, s1_update_idx_masked)
     evf_we := doing_reset || (s1_any_disp && (s1_upd_sec || !s1_upd_atk)) || evf_same
     eva_we := doing_reset || (s1_any_disp && (s1_upd_atk || !s1_upd_sec)) || eva_same
-    evf_wd := Mux(doing_reset, 0.U(recW.W), Cat(s1_any_disp && s1_upd_sec, rec_body))
-    eva_wd := Mux(doing_reset, 0.U(recW.W), Cat(s1_any_disp && s1_upd_atk, rec_body))
+    evf_wd := Mux(doing_reset, 0.U(recW.W),
+                Cat(s1_any_disp && s1_upd_sec, s1_upd_old8, recSlotD(s1_upd_evf), s1_upd_pc12))
+    eva_wd := Mux(doing_reset, 0.U(recW.W),
+                Cat(s1_any_disp && s1_upd_atk, s1_upd_old8, recSlotD(s1_upd_eva), s1_upd_pc12))
     when (evf_we) { ift_btb_evf.write(rec_wa, evf_wd) }
     when (eva_we) { ift_btb_eva.write(rec_wa, eva_wd) }
   }
