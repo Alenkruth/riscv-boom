@@ -320,10 +320,20 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
     val eva_v    = RegInit(false.B)           // [BTBATK] attacker record
     val eva_tag  = Reg(UInt(tag8W.W))
     val eva_pc   = Reg(UInt(cfPcBits.W))
+    // [UBTBSLOT] t83 ROOTCAUSE-t83.md (portsmash-fb-stall-20261103 folder): the displaced word is ONE (way, slot) (this
+    // bank keeps a tag per slot), so each record also keeps the displaced slot and a fetch hits it only when that slot
+    // is part of the fetched packet (s1_mask, the [BPDMASK] / [ATKDMMASK] rule of the hit edges above).  Before this a
+    // fetch that started past the displaced slot (t83: main's `jal s114` at 0x8000286c fetched after the attacker ret
+    // 0x800042b8 overwrote slot 0 = `jal s113` of the same tag) took a false BTB_DISPLACE edge: its prediction cannot
+    // depend on a slot below its fetch PC.  2 x log2(bankWidth) FF.
+    val slotW    = log2Ceil(bankWidth) max 1
+    val evf_slot = Reg(UInt(slotW.W))
+    val eva_slot = Reg(UInt(slotW.W))
 
     // fetch side (s1)
-    val s1_evf_hit = s1_valid && evf_v && evf_tag === s1_req_tag(tag8W - 1, 0)
-    val s1_eva_hit = s1_valid && eva_v && eva_tag === s1_req_tag(tag8W - 1, 0)
+    // [UBTBSLOT] s1_mask(slot): a 4:1 select of flops by flops (1 LUT) beside the 8-b compare, ending at the f2 flops
+    val s1_evf_hit = s1_valid && evf_v && evf_tag === s1_req_tag(tag8W - 1, 0) && s1_mask(evf_slot)
+    val s1_eva_hit = s1_valid && eva_v && eva_tag === s1_req_tag(tag8W - 1, 0) && s1_mask(eva_slot)
     val s1_sec_any = s1_ubtb_secret_mismatch.reduce(_||_)
     val s1_sec_pc  = Mux(s1_sec_any,
       PriorityMux(s1_ubtb_secret_mismatch, (0 until bankWidth).map(w => Mux1H(s1_hit_ohs(w), ubtb_spc))),
@@ -342,6 +352,16 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
     val upd_pc12  = (s1_update.bits.pc + (s1_update_cfi_idx << 1))(cfPcBits + 1, 2)
     val old_tag8  = PriorityMux(upd_wslot, (0 until bankWidth).map(w => meta(s1_update_write_way)(w).tag(tag8W - 1, 0)))
     val old_miss  = PriorityMux(upd_wslot, (0 until bankWidth).map(w => !s1_update_meta.hits(w)))
+    val old_slot  = PriorityEncoder(upd_wslot)   // [UBTBSLOT] the slot old_tag8 / old_miss are read from
+    // [UBTBSLOT-MAX] (REVIEW-r2 F1): an own-kind displacement of the SAME victim tag (record valid, old tag == record
+    // tag: an earlier slot of that tag was displaced and not re-allocated, else [BTBSAMETAG] would have cleared it)
+    // keeps the HIGHER slot.  A bank's fetch mask is a suffix (slots >= the fetch start, frontend.scala fetchMask), so
+    // s1_mask(max) == "some displaced slot of that tag is in the packet": exact for every displaced slot of the
+    // recorded victim, where keeping only the newest slot missed a fetch that covers only the older, higher one.
+    // FPGA: the 8-b compare is parallel to old_tag8 =/= new_tag8 on the same 64:1 mux output; the 2-b max + select is
+    // one LUT6 per slot bit (5 inputs) into the slot flop D, at the depth of the existing any_disp enable (0 levels).
+    val evf_slot_d = Mux(evf_v && evf_tag === old_tag8 && evf_slot > old_slot, evf_slot, old_slot)
+    val eva_slot_d = Mux(eva_v && eva_tag === old_tag8 && eva_slot > old_slot, eva_slot, old_slot)
     val new_tag8  = s1_update_idx(tag8W - 1, 0)
     val any_disp  = upd_any && old_miss && old_tag8 =/= 0.U && old_tag8 =/= new_tag8
     when (upd_sec) { ubtb_spc(s1_update_write_way) := upd_pc12 }
@@ -349,9 +369,9 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
     when (upd_any && evf_v && evf_tag === new_tag8) { evf_v := false.B }
     when (upd_any && eva_v && eva_tag === new_tag8) { eva_v := false.B }
     when (any_disp && (upd_is_sec || !upd_is_atk)) { evf_v := upd_is_sec }
-    when (any_disp && upd_is_sec)                  { evf_tag := old_tag8; evf_pc := upd_pc12 }
+    when (any_disp && upd_is_sec)                  { evf_tag := old_tag8; evf_pc := upd_pc12; evf_slot := evf_slot_d }
     when (any_disp && (upd_is_atk || !upd_is_sec)) { eva_v := upd_is_atk }
-    when (any_disp && upd_is_atk)                  { eva_tag := old_tag8; eva_pc := upd_pc12 }
+    when (any_disp && upd_is_atk)                  { eva_tag := old_tag8; eva_pc := upd_pc12; eva_slot := eva_slot_d }
     // [SPECBPU-REP] a restore brings the logged tag back into its way: the [BTBSAMETAG] same-tag clear applies (the
     // victim of an earlier displacement is resident again); a restore records no displacement of its own
     when (s1_rst && s1_uu.w && evf_v && evf_tag === s1_uu.tag(tag8W - 1, 0)) { evf_v := false.B }
