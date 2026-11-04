@@ -457,6 +457,10 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   // the fetch buffer, decode or rename has an older one.  Read only by the core's held-behind stall edge
   // (core.scala [FBHOLD]).  IFT only.
   val cf_fb_next_oc = if (ENABLE_IFT) Some(Input(UInt(uopIDCounterWidthCF.W))) else None
+  // [FBHUP] rule-a1-fbhup-20261104 (RULES C 'New IFT rules' (a) part 1): Cat(enq_q, up_q), both registers: enq_q = a
+  // packet left f4 for the fetch buffer last cycle (so cf_fb_next_oc already counts it), up_q = packets in f3 + f4 last
+  // cycle (0-2).  Read only by the core's [FBHOLD] upstream extension (core.scala [FBHUP]).  IFT only.
+  val cf_fb_up = if (ENABLE_IFT) Some(Input(UInt(3.W))) else None
 }
 
 /**
@@ -1367,6 +1371,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // so this is 1 LUT -> 1 FF, off every fetch path (a new leaf).  IFT off: no port, no flop.
   io.cpu.cf_ftq_full.foreach(_ := RegNext(f4.io.deq.valid && !ftq.io.enq.ready, false.B))
   io.cpu.cf_fb_next_oc.foreach(_ := fb.io.cf_next_oc.get)   // [FBHOLD] register to the core, no logic
+  // [FBHUP] rule-a1-fbhup-20261104: f4.io.deq.fire = the fetch-buffer enqueue (fb.io.enq.valid && do_enq, the cycle the
+  // fetch buffer's uopCount advances); f3 / f4 deq.valid are the two 1-entry queues' full flags.  1 LUT each into
+  // the 3 new flops (a new leaf; no fetch path gains a level).  IFT off: no port, no flop.
+  io.cpu.cf_fb_up.foreach(_ := Cat(RegNext(f4.io.deq.fire, false.B),
+                                   RegNext(f3.io.deq.valid.asUInt +& f4.io.deq.valid.asUInt, 0.U(2.W))))
 
   fb.io.enq.valid := f4.io.deq.valid && ftq.io.enq.ready && !f4_delay
   fb.io.enq.bits  := f4.io.deq.bits

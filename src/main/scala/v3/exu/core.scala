@@ -2382,13 +2382,15 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // attacker-domain uop whose only own flag is the raw atk of an attacker head, kept no held sec): the captured
   // key / code / labels, is_atk only on a victim consumer ([VICGATE] F1), never flagless.
   // v clears on the first dispatch group with no held uop (fbh_pass) and on any front-end flush (the held uops are
-  // gone; refetched uops get new, younger op_counts, so the flush term is a safety net only).
+  // gone; refetched uops get new, younger op_counts, so the flush term is a safety net only); lim also extends over
+  // the f3 / f4 packets ([FBHUP] below).
   // Label: the first flagged edge in the order REG, ROB, IQ (lane order), LDQ, STQ.  While v is set a new flagged
   // stall replaces the label only when it carries every flag the held one has, or when the held set has just
   // drained (fbh_pass in the same cycle: the old label must not reach uops that were never behind it; review r1 F2)
   // (fbh_take); lim always extends.
   // Compare width fbhW: the held span (lim - op_count) is at most fetch buffer + 3 x coreWidth (decode, rename 1,
-  // rename 2), and v clears within one group after the span, so fbhW = log2Ceil(span) + 2 low bits are exact.
+  // rename 2) + the two f3 / f4 packets of [FBHUP] (2 x fetchWidth), and v clears within one group after the span,
+  // so fbhW = log2Ceil(span) + 2 low bits are exact (9 at FB 64, fetchWidth 8, coreWidth 1-4: unchanged by [FBHUP]).
   // Levels: every term is FF-sourced (ren2 op_count, the capture FFs, the dis_stall_was_* FFs, the [HEADREG] head
   // FFs): fbh_older = one fbhW-bit carry chain, fbh_own_sec / fbh_own_atk = 2 LUT; the candidate cond = 1-2 LUT after them
   // (<= 4 levels, as d_win_sec's CONTROL_FLOW cond), feeding only the prefix network (register endpoints).  No
@@ -2396,7 +2398,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // Cost (coreWidth 4, fetch buffer 64): 1 + 9 + 16 + 3 + 2 = 31 FF; ~4 x 9-bit compares, a (4 + coreWidth):1 x 21-bit
   // capture mux, the cap LUTs, and one more candidate per lane in the dispatch batch.  IFT off: all constants, the
   // candidate cond is constant false, the frontend port does not exist: Verilog unchanged.
-  val fbhW = math.min(uopIDCounterWidthCF, log2Ceil(numFetchBufferEntries + 3 * coreWidth) + 2)
+  val fbhW = math.min(uopIDCounterWidthCF, log2Ceil(numFetchBufferEntries + 2 * fetchWidth + 3 * coreWidth) + 2)
   def fbhCode(t: Int): UInt = { require((t >> 3) == (INFL_ROB_FULL >> 3), "[FBHOLD] stall codes share bits [5:3]"); (t & 7).U(3.W) }
   // consumer-independent attacker labels of the blockers (the candidates AND them with d_victim per lane)
   val fbh_reg_atk = reg_stuck_dom === 1.U || reg_stuck_ldatk || reg_stuck_valatk
@@ -2530,9 +2532,37 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     ((rename_stage.io.ren2_uops(w).cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)))(fbhW - 1, 0) - fbh_lim)(fbhW - 1))
   val fbh_pass = dis_valids.reduce(_ || _) && (0 until coreWidth).map(w => !dis_valids(w) || !fbh_older(w)).reduce(_ && _)
   val fbh_take = fbh_cap && (!fbh_v || fbh_pass || ((fbh_n_sec || !fbh_sec) && (fbh_n_atk || !fbh_atk)))
+  // [FBHUP] rule-a1-fbhup-20261104 (DESIGN.md in claude-artifacts/ift-overhaul/execution/diffs/rule-a1-fbhup-20261104;
+  // RULES C 'New IFT rules' (a) part 1, owner 2026-11-04: "the fbhold hold also covers packets waiting upstream of the
+  // fetch buffer (f3/f4) during a flagged stall"; route: RULES C 'Rules (a)/(b) implementation route' (part 1 in RTL,
+  // no reliable record-only signal); CONFIRM-F3 class (b), fbhold DESIGN residual U1).  A packet waiting in f3 / f4
+  // has no op_count yet, so lim (the fetch buffer's next op_count) cannot name it (W 1 / FB 8: the fetch buffer takes a
+  // packet only when empty, so the ret's packet waits in f4 / f3 for the whole stall).
+  // Mechanism: the frontend sends two registers, up_q = packets in f3 + f4 last cycle (0-2) and enq_q = a packet left
+  // f4 for the fetch buffer last cycle (cf_fb_next_oc already counts it).  A capture at cycle k (stall at k-1) sets
+  // fbh_pk := up_q - enq_q = the packets still upstream at the end of k-1; each later fetch-buffer enqueue (enq_q,
+  // aligned with the cf_fb_next_oc it produced) with fbh_pk != 0 extends lim over that packet and counts fbh_pk down.
+  // f3 -> f4 -> fetch buffer is in order and one-to-one, so the next fbh_pk enqueues are exactly those packets; no uop
+  // of such a packet reaches dispatch before its enqueue has extended lim (fetch-buffer RAM, decode, rename 1, rename 2
+  // in between), so it compares older than lim and takes the held edge through the unchanged candidate.  A newer
+  // capture replaces fbh_pk (a newer snapshot of the same in-order stream).  Any front-end flush clears fbh_pk (f3, f4
+  // and the fetch buffer are cleared; refetched packets are not covered).  Bound: at most 2 packets (2 x fetchWidth
+  // uops) per flagged stall interval beyond the r1 span; packets fetched after the last flagged stall cycle, or still
+  // in s1 / s2 then, are not covered.  v stays set while fbh_pk != 0 (no held uop can have dispatched before its
+  // packet enqueued, so fbh_pass cannot fire then; the term is a safety net).
+  // Levels: fbh_up / fbh_enq / fbh_pk are FFs.  fbh_ext 1 LUT; fbh_v D: cap (5) + 1 (as r1: one more FF input);
+  // fbh_pk D: cap + 1; fbh_lim CE (cap || ext): cap + 1.  All end at flops; dis_fire is not read; the candidate and the
+  // prefix network are unchanged.  Cost: 2 FF (pk) core, 3 FF frontend; ~8 LUT.  IFT off: constants, no port.
+  val fbh_up    = io.ifu.cf_fb_up.map(_(1, 0)).getOrElse(0.U(2.W))
+  val fbh_enq   = io.ifu.cf_fb_up.map(_(2)).getOrElse(false.B)
+  val fbh_pk    = if (ENABLE_IFT) RegInit(0.U(2.W)) else 0.U(2.W)
+  val fbh_ext   = fbh_pk =/= 0.U && fbh_enq
   if (ENABLE_IFT) {
-    fbh_v := !io.ifu.redirect_flush && (fbh_cap || (fbh_v && !fbh_pass))
-    when (fbh_cap)  { fbh_lim := (io.ifu.cf_fb_next_oc.get)(fbhW - 1, 0) }
+    fbh_v := !io.ifu.redirect_flush && (fbh_cap || fbh_pk =/= 0.U || (fbh_v && !fbh_pass))
+    when (io.ifu.redirect_flush) { fbh_pk := 0.U }
+      .elsewhen (fbh_cap)        { fbh_pk := fbh_up - fbh_enq.asUInt }
+      .elsewhen (fbh_ext)        { fbh_pk := fbh_pk - 1.U }
+    when (fbh_cap || fbh_ext) { fbh_lim := (io.ifu.cf_fb_next_oc.get)(fbhW - 1, 0) }
     when (fbh_take) { fbh_key := fbh_n_key; fbh_code := fbh_n_code; fbh_sec := fbh_n_sec; fbh_atk := fbh_n_atk }
   }
   // [CFWIN] patch 31: raise CONTROL_FLOW (ty 20) for attacker-window members too (see the candidate).
