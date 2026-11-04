@@ -401,6 +401,10 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     c.io.clearDom.valid := cev_i_on && io.invalidate && !io.cf_cev_dbg_flush.get
     c.io.clearDom.bits  := io.cf_cev_inval_dom.get
     assert(!cev_i_on || (io.cf_icache_set_conf === 0.U && io.cf_icache_way_conf === 0.U), "Ceviche needs the full I$ geometry")
+    // [TF-LUTRAM] sSec / sIftDom are index reads at sLine: equal to the old Mux1H only for a one-hot match (G3: one own and one
+    // shared copy, own first).  D13 twin, simulation / debug-print builds only (the PopCount of 512 is not built for the FPGA).
+    if (tileParams.core.asInstanceOf[BoomCoreParams].enableCfDebugPrintf)
+      assert(!(c.io.sHit(0) && PopCount(c.io.sMatch(0)) =/= 1.U), "Ceviche I$: multiple CRF matches")
   }
 
   val s2_dout   = Wire(Vec(nWays, UInt(wordBits.W)))

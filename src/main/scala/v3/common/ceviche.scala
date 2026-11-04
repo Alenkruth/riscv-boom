@@ -70,19 +70,34 @@ class CevCRF(val nLines: Int, val keyBits: Int, val nSearch: Int, val isI: Boole
   val key  = Reg(Vec(nLines, UInt(keyBits.W)))
   val dom  = Reg(Vec(nLines, Bool()))
   val v    = RegInit(VecInit(Seq.fill(nLines)(false.B)))
-  val coh  = Reg(Vec(nLines, UInt(2.W)))                // D$ only (firtool removes it in the I$: never read)
+  // [TF-LUTRAM] (FPGA timing fit, owner 2026-11-03, task-reports/fpga-timing-fit-20261103.md row 3 (a)): coh, sec and idom are
+  // read ONLY at the matched line (the search ports) and written ONLY by the single io.wr port, never reset, never touched by
+  // clearAll / clearDom / rsv* / the FREQ update, and never read in parallel (CAM, free pool, occupancy).  They therefore live in
+  // combinational-read Mems (Vivado: distributed RAM, 1 write port + nSearch read ports) instead of nLines flops each, and the
+  // nLines:1 Mux1H AND-OR trees become an index read at OHToUInt(match) (the sLine encoder, already built).  Semantics: identical.
+  //   - write: same port, same enable, same cycle (a Mem write is visible from the next cycle, like the Reg it replaces);
+  //   - read: combinational in the same cycle, old data during a same-cycle write (as the Reg); a miss drives 0 (the Mux1H
+  //     value of an all-zero select), via the hit gate below;
+  //   - no reset before or after (the Reg Vecs had none either, so a read of a never-written entry is equally undefined in both;
+  //     in practice every valid line was written: coh by every wr, sec/idom by the allocating wr, and the CAM matches v lines only).
+  // Only differs if the match is not one-hot (Mux1H ORs the entries, the index read takes the OR of the indices): that state is
+  // excluded by construction (G3) and asserted in the D$ ("Ceviche D$: multiple CRF matches").
+  // Kept in flops (each has a parallel reader or more than one writer): key, v (CAM / free pool / occ / bulk clears), dom (I$ CAM,
+  // occ, clearDom), freq (per-line increment + tick every cycle), rsv (free pool, occ, clearAll), rsvDom (occ popcount; 2 writers
+  // rsvHold + rsvSet), s (I$ CAM), inv (clearDom), tS / tA (written by the parallel incVec AND by wr.alloc in the same cycle).
+  val coh  = if (!isI) Some(Mem(nLines, UInt(2.W))) else None   // D$ only (was a Reg Vec; the I$ never read it)
   val freq = Reg(Vec(nLines, UInt(4.W)))
   val rsv  = RegInit(VecInit(Seq.fill(nLines)(false.B)))
   val rsvDom = Reg(Vec(nLines, Bool()))                 // domain of the reservation; read only while rsv (no reset)
   val s    = Reg(Vec(nLines, Bool()))                   // I$ only
   val inv  = Reg(Vec(nLines, Bool()))                   // I$ only
-  val sec  = Reg(Vec(nLines, Bool()))                   // I$ IFT only
+  val sec  = if (withSec) Some(Mem(nLines, Bool())) else None   // I$ IFT only [TF-LUTRAM] (was a Reg Vec; unread when !withSec)
   // [T-IFT v4, B1] per-line replacement-state taint {secret, attacker}: the stock per-set ift_repl_sec/atk rule moved to the line, the
   // line being what the FREQ (access-driven) state belongs to.  Latest advancer wins: an increment overwrites it with that access's own
   // terms, the allocating write with the allocating MSHR's.  Read only for valid, unreserved candidates (no reset needed, like freq).
   val tS   = if (withTaint) Some(Reg(Vec(nLines, Bool()))) else None
   val tA   = if (withTaint) Some(Reg(Vec(nLines, Bool()))) else None
-  val idom = if (withIftDom) Some(Reg(Vec(nLines, Bool()))) else None   // [T-IFT v5] I$ IFT domain of the line (no reset: read only on a hit)
+  val idom = if (withIftDom) Some(Mem(nLines, Bool())) else None   // [T-IFT v5] I$ IFT domain of the line (no reset: read only on a hit) [TF-LUTRAM]
 
   // ---- search: own match and (I$) shared match; one-hot encode with OR trees ----
   for (p <- 0 until nSearch) {
@@ -98,13 +113,18 @@ class CevCRF(val nLines: Int, val keyBits: Int, val nSearch: Int, val isI: Boole
               val shr  = Mux(io.sDom(p), shr1, shr0) & Fill(nLines, io.sShare(p))
               Mux(own.orR, own, shr)                     // own copy first; at most one of each kind exists (G3)
             }
+    val hit  = m.orR
+    val line = OHToUInt(m)                               // OR-tree encoder (exactly one bit set on a hit)
     io.sMatch(p)  := m
-    io.sHit(p)    := m.orR
-    io.sLine(p)   := OHToUInt(m)                         // OR-tree encoder (exactly one bit set on a hit)
-    io.sCoh(p)    := (if (!isI) Mux1H(m, coh) else 0.U)
+    io.sHit(p)    := hit
+    io.sLine(p)   := line
+    // [TF-LUTRAM] index reads at the encoded match (one LUTRAM read port per search port), gated by the hit = the old Mux1H value.
+    // Levels: encoder (already on the sLine path) + the LUTRAM address-to-data mux (RAM64 + F7/F8 + 1 LUT for 1024 lines) in place
+    // of the 1024:1 AND-OR; about +1..2 LUT levels on sCoh (D$: ends at the s2_cev_coh flop) and sSec / sIftDom (I$ s1 IFT flags).
+    io.sCoh(p)    := (if (!isI) Mux(hit, coh.get(line), 0.U) else 0.U)
     io.sDomOut(p) := Mux1H(m, dom)
-    io.sSec(p)    := (if (withSec) Mux1H(m, sec) else false.B)
-    io.sIftDom.foreach(_(p) := Mux1H(m, idom.get))      // [T-IFT v5] same 1:nLines AND-OR as sSec
+    io.sSec(p)    := (if (withSec) hit && sec.get(line) else false.B)
+    io.sIftDom.foreach(_(p) := hit && idom.get(line))   // [T-IFT v5] same index read as sSec [TF-LUTRAM]
     io.sRsv(p)    := Mux1H(m, rsv)                       // the matched line is a granted victim (D3b nack)
   }
 
@@ -125,10 +145,11 @@ class CevCRF(val nLines: Int, val keyBits: Int, val nSearch: Int, val isI: Boole
   // ---- write mirror ----
   when (io.wr.valid) {
     val l = io.wr.bits.line
-    key(l) := io.wr.bits.key; v(l) := io.wr.bits.v; coh(l) := io.wr.bits.coh
+    key(l) := io.wr.bits.key; v(l) := io.wr.bits.v
+    coh.foreach(_.write(l, io.wr.bits.coh))              // [TF-LUTRAM] the Mems' only write port (same enable as before)
     when (io.wr.bits.alloc) { dom(l) := io.wr.bits.dom; s(l) := io.wr.bits.s; inv(l) := io.wr.bits.inv
-                              sec(l) := io.wr.bits.sec; rsv(l) := false.B
-                              if (withIftDom) { idom.get(l) := io.wr.bits.idom.get }   // [T-IFT v5]
+                              sec.foreach(_.write(l, io.wr.bits.sec)); rsv(l) := false.B       // [TF-LUTRAM]
+                              idom.foreach(_.write(l, io.wr.bits.idom.get))                    // [T-IFT v5] [TF-LUTRAM]
                               if (withTaint) { tS.get(l) := io.wr.bits.ts.get; tA.get(l) := io.wr.bits.ta.get } }   // [T-IFT v4, B1] after the increment: wins
   }
   when (io.rsvRel.valid)  { rsv(io.rsvRel.bits) := false.B }
