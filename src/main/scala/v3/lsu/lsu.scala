@@ -159,6 +159,9 @@ with CoreFuzzingConstants
   // is evicting, same-set writeback), i.e. neither a probe nor a data-bank nack (registered terms).
   // IFT only (None otherwise).
   val cf_aatk_busy = if (ENABLE_IFT) Some(Flipped(Bool())) else None
+  // [U6BDRAIN] u6b-stq-drain-edge-20261104: the D$ MSHR drain blocker Cat(atk, sec, op_count), registered in the
+  // MSHR file (mshrs.scala cf_drn).  IFT only.
+  val cf_drn       = if (ENABLE_IFT) Some(Flipped(UInt((uopIDCounterWidthCF + 2).W))) else None
   val cf_nack_mshr = if (ENABLE_IFT) Some(Flipped(Vec(memWidth, Bool()))) else None
   // [NACKCONF] patch 68 (V12): lane w's CONFLICTING MSHR(s) hold an attacker-influenced request (mshrs.scala)
   val cf_nack_aatk = if (ENABLE_IFT) Some(Flipped(Vec(memWidth, Bool()))) else None
@@ -282,6 +285,9 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   // duration that INFL_MEM_HOL never carried.  Residency only -- the consumer's domain is
   // not known here, so the core applies the cross-domain/secret test at capture.
   val stq_hol_cycles     = Output(UInt(6.W))
+  // [U6BDRAIN] u6b-stq-drain-edge-20261104: io.dmem.cf_drn passed through (a wire; the register is in the MSHR file):
+  // the busy MSHR a drain waiter (fence / CSR / AMO after the ROB and STQ are empty) is held by.  IFT only.
+  val cf_drn             = if (ENABLE_IFT) Some(Output(UInt((uopIDCounterWidthCF + 2).W))) else None
   // corefuzzing: TLB-stage FTQ secret updates — fires when s_acc determined at address resolution
   // One port per memWidth; fires even for speculatively-executed (later squashed) memory ops
   val cf_secret_ftq_updates = Output(Vec(memWidth, Valid(UInt(log2Ceil(ftqSz).W))))
@@ -948,6 +954,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     stq_hol_cycles_r := Mux(stq_hol_cycles_r === 63.U, 63.U, stq_hol_cycles_r + 1.U)
   }
   io.core.stq_hol_cycles     := stq_hol_cycles_r
+  io.core.cf_drn.foreach(_ := io.dmem.cf_drn.get)   // [U6BDRAIN] u6b (wire)
 
   io.dmem.force_order   := io.core.fence_dmem
   io.core.fencei_rdy    := !stq_nonempty && io.dmem.ordered

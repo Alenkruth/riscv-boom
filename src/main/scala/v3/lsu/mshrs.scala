@@ -179,6 +179,11 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     val cf_wb_wait     = if (ENABLE_IFT) Some(Output(Bool())) else None
     val cf_req_sum_sec = if (ENABLE_IFT) Some(Output(Bool())) else None
     val cf_req_sum_atk = if (ENABLE_IFT) Some(Output(Bool())) else None
+    // [U6BDRAIN] u6b-stq-drain-edge-20261104: the primary is a prefetch (M_PFR / M_PFW: the prefetcher's
+    // NullMicroOp request, or a SpecASan unknown-key fill), i.e. no instruction and no op_count.  Latched at
+    // allocation (review r1 F1): a write secondary rewrites req.uop.mem_cmd (M_PFW -> M_XWR, dirtier_cmd), but
+    // req.uop keeps the NullMicroOp op_count 0.  IFT only.
+    val cf_req_pf      = if (ENABLE_IFT) Some(Output(Bool())) else None
     // [V3STATE] SP-15 (design 5.1 M m_src, flag pf_drop [254]): this MSHR is in s_meta_clear (a granted meta write
     // is its clear before writeback), and this MSHR leaves s_prefetch this cycle without writing the parked line.
     // Record/STATE builds only.
@@ -355,6 +360,10 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
                                  req.uop.cf_secret_propagation.getOrElse(false.B) || io.cf_req_addr_sec)
   io.cf_req_sum_atk.foreach(_ := req.uop.cf_domain_id.getOrElse(0.U(1.W))(0) ||
                                  req.uop.cf_attacker_influence.getOrElse(false.B) || io.cf_req_addr_atk)
+  // [U6BDRAIN] review r1 F1: the PRIMARY's command, latched in handle_pri_req (1 FF; its D is the isPrefetch decode
+  // cf_first_rp already uses, on the allocation enable of the req flops: 0 levels on any existing path).
+  val cf_pri_pf = if (ENABLE_IFT) Some(RegInit(false.B)) else None
+  io.cf_req_pf.foreach(_ := cf_pri_pf.get)
   // [V3STATE] SP-15: decodes of the state flop and of the s_prefetch exit terms of the state machine below (the
   // s_prefetch branch): a drop is the s_invalid exit or the reallocation exit; the sec_rdy exit is a promotion
   // (s_meta_read) or a re-acquire (s_refill_req), whose line this MSHR writes later (an M fill), so not a drop.
@@ -739,6 +748,8 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
       cev_prom.foreach(_ := false.B)   // [T-IFT v4, N3]
       cf_first_rp := (if (SPECASAN) !isPrefetch(io.req.uop.mem_cmd) && !io.req.sa_unk.get   // [SA-F1] no rpq entry of its own
                       else          !isPrefetch(io.req.uop.mem_cmd))
+      cf_pri_pf.get := (if (SPECASAN) isPrefetch(io.req.uop.mem_cmd) || io.req.sa_unk.get   // [U6BDRAIN] r1 F1
+                        else          isPrefetch(io.req.uop.mem_cmd))
       // [SACCU] 2026-10-21 (one s_acc definition: the STQ uop bit is now set for a plain in-range store too): the
       // primary's s_acc becomes the refill LINE mark (cf_req_secret, all 8 DWs) only when the primary READS
       // (isRead: load, LR, SC, AMO).  A plain store primary keeps its s_acc on its rpq copy, so its replay marks
@@ -1252,6 +1263,11 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     // primary or a merged secondary: cf_req_addr_atk).  Its PC rides on cf_asec_busy.bits, which
     // is now the PC of the nack's blocking access, secret-first.  IFT only.
     val cf_aatk_busy = if (ENABLE_IFT) Some(Output(Bool())) else None
+    // [U6BDRAIN] u6b-stq-drain-edge-20261104: registered (one cycle old, as cf_asec_busy) drain blocker of a fence /
+    // CSR / AMO waiting for io.lsu.ordered: Cat(atk, sec, op_count) of the lowest busy (way.valid) non-prefetch MSHR
+    // whose primary RECORD summary (cf_req_sum_sec / cf_req_sum_atk, the [V3EDGE] labels) is secret, else the lowest
+    // attacker-flagged one, else 0.  IFT only.
+    val cf_drn       = if (ENABLE_IFT) Some(Output(UInt((uopIDCounterWidthCF + 2).W))) else None
     // [NACKCONF] patch 68 (V12): per lane, the MSHR(s) this lane's request CONFLICTS with hold an
     // attacker-influenced request: the same-set MSHR when one matches (same-set miss, a hit on a line it is
     // evicting, its same-set writeback), else any valid MSHR (MSHRs full).  Same registered state as
@@ -1604,6 +1620,23 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
   if (ENABLE_IFT) {
     val cf_aatk_live = mshrs.map(m => m.io.way.valid && (m.io.cf_req_domain(0) || m.io.cf_req_addr_atk))
     io.cf_aatk_busy.get := RegNext(cf_aatk_live.reduce(_ || _), false.B)
+    // [U6BDRAIN] u6b-stq-drain-edge-20261104 (DESIGN.md in claude-artifacts/ift-overhaul/execution/diffs/
+    // u6b-stq-drain-edge-20261104; RULES A reading 4).  After the ROB and the STQ are empty, a waiting unique uop
+    // (wait_for_empty_pipeline: !fencei_rdy = !ordered) is held by the busy MSHRs (fence_rdy = every MSHR req_pri_rdy;
+    // way.valid is the same set: not s_invalid, not s_prefetch).  A store miss is acked at s2 ([RESPSEL] st_ack), so
+    // its STQ entry clears and the miss latency is spent HERE.  The core takes this blocker the way it takes the ROB
+    // head ([UNIQDRAIN]).  Key = the primary's op_count (a store miss: the store; a load miss, also a squashed one:
+    // the load); labels = the primary's record summary, the same leaves as the DC_PORT_BLOCK winner ([V3EDGE]):
+    // sec = s_acc || s_prop (a committed store: data_is_secret || its commit-time record cf_win_sec) || the
+    // address / line secret mark; atk = attacker domain || cf_attacker_influence || the attacker address mark.
+    // A prefetch primary (no instruction, op_count 0) is skipped: it has no record to name.
+    // Shape and depth = cf_asec_busy.bits above (secret-first PriorityMux over the MSHRs into a register):
+    // a new flop-to-flop path, 0 levels on any existing path.  Cost: 18 FF, ~8 + 16 + ~55 LUT.
+    val cf_dr_s = mshrs.map(m => m.io.way.valid && !m.io.cf_req_pf.get && m.io.cf_req_sum_sec.get)
+    val cf_dr_a = mshrs.map(m => m.io.way.valid && !m.io.cf_req_pf.get && m.io.cf_req_sum_atk.get)
+    val cf_dr_d = mshrs.map(m => Cat(m.io.cf_req_sum_atk.get, m.io.cf_req_sum_sec.get, m.io.cf_req_op_count))
+    io.cf_drn.get := RegNext(PriorityMux(cf_dr_s ++ cf_dr_a :+ true.B, cf_dr_d ++ cf_dr_d :+ 0.U((uopIDCounterWidthCF + 2).W)),
+                             0.U((uopIDCounterWidthCF + 2).W))
     // [NACKCONF] patch 68 (V12, owner 2026-10-19 16:3x): the nack's attacker flag names the CONFLICTING MSHR, not
     // ANY attacker MSHR.  The per-MSHR bits are registered (as cf_aatk_busy: nMSHRs FF); idx_matches(w) is the
     // existing same-set compare of lane w's request (it also feeds tag_match / pri_val -> ready -> s2_nack, so

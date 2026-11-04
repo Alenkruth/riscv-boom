@@ -3626,6 +3626,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // MSHR-ready -> s2_nack path: 0 added levels.  A nack with an MSHR cause AND a probe/bank cause
   // in the same cycle records nothing (under-taint only).
   io.lsu.cf_aatk_busy.foreach(_ := mshrs.io.cf_aatk_busy.get)
+  io.lsu.cf_drn.foreach(_ := mshrs.io.cf_drn.get)           // [U6BDRAIN] u6b: registered MSHR drain blocker (wire)
   io.lsu.cf_nack_aatk.foreach(_ := mshrs.io.cf_nack_aatk.get)   // [NACKCONF] patch 68 (V12)
   io.lsu.cf_nack_asec.foreach(_ := mshrs.io.cf_nack_asec.get)   // [NACKCONFSEC] lean58 (M8)
   io.lsu.cf_nack_pc.foreach(_ := mshrs.io.cf_nack_pc.get)       // [NACKPC] stall-edge audit D6

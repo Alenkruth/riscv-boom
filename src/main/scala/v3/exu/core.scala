@@ -2404,6 +2404,97 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
                     rob.io.rob_head_valatk.getOrElse(false.B)
   val fbh_ldq_atk = dis_stall_ldq_head_domain(0) === 1.U || io.lsu.ldq_head_atk.getOrElse(false.B)
   val fbh_stq_atk = dis_stall_stq_head_domain(0) === 1.U || io.lsu.stq_head_atk.getOrElse(false.B)
+  // [UNIQDRAIN] u6-unique-drain-edge-20261104 (DESIGN.md in claude-artifacts/ift-overhaul/execution/diffs/u6-unique-drain-edge-20261104;
+  // ROOTCAUSE-ps3.md "Residual U6"; RULES A reading 4 "An instruction stalled behind one whose record is secret (s_acc or
+  // s_prop) gets s_prop itself; the attacker side works the same way").  A uop that waits at dispatch for the ROB to drain
+  // (wait_for_empty_pipeline above: is_unique = every CSR access incl. rdcycle, fence, fence.i, AMO, sfence, ecall/xRET,
+  // wfi; or every uop under disableOOO) waits behind every older ROB row, but that wait is none of the stall edges (it is
+  // not !rob.io.ready), so `div <secret>; rdcycle` read secret-dependent time with s_prop = 0.
+  // Edge: its own code INFL_DRAIN_WAIT (0x17, OC key = the last flagged blocker the waiter was held behind; owner
+  // 2026-11-04, RULES C "Drain edges U6 + U6b": one drain code for the ROB, STQ and MSHR phases, ROB_FULL / MEM_HOL keep
+  // their meaning), merged INTO the ROB_FULL candidate as the FTQ edge is (no new candidate, no prefix-network growth):
+  // the code is one more constant on that candidate's code select.  A waiter behind an older unique (ROB in
+  // s_wait_till_empty, not ready) also has the ordinary ROB_FULL stall (srob >= 1); the drain edge wins the slot.
+  // Capture {dw_oc, dw_sec, dw_atk}: on every cycle k with dw_q (a waiter was valid, outside debug mode, and the ROB not
+  // empty at k-1) the [HEADREG] head (= head(k-1), a row the waiter was behind) is taken when it is flagged and carries
+  // every flag the held one has (the [FBHOLD] take rule; a later equal head wins, so the key names the last flagged
+  // blocker).  The candidate reads the MERGED value (held, or this cycle's head when it is taken), so on the fire cycle
+  // the last row (it committed one cycle before the ROB read empty) counts with its commit-cycle labels (writeback-cycle
+  // s_prop / atk included, the [REGREL] F2 point).  Labels exactly as ROB_FULL: is_secret = the head's s_acc || s_prop,
+  // atk = fbh_rob_atk (domain, 42b load term, value taint / sticky atk); is_atk only on a victim consumer ([VICGATE] F1);
+  // never flagless.  [UNIQDRAIN] r1 F1: the head's atk flag is captured only for a VICTIM waiter (dw_vq, the waiter of
+  // k-1, aligned with dw_q): an attacker-domain waiter can take no atk (F1 gate), so an atk-only head (every attacker-
+  // domain row) must not block the take of a later sec-only victim head (`call victim; ...; rdcycle` in attacker code).
+  // Kept while a waiter is valid in dispatch and has not fired; cleared on its fire, on a front-end
+  // flush and when no waiter is valid (a killed waiter), so a later waiter never sees an old interval.
+  // The waiter lane carries the edge; the uops behind it (same dispatch group, rename, decode, fetch buffer) get it
+  // through [FBHOLD]: the drain edge is a capture source in fbh_src below (held under code 0x17).  In BOOM v3 every is_unique uop is also
+  // flush_on_commit, so those followers are killed at its commit (the held edge lands in kill / squash records only);
+  // under disableOOO every uop is a waiter and carries its own edge.
+  // Levels: every input is an FF (ren2 valid / is_unique, the disableOOO CSR bit, cf_dbg, the [HEADREG] head FFs and
+  // their bank select, the dw_* FFs).  dw_h_atk = fbh_rob_atk && dw_vq is one LUT over the head bank-select LUTs (2);
+  // dw_take / dw_m_sec / dw_m_atk = 1 LUT6 over (dw_q, h_sec, h_atk, dw_sec, dw_atk): 3; the lane flag dw_edge (with
+  // d_victim) 4; the ROB_FULL candidate cond 5 (its code select dw_edge ? 0x17 : ..., a data leg at 5), and the drain term deepens fbh_own_sec / fbh_cap by 1 (review r1 F3):
+  // +1 over the deepest existing prefix-network input (the [FBHOLD] cond), whose outputs are registers.  dw_m_oc is a
+  // 2:1 data select (level 4, key leg 5), shallower than the slot-select network.  dis_fire only feeds the dw_sec /
+  // dw_atk D (<= 2 LUT into a flop at coreWidth 4: 4 fire + 4 dw_wt inputs; ftq_pend is 1): 0 levels on the dispatch
+  // loop.  rob.io.empty feeds only the dw_q flop.
+  // Cost: 1 + 1 + 16 + 2 = 20 FF; ~25 LUT capture, ~17 LUT per lane on the ROB_FULL candidate's data legs, one more
+  // (4 + coreWidth + 1):1 x 21-bit leg in the [FBHOLD] capture mux.  IFT off: every register is a constant and dw_edge
+  // is constant false (the candidate Muxes fold): Verilog unchanged.
+  val dw_wt    = (0 until coreWidth).map(w => dis_valids(w) && (rename_stage.io.ren2_uops(w).is_unique || custom_csrs.disableOOO))
+  val dw_any   = dw_wt.reduce(_ || _)
+  val dw_q     = if (ENABLE_IFT) RegNext(dw_any && !rob.io.empty && !cf_dbg, false.B) else false.B
+  val dw_vq    = if (ENABLE_IFT) RegNext((0 until coreWidth).map(w => dw_wt(w) &&
+                   rename_stage.io.ren2_uops(w).cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U).reduce(_ || _), false.B) else false.B   // r1 F1
+  val dw_oc    = if (ENABLE_IFT) RegInit(0.U(uopIDCounterWidthCF.W)) else 0.U(uopIDCounterWidthCF.W)
+  val dw_sec   = if (ENABLE_IFT) RegInit(false.B) else false.B
+  val dw_atk   = if (ENABLE_IFT) RegInit(false.B) else false.B
+  val dw_h_sec = rob.io.rob_head_is_secret
+  val dw_h_atk = fbh_rob_atk && dw_vq   // r1 F1: atk is captured for a victim waiter only
+  val dw_take  = dw_q && (dw_h_sec || dw_h_atk) && (dw_h_sec || !dw_sec) && (dw_h_atk || !dw_atk)
+  // [U6BDRAIN] u6b-stq-drain-edge-20261104 (DESIGN.md in claude-artifacts/ift-overhaul/execution/diffs/u6b-stq-drain-edge-20261104;
+  // UNIQDRAIN review r1 "U6b"; RULES A reading 4).  The waiter also waits for io.lsu.fencei_rdy (= STQ empty && D$
+  // ordered) AFTER the ROB is empty: every STQ entry is then a committed store draining to the D$ (a fence / AMO entry
+  // included), and once the STQ is empty the busy MSHRs hold `ordered` low (a store miss is acked at s2, so its miss
+  // latency is spent in its MSHR, not at the STQ head).  `sd <secret-derived addr>; rdcycle` and `...; fence` read that
+  // secret-dependent time with no edge.  The same capture now also takes, on every cycle k with dm_q (a waiter was
+  // valid outside debug mode and the ROB was EMPTY at k-1; exclusive with dw_q), the memory-drain blocker of k-1:
+  //   STQ head ([HEADREG] stq_head_*: the oldest committed store not yet written; labels exactly as the STQ_FULL /
+  //   MEM_HOL candidates and the [FBHOLD] STQ leg: sec = its s_acc || s_prop, atk = fbh_stq_atk), or
+  //   the MSHR drain blocker (io.lsu.cf_drn, registered in the MSHR file, the same k-1 alignment: the lowest busy
+  //   non-prefetch MSHR, secret-first; key = its primary's op_count; labels = the primary's record summary, the
+  //   DC_PORT_BLOCK winner leaves),
+  // secret-first (STQ head, MSHR, then the attacker-only ones), under the same take rule (flagged, carries every held
+  // flag, an equal later blocker wins: the key names the last flagged blocker) and the same r1 F1 victim-waiter gate.
+  // Only an EMPTY-ROB cycle samples them: before that the ROB head is the waiter's blocker, and a store / miss that
+  // finishes while older rows still commit did not delay it.  All three phases share the slot code INFL_DRAIN_WAIT
+  // (0x17; U6b review r1 F2 option (b), owner 2026-11-04), so no phase bit is kept (the r1 dw_mem flop is removed).
+  // Levels: dm_h_* = 1 LUT over FFs (headReg'd STQ head bits, cf_drn bits, dw_vq); dw_tk_m 2; merged sec / atk keep
+  // fix-r1's 1 LUT6 form with dw_tk_m && dm_h_* as its 6th input: 3 (unchanged); dw_m_oc per bit 1 LUT6 (dm_h_oc,
+  // level 1, as one more data input): 4 (unchanged).  0 levels added on any path.
+  // Cost: 1 FF (dm_q); ~4 LUT select, ~16 LUT on the oc merge.  IFT off: dm_q is constant false and cf_drn is absent
+  // (0): the selects fold, Verilog unchanged.
+  val dm_q     = if (ENABLE_IFT) RegNext(dw_any && rob.io.empty && !cf_dbg, false.B) else false.B
+  val dm_drn   = io.lsu.cf_drn.getOrElse(0.U((uopIDCounterWidthCF + 2).W))
+  val dm_m_sec = dm_drn(uopIDCounterWidthCF)
+  val dm_m_atk = dm_drn(uopIDCounterWidthCF + 1)
+  val dm_s_sec = io.lsu.stq_head_is_secret
+  val dm_use_s = dm_s_sec || (!dm_m_sec && fbh_stq_atk)   // secret-first: STQ head, MSHR, STQ head (atk), MSHR (atk)
+  val dm_h_oc  = Mux(dm_use_s, io.lsu.stq_head_op_count, dm_drn(uopIDCounterWidthCF - 1, 0))
+  val dm_h_sec = dm_s_sec || dm_m_sec
+  val dm_h_atk = Mux(dm_use_s, fbh_stq_atk, dm_m_atk) && dw_vq   // r1 F1 gate, as dw_h_atk
+  val dw_tk_m  = dm_q && (dm_h_sec || dm_h_atk) && (dm_h_sec || !dw_sec) && (dm_h_atk || !dw_atk)
+  val dw_m_oc  = Mux(dw_take, rob.io.rob_head_op_count, Mux(dw_tk_m, dm_h_oc, dw_oc))
+  // the take rule makes a taken head carry every held flag, so (held || taken head) = the merged label
+  val dw_m_sec = Mux(dw_take, dw_h_sec, dw_sec) || (dw_tk_m && dm_h_sec)
+  val dw_m_atk = Mux(dw_take, dw_h_atk, dw_atk) || (dw_tk_m && dm_h_atk)
+  val dw_keep  = dw_any && !(0 until coreWidth).map(w => dis_fire(w) && dw_wt(w)).reduce(_ || _) && !io.ifu.redirect_flush
+  if (ENABLE_IFT) {
+    when (dw_take || dw_tk_m) { dw_oc := dw_m_oc }
+    dw_sec := dw_keep && dw_m_sec
+    dw_atk := dw_keep && dw_m_atk
+  }
   // per lane: (flagged cond, key, code, sec, atk) of the stall edges lane w carries this cycle (= the dispatch
   // candidates' conds and keys; the head fields of REG / ROB / LDQ / STQ are the same for every lane)
   val fbh_src = (0 until coreWidth).map { w => Seq(
@@ -2411,7 +2502,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     (dis_valids(w) && dis_stall_was_rob(w), dis_stall_rob_head_op_count(0), fbhCode(INFL_ROB_FULL),     dis_stall_rob_head_is_secret(0), fbh_rob_atk),
     (dis_valids(w) && dis_stall_was_iq(w),  dis_stall_iq_head(w).oc,        fbhCode(INFL_IQ_FULL),      dis_stall_iq_head(w).sec,        dis_stall_iq_head(w).atk),
     (dis_valids(w) && dis_stall_was_ldq(w), dis_stall_ldq_head_op_count(0), fbhCode(INFL_LDQ_FULL),     dis_stall_ldq_head_is_secret(0), fbh_ldq_atk),
-    (dis_valids(w) && dis_stall_was_stq(w), dis_stall_stq_head_op_count(0), fbhCode(INFL_STQ_FULL),     dis_stall_stq_head_is_secret(0), fbh_stq_atk))
+    (dis_valids(w) && dis_stall_was_stq(w), dis_stall_stq_head_op_count(0), fbhCode(INFL_STQ_FULL),     dis_stall_stq_head_is_secret(0), fbh_stq_atk),
+    (dw_wt(w),                              dw_m_oc,                        fbhCode(INFL_DRAIN_WAIT),   dw_m_sec,                        dw_m_atk))   // [UNIQDRAIN] [U6BDRAIN]
     .map { case (c, k, t, s, a) => (c && (s || a) && !cf_dbg && ENABLE_IFT.B, k, t, s, a) } }
   // lane w's own stall edges of this cycle carry sec / raw atk (the candidate ANDs atk with d_victim, as F1 does)
   val fbh_own_sec  = fbh_src.map(_.map { case (c, _, _, s, _) => c && s }.reduce(_ || _))
@@ -2420,7 +2512,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   def fbhAny(i: Int): Bool = fbh_src.map(_(i)._1).reduce(_ || _)
   val fbh_order = Seq((fbhAny(0), fbh_src(0)(0)), (fbhAny(1), fbh_src(0)(1))) ++
                   (0 until coreWidth).map(w => (fbh_src(w)(2)._1, fbh_src(w)(2))) ++
-                  Seq((fbhAny(3), fbh_src(0)(3)), (fbhAny(4), fbh_src(0)(4)))
+                  Seq((fbhAny(3), fbh_src(0)(3)), (fbhAny(4), fbh_src(0)(4)), (fbhAny(5), fbh_src(0)(5)))   // [UNIQDRAIN] last
   val fbh_new = PriorityMux(fbh_order.map(_._1), fbh_order.map { case (_, (_, k, t, s, a)) =>
                   Cat(a, s, t, k.pad(uopIDCounterWidthCF)(uopIDCounterWidthCF - 1, 0)) })
   val fbh_n_key = fbh_new(uopIDCounterWidthCF - 1, 0)
@@ -2556,6 +2648,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     // [FTQFULL] patch 59: this lane's FTQ-starvation edge has a flag (blocker secret, or attacker-flagged
     // with a victim uop).  1 LUT over FFs (ftq_pend, ftq_cap_sec, ftq_cap_atk, d_victim).
     val ftq_edge = ftq_hot && (ftq_cap_sec || (ftq_cap_atk && d_victim))
+    // [UNIQDRAIN] this lane waits on the ROB drain and the merged drain head has a flag for it (sec, or atk on a victim).
+    // 1 LUT6 over (ren2 valid, is_unique, disableOOO, dw_m_sec, dw_m_atk, d_victim).  IFT off: constant false.
+    val dw_edge = ENABLE_IFT.B && dw_wt(w) && (dw_m_sec || (dw_m_atk && d_victim))
     // [DISPAR] patch 51 (B3): the dispatch candidates, MEM_HOL, the C5 s_prop set and the two
     // stall-duration fields are gated by dis_valids(w), not dis_fire(w).  Each is DATA of lane w's
     // enqueue (dis_ift(w), dis_uops(w).cf_*, dis_sec_any(w)) and lands only through
@@ -2573,13 +2668,19 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       // [RECV3] SP-07 (design 2.5): the FTQ edge has its own code INFL_FTQ_FULL (0x14; v1 ROB_FULL with srob = 0).  Still
       // one candidate (no prefix-network growth): the code is chosen by dis_stall_was_rob(w), the flop that already
       // chooses the key and labels (codes 0x10 / 0x14 differ in bit 2 only).  Both codes are OC-keyed.
-      InfluencerCandidate(dis_valids(w) && (dis_stall_was_rob(w) || ftq_edge),   // [FTQLANE] every lane
-                          Mux(dis_stall_was_rob(w), dis_stall_rob_head_op_count(w), ftq_cap_oc),  INFL_ROB_FULL,
+      // [UNIQDRAIN] [U6BDRAIN] u6 + u6b: the drain wait edge (ROB, STQ or MSHR phase) rides this candidate too, FIRST (it
+      // fires only with a flag, and its merged blocker already includes the [HEADREG] head a coinciding full-ROB stall
+      // would name).  Own code INFL_DRAIN_WAIT (0x17, OC-keyed like 0x10 / 0x14; owner 2026-11-04): one more constant on
+      // the code select (dw_edge is the flag that already picks the key and labels).  The selects are data legs only.
+      InfluencerCandidate(dis_valids(w) && (dis_stall_was_rob(w) || ftq_edge || dw_edge),   // [FTQLANE] every lane
+                          Mux(dw_edge, dw_m_oc, Mux(dis_stall_was_rob(w), dis_stall_rob_head_op_count(w), ftq_cap_oc)),  INFL_ROB_FULL,
+                          Mux(dw_edge, dw_m_atk && d_victim,
                           Mux(dis_stall_was_rob(w), (dis_stall_rob_head_domain(w) === 1.U || rob_head_ld_atk || rob_head_val_atk) && d_victim,   // [VICGATE] F1
-                              ftq_cap_atk && d_victim),
-                          Mux(dis_stall_was_rob(w), dis_stall_rob_head_is_secret(w), ftq_cap_sec),
-                          infl_type_dyn = Some(Mux(dis_stall_was_rob(w), INFL_ROB_FULL.U(inflTypeWidthCF.W),
-                                                                         INFL_FTQ_FULL.U(inflTypeWidthCF.W)))),
+                              ftq_cap_atk && d_victim)),
+                          Mux(dw_edge, dw_m_sec, Mux(dis_stall_was_rob(w), dis_stall_rob_head_is_secret(w), ftq_cap_sec)),
+                          infl_type_dyn = Some(Mux(dw_edge,               INFL_DRAIN_WAIT.U(inflTypeWidthCF.W),
+                                               Mux(dis_stall_was_rob(w), INFL_ROB_FULL.U(inflTypeWidthCF.W),
+                                                                         INFL_FTQ_FULL.U(inflTypeWidthCF.W))))),
       // [MEMORDATK] patch 42: is_atk also when the queue head's address is attacker-tainted and this uop is a victim
       // [VICGATE] F1: domain term gated to victim consumers (ldq_head_atk / stq_head_atk already are).
       InfluencerCandidate(dis_valids(w) && dis_stall_was_ldq(w), dis_stall_ldq_head_op_count(w),  INFL_LDQ_FULL,     (dis_stall_ldq_head_domain(w) === 1.U || ldq_head_atk) && d_victim,  dis_stall_ldq_head_is_secret(w)),
