@@ -871,8 +871,10 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   // be ordered by any software fence.  Staging + apply-on-idle closes both.
   //
   // Only these two registers drive the live geometry.  cf_dcache_repl_conf is
-  // deliberately NOT staged: a policy change remaps nothing, and dcache_clean()
-  // depends on it taking effect immediately.
+  // NOT staged by this gate (a policy change remaps nothing); it only passes through
+  // the one-cycle copy cf_repl_conf ([TF-CSR], below, 2026-11-03), which dcache_clean()
+  // cannot observe: its csrw 0xbc1 flushes the pipeline, so its first sweep load reaches
+  // s2 many cycles after the copy has taken the new value.
   // Timing/area: 2x2b of state; the idle term is an AND of existing quasi-static
   // signals; nothing is added to the s0-s2 datapath.  In a build without
   // reconfiguration these become plain wires off the (tied-off) CSR, so the whole
@@ -1466,6 +1468,19 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // [r149] `cacheParams.replacement` is NOT random: rocket-chip HellaCache.scala:51-52 returns
   // one global PseudoLRU(nWays) tree.  Policy 3 therefore builds its own LFSR here (rocket-chip
   // untouched, so Rocket and BOOM v4 are unaffected).  way = LFSR low bits (0 logic levels).
+  // [TF-CSR] (FPGA timing fit, owner 2026-11-03 "Register CSR copy", task-reports/fpga-timing-fit-20261103.md row 1):
+  // a one-cycle registered copy of 0xbc1[5:4], placed in the D$, read by EVERY consumer of the policy (s2_repl_way_raw,
+  // cf_repl_rand and the IFT LFSR terms, s2_repl_upd, cf_repl_is_plru, cf_lru_upd, the [REPLUPD] prints and their LRU/PLRU
+  // select).  The CSR flop (core/csr, SLR2) reached the D$ victim select with a 3.1 ns first net (fo=71) at the head of all 182
+  // policy paths of the 200 worst AllDef paths; the copy restarts them at a local flop.  0 logic levels added.
+  // Masked-structure consistency (doc 04): all consumers read this ONE copy, so the victim choice, the state update (which
+  // memory, whether at all) and the IFT replacement taint always see the same policy in the same cycle; the policy takes
+  // effect one cycle after the CSR write (DMI-only reconfiguration; a csrw 0xbc1 flushes the pipeline anyway).
+  // Reset value = the CSR's reset field (DCACHE_REPL_DEFAULT), so the copy equals the CSR delayed by one cycle from reset on.
+  // Reconf off: the CSR field is the design-default constant; no flop is built (the old constant-folded netlist, unchanged).
+  // Only bits [1:0] are carried: the 8-bit port's upper bits are constant 0 (parameters.scala cf_dcache_repl_conf = value(5,4)).
+  val cf_repl_conf  = if (ENABLE_RECONF) RegNext(io.lsu.cf_dcache_repl_conf(1, 0), DCACHE_REPL_DEFAULT.U(2.W))
+                      else io.lsu.cf_dcache_repl_conf(1, 0)
   val replacer      = new RandomReplacement(nWays)     // true LFSR random (policy 3 only)
   val lru_replacer  = new TrueLRU(nWays)               // helper: get_replace_way / get_next_state
   val plru_replacer = new PseudoLRU(nWays)             // helper: get_replace_way / get_next_state
@@ -1655,7 +1670,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   val s2_plru_way_en   = if (ENABLE_RECONF) widthMap(w => UIntToOH(cfPlruWay(s2_plru_state(w)), nWays))
                          else widthMap(w => UIntToOH(plru_replacer.get_replace_way(s2_plru_state(w)) & (cf_dcache_active_ways - 1.U)))
   // [r149] default (codes 0 and 2) = PseudoLRU; 1 = TrueLRU; 3 = LFSR random.
-  val s2_repl_way_raw  = widthMap(w => MuxLookup(io.lsu.cf_dcache_repl_conf, s2_plru_way_en(w))(Seq(
+  val s2_repl_way_raw  = widthMap(w => MuxLookup(cf_repl_conf, s2_plru_way_en(w))(Seq(
     1.U -> s2_lru_way_en(w),
     3.U -> s2_random_way_en(w)
   )))
@@ -1885,7 +1900,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // replaces a VALID line is secret-chosen when its own address is secret-derived, or when the
   // replacement state that picked the victim was last advanced by a secret-address access
   // (per-set LRU/PLRU taint, or the global LFSR taint under random replacement).
-  val cf_repl_rand  = io.lsu.cf_dcache_repl_conf === 3.U   // [r149] LFSR random = code 3
+  val cf_repl_rand  = cf_repl_conf === 3.U   // [r149] LFSR random = code 3 [TF-CSR] registered copy
   // [PRIALLOC] patch 32: cf_req_alloc = fire && cacheable && !idx_match (mshrs.scala), so an
   // uncacheable (MMIO) request, which allocates nothing, no longer records a phantom eviction
   // that, by [EVFLAST], also wiped the set's pending record (under-taint).
@@ -2153,9 +2168,9 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // which also dropped a same-cycle hit's refresh on the other lane: a state change caused by a possibly mismatching access).
   // cf_alloc_rp = the allocations that own the port; one flop input (s2_sa_unk) beside the MSHR fire, all endpoints.
   val cf_alloc_rp   = (if (SPECASAN) widthMap(w => cf_alloc(w) && !s2_sa_unkm.get(w)) else cf_alloc)
-  val s2_repl_upd   = widthMap(w => (cf_alloc_rp(w) || s2_lsu_hit(w)) && io.lsu.cf_dcache_repl_conf =/= 3.U)
+  val s2_repl_upd   = widthMap(w => (cf_alloc_rp(w) || s2_lsu_hit(w)) && cf_repl_conf =/= 3.U)   // [TF-CSR]
   // [r149] PseudoLRU = code 0 or its alias 2 (bit 0 clear; code 3 is excluded by s2_repl_upd).
-  val cf_repl_is_plru = !io.lsu.cf_dcache_repl_conf(0)
+  val cf_repl_is_plru = !cf_repl_conf(0)   // [TF-CSR]
   // [reconf-fix doc35 ROOT CAUSE] advance state with the POLICY-CHOSEN victim (pre-MSHR-override
   // s2_repl_way_raw), NOT the post-override allocated way — else a PLRU fixpoint
   // (get_next_state(0x7d,way0)==0x7d) freezes the set state and victim collapses to way 0. See
@@ -2194,12 +2209,12 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // [OOC 1-way] rocket-chip TrueLRU.get_next_state is undefined for one way (empty Vec); a 1-way set has no LRU state.
   val cf_lru_next  = if (nWays > 1) lru_replacer.get_next_state(s2_lru_state(uw), way) else 0.U
   val cf_plru_next = plru_replacer.get_next_state(s2_plru_state(uw), way)
-  val cf_lru_upd   = upd && io.lsu.cf_dcache_repl_conf === 1.U
+  val cf_lru_upd   = upd && cf_repl_conf === 1.U   // [TF-CSR]
   val cf_plru_upd  = upd && cf_repl_is_plru
   // [REPLRST] one write port per memory: the reset sweep (addr = counter, data = 0) or the update.
   // [r147] each functional memory is swept when its policy can be in use (reconf, or the
   // reconf-off fixed default); otherwise it is written by the plain update only.  With reconf
-  // off cf_dcache_repl_conf is a constant, so the unused policy's write folds away.
+  // off cf_dcache_repl_conf (and so cf_repl_conf) is a constant, so the unused policy's write folds away.
   if (cf_repl_sweep_lru) {
     cf_lru_we := cf_repl_rst || cf_lru_upd
     cf_lru_wa := Mux(cf_repl_rst, cf_repl_rst_idx, set)
@@ -2270,7 +2285,8 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   if (ENABLE_CF_DEBUG_PRINTF) {
     val cf_ru_cyc = RegInit(0.U(32.W))
     cf_ru_cyc := cf_ru_cyc + 1.U
-    val cf_ru_lru = io.lsu.cf_dcache_repl_conf === 1.U
+    // [TF-CSR] the policy the update above used; the prints pad the copy to the port width so the %d field keeps its old width.
+    val cf_ru_lru = cf_repl_conf === 1.U
     val cf_ru_byp = RegNext(VecInit((0 until memWidth).map(w => Mux(cf_ru_lru,
                       cf_lru_we  && cf_lru_wa  === s1_set_for_repl(w),
                       cf_plru_we && cf_plru_wa === s1_set_for_repl(w)))))
@@ -2285,7 +2301,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       val cf_ru_wset  = Mux(cf_repl_rst, cf_repl_rst_idx, set)
       when ((upd || cf_repl_rst) && cf_repl_log) {   // [REPLUPDOC] 0xbc0 bit 7 or +cf_replupd=1
         printf("[REPLUPD] c=%d conf=%d upd=%b fire=%b hit=%b set0=%d set1=%d uw=%d way=%d byp=%b old=%x new=%x kind=%d oc=%d pc=0x%x wset=%d\n",
-          cf_ru_cyc, io.lsu.cf_dcache_repl_conf, s2_repl_upd.asUInt, cf_repl_fire.asUInt, s2_lsu_hit.asUInt,
+          cf_ru_cyc, cf_repl_conf.pad(io.lsu.cf_dcache_repl_conf.getWidth), s2_repl_upd.asUInt, cf_repl_fire.asUInt, s2_lsu_hit.asUInt,
           dcacheMaskIdx(s2_req(0).addr), dcacheMaskIdx(s2_req(memWidth - 1).addr), uw, way, cf_ru_byp.asUInt,
           Mux(cf_ru_lru, s2_lru_state(uw), s2_plru_state(uw)), Mux(cf_ru_lru, cf_lru_next, cf_plru_next),
           cf_ru_kind, cf_ru_oc, cf_ru_pc, cf_ru_wset)
@@ -2293,7 +2309,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     } else {
       when (upd && io.lsu.cf_debug_repl_enable) {
         printf("[REPLUPD] c=%d conf=%d upd=%b fire=%b hit=%b set0=%d set1=%d uw=%d way=%d byp=%b old=%x new=%x\n",
-          cf_ru_cyc, io.lsu.cf_dcache_repl_conf, s2_repl_upd.asUInt, cf_repl_fire.asUInt, s2_lsu_hit.asUInt,
+          cf_ru_cyc, cf_repl_conf.pad(io.lsu.cf_dcache_repl_conf.getWidth), s2_repl_upd.asUInt, cf_repl_fire.asUInt, s2_lsu_hit.asUInt,
           dcacheMaskIdx(s2_req(0).addr), dcacheMaskIdx(s2_req(memWidth - 1).addr), uw, way, cf_ru_byp.asUInt,
           Mux(cf_ru_lru, s2_lru_state(uw), s2_plru_state(uw)), Mux(cf_ru_lru, cf_lru_next, cf_plru_next))
       }
