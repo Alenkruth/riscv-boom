@@ -331,6 +331,7 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
  * IO for the BOOM Frontend to/from the CPU
  */
 class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
+  with freechips.rocketchip.util.CoreFuzzingConstants   // [FBHOLD] uopIDCounterWidthCF (as IftIqHead)
 {
   // Give the backend a packet of instructions.
   val fetchpacket       = Flipped(new DecoupledIO(new FetchBufferResp))
@@ -452,6 +453,10 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   // full (ftq.io.enq.ready = 0), registered here so the route to the core starts at a flop.  Read
   // only by the core's FTQ-starvation edge (core.scala [FTQFULL]).  IFT only.
   val cf_ftq_full = if (ENABLE_IFT) Some(Input(Bool())) else None
+  // [FBHOLD] portsmash-fb-stall-20261103: the fetch buffer's next op_count (its uopCount register): every uop in
+  // the fetch buffer, decode or rename has an older one.  Read only by the core's held-behind stall edge
+  // (core.scala [FBHOLD]).  IFT only.
+  val cf_fb_next_oc = if (ENABLE_IFT) Some(Input(UInt(uopIDCounterWidthCF.W))) else None
 }
 
 /**
@@ -1361,6 +1366,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // [FTQFULL] patch 59: ftq.io.enq.ready and f4.io.deq.valid are registers (FTQ RegNext, f4 Queue),
   // so this is 1 LUT -> 1 FF, off every fetch path (a new leaf).  IFT off: no port, no flop.
   io.cpu.cf_ftq_full.foreach(_ := RegNext(f4.io.deq.valid && !ftq.io.enq.ready, false.B))
+  io.cpu.cf_fb_next_oc.foreach(_ := fb.io.cf_next_oc.get)   // [FBHOLD] register to the core, no logic
 
   fb.io.enq.valid := f4.io.deq.valid && ftq.io.enq.ready && !f4_delay
   fb.io.enq.bits  := f4.io.deq.bits

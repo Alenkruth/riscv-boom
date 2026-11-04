@@ -77,6 +77,10 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
     // [FTQHOLD] FTQ plan T1 (option A): Log2Bucket of the f4 FTQ-full hold of the packet enqueued this cycle
     // (frontend.scala f4_hold_b3, a register).  IFT only.
     val cf_ftq_hold3 = if (ENABLE_IFT) Some(Input(UInt(3.W))) else None
+    // [FBHOLD] portsmash-fb-stall-20261103: the next op_count to assign (uopCount below, a register), so every uop
+    // in this buffer or past it has an older op_count.  Read only by the core's held-behind stall edge
+    // (core.scala [FBHOLD]).  IFT only.
+    val cf_next_oc = if (ENABLE_IFT) Some(Output(UInt(uopIDCounterWidthCF.W))) else None
     // 3-bit active width {4, 2, 1}: controls sub-row slicing and fetch cooldown
     val cf_active_width     = Input(UInt(3.W))
     // High when fetch cooldown is zero (gates IFU allow_fetch in the frontend)
@@ -223,6 +227,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // an Option that is None without ENABLE_IFT, so IFT off the dontTouch alone kept 16 dead FF
   // (and the adder) alive.  Kept with IFT on (Verilog unchanged there).
   if (ENABLE_IFT) dontTouch(uopCount)
+  io.cf_next_oc.foreach(_ := uopCount)   // [FBHOLD] a register output: 0 logic
 
   // Step 1: Convert FetchPacket into a vector of MicroOps.
   for (b <- 0 until nBanks) {

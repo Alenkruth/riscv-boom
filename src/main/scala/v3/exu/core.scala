@@ -2367,6 +2367,82 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       RegEnable(PriorityMux(own ++ refused, heads ++ heads), dis_stall_iq_now(w))
     } else 0.U.asTypeOf(new IftIqHead)
   }
+  // [FBHOLD] portsmash-fb-stall-20261103 (DESIGN.md in claude-artifacts/ift-overhaul/execution/diffs/portsmash-fb-stall-20261103;
+  // RULES A reading 4 "An instruction stalled behind one whose record is secret (s_acc or s_prop) gets s_prop itself;
+  // the attacker side works the same way", and RULES C "Stall-edge fixes" F5: every lane blocked behind the stall gets
+  // the edge).  A flagged (sec or atk) REG_PRESSURE / ROB_FULL / IQ_FULL / LDQ_FULL / STQ_FULL stall edge reached only
+  // the dispatch group stalled in that cycle; the uops waiting behind it UPSTREAM (fetch buffer, decode, rename 1) were
+  // delayed by the same stall and got nothing (portsmash: 61 of 363 leaking FPGA runs, attacker probe with no edge).
+  // Mechanism: one hold register {v, lim, key, code, sec, atk}.  Every cycle in which a dispatch lane carries a FLAGGED
+  // stall edge (cap), lim := the fetch buffer's next op_count (io.ifu.cf_fb_next_oc), so the held set is exactly the
+  // uops with op_count < lim that are not in the stalled group itself (all of them were upstream during a flagged
+  // stall cycle; op_counts are assigned in fetch order and dispatch is in order).  A later dispatch lane w with
+  // op_count older than lim (fbh_older) gets the held edge for each held flag its own stall edges of this cycle do
+  // not already carry (fbh_own_sec / fbh_own_atk; review r1 F1: a lane with a weaker own flagged edge, e.g. an
+  // attacker-domain uop whose only own flag is the raw atk of an attacker head, kept no held sec): the captured
+  // key / code / labels, is_atk only on a victim consumer ([VICGATE] F1), never flagless.
+  // v clears on the first dispatch group with no held uop (fbh_pass) and on any front-end flush (the held uops are
+  // gone; refetched uops get new, younger op_counts, so the flush term is a safety net only).
+  // Label: the first flagged edge in the order REG, ROB, IQ (lane order), LDQ, STQ.  While v is set a new flagged
+  // stall replaces the label only when it carries every flag the held one has, or when the held set has just
+  // drained (fbh_pass in the same cycle: the old label must not reach uops that were never behind it; review r1 F2)
+  // (fbh_take); lim always extends.
+  // Compare width fbhW: the held span (lim - op_count) is at most fetch buffer + 3 x coreWidth (decode, rename 1,
+  // rename 2), and v clears within one group after the span, so fbhW = log2Ceil(span) + 2 low bits are exact.
+  // Levels: every term is FF-sourced (ren2 op_count, the capture FFs, the dis_stall_was_* FFs, the [HEADREG] head
+  // FFs): fbh_older = one fbhW-bit carry chain, fbh_own_sec / fbh_own_atk = 2 LUT; the candidate cond = 1-2 LUT after them
+  // (<= 4 levels, as d_win_sec's CONTROL_FLOW cond), feeding only the prefix network (register endpoints).  No
+  // dis_fire term anywhere (fbh_pass uses dis_valids), so 0 levels on the dispatch loop.
+  // Cost (coreWidth 4, fetch buffer 64): 1 + 9 + 16 + 3 + 2 = 31 FF; ~4 x 9-bit compares, a (4 + coreWidth):1 x 21-bit
+  // capture mux, the cap LUTs, and one more candidate per lane in the dispatch batch.  IFT off: all constants, the
+  // candidate cond is constant false, the frontend port does not exist: Verilog unchanged.
+  val fbhW = math.min(uopIDCounterWidthCF, log2Ceil(numFetchBufferEntries + 3 * coreWidth) + 2)
+  def fbhCode(t: Int): UInt = { require((t >> 3) == (INFL_ROB_FULL >> 3), "[FBHOLD] stall codes share bits [5:3]"); (t & 7).U(3.W) }
+  // consumer-independent attacker labels of the blockers (the candidates AND them with d_victim per lane)
+  val fbh_reg_atk = reg_stuck_dom === 1.U || reg_stuck_ldatk || reg_stuck_valatk
+  val fbh_rob_atk = dis_stall_rob_head_domain(0) === 1.U || (rob_ld_head_q && io.lsu.ldq_head_atk.getOrElse(false.B)) ||
+                    rob.io.rob_head_valatk.getOrElse(false.B)
+  val fbh_ldq_atk = dis_stall_ldq_head_domain(0) === 1.U || io.lsu.ldq_head_atk.getOrElse(false.B)
+  val fbh_stq_atk = dis_stall_stq_head_domain(0) === 1.U || io.lsu.stq_head_atk.getOrElse(false.B)
+  // per lane: (flagged cond, key, code, sec, atk) of the stall edges lane w carries this cycle (= the dispatch
+  // candidates' conds and keys; the head fields of REG / ROB / LDQ / STQ are the same for every lane)
+  val fbh_src = (0 until coreWidth).map { w => Seq(
+    (dis_valids(w) && dis_stall_was_reg(w), reg_stuck_oc,                   fbhCode(INFL_REG_PRESSURE), reg_stuck_sec,                   fbh_reg_atk),
+    (dis_valids(w) && dis_stall_was_rob(w), dis_stall_rob_head_op_count(0), fbhCode(INFL_ROB_FULL),     dis_stall_rob_head_is_secret(0), fbh_rob_atk),
+    (dis_valids(w) && dis_stall_was_iq(w),  dis_stall_iq_head(w).oc,        fbhCode(INFL_IQ_FULL),      dis_stall_iq_head(w).sec,        dis_stall_iq_head(w).atk),
+    (dis_valids(w) && dis_stall_was_ldq(w), dis_stall_ldq_head_op_count(0), fbhCode(INFL_LDQ_FULL),     dis_stall_ldq_head_is_secret(0), fbh_ldq_atk),
+    (dis_valids(w) && dis_stall_was_stq(w), dis_stall_stq_head_op_count(0), fbhCode(INFL_STQ_FULL),     dis_stall_stq_head_is_secret(0), fbh_stq_atk))
+    .map { case (c, k, t, s, a) => (c && (s || a) && !cf_dbg && ENABLE_IFT.B, k, t, s, a) } }
+  // lane w's own stall edges of this cycle carry sec / raw atk (the candidate ANDs atk with d_victim, as F1 does)
+  val fbh_own_sec  = fbh_src.map(_.map { case (c, _, _, s, _) => c && s }.reduce(_ || _))
+  val fbh_own_atk  = fbh_src.map(_.map { case (c, _, _, _, a) => c && a }.reduce(_ || _))
+  val fbh_cap      = fbh_src.flatten.map(_._1).reduce(_ || _)
+  def fbhAny(i: Int): Bool = fbh_src.map(_(i)._1).reduce(_ || _)
+  val fbh_order = Seq((fbhAny(0), fbh_src(0)(0)), (fbhAny(1), fbh_src(0)(1))) ++
+                  (0 until coreWidth).map(w => (fbh_src(w)(2)._1, fbh_src(w)(2))) ++
+                  Seq((fbhAny(3), fbh_src(0)(3)), (fbhAny(4), fbh_src(0)(4)))
+  val fbh_new = PriorityMux(fbh_order.map(_._1), fbh_order.map { case (_, (_, k, t, s, a)) =>
+                  Cat(a, s, t, k.pad(uopIDCounterWidthCF)(uopIDCounterWidthCF - 1, 0)) })
+  val fbh_n_key = fbh_new(uopIDCounterWidthCF - 1, 0)
+  val fbh_n_code = fbh_new(uopIDCounterWidthCF + 2, uopIDCounterWidthCF)
+  val fbh_n_sec = fbh_new(uopIDCounterWidthCF + 3)
+  val fbh_n_atk = fbh_new(uopIDCounterWidthCF + 4)
+  val fbh_v    = if (ENABLE_IFT) RegInit(false.B) else false.B
+  val fbh_lim  = if (ENABLE_IFT) RegInit(0.U(fbhW.W)) else 0.U(fbhW.W)
+  val fbh_key  = if (ENABLE_IFT) RegInit(0.U(uopIDCounterWidthCF.W)) else 0.U(uopIDCounterWidthCF.W)
+  val fbh_code = if (ENABLE_IFT) RegInit(0.U(3.W)) else 0.U(3.W)
+  val fbh_sec  = if (ENABLE_IFT) RegInit(false.B) else false.B
+  val fbh_atk  = if (ENABLE_IFT) RegInit(false.B) else false.B
+  // lane w's uop is older than lim (modular, fbhW bits): it was upstream during a flagged stall cycle
+  val fbh_older = (0 until coreWidth).map(w =>
+    ((rename_stage.io.ren2_uops(w).cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W)))(fbhW - 1, 0) - fbh_lim)(fbhW - 1))
+  val fbh_pass = dis_valids.reduce(_ || _) && (0 until coreWidth).map(w => !dis_valids(w) || !fbh_older(w)).reduce(_ && _)
+  val fbh_take = fbh_cap && (!fbh_v || fbh_pass || ((fbh_n_sec || !fbh_sec) && (fbh_n_atk || !fbh_atk)))
+  if (ENABLE_IFT) {
+    fbh_v := !io.ifu.redirect_flush && (fbh_cap || (fbh_v && !fbh_pass))
+    when (fbh_cap)  { fbh_lim := (io.ifu.cf_fb_next_oc.get)(fbhW - 1, 0) }
+    when (fbh_take) { fbh_key := fbh_n_key; fbh_code := fbh_n_code; fbh_sec := fbh_n_sec; fbh_atk := fbh_n_atk }
+  }
   // [CFWIN] patch 31: raise CONTROL_FLOW (ty 20) for attacker-window members too (see the candidate).
   val cfCtrlFlowAtkWin = false
   // [R117SWEEP] patch 33: per lane, OR of is_secret over every firing dispatch candidate (below)
@@ -2515,6 +2591,14 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       InfluencerCandidate(dis_valids(w) && dis_stall_was_iq(w) && ENABLE_IFT.B,
                           dis_stall_iq_head(w).oc, INFL_IQ_FULL,
                           dis_stall_iq_head(w).atk && pre.cf_domain_id.getOrElse(0.U(iftTagWidth.W)) === 0.U, dis_stall_iq_head(w).sec),
+      // [FBHOLD] portsmash-fb-stall-20261103: the held-behind stall edge (see fbh_* above): a uop that was upstream
+      // (fetch buffer / decode / rename 1) during a flagged dispatch stall gets that stall's edge (same code, key and
+      // labels; is_atk only on a victim consumer, never flagless) when its own stall edges lack a held flag (r1 F1).
+      // Placed after IQ_FULL: newer than the fetch candidates and this uop's own stall edges in the age-ordered list.
+      InfluencerCandidate(dis_valids(w) && fbh_v && fbh_older(w) &&
+                          ((fbh_sec && !fbh_own_sec(w)) || (fbh_atk && d_victim && !fbh_own_atk(w))) && ENABLE_IFT.B,
+                          fbh_key, INFL_REG_PRESSURE, fbh_atk && d_victim, fbh_sec,
+                          infl_type_dyn = Some(Cat((INFL_ROB_FULL >> 3).U((inflTypeWidthCF - 3).W), fbh_code))),
       InfluencerCandidate(dis_hol_any,                          hol_head_op,                     INFL_MEM_HOL,      hol_is_atk,                            hol_is_secret),
       // FIX 2: implicit flow gets its own edge.  Placed LAST: addInfluencerBatch appends
       // and drops into 4 slots, so position is priority, and this must never evict a
