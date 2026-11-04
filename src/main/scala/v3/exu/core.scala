@@ -2543,10 +2543,30 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // FFs (ren2 valid 0..w, is_unique, disableOOO <= 6 inputs), parallel to dw_m_sec / dw_m_atk (3): 0 added; lane 0's
   // prior term is constant false.  IFT off: the leg cond is constant false: Verilog unchanged.
   val fbh_dw_cap   = (0 until coreWidth).map(w => fbh_src(w)(5)._1 && !dis_prior_slot_valid(w))
-  val fbh_cap      = (fbh_src.flatMap(_.init.map(_._1)) ++ fbh_dw_cap).reduce(_ || _)
-  def fbhAny(i: Int): Bool = fbh_src.map(_(i)._1).reduce(_ || _)
+  // [FBOLDER] fbhold-older-lane-20261104 (DESIGN.md and REVIEW.md in claude-artifacts/ift-overhaul/execution/diffs/
+  // fbhold-older-lane-20261104; RULES A reading 4; the per-lane sibling of [DWOLDER] above): the REG / IQ / LDQ / STQ
+  // legs CAPTURE only from a lane with no valid OLDER lane in its dispatch group.  The capture sets lim over all of
+  // rename 2, so a lane-w capture labelled the older group lanes too, although dispatch is in order and no older lane is
+  // behind lane w (rename stalls, IQ ready (num_available > w), LDQ / STQ full are per lane: lane w can hit them while
+  // an older lane is stalled for its own, unflagged reason; that lane then took w's held label, or w's label replaced
+  // the one it was owed).  While w is valid the group is not refilled, so "no valid older lane at k" = every older lane
+  // fired at k-1: w was the oldest stalled lane at k-1, its own stall was binding (the fire-based *_full_obs then equal
+  // the hazard terms), and every uop it labels (itself, younger lanes, upstream) was behind it; the older-lane terms of
+  // [STALLLANE] F5 are zero, so these legs capture exactly the binding lane's own stall.  A younger lane's flagged stall
+  // that ends at or before the older blocker fires is not captured (it did not delay anything behind it).  ROB is
+  // global (an older valid lane carries the same ROB leg itself, same key and flags): unchanged.  The drain leg is
+  // gated by fbh_dw_cap ([DWOLDER]).  Only the capture is gated: fbh_own_sec / fbh_own_atk still read every leg of
+  // lane w, because they must match lane w's own dispatch candidates, and lane w may fire in the same cycle as older
+  // lanes.  Levels: valid(w) && !prior(w) is one LUT over ren2 valid FFs (level 1), folded into the leg cond with
+  // was / cf_dbg (FFs): 0 added levels expected on fbh_cap / fbh_new (worst +1), whose endpoints are FFs (fbh_v,
+  // fbh_pk, fbh_lim CE, label CE); no dis_fire and no candidate path.  0 FF, ~3-6 LUT.  Lane 0's prior term is
+  // constant false.  IFT off: every leg is constant false, Verilog unchanged.
+  val fbh_csrc     = fbh_src.zipWithIndex.map { case (legs, w) => legs.zipWithIndex.map { case ((c, k, t, s, a), i) =>
+                       (if (Set(0, 2, 3, 4).contains(i)) c && !dis_prior_slot_valid(w) else c, k, t, s, a) } }   // REG IQ LDQ STQ
+  val fbh_cap      = (fbh_csrc.flatMap(_.init.map(_._1)) ++ fbh_dw_cap).reduce(_ || _)
+  def fbhAny(i: Int): Bool = fbh_csrc.map(_(i)._1).reduce(_ || _)
   val fbh_order = Seq((fbhAny(0), fbh_src(0)(0)), (fbhAny(1), fbh_src(0)(1))) ++
-                  (0 until coreWidth).map(w => (fbh_src(w)(2)._1, fbh_src(w)(2))) ++
+                  (0 until coreWidth).map(w => (fbh_csrc(w)(2)._1, fbh_csrc(w)(2))) ++
                   Seq((fbhAny(3), fbh_src(0)(3)), (fbhAny(4), fbh_src(0)(4)),
                       (fbh_dw_cap.reduce(_ || _), fbh_src(0)(5)))   // [UNIQDRAIN] last; [DWOLDER] gated capture
   val fbh_new = PriorityMux(fbh_order.map(_._1), fbh_order.map { case (_, (_, k, t, s, a)) =>
