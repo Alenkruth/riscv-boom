@@ -2528,11 +2528,27 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // lane w's own stall edges of this cycle carry sec / raw atk (the candidate ANDs atk with d_victim, as F1 does)
   val fbh_own_sec  = fbh_src.map(_.map { case (c, _, _, s, _) => c && s }.reduce(_ || _))
   val fbh_own_atk  = fbh_src.map(_.map { case (c, _, _, _, a) => c && a }.reduce(_ || _))
-  val fbh_cap      = fbh_src.flatten.map(_._1).reduce(_ || _)
+  // [DWOLDER] t83-g4-store-0x17-20261104 (ROOTCAUSE.md and REVIEW.md in claude-artifacts/ift-overhaul/execution/diffs/
+  // t83-g4-store-0x17-20261104; RULES A reading 4): the drain leg CAPTURES only for a waiter with no valid OLDER lane in
+  // its dispatch group.  Dispatch is in order (dis_stalls scans left to right), so an older group lane is never behind
+  // the waiter, yet it compares older than the lim a capture sets: t83 m109 committed sd 0x80001b58 (oc 53084, stalled
+  // by its own STQ_FULL in a lane older than the section-end fence 53085) took the held {0x17, key 53081, sec 1}, and the
+  // drain capture replaced the held STQ_FULL label {key = the secret store 53074} it was owed.  While an older lane is
+  // valid the waiter waits for that lane (wait_for_empty_pipeline's prior-slot term), not yet for the drain; once the
+  // older lanes fire, the leg captures as before and every valid group lane is younger (behind it by
+  // dis_prior_slot_unique); dw_keep holds the merged flags meanwhile, so the capture is late, never lost.  Only the
+  // capture side is gated: fbh_own_sec / fbh_own_atk keep the ungated leg, so they stay exactly lane w's own drain edge
+  // (dw_edge, which is unchanged) also when a waiter fires beside an older lane (cf_quiesce_core drops the prior-slot
+  // term).  The dw_q / dm_q blocker tracking is unchanged.  Levels: dw_wt(w) && !dis_prior_slot_valid(w) = 1 LUT over
+  // FFs (ren2 valid 0..w, is_unique, disableOOO <= 6 inputs), parallel to dw_m_sec / dw_m_atk (3): 0 added; lane 0's
+  // prior term is constant false.  IFT off: the leg cond is constant false: Verilog unchanged.
+  val fbh_dw_cap   = (0 until coreWidth).map(w => fbh_src(w)(5)._1 && !dis_prior_slot_valid(w))
+  val fbh_cap      = (fbh_src.flatMap(_.init.map(_._1)) ++ fbh_dw_cap).reduce(_ || _)
   def fbhAny(i: Int): Bool = fbh_src.map(_(i)._1).reduce(_ || _)
   val fbh_order = Seq((fbhAny(0), fbh_src(0)(0)), (fbhAny(1), fbh_src(0)(1))) ++
                   (0 until coreWidth).map(w => (fbh_src(w)(2)._1, fbh_src(w)(2))) ++
-                  Seq((fbhAny(3), fbh_src(0)(3)), (fbhAny(4), fbh_src(0)(4)), (fbhAny(5), fbh_src(0)(5)))   // [UNIQDRAIN] last
+                  Seq((fbhAny(3), fbh_src(0)(3)), (fbhAny(4), fbh_src(0)(4)),
+                      (fbh_dw_cap.reduce(_ || _), fbh_src(0)(5)))   // [UNIQDRAIN] last; [DWOLDER] gated capture
   val fbh_new = PriorityMux(fbh_order.map(_._1), fbh_order.map { case (_, (_, k, t, s, a)) =>
                   Cat(a, s, t, k.pad(uopIDCounterWidthCF)(uopIDCounterWidthCF - 1, 0)) })
   val fbh_n_key = fbh_new(uopIDCounterWidthCF - 1, 0)
