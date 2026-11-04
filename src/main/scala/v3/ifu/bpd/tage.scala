@@ -410,7 +410,20 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
   // Per-table enable mask: in GShare mode only table 3 is active; in TAGE mode
   // all tables except table 3 that are within the cf_tage_active range are active.
   // This mask is used for prediction, metadata tracking, and allocation.
-  val bank_enable_mask = VecInit((0 until tageNTables).map { i =>
+  // [FPGA-TIMING-FIT] (owner 2026-11-03, RULES C 'FPGA timing fit'): the mask is a ONE-cycle registered copy of the
+  // 0x7c2 bit 2 / 0xbca fields, the only copy in this bank, read by prediction (bank3 use, provider tracking,
+  // allocation) and by the spec-BPU repair / undo masking (left_off), so read and write masking always agree
+  // (04-reconfiguration-infrastructure.md masked-structure rules).  The CSR flop (core) -> SLR hop -> mask compare now
+  // ends at this register instead of continuing through f3 -> s1 -> I$ (the AllDef worst paths); no level is added on
+  // the fetch side (the mask is read from a flop).  A DMI write takes effect one cycle later, while the hart is halted.
+  // Reset value = the mask at the CSRs' reset values (TAGE mode, count index 0); with reconfiguration off both inputs
+  // are constants equal to those values, so the register folds to the same constant.
+  val bank_enable_mask_init = (0 until tageNTables).map { i =>
+    if (i != 3 && i < (tagetableCountOptions(0) min tageNTables)) BigInt(1) << i else BigInt(0) }.sum
+  // RegInit + := (not RegNext(next, init)): RegNext drops the width (Chisel 6 cloneTypeWidth(Width())) and the
+  // width queries below (allocatable_slots) need it.  Same register, same reset value.
+  val bank_enable_mask = RegInit(bank_enable_mask_init.U(tageNTables.W))
+  bank_enable_mask := VecInit((0 until tageNTables).map { i =>
     val is_gshare_table = (i.U === 3.U)
     Mux(cf_bpd_tage_to_gshare,
       is_gshare_table,                            // GShare mode: only table 3
