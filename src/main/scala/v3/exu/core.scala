@@ -1367,7 +1367,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // winCtr is not elaborated.
   val cf_dbg_hist     = if (ENABLE_IFT) { val q2 = RegNext(cf_dbg_q, false.B); cf_dbg || cf_dbg_q || q2 || RegNext(q2, false.B) } else false.B
   val cf_fl_q1        = if (ENABLE_IFT) RegNext(rob.io.flush.valid && !cf_dbg_hist, false.B) else false.B
-  val cf_fl_q3        = if (ENABLE_IFT) RegNext(RegNext(cf_fl_q1, false.B), false.B) else false.B
+  val cf_fl_q2        = if (ENABLE_IFT) RegNext(cf_fl_q1, false.B) else false.B   // [FLUSHFILL] named (the same flop as before)
+  val cf_fl_q3        = if (ENABLE_IFT) RegNext(cf_fl_q2, false.B) else false.B
   val win_flush_close = cf_fl_q3 && !cf_dbg   // [FLUSHCLOSE] drops the debug-entry flush (cf_dbg = 1 at flush + 3)
   val (win_sec_ctr_r, win_sec_ep, win_sec_close) = winCtr(win_arm_sec_v, cf_sec_disarm_c || win_flush_close)   // [GHRWIN2] 71; [FLUSHCLOSE]
   val (win_atk_ctr_r, win_atk_ep, win_atk_close) = winCtr(win_arm_atk_v, win_flush_close)                      // [GHRWIN] 62; [FLUSHCLOSE]
@@ -1381,6 +1382,23 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val win_atk_ctr = Mux(cf_dbg, 0.U, win_atk_ctr_r)
   io.ifu.cf_win_sec_ctr := win_sec_ctr
   io.ifu.cf_win_atk_ctr := win_atk_ctr
+  // [FLUSHFILL] 2026-11-04 (t60 SAMETAG A4; RULES A "a full pipeline flush ... CLOSES the secret and attacker
+  // windows"): the [FLUSHCLOSE] close zeroes the counters only from flush + 4 (cf_fl_q3 at + 3 -> the winCtr
+  // register), but the I$ fill label of a refetch (frontend.scala icache.io.s1_is_secret / cf_s1_fill_atk) is a
+  // RegNext of the exported counter taken at the fetch's s0: the redirect is at flush + 1 (s0), so a refetch whose
+  // s0 is at flush + 1..+3 read the still-open window and its miss was filled sec=1 / dom=1 after the close.  This
+  // bit is high exactly in those three cycles (q1 at + 1, q2 at + 2, q3 at + 3); the frontend ANDs it into both fill
+  // terms, so every fetch made after a closing flush sees the window closed, as the f3 / fetch-buffer / dispatch
+  // readers (flush + 4 or later) already do.  It never hides a window that survives: any arm in + 1..+3 is wiped by
+  // the clr at + 3 (clr wins in winCtr).  Debug entry (close dropped at + 3 because cf_dbg = 1): + 1/+ 2 are the
+  // debug-ROM fetches, which patch 85 treats as closed anyway (from + 3 by cf_dbg); dret and flushes in debug mode
+  // never raise q1 (cf_dbg_hist), so the program refetch after dret still sees the preserved window.
+  // Cost: 0 FF (q1..q3 exist), one 3-input OR on flops (absorbable into the frontend LUT), one port.  Levels: the
+  // frontend D path is counter flops -> 7-bit zero detect (2 LUT) -> its flop; the mask joins the second LUT
+  // (6 inputs: the first-level LUT, the 7th counter bit, q1..q3 or their OR), so 0 added levels on a flop-to-flop
+  // path.  IFT off: None, nothing elaborated.  RECORD CHANGE (fewer I$ fill sec/atk marks after closing flushes;
+  // refetch hits on secret lines in that gap now raise the ICACHE_STATE secret mismatch, as any post-close fetch).
+  io.ifu.cf_win_fill_mask.foreach(_ := cf_fl_q1 || cf_fl_q2 || cf_fl_q3)
   val win_sec_now = win_sec_ctr =/= 0.U || win_arm_sec
   val win_atk_now = win_atk_ctr =/= 0.U || win_arm_atk
   // [L11CFATK] lean59 (Fable audit 2026-10-23 L11; RULES A "Record summary for both", U2 "all edges", D1 "Edge

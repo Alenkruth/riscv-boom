@@ -440,6 +440,10 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   // [DBGFREEZE] patch 85 (b): the hart is in debug mode (core.scala cf_dbg, a flop): the fetch buffer gives the
   // packets it enqueues no fetch-time label (edges, s_prop / atk, domain).  IFT only.
   val cf_dbg = if (ENABLE_IFT) Some(Output(Bool())) else None
+  // [FLUSHFILL] 2026-11-04: high at flush + 1..+3 of a window-closing ROB flush (core.scala cf_fl_q1..q3, flops):
+  // the counters above are still nonzero there but are zeroed by the [FLUSHCLOSE] clr at + 3.  Masks the two
+  // RegNext'd I$ fill window terms (icache.io.s1_is_secret, cf_s1_fill_atk).  IFT only.
+  val cf_win_fill_mask = if (ENABLE_IFT) Some(Output(Bool())) else None
   // [WINFTQ] patch 29b (owner r160): the FTQ index of the oldest secret-window arming branch
   // that resolved (registered); the FTQ tags every entry younger than it (fetch-target-queue.scala).
   val cf_win_ftq_rs = if (ENABLE_IFT) Some(Output(Valid(UInt(log2Ceil(ftqSz).W)))) else None
@@ -662,7 +666,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // domain (the twin of the secret window term on s1_is_secret, registered the same way).  Fill side only: the
   // fetch's own domain for the I$ mismatch compare is unchanged (a domain compare, unlike the secret flag, would
   // flag every window fetch of a victim line).  RECORD CHANGE.
-  icache.io.cf_s1_fill_atk.foreach(_ := RegNext(io.cpu.cf_win_atk_ctr =/= 0.U, false.B))
+  // [FLUSHFILL] 2026-11-04: masked in flush + 1..+3 of a closing flush (core.scala [FLUSHFILL]), as s1_is_secret below.
+  icache.io.cf_s1_fill_atk.foreach(_ := RegNext(io.cpu.cf_win_atk_ctr =/= 0.U && !io.cpu.cf_win_fill_mask.getOrElse(false.B), false.B))
   // [ICSEC] step 15: icache.io.s1_is_secret is driven below, after `ftq` is in Scala scope.
 
   // [FIFO10] step 10 (owner ruling 94: machine mode, paging off): the ITLB domain/secret shadow
@@ -1271,7 +1276,13 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // Registered (1 FF) to keep the core counter compare off the I$ s1 path.  The same bit gates
   // the reader-side mismatch: a fetch inside the window does not flag itself.
   // [R124GATE] patch 26: the window-term flop exists only with ENABLE_IFT.
-  icache.io.s1_is_secret := (if (ENABLE_IFT) s1_fetch_is_secret || RegNext(io.cpu.cf_win_sec_ctr =/= 0.U, false.B)
+  // [FLUSHFILL] 2026-11-04 (t60 SAMETAG A4): the window term is masked while a closing flush's [FLUSHCLOSE] clr is
+  // still in flight (io.cpu.cf_win_fill_mask, flush + 1..+3), so a refetch miss after fence / fence.i / CSR is not
+  // filled secret after the close.  The same bit gates the hit-side secret mismatch (icache.scala), so such a
+  // refetch that hits a secret line flags it like any post-close fetch.  0 FF; the mask joins the existing second
+  // LUT of the 7-bit zero detect (0 added levels, counter / mask flops -> this flop).
+  icache.io.s1_is_secret := (if (ENABLE_IFT) s1_fetch_is_secret ||
+                                             RegNext(io.cpu.cf_win_sec_ctr =/= 0.U && !io.cpu.cf_win_fill_mask.get, false.B)
                              else s1_fetch_is_secret)
   f3_fetch_bundle.ghist_atk.foreach(_ := io.cpu.cf_win_atk_ctr =/= 0.U)
   f3_fetch_bundle.ghist_secret_ctr.foreach(_ := io.cpu.cf_win_sec_ctr)
