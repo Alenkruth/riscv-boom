@@ -95,6 +95,16 @@ class ICacheBundle(val outer: ICache) extends BoomBundle()(outer.p)
   // (s1_is_secret) is not touched.  IFT only.
   val cf_s1_pred_sec = if (ENABLE_IFT) Some(Input(Bool())) else None
   val cf_s2_pred_sec = if (ENABLE_IFT) Some(Input(Bool())) else None
+  // [ICPREDATK] 2026-11-04: the attacker label of the prediction that chose the s1 / s2 fetch's PC (frontend.scala
+  // [ICPREDATK]; a victim packet's BPD / BTB / uBTB / RAS state written by the attacker).  It joins the FILL domain
+  // only (cf_refill_dom_pred) and gates the s2 domain mismatch of the fetch's own refill when it alone made the line
+  // attacker; the s1 domain compare (s1_domain_id) is not touched.  IFT only.
+  val cf_s1_pred_atk = if (ENABLE_IFT) Some(Input(Bool())) else None
+  val cf_s2_pred_atk = if (ENABLE_IFT) Some(Input(Bool())) else None
+  // [ICOWNHOLD] 2026-11-04 (REVIEW icfill-atk-20261104 R1): the frontend will not take this cycle's s2 response (f3 not
+  // ready: f2 replays the fetch, frontend.scala f2_replay).  An s2 hit in such a cycle does not consume the own-fill
+  // flops (cf_ownfill_q, cf_ownfill_atk_q).  IFT only.
+  val cf_s2_hold     = if (ENABLE_IFT) Some(Input(Bool())) else None
   // [ICFILL] runtime enable of the debug fill print (0xbc0 bit 4, cf_debug_rob_enable, as [D4RAS]); the port exists
   // only in debug-printf IFT builds (enableCfDebugPrintf && enableIFT), so other configs keep their Verilog.
   val cf_dbg_print  = if (ENABLE_CF_DEBUG_PRINTF && ENABLE_IFT) Some(Input(Bool())) else None
@@ -335,11 +345,29 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
       refill_secret_reg := true.B
     }
   }
+  // [ICPREDATK] 2026-11-04 (REVIEW f0c25b0b F3, RULES C "Attacker-domain twin of the I$ fill gap"): the fill's
+  // attacker label from the steering prediction, in its own bit beside refill_domain_reg (same capture and request-cycle
+  // OR as refill_secret_reg [ICPRED]).  The line's written domain is refill_dom_w = refill_domain_reg ||
+  // cf_refill_dom_pred (ift_tag_meta, the Ceviche CRF idom, [ICFILL], the V3STATE IC tap).  Kept apart so that
+  // (1) refill_domain_reg and its D cone (io.s1_domain_id, the s1 range compare) are untouched: 0 added levels on the
+  // I$ s1 domain path; the new OR sits between two flops and the BRAM write data; (2) the own-fill gate below can
+  // tell a line made attacker by the label ALONE from one the PC range / [ICREDIR] / [M3ATKWIN] already made attacker
+  // (whose own refetch flags today and keeps flagging).  RegInit + := (no RegNext(next, init)).  IFT off: not built,
+  // refill_dom_w = refill_domain_reg (unchanged Verilog).
+  val cf_refill_dom_pred = if (ENABLE_IFT) RegInit(false.B) else false.B
+  if (ENABLE_IFT) {
+    when (s1_valid && !(refill_valid || s2_miss)) {
+      cf_refill_dom_pred := io.cf_s1_pred_atk.get
+    } .elsewhen (s2_miss && !refill_valid && io.cf_s2_pred_atk.get) {
+      cf_refill_dom_pred := true.B
+    }
+  }
+  val refill_dom_w = if (ENABLE_IFT) refill_domain_reg || cf_refill_dom_pred else refill_domain_reg
   if (ENABLE_IFT) {
     when (refill_done) {
       // [T-IFT] refill_row = refill_idx in stock mode, the granted CRF line's row (with repl_way = its way) in Ceviche mode.  The read
       // above stays address-indexed: with cev_i_on its result is not selected (s1_way_domain/secret come from the CRF, I2).
-      ift_tag_meta.write(refill_row, VecInit(Seq.fill(nWays)(refill_domain_reg)),
+      ift_tag_meta.write(refill_row, VecInit(Seq.fill(nWays)(refill_dom_w)),   // [ICPREDATK] + the prediction label
         Seq.tabulate(nWays)(repl_way === _.U))
       ift_tag_meta_secret.write(refill_row, VecInit(Seq.fill(nWays)(refill_secret_reg)),
         Seq.tabulate(nWays)(repl_way === _.U))
@@ -362,7 +390,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     c.io.wr.bits.dom   := cev_refill_dom
     c.io.wr.bits.s     := pd(3); c.io.wr.bits.inv := pd(2)          // burned from the owner's Fig. 2(b) bits
     c.io.wr.bits.sec   := refill_secret_reg
-    c.io.wr.bits.idom.foreach(_ := refill_domain_reg)                // [T-IFT v5] the value ift_tag_meta gets for this line
+    c.io.wr.bits.idom.foreach(_ := refill_dom_w)                     // [T-IFT v5] the value ift_tag_meta gets for this line ([ICPREDATK])
     // I7 [CEVI] debug record (same gate as [ICFILL]): one line per Ceviche-mode refill, in the cycle the line is keyed.
     io.cf_dbg_print.foreach { en =>
       val cevi_cyc = RegInit(0.U(40.W))
@@ -387,7 +415,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     icf_cyc := icf_cyc + 1.U
     when (en && refill_done) {
       printf("[ICFILL] c=%d set=%d way=%d dom=%d sec=%d pa=0x%x inv=%d\n", icf_cyc, refill_row, repl_way,   // [T-IFT] refill_row = refill_idx in stock mode
-        refill_domain_reg, refill_secret_reg, (refill_paddr >> blockOffBits) << blockOffBits, invalidated)
+        refill_dom_w, refill_secret_reg, (refill_paddr >> blockOffBits) << blockOffBits, invalidated)   // [ICPREDATK] dom as written
     }
   }
 
@@ -400,7 +428,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     w.v       := refill_done || io.invalidate
     w.g.inval := io.invalidate
     w.g.drop  := refill_done && invalidated
-    w.g.dom   := refill_done && refill_domain_reg
+    w.g.dom   := refill_done && refill_dom_w   // [ICPREDATK] the domain as written into ift_tag_meta
     w.g.sec   := refill_done && refill_secret_reg
     w.g.set   := Mux(refill_done, refill_row, 0.U)   // [T-IFT] the line's row in Ceviche mode (refill_row = refill_idx in stock mode)
     w.g.way   := Mux(refill_done, repl_way, 0.U)
@@ -622,7 +650,28 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   io.resp.bits.ae := DontCare
   io.resp.bits.replay := DontCare
   io.resp.bits.data := s2_data
-  io.resp.bits.icache_domain_mismatch := s2_domain_mismatch
+  // [ICPREDATK] hit side, own-fill gate of the domain term (REVIEW F3 "the same own-fill gate on the domain mismatch";
+  // its own flop, as [ICPRED-R1] for the secret term below).  Without it the steered victim fetch's refetch after its
+  // own refill would hit the line the label just made attacker and raise ICACHE_STATE atk=1 on itself, but only when
+  // the line was cold: a residency artifact (only the predicting packet is labelled, fetch-buffer.scala fetch_dom_atk).
+  // cf_ownfill_atk_q = "the last refill request was sent for an attacker-steered fetch whose line only the label made
+  // attacker (refill_domain_reg = 0), and no fetch has hit since": loaded on refill_fire with the fill's full label
+  // (cf_refill_dom_pred || the s2 label: exactly the value cf_refill_dom_pred takes on that edge), cleared by the first
+  // s2 hit.  A line already attacker by the PC range / [ICREDIR] / [M3ATKWIN] does not load it, so its own refetch
+  // flags exactly as today.  The first hit after the request is the fetch's own refetch unless a redirect killed it
+  // (each f2 replay sets f1_clear); a redirect target that hits first clears the flop and is gated only if it is
+  // attacker-steered itself (the [ICPRED-R1] residual).  Cost: 1 FF + 1 LUT (D: refill_fire, label, refill_domain_reg,
+  // s2_valid && s2_hit, q); the gate is one more flop input on the LUT after the s2 flop (0 added levels on that flop's
+  // path; the s2 label is the [ICPRED] f3 cone).  IFT off: unchanged.
+  val cf_ownfill_atk_q = if (ENABLE_IFT) RegInit(false.B) else false.B
+  if (ENABLE_IFT) {
+    // [ICOWNHOLD] cleared by the first s2 hit the frontend TAKES: a hit while f3 is not ready is replayed, and the
+    // replay is still the fetch's own refetch (only it reaches s2 while it replays), so it keeps the gate.
+    when (refill_fire) { cf_ownfill_atk_q := (cf_refill_dom_pred || io.cf_s2_pred_atk.get) && !refill_domain_reg }
+      .elsewhen (s2_valid && s2_hit && !io.cf_s2_hold.get) { cf_ownfill_atk_q := false.B }
+  }
+  io.resp.bits.icache_domain_mismatch := (if (ENABLE_IFT) s2_domain_mismatch && !(cf_ownfill_atk_q && io.cf_s2_pred_atk.get)
+                                          else s2_domain_mismatch)
   // [ICPRED] hit side: a secret-steered fetch does not flag the line ITS OWN refill marked (its refetch after the
   // fill), and only that line.  [ICPRED-R1] (review 2026-11-04 F1): the label alone does not gate the flag.  Unlike a
   // window fetch (s_prop at dispatch through ghist_secret), the steered fetch's packet gets no s_prop from its
@@ -638,7 +687,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val cf_ownfill_q = if (ENABLE_IFT) RegInit(false.B) else false.B
   if (ENABLE_IFT) {
     when (refill_fire) { cf_ownfill_q := io.cf_s2_pred_sec.get }
-      .elsewhen (s2_valid && s2_hit) { cf_ownfill_q := false.B }
+      .elsewhen (s2_valid && s2_hit && !io.cf_s2_hold.get) { cf_ownfill_q := false.B }   // [ICOWNHOLD] as above
   }
   io.resp.bits.icache_secret_mismatch := (if (ENABLE_IFT) s2_secret_mismatch && !(cf_ownfill_q && io.cf_s2_pred_sec.get)
                                           else s2_secret_mismatch)
