@@ -677,6 +677,19 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // cf_f3_pred_sec and s1_pred_lbl are Wires declared here and driven further down (no forward val reference).
   val s0_pred_sec     = WireInit(false.B)
   val cf_f3_pred_sec  = WireInit(false.B)   // driven at f3 ([ICPRED] beside ras_pop_secret)
+  // [ICPREDF3] 2026-11-04 (ROOTCAUSE-C3.md, t83 m107+ flood): the part of the f3 label that a fetch ALREADY at s1 / s2
+  // can carry: the BPD / BTB bank flops only.  ras_pop_secret is read at f3 and chooses a PC only through the f3 leg
+  // (s0_pred_sec := cf_f3_pred_sec below); a fetch already at s1 / s2 was issued by the packet's f1 / f2 choice before
+  // the RAS was read, and when the f3 ret redirect discards it its request is still sent (f2_clear does not kill
+  // tl_out.a).  Before, that discarded fall-through fetch took the RAS label and marked a line no RAS slot chose.
+  val cf_f3_pred_sec_pre = WireInit(false.B)   // driven at f3 beside cf_f3_pred_sec
+  // [ICPREDF3-R1] (REVIEW-f3ras F1/F2): the RAS term DOES reach a fetch already at s1 / s2 when f3 FIRES without
+  // redirecting (the RAS target equals that fetch's PC) and the fetch's request is sent only after this cycle: X at s1
+  // with s2 empty (an f3 redirect would have killed it by f1_clear -> icache s1_kill; its request goes out at its s2
+  // next cycle), or X at s2 that misses without a request (refill busy / a.ready low) and replays (an f3 redirect would
+  // override the replay).  Its fill then exists only because the RAS agreed.  Not on the s2 request label: a request
+  // sent in this cycle goes out whatever f3 decides.  Stalled f3 (no fire): nothing is decided yet, so no RAS term.
+  val cf_f3_ras_sec_fire = WireInit(false.B)   // driven at f3 beside cf_f3_pred_sec
   val s1_pred_lbl     = WireInit(false.B)   // driven at the I$ ports ([ICPRED] beside icache.io.s1_is_secret)
   val s1_pred_sec     = if (ENABLE_IFT) RegInit(false.B) else false.B
   val s2_pred_q       = if (ENABLE_IFT) RegInit(false.B) else false.B
@@ -684,7 +697,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s1_pred_sec := s0_pred_sec
     s2_pred_q   := s1_pred_lbl
   }
-  val s2_pred_lbl     = s2_pred_q || cf_f3_pred_sec   // the s2 fetch's full label (P is in f3 now, if anywhere)
+  val s2_pred_lbl     = s2_pred_q || cf_f3_pred_sec_pre   // the s2 fetch's full label (P is in f3 now, if anywhere) [ICPREDF3]
   // [ICPREDATK] 2026-11-04 (REVIEW f0c25b0b F3; RULES C "Attacker-domain twin of the I$ fill gap"; D1 owner item (5) of
   // 10-15 "the attacker trained entries are being used by the victim to fetch something ... => to be tracked", D1 l.15
   // destination rule, A U8 "symmetric"): the attacker twin of [ICPRED].  A line filled for a fetch whose PC was chosen
@@ -703,6 +716,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // cf_f3_pred_atk and s1_pred_atk_lbl are Wires declared here and driven further down (no forward val reference).
   val s0_pred_atk     = WireInit(false.B)
   val cf_f3_pred_atk  = WireInit(false.B)   // driven at f3 ([ICPREDATK] beside cf_f3_pred_sec)
+  val cf_f3_pred_atk_pre = WireInit(false.B)   // [ICPREDF3] the s1 / s2 part (no RAS term), as cf_f3_pred_sec_pre
+  val cf_f3_ras_atk_fire = WireInit(false.B)   // [ICPREDF3-R1] as cf_f3_ras_sec_fire (victim packet, RAS mismatch)
   val s1_pred_atk_lbl = WireInit(false.B)   // driven at the I$ ports ([ICPREDATK] beside s1_pred_lbl)
   val s1_pred_atk     = if (ENABLE_IFT) RegInit(false.B) else false.B
   val s2_pred_atk_q   = if (ENABLE_IFT) RegInit(false.B) else false.B
@@ -710,7 +725,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s1_pred_atk   := s0_pred_atk
     s2_pred_atk_q := s1_pred_atk_lbl
   }
-  val s2_pred_atk_lbl = s2_pred_atk_q || cf_f3_pred_atk   // the s2 fetch's full attacker label
+  val s2_pred_atk_lbl = s2_pred_atk_q || cf_f3_pred_atk_pre   // the s2 fetch's full attacker label [ICPREDF3]
   icache.io.s1_domain_id := s1_fetch_domain || s1_redir_atk
   icache.io.cf_cev_s1_dom.foreach(_ := s1_fetch_domain)   // Ceviche: the running domain by PC range, without the IFT redirect bit
   // [M3ATKWIN] lean58 (Fable audit M3; RULES A U8 "symmetric", reading 1): a line FILLED while the attacker window is open takes the attacker fill
@@ -814,8 +829,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_vpc   := s2_vpc
     s0_is_replay := s2_valid && icache.io.resp.valid
     s0_redir_atk := s2_redir_atk   // [ICREDIR] a replay keeps its packet's bit
-    s0_pred_sec  := s2_pred_lbl    // [ICPRED] likewise (its full s2 label)
-    s0_pred_atk  := s2_pred_atk_lbl   // [ICPREDATK] likewise
+    s0_pred_sec  := s2_pred_lbl || cf_f3_ras_sec_fire       // [ICPRED] likewise (its full s2 label) [ICPREDF3-R1]
+    s0_pred_atk  := s2_pred_atk_lbl || cf_f3_ras_atk_fire   // [ICPREDATK] likewise [ICPREDF3-R1]
     // When this is not a replay (it queried the BPDs, we should use f3 resp in the replaying s1)
     s0_s1_use_f3_bpd_resp := !s2_is_replay
     s0_ghist := s2_ghist
@@ -1162,19 +1177,25 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // [ICPRED] the f3 packet's prediction secret label (see [ICPRED] at s0_pred_sec): the f3 BPD/BTB flags are flops in the
   // banks (OR + the flow-queue mux on the way), ras_pop_secret is the existing f3 node (already gated by f3 valid).
   if (ENABLE_IFT) {
-    cf_f3_pred_sec := (f3_bpd_resp.io.deq.valid && (f3_bpd_resp.io.deq.bits.bpd_secret_mismatch.get ||
-                                                    f3_bpd_resp.io.deq.bits.btb_secret_mismatch.get)) ||
-                      f3_fetch_bundle.ras_pop_secret.get
+    // [ICPREDF3] the s1 / s2 part (bank flops) and the f3-leg label (+ the RAS pop, read at f3)
+    cf_f3_pred_sec_pre := f3_bpd_resp.io.deq.valid && (f3_bpd_resp.io.deq.bits.bpd_secret_mismatch.get ||
+                                                       f3_bpd_resp.io.deq.bits.btb_secret_mismatch.get)
+    cf_f3_pred_sec := cf_f3_pred_sec_pre || f3_fetch_bundle.ras_pop_secret.get
+    // [ICPREDF3-R1] the RAS term on a confirming f3 fire (the f3 redirect when-block's own select)
+    cf_f3_ras_sec_fire := f3.io.deq.valid && f4_ready && f3_fetch_bundle.ras_pop_secret.get
   }
   // [ICPREDATK] the f3 packet's prediction ATTACKER label (see [ICPREDATK] at s0_pred_atk): a victim packet whose BPD /
   // BTB / uBTB / RAS state was written by the attacker.  bpd/btb_domain_mismatch are bank flops (OR + the flow-queue mux,
   // masked by [ATKDMMASK]); ras_domain_mismatch and f3_fetch_is_attacker are the existing f3 nodes ([ICREDIR] already
   // sends f3_fetch_is_attacker into the s0 select).  ras_domain_mismatch is gated by cfi_idx.valid (f3 valid).
   if (ENABLE_IFT) {
-    cf_f3_pred_atk := !f3_fetch_is_attacker &&
-                      ((f3_bpd_resp.io.deq.valid && (f3_bpd_resp.io.deq.bits.bpd_domain_mismatch.get ||
-                                                     f3_bpd_resp.io.deq.bits.btb_domain_mismatch.get)) ||
-                       f3_fetch_bundle.ras_domain_mismatch.get)
+    // [ICPREDF3] the s1 / s2 part (bank flops, no RAS term) and the f3-leg label (+ the RAS pop, read at f3)
+    cf_f3_pred_atk_pre := !f3_fetch_is_attacker &&
+                          f3_bpd_resp.io.deq.valid && (f3_bpd_resp.io.deq.bits.bpd_domain_mismatch.get ||
+                                                       f3_bpd_resp.io.deq.bits.btb_domain_mismatch.get)
+    cf_f3_pred_atk := cf_f3_pred_atk_pre || (!f3_fetch_is_attacker && f3_fetch_bundle.ras_domain_mismatch.get)
+    cf_f3_ras_atk_fire := f3.io.deq.valid && f4_ready && !f3_fetch_is_attacker &&
+                          f3_fetch_bundle.ras_domain_mismatch.get   // [ICPREDF3-R1]
   }
   // corefuzzing: BPD/BTB domain and secret mismatches from the prediction response
   f3_fetch_bundle.bpd_domain_mismatch.foreach(_ := f3_bpd_resp.io.deq.bits.bpd_domain_mismatch.getOrElse(false.B))
@@ -1363,13 +1384,16 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // after a bubble, replay behind a stalled f3): with s2 empty, the fetch was put at s0 by that packet's f2 choice or is
   // a replay (an f3 redirect leaves f3 empty, a core redirect / sfence clears it).  If f3 later disagrees, the fetch is
   // killed (f1_clear / f2_clear) but was still chosen by that packet's f1/f2 prediction, so the label is its own.
+  // [ICPREDF3] only the f1/f2 part of the label (cf_f3_pred_sec_pre / cf_f3_pred_atk_pre): the RAS pop is read at f3,
+  // so it cannot have chosen a fetch that is already at s1 / s2; it reaches only the f3 leg's target (s0_pred_*).
   // With s2 valid, s2 holds the predecessor, which is in f3 when the fetch is at s2 (s2_pred_lbl).
-  if (ENABLE_IFT) { s1_pred_lbl := s1_pred_sec || (!s2_valid && cf_f3_pred_sec) }
+  // [ICPREDF3-R1] ...except on a confirming f3 fire: X's request goes out at its s2 next cycle, after f3 kept it.
+  if (ENABLE_IFT) { s1_pred_lbl := s1_pred_sec || (!s2_valid && (cf_f3_pred_sec_pre || cf_f3_ras_sec_fire)) }
   icache.io.cf_s1_pred_sec.foreach(_ := s1_pred_lbl)
   icache.io.cf_s2_pred_sec.foreach(_ := s2_pred_lbl)
   // [ICPREDATK] the attacker label of the s1 / s2 fetch (icache.scala cf_refill_dom_pred and the own-fill domain gate),
   // formed exactly like s1_pred_lbl / s2_pred_lbl above (same predecessor argument).
-  if (ENABLE_IFT) { s1_pred_atk_lbl := s1_pred_atk || (!s2_valid && cf_f3_pred_atk) }
+  if (ENABLE_IFT) { s1_pred_atk_lbl := s1_pred_atk || (!s2_valid && (cf_f3_pred_atk_pre || cf_f3_ras_atk_fire)) }
   icache.io.cf_s1_pred_atk.foreach(_ := s1_pred_atk_lbl)
   icache.io.cf_s2_pred_atk.foreach(_ := s2_pred_atk_lbl)
   // [ICOWNHOLD] (REVIEW icfill-atk-20261104 R1): f3 not ready = f2 replays the s2 fetch even on a hit (f2_replay's second
