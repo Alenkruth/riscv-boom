@@ -53,6 +53,9 @@ class ComposedBranchPredictorBank(implicit p: Parameters) extends BranchPredicto
   io.f3_btb_domain_mismatch := components.map(_.io.f3_btb_domain_mismatch).reduce(_||_)
   io.f3_bpd_secret_mismatch := components.map(_.io.f3_bpd_secret_mismatch).reduce(_||_)
   io.f3_btb_secret_mismatch := components.map(_.io.f3_btb_secret_mismatch).reduce(_||_)
+  // [ICPREDF3-TAGE] the bpd part that is not f3-only (BIM): what an s1 / s2 request label may carry (frontend.scala)
+  io.f3_bpd_secret_early.foreach(_ := components.filterNot(_.cfBpdF3Only).map(_.io.f3_bpd_secret_mismatch).foldLeft(false.B)(_||_))
+  io.f3_bpd_domain_early.foreach(_ := components.filterNot(_.cfBpdF3Only).map(_.io.f3_bpd_domain_mismatch).foldLeft(false.B)(_||_))
   // [BTBDISP] step 16: OR of the components (BTB, uBTB; the rest drive false); the PC of the
   // first component with a BTB secret edge.  All inputs are f3 registers.
   // [BTBPICK] ruling 146 (v): two-tier pick (predictor.scala CfBtbPcPick) over the BTB-type

@@ -335,6 +335,7 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
   with freechips.rocketchip.util.CoreFuzzingConstants
 {
   val tageUBitPeriod = params.uBitPeriod
+  override def cfBpdF3Only: Boolean = true   // [ICPREDF3-TAGE] f3-only bpd mismatch (predictor.scala)
   // [SPECBPU] (owner 2026-11-02, RULES C 'Speculative TAGE/BTB updates'): trained once per resolved CFI at
   // resolution (wrong path included) from io.spec_update; no commit training (predictor.scala cf_upd_bus).
   override def trainsAtResolution: Boolean = true

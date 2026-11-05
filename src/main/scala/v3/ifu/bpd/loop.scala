@@ -19,6 +19,7 @@ case class BoomLoopPredictorParams(
 
 class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(p)
 {
+  override def cfBpdF3Only: Boolean = true   // [ICPREDF3-TAGE] f3-only bpd mismatch (predictor.scala)
   val tagSz = 10
   override val nSets = 16
 

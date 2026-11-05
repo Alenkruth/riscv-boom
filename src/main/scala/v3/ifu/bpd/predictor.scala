@@ -44,6 +44,10 @@ class BranchPredictionBundle(implicit p: Parameters) extends BoomBundle()(p)
   val btb_domain_mismatch = if (ENABLE_IFT) Some(Bool()) else None
   // corefuzzing: TAGE/BTB entry was trained by a secret-dependent instruction
   val bpd_secret_mismatch = if (ENABLE_IFT) Some(Bool()) else None
+  // [ICPREDF3-TAGE] the part of bpd_*_mismatch from the banks that are not f3-only (BIM): the s1 / s2 request label
+  // (frontend.scala cf_f3_pred_*_pre).  bpd_*_mismatch stays the full OR (fetch buffer, f3 redirect target).
+  val bpd_secret_early    = if (ENABLE_IFT) Some(Bool()) else None
+  val bpd_domain_early    = if (ENABLE_IFT) Some(Bool()) else None
   val btb_secret_mismatch = if (ENABLE_IFT) Some(Bool()) else None
   // [BTBDISP] step 16: displacement-filter hit and PC[13:2] of the secret allocator
   // [R124GATE] patch 26 (ruling 124): the three BTB-displacement fields exist only with
@@ -187,6 +191,9 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
   // [BTBATK] DF-btbatk: Scala-time flag, true only for the banks that drive f3_btb_sec_pc (BTB,
   // uBTB), so the composer's PC select sees only them (no constant-zero default term).
   def cfDrivesBtbPc: Boolean = false
+  // [ICPREDF3-TAGE] (REVIEW-f3ras F4): Scala-time flag, true for the banks whose bpd_{secret,domain}_mismatch is known only
+  // at f3 (TAGE, loop: table / column hit read in s2, flopped for f3).  The composer leaves them out of f3_bpd_*_early.
+  def cfBpdF3Only: Boolean = false
   // [SPECBPU] (owner 2026-11-02, RULES C 'Speculative TAGE/BTB updates' + 'Speculative BPU follow-ups' O1 (a)): true
   // for the components that train at branch resolution (TAGE, BTB, BIM, uBTB): their update stage reads
   // io.spec_update (the FTQ's resolution-time update, one resolved CFI per update) instead of io.update (the FTQ
@@ -240,6 +247,9 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
     // corefuzzing: secret shadow mismatch — predictor entry was trained by secret instruction
     val f3_bpd_secret_mismatch = Output(Bool())
     val f3_btb_secret_mismatch = Output(Bool())
+    // [ICPREDF3-TAGE] composer only: bpd mismatch of the non-f3-only components (None IFT off; every other bank drives 0)
+    val f3_bpd_secret_early    = if (ENABLE_IFT) Some(Output(Bool())) else None
+    val f3_bpd_domain_early    = if (ENABLE_IFT) Some(Output(Bool())) else None
     // [BTBDISP] step 16 (owner ruling 110): the fetch hit the tag a secret allocation displaced
     // (BTB per set / uBTB one entry), and PC[13:2] of the secret allocator behind
     // f3_btb_secret_mismatch || f3_btb_sec_disp.  Edge only (FetchIftInfo bit 7, BTB_STATE sec).
@@ -261,6 +271,8 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
   io.f3_btb_domain_mismatch := false.B
   io.f3_bpd_secret_mismatch := false.B
   io.f3_btb_secret_mismatch := false.B
+  io.f3_bpd_secret_early.foreach(_ := false.B)
+  io.f3_bpd_domain_early.foreach(_ := false.B)
   io.f3_btb_sec_disp        := false.B
   io.f3_btb_sec_pc          := 0.U
   io.f3_btb_atk_disp        := false.B
@@ -703,6 +715,12 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
   io.resp.f3.btb_domain_mismatch.foreach(_ := banked_predictors.map(_.io.f3_btb_domain_mismatch).reduce(_||_))
   io.resp.f3.bpd_secret_mismatch.foreach(_ := banked_predictors.map(_.io.f3_bpd_secret_mismatch).reduce(_||_))
   io.resp.f3.btb_secret_mismatch.foreach(_ := banked_predictors.map(_.io.f3_btb_secret_mismatch).reduce(_||_))
+  io.resp.f3.bpd_secret_early.foreach(_ := banked_predictors.map(_.io.f3_bpd_secret_early.get).reduce(_||_))   // [ICPREDF3-TAGE]
+  io.resp.f3.bpd_domain_early.foreach(_ := banked_predictors.map(_.io.f3_bpd_domain_early.get).reduce(_||_))
+  io.resp.f1.bpd_secret_early.foreach(_ := false.B)
+  io.resp.f2.bpd_secret_early.foreach(_ := false.B)
+  io.resp.f1.bpd_domain_early.foreach(_ := false.B)
+  io.resp.f2.bpd_domain_early.foreach(_ := false.B)
   io.resp.f1.bpd_secret_mismatch.foreach(_ := false.B)
   io.resp.f2.bpd_secret_mismatch.foreach(_ := false.B)
   io.resp.f1.btb_secret_mismatch.foreach(_ := false.B)
