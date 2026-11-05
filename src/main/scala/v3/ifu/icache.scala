@@ -89,6 +89,12 @@ class ICacheBundle(val outer: ICache) extends BoomBundle()(outer.p)
   val cf_s1_fill_atk = if (ENABLE_IFT) Some(Input(Bool())) else None
   // corefuzzing: whether s1 fetch PC is in the secret range (for secret mismatch detection)
   val s1_is_secret  = Input(Bool())
+  // [ICPRED] 2026-11-04: the secret label of the prediction that chose the s1 / s2 fetch's PC (frontend.scala
+  // [ICPRED]; s2 = the full label, the s1 part registered + the predecessor's f3 label).  It joins the FILL secret
+  // mark and gates the s2 secret mismatch of the fetch's own refill only ([ICPRED-R1]); the s1 compare
+  // (s1_is_secret) is not touched.  IFT only.
+  val cf_s1_pred_sec = if (ENABLE_IFT) Some(Input(Bool())) else None
+  val cf_s2_pred_sec = if (ENABLE_IFT) Some(Input(Bool())) else None
   // [ICFILL] runtime enable of the debug fill print (0xbc0 bit 4, cf_debug_rob_enable, as [D4RAS]); the port exists
   // only in debug-printf IFT builds (enableCfDebugPrintf && enableIFT), so other configs keep their Verilog.
   val cf_dbg_print  = if (ENABLE_CF_DEBUG_PRINTF && ENABLE_IFT) Some(Input(Bool())) else None
@@ -311,7 +317,24 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   // corefuzzing: write ift_tag_meta on refill_done (same cycle as tag_array write, one way mask)
   val refill_domain_reg = RegEnable(if (ENABLE_IFT) io.s1_domain_id || io.cf_s1_fill_atk.get else io.s1_domain_id,   // [M3ATKWIN]
                                     s1_valid && !(refill_valid || s2_miss))
-  val refill_secret_reg = RegEnable(io.s1_is_secret,  s1_valid && !(refill_valid || s2_miss))
+  // [ICPRED] 2026-11-04 (attack-ext psmic-nosignal-rootcause Q4: a fill steered by a sec=1 BTB/BPD prediction was
+  // written sec=0): IFT on, the fill label also takes the label of the prediction that chose the missing fetch's PC.
+  // - s1 part (cf_s1_pred_sec): captured with the existing s1 label, same enable.
+  // - s2 label (cf_s2_pred_sec): ORed in at the missing fetch's request cycle (s2_miss && !refill_valid, the cycle
+  //   tl_out.a.valid rises unless s2_kill).  The enable is low then (s2_miss), so the register holds exactly that
+  //   fetch's s1 label; a request that is not sent is overwritten by the next capture as before.
+  // Levels: io.s1_is_secret (the s1 range compare) still meets only the final D LUT {en, s1_is_secret, s1 part, q,
+  // req && s2 label}: 0 added levels on the I$ s1 path.
+  // RegInit + := (no RegNext(next, init)); IFT off: the RegEnable below is unchanged.
+  val refill_secret_reg = if (ENABLE_IFT) RegInit(false.B)
+                          else RegEnable(io.s1_is_secret,  s1_valid && !(refill_valid || s2_miss))
+  if (ENABLE_IFT) {
+    when (s1_valid && !(refill_valid || s2_miss)) {
+      refill_secret_reg := io.s1_is_secret || io.cf_s1_pred_sec.get
+    } .elsewhen (s2_miss && !refill_valid && io.cf_s2_pred_sec.get) {
+      refill_secret_reg := true.B
+    }
+  }
   if (ENABLE_IFT) {
     when (refill_done) {
       // [T-IFT] refill_row = refill_idx in stock mode, the granted CRF line's row (with repl_way = its way) in Ceviche mode.  The read
@@ -600,7 +623,25 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   io.resp.bits.replay := DontCare
   io.resp.bits.data := s2_data
   io.resp.bits.icache_domain_mismatch := s2_domain_mismatch
-  io.resp.bits.icache_secret_mismatch := s2_secret_mismatch
+  // [ICPRED] hit side: a secret-steered fetch does not flag the line ITS OWN refill marked (its refetch after the
+  // fill), and only that line.  [ICPRED-R1] (review 2026-11-04 F1): the label alone does not gate the flag.  Unlike a
+  // window fetch (s_prop at dispatch through ghist_secret), the steered fetch's packet gets no s_prop from its
+  // predecessor's flags (fetch-buffer.scala:396-399 label only the predicting packet), so dropping its flag on a line
+  // marked by ANOTHER source would lose a sec=1 edge (RULES D1 "every edge with sec=1 sets s_prop").
+  // cf_ownfill_q = "the last refill request was sent for a secret-steered fetch, and no fetch has hit since": loaded
+  // with the s2 label on refill_fire (tl_out.a.fire, the cycle refill_valid is set), cleared by the first s2 hit.
+  // While a refill is in flight the frontend only replays the missing fetch (each replay sets f1_clear, so no other
+  // fetch reaches s2), so the first hit after the request is that fetch's own refetch unless a redirect killed it; a
+  // redirect target that hits first clears the flag and is gated only if it is secret-steered itself.
+  // Cost: 1 FF + 1 LUT (D: refill_fire, s2 label, s2_valid, s2_hit, q); the gate adds one flop input to the existing
+  // LUT after the s2 flop: 0 added levels.  IFT off: unchanged.
+  val cf_ownfill_q = if (ENABLE_IFT) RegInit(false.B) else false.B
+  if (ENABLE_IFT) {
+    when (refill_fire) { cf_ownfill_q := io.cf_s2_pred_sec.get }
+      .elsewhen (s2_valid && s2_hit) { cf_ownfill_q := false.B }
+  }
+  io.resp.bits.icache_secret_mismatch := (if (ENABLE_IFT) s2_secret_mismatch && !(cf_ownfill_q && io.cf_s2_pred_sec.get)
+                                          else s2_secret_mismatch)
   io.resp.valid := s2_valid && s2_hit
 
   tl_out.a.valid := s2_miss && !refill_valid && !io.s2_kill
