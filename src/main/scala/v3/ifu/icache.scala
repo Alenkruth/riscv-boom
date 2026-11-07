@@ -161,7 +161,8 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val cev_i_on  = if (ENABLE_CEVICHE) RegInit(false.B) else false.B
   val cevICrf   = if (ENABLE_CEVICHE) Some(Module(new CevCRF(cevILines, paddrBits - blockOffBits, 1, isI = true,
                                                              withSec = ENABLE_IFT, expireCycles = 64,
-                                                             withIftDom = ENABLE_IFT))) else None   // [T-IFT v5] I$ IFT domain copy
+                                                             withIftDom = ENABLE_IFT,   // [T-IFT v5] I$ IFT domain copy
+                                                             dbgChecks = tileParams.core.asInstanceOf[BoomCoreParams].enableCfDebugPrintf))) else None   // [B1]
   val cevIVsu   = if (ENABLE_CEVICHE) Some(Module(new CevVSU(cevILines, hardDefault = cevILines * 3 / 4, softDefault = cevILines / 2))) else None
   def pol(d: Bool): UInt = Mux(d, io.cf_ceviche_pol.get(7, 4), io.cf_ceviche_pol.get(3, 0))   // {S, I, W, R}
   val io = IO(new ICacheBundle(outer))
@@ -191,8 +192,11 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   cevICrf.foreach { c =>
     val d = io.cf_cev_s1_dom.get
     c.io.sKey(0) := s1_vaddr.pad(paddrBits)(paddrBits - 1, blockOffBits); c.io.sDom(0) := d; c.io.sShare(0) := pol(d)(3)
+    c.io.s0Key(0) := s0_vaddr.pad(paddrBits)(paddrBits - 1, blockOffBits)   // [B1] the BRAM CAM reads its row in s0 (s1_vaddr = RegNext(s0_vaddr))
     s1_cev_hit := c.io.sHit(0); s1_cev_line := c.io.sLine(0)
-    c.io.incVec := Mux(cev_i_on && RegNext(s1_valid && !io.s1_kill && c.io.sHit(0)), RegNext(c.io.sMatch(0)), 0.U)
+    // [N1] the CRF decodes the increment from the registered matched line (was RegNext(sMatch(0)), one-hot at the same line)
+    c.io.incEn(0)   := cev_i_on && RegNext(s1_valid && !io.s1_kill && c.io.sHit(0))
+    c.io.incLine(0) := RegNext(c.io.sLine(0))
   }
   val s1_tag_hit = Wire(Vec(nWays, Bool()))
   val s1_hit = s1_tag_hit.reduce(_||_)
@@ -453,9 +457,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     c.io.clearDom.bits  := io.cf_cev_inval_dom.get
     assert(!cev_i_on || (io.cf_icache_set_conf === 0.U && io.cf_icache_way_conf === 0.U), "Ceviche needs the full I$ geometry")
     // [TF-LUTRAM] sSec / sIftDom are index reads at sLine: equal to the old Mux1H only for a one-hot match (G3: one own and one
-    // shared copy, own first).  D13 twin, simulation / debug-print builds only (the PopCount of 512 is not built for the FPGA).
-    if (tileParams.core.asInstanceOf[BoomCoreParams].enableCfDebugPrintf)
-      assert(!(c.io.sHit(0) && PopCount(c.io.sMatch(0)) =/= 1.U), "Ceviche I$: multiple CRF matches")
+    // shared copy, own first).  D13 twin: [B1] moved into the CRF (dbgChecks, simulation / debug-print builds only).
   }
 
   val s2_dout   = Wire(Vec(nWays, UInt(wordBits.W)))

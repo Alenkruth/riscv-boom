@@ -8,13 +8,41 @@ import chisel3.util._
 
 object CevKind extends Enumeration { val D, I = Value }
 
+// [B1] The CRF key store is a key-sliced BRAM CAM (REPORT ceviche-bram-cam-20261105 section 3.1; owner order 2026-11-05).
+// One CevCamRam is a RAMB36 used as 512 rows x 64 bits (read port) with a 1-bit write port: bit (row, c) = 1 when line
+// (group*64 + c) holds a key whose slice value is `row`.  A search reads row slice_s(key) of every slice RAM; the match of a line is
+// AND over the slices.  Verilog: src/main/resources/vsrc/CevCamRam.v (read-first, synchronous read, no output register).
+class CevCamRam extends BlackBox with HasBlackBoxResource {
+  val io = IO(new Bundle {
+    val clock  = Input(Clock())
+    val rdAddr = Input(UInt(9.W))     // row (slice value), presented in s0
+    val rdData = Output(UInt(64.W))   // the row, one cycle later (s1); old data when the same bit is written in the read cycle
+    val wrEn   = Input(Bool())
+    val wrAddr = Input(UInt(15.W))    // {row, line column}: bit address of the 1-bit write port
+    val wrData = Input(Bool())
+  })
+  addResource("/vsrc/CevCamRam.v")
+}
+
 // One entry per cache line; entry index = line number (paper 4: registers = lines, 1:1; ambiguity 1.4-4).
+//
+// [B1] Search timing is unchanged: the match of lane p is ready in the caller's s1, as the flop CAM gave it.  The BRAM read address
+// is the s0 key (`s0Key`, the signal the caller registers into `sKey`), so the row arrives in s1.  Reg semantics are kept exactly:
+// a write at cycle t is seen by the searches of t+1 on.  The BRAM write port is slower (erase at E, set at E+1, readable by a
+// search from S+2), so a key-changing write is covered by `pend` (masks the line's stale BRAM bits from t+1) and by the entry queue
+// (compares the new key in s1, supplies line / dom / rsv).  Proofs: task-reports/ceviche-bram-cam-20261105/b1/NOTE.md.
+//   D$  : key changes only at the allocating final write (R1c B4 (i)): that write enqueues {line, key}.
+//   I$  : key changes only at the first refill beat (non-allocating write, v = 0); the refill_done write (alloc) repeats the key.
+//         v = 0 until done, done >= first beat + 3 cycles, the set lands in time: no pend, no bypass (asserted).
+// N1: the FREQ increment arrives as {lane enable, s2 line}; the one-hot vectors are decoded here (no nLines-wide bus at the boundary).
 class CevCRF(val nLines: Int, val keyBits: Int, val nSearch: Int, val isI: Boolean, val withSec: Boolean,
-             val expireCycles: Int, val withTaint: Boolean = false, val withIftDom: Boolean = false) extends Module {
+             val expireCycles: Int, val withTaint: Boolean = false, val withIftDom: Boolean = false,
+             val dbgChecks: Boolean = false) extends Module {
   val lineBits = log2Ceil(nLines)
   val io = IO(new Bundle {
     // ---- search (combinational within the caller's s1; caller registers the results) ----
     val sKey   = Input(Vec(nSearch, UInt(keyBits.W)))
+    val s0Key  = Input(Vec(nSearch, UInt(keyBits.W)))   // [B1] the key of the cycle before: sKey == RegNext(s0Key) (asserted when dbgChecks)
     val sDom   = Input(Vec(nSearch, Bool()))            // I$: the requester's domain; D$: unused (masked search)
     val sShare = Input(Vec(nSearch, Bool()))            // I$: requester's policy S bit; D$: unused
     val sHit   = Output(Vec(nSearch, Bool()))
@@ -26,14 +54,16 @@ class CevCRF(val nLines: Int, val keyBits: Int, val nSearch: Int, val isI: Boole
     // IFT domain incl. the [M3ATKWIN] attacker-fill term), kept apart from `dom` (the Ceviche owner domain, PC range only) so the I$ IFT reads
     // its own state in Ceviche mode, not the defense's.
     val sIftDom = if (withIftDom) Some(Output(Vec(nSearch, Bool()))) else None
-    val sMatch = Output(Vec(nSearch, UInt(nLines.W)))   // the one-hot match vector (FREQ increment, registered by caller)
     val sRsv   = Output(Vec(nSearch, Bool()))           // the matched line is reserved as an in-flight victim
-    // ---- FREQ ----
-    val incVec = Input(UInt(nLines.W))                  // registered s1 match vector(s) ORed by the caller, gated by s2 validity
-    // [T-IFT v4, B1] IFT replacement taint (D$ + IFT builds only, withTaint): the same vector as incVec restricted to the increments whose
-    // access is secret- / attacker-attributed (the caller builds them exactly like incVec).
-    val incSecVec = if (withTaint) Some(Input(UInt(nLines.W))) else None
-    val incAtkVec = if (withTaint) Some(Input(UInt(nLines.W))) else None
+    // ---- FREQ [N1] ----
+    // Per lane: the access increments `incLine` when `incEn` (the caller's registered s1 hit, gated by s2 validity); the CRF decodes
+    // the one-hot vectors (formerly the caller's registered sMatch ORed over the lanes).  incEn needs a hit, so incLine is the matched line.
+    val incEn   = Input(Vec(nSearch, Bool()))
+    val incLine = Input(Vec(nSearch, UInt(lineBits.W)))
+    // [T-IFT v4, B1] IFT replacement taint (D$ + IFT builds only, withTaint): per lane, the increments whose access is secret- / attacker-
+    // attributed (incSec / incAtk imply incEn).
+    val incSec = if (withTaint) Some(Input(Vec(nSearch, Bool()))) else None
+    val incAtk = if (withTaint) Some(Input(Vec(nSearch, Bool()))) else None
     // ---- write (mirror of the cache's metadata write / I$ refill_done); at most one per cycle ----
     val wr = Input(Valid(new Bundle {
       val line  = UInt(lineBits.W)
@@ -67,7 +97,9 @@ class CevCRF(val nLines: Int, val keyBits: Int, val nSearch: Int, val isI: Boole
     val freeIdx   = Output(UInt(lineBits.W))            // lowest-index free line (valid when !poolEmpty)
     val occ       = Output(Vec(2, UInt((lineBits + 1).W)))
   })
-  val key  = Reg(Vec(nLines, UInt(keyBits.W)))
+  // [B1] The key lives in the BRAM CAM (a bit per line and slice row) and in keyCopy, which supplies the old key to the erase.  keyCopy is
+  // written at the set cycle only, so it always names the key whose bits the BRAM holds (or will hold after the set in flight).
+  val keyCopy = Mem(nLines, UInt(keyBits.W))                // combinational read, 1 write port (set) + 1 read port (erase) [+ 1 debug read]
   val dom  = Reg(Vec(nLines, Bool()))
   val v    = RegInit(VecInit(Seq.fill(nLines)(false.B)))
   // [TF-LUTRAM] (FPGA timing fit, owner 2026-11-03, task-reports/fpga-timing-fit-20261103.md row 3 (a)): coh, sec and idom are
@@ -81,10 +113,10 @@ class CevCRF(val nLines: Int, val keyBits: Int, val nSearch: Int, val isI: Boole
   //   - no reset before or after (the Reg Vecs had none either, so a read of a never-written entry is equally undefined in both;
   //     in practice every valid line was written: coh by every wr, sec/idom by the allocating wr, and the CAM matches v lines only).
   // Only differs if the match is not one-hot (Mux1H ORs the entries, the index read takes the OR of the indices): that state is
-  // excluded by construction (G3) and asserted in the D$ ("Ceviche D$: multiple CRF matches").
-  // Kept in flops (each has a parallel reader or more than one writer): key, v (CAM / free pool / occ / bulk clears), dom (I$ CAM,
+  // excluded by construction (G3) and asserted (dbgChecks).
+  // Kept in flops (each has a parallel reader or more than one writer): v (CAM / free pool / occ / bulk clears), dom (I$ CAM,
   // occ, clearDom), freq (per-line increment + tick every cycle), rsv (free pool, occ, clearAll), rsvDom (occ popcount; 2 writers
-  // rsvHold + rsvSet), s (I$ CAM), inv (clearDom), tS / tA (written by the parallel incVec AND by wr.alloc in the same cycle).
+  // rsvHold + rsvSet), s (I$ CAM), inv (clearDom), tS / tA (written by the parallel increment AND by wr.alloc in the same cycle).
   val coh  = if (!isI) Some(Mem(nLines, UInt(2.W))) else None   // D$ only (was a Reg Vec; the I$ never read it)
   val freq = Reg(Vec(nLines, UInt(4.W)))
   val rsv  = RegInit(VecInit(Seq.fill(nLines)(false.B)))
@@ -99,10 +131,115 @@ class CevCRF(val nLines: Int, val keyBits: Int, val nSearch: Int, val isI: Boole
   val tA   = if (withTaint) Some(Reg(Vec(nLines, Bool()))) else None
   val idom = if (withIftDom) Some(Mem(nLines, Bool())) else None   // [T-IFT v5] I$ IFT domain of the line (no reset: read only on a hit) [TF-LUTRAM]
 
+  // ---- [B1] BRAM CAM geometry: slices of 9 key bits (9/9/8 for 26 bits), 64 lines per RAMB36 ----
+  val sliceBits = 9
+  val nSlices   = (keyBits + sliceBits - 1) / sliceBits
+  val grpLines  = math.min(nLines, 64)
+  val nGroups   = (nLines + 63) / 64
+  val colBits   = log2Ceil(grpLines)
+  def sliceOf(k: UInt, sl: Int): UInt = {
+    val lo = sl * sliceBits; val hi = math.min(keyBits, lo + sliceBits) - 1
+    k(hi, lo).pad(sliceBits)
+  }
+  // ram(p)(slice)(group): one copy per search lane (a RAMB36 has one read port), both written with the same address and data
+  val ram = Seq.tabulate(nSearch, nSlices, nGroups)((_, _, _) => Module(new CevCamRam))
+  for (p <- 0 until nSearch; sl <- 0 until nSlices; g <- 0 until nGroups) {
+    ram(p)(sl)(g).io.clock  := clock
+    ram(p)(sl)(g).io.rdAddr := sliceOf(io.s0Key(p), sl)      // s0 address: the row is read in s1
+  }
+  // the nLines-wide per-slice rows ANDed: key match of every line (v and pend are applied by the caller)
+  def camRaw(p: Int): UInt = (0 until nSlices).map { sl =>
+    Cat((0 until nGroups).reverse.map(g => ram(p)(sl)(g).io.rdData(grpLines - 1, 0)))
+  }.reduce(_ & _)
+
+  // ---- [B1] write queue and engine: erase (E), set (E+1) for a key-changing write, in order ----
+  val qDepth = if (isI) 2 else 8                     // D$: nMSHRs = 8 (bound proof: NOTE.md); I$: one refill at a time
+  val ST_FREE = 0.U(2.W); val ST_WAIT = 1.U(2.W); val ST_ERASED = 2.U(2.W); val ST_DONE = 3.U(2.W)
+  val qSt   = RegInit(VecInit(Seq.fill(qDepth)(ST_FREE)))   // DONE = the set was issued last cycle: alive one more cycle (bypass / pend)
+  val qLine = Reg(Vec(qDepth, UInt(lineBits.W)))
+  val qKey  = Reg(Vec(qDepth, UInt(keyBits.W)))
+  val qSup  = Reg(Vec(qDepth, Bool()))               // D$: a younger entry of the same line exists (youngest wins)
+  val qV    = Reg(Vec(qDepth, Bool()))               // D$: copies of v / dom / rsv of the entry's line, kept equal to the line's flops
+  val qDom  = Reg(Vec(qDepth, Bool()))
+  val qRsv  = Reg(Vec(qDepth, Bool()))
+  val ptrW  = log2Ceil(qDepth)
+  val eh    = RegInit(0.U(ptrW.W))                   // oldest entry whose set is not issued yet
+  val qt    = RegInit(0.U(ptrW.W))                   // next free slot
+  // D$: the allocating write changes the key; I$: the first-beat write (non-allocating) does; the refill_done write repeats it
+  val enq = io.wr.valid && (if (isI) !io.wr.bits.alloc else io.wr.bits.alloc)
+
+  for (e <- 0 until qDepth) when (qSt(e) === ST_DONE) { qSt(e) := ST_FREE }
+  val hSt      = qSt(eh)
+  val engErase = hSt === ST_WAIT
+  val engSet   = hSt === ST_ERASED
+  val hLine    = qLine(eh)
+  val engKey   = Mux(engSet, qKey(eh), keyCopy(hLine))   // erase: the key the BRAM holds for the line; set: the new key
+  when (engErase) { qSt(eh) := ST_ERASED }
+  when (engSet)   { qSt(eh) := ST_DONE; eh := eh + 1.U; keyCopy.write(hLine, qKey(eh)) }
+  for (p <- 0 until nSearch; sl <- 0 until nSlices; g <- 0 until nGroups) {
+    val r = ram(p)(sl)(g).io
+    r.wrEn   := (engErase || engSet) && (if (nGroups == 1) true.B else hLine(lineBits - 1, colBits) === g.U)
+    r.wrAddr := Cat(sliceOf(engKey, sl), hLine(colBits - 1, 0).pad(6))   // {row, column}: column padded to the 6-bit line slot of a RAMB36
+    r.wrData := engSet
+  }
+  // enqueue (the entry is readable from the next cycle: the engine starts at t+1, pend / bypass cover t+1 on)
+  assert(!(enq && qSt(qt) =/= ST_FREE && qSt(qt) =/= ST_DONE), "Ceviche CRF: write queue overflow")
+  when (enq) {
+    qSt(qt) := ST_WAIT; qLine(qt) := io.wr.bits.line; qKey(qt) := io.wr.bits.key
+    qt := qt + 1.U
+  }
+  if (!isI) {
+    // youngest wins: the older entries of the same line stop answering the bypass
+    for (e <- 0 until qDepth) when (enq && qSt(e) =/= ST_FREE && qLine(e) === io.wr.bits.line) { qSup(e) := true.B }
+    when (enq) { qSup(qt) := false.B }                  // after the loop: the new entry is the youngest (its slot may be a DONE entry of the same line)
+    // copies: the same events, in the same priority, as the flops v / rsv (write, rel, hold, set, clearAll last); dom only at the alloc
+    for (e <- 0 until qDepth) {
+      when (io.wr.valid && !io.wr.bits.alloc && io.wr.bits.line === qLine(e)) { qV(e) := io.wr.bits.v }
+      when (io.rsvRel.valid  && io.rsvRel.bits  === qLine(e)) { qRsv(e) := false.B }
+      when (io.rsvHold.valid && io.rsvHold.bits === qLine(e)) { qRsv(e) := true.B }
+      when (io.rsvSet.valid  && io.rsvSet.bits  === qLine(e)) { qRsv(e) := true.B }
+      when (io.clearAll) { qV(e) := false.B; qRsv(e) := false.B }
+    }
+    when (enq) {   // the new entry starts from what the alloc leaves in the flops (v := wr.v, dom, rsv := 0), then the same-cycle events
+      val l = io.wr.bits.line
+      qV(qt)   := io.wr.bits.v && !io.clearAll
+      qDom(qt) := io.wr.bits.dom
+      qRsv(qt) := !io.clearAll && ((io.rsvHold.valid && io.rsvHold.bits === l) || (io.rsvSet.valid && io.rsvSet.bits === l))
+    }
+  }
+  // pend: the line has an entry in the queue (its BRAM bits are stale or not readable yet): masked from the BRAM match
+  val pend = if (!isI) Some(RegInit(VecInit(Seq.fill(nLines)(false.B)))) else None
+  pend.foreach { pd =>
+    // [B1 review] at most one entry is DONE in a cycle (one set per cycle; DONE lasts one cycle), so the clear is one port with one
+    // nLines decoder (was one dynamic-index clear per entry: qDepth decoders ORed into every pend bit).  Same function: for the DONE
+    // entry, "another live entry of its line" is a live entry that is not DONE.
+    val isDone = VecInit(qSt.map(_ === ST_DONE))
+    val dnLine = Mux1H(isDone, qLine)
+    val others = (0 until qDepth).map(e => !isDone(e) && qSt(e) =/= ST_FREE && qLine(e) === dnLine).reduce(_ || _)
+    when (isDone.asUInt.orR && !others && !(enq && io.wr.bits.line === dnLine)) { pd(dnLine) := false.B }
+    when (enq) { pd(io.wr.bits.line) := true.B }
+    if (dbgChecks) assert(PopCount(isDone) <= 1.U, "Ceviche CRF: more than one write queue entry DONE")
+  }
+  // I$: nothing may be pending when the done write comes (set issued at least a cycle before it) and the key is the first beat's
+  if (isI) assert(!(io.wr.valid && io.wr.bits.alloc && (qSt.map(x => x === ST_WAIT || x === ST_ERASED).reduce(_ || _))),
+                  "Ceviche I$ CRF: refill_done before the CAM set of the first beat")
+  if (dbgChecks) {
+    val kc   = keyCopy(io.wr.bits.line)
+    if (isI) assert(!(io.wr.valid && io.wr.bits.alloc && kc =/= io.wr.bits.key), "Ceviche I$ CRF: refill_done key differs from the first beat's")
+    else {
+      val newest = (0 until qDepth).map(e => qSt(e) =/= ST_FREE && !qSup(e) && qLine(e) === io.wr.bits.line)
+      val expKey = Mux(newest.reduce(_ || _), Mux1H(newest, qKey), kc)
+      assert(!(io.wr.valid && !io.wr.bits.alloc && expKey =/= io.wr.bits.key), "Ceviche D$ CRF: a non-allocating write changes the key")
+    }
+    for (p <- 0 until nSearch) assert(RegNext(io.s0Key(p)) === io.sKey(p), "Ceviche CRF: sKey is not the registered s0Key")
+  }
+
   // ---- search: own match and (I$) shared match; one-hot encode with OR trees ----
   for (p <- 0 until nSearch) {
-    val tagEq   = VecInit((0 until nLines).map(i => v(i) && key(i) === io.sKey(p))).asUInt
-    val domVec  = dom.asUInt
+    val raw    = camRaw(p)
+    val tagEq0 = v.asUInt & raw
+    val tagEq  = pend.map(pd => tagEq0 & ~pd.asUInt).getOrElse(tagEq0)
+    val domVec = dom.asUInt
     val m = if (!isI) tagEq                              // D$: domain-masked (CEV4-1 (a))
             else {
               // own copy: dom == requester; shared copy (paper 5.3): other domain, requester policy S && line S.
@@ -113,39 +250,49 @@ class CevCRF(val nLines: Int, val keyBits: Int, val nSearch: Int, val isI: Boole
               val shr  = Mux(io.sDom(p), shr1, shr0) & Fill(nLines, io.sShare(p))
               Mux(own.orR, own, shr)                     // own copy first; at most one of each kind exists (G3)
             }
-    val hit  = m.orR
-    val line = OHToUInt(m)                               // OR-tree encoder (exactly one bit set on a hit)
-    io.sMatch(p)  := m
+    // D$ bypass: an entry of the queue answers for its line (pend masked the BRAM bits of that line)
+    val hitE = if (!isI) (0 until qDepth).map(e => qSt(e) =/= ST_FREE && !qSup(e) && qV(e) && qKey(e) === io.sKey(p))
+               else Seq.empty[Bool]
+    val bypHit = if (!isI) hitE.reduce(_ || _) else false.B
+    val hit  = m.orR || bypHit
+    val line = if (!isI) Mux(bypHit, Mux1H(hitE, qLine), OHToUInt(m)) else OHToUInt(m)   // OR-tree encoder (exactly one bit set on a hit)
     io.sHit(p)    := hit
     io.sLine(p)   := line
     // [TF-LUTRAM] index reads at the encoded match (one LUTRAM read port per search port), gated by the hit = the old Mux1H value.
-    // Levels: encoder (already on the sLine path) + the LUTRAM address-to-data mux (RAM64 + F7/F8 + 1 LUT for 1024 lines) in place
-    // of the 1024:1 AND-OR; about +1..2 LUT levels on sCoh (D$: ends at the s2_cev_coh flop) and sSec / sIftDom (I$ s1 IFT flags).
     io.sCoh(p)    := (if (!isI) Mux(hit, coh.get(line), 0.U) else 0.U)
-    io.sDomOut(p) := Mux1H(m, dom)
+    io.sDomOut(p) := (if (!isI) Mux1H(m, dom) || Mux1H(hitE, qDom) else Mux1H(m, dom))
     io.sSec(p)    := (if (withSec) hit && sec.get(line) else false.B)
     io.sIftDom.foreach(_(p) := hit && idom.get(line))   // [T-IFT v5] same index read as sSec [TF-LUTRAM]
-    io.sRsv(p)    := Mux1H(m, rsv)                       // the matched line is a granted victim (D3b nack)
+    io.sRsv(p)    := (if (!isI) Mux1H(m, rsv) || Mux1H(hitE, qRsv) else Mux1H(m, rsv))   // the matched line is a granted victim (D3b nack)
+    // D13: at most one match (G3); an entry hit and a BRAM hit never coexist (pend masks the entry's line, keys are unique among valid lines)
+    if (dbgChecks) assert(PopCount(Cat(m, if (!isI) Cat(hitE) else 0.U(1.W))) <= 1.U, "Ceviche CRF: multiple CRF matches")
   }
+
+  // ---- [N1] FREQ increment vectors, decoded from {incEn, incLine} per lane ----
+  def decode(en: Seq[Bool]): UInt =
+    (0 until nSearch).map(w => Mux(en(w), UIntToOH(io.incLine(w), nLines), 0.U(nLines.W))).reduce(_ | _)
+  val incVec    = decode(io.incEn)
+  val incSecVec = io.incSec.map(x => decode(x))
+  val incAtkVec = io.incAtk.map(x => decode(x))
 
   // ---- expiration tick and FREQ (paper 5.2): sat +1 on access, sat -1 at each interval, 5 on allocation ----
   val tickCnt = RegInit(0.U(log2Ceil(expireCycles).W)); tickCnt := tickCnt + 1.U
   val tick    = tickCnt === (expireCycles - 1).U
   for (i <- 0 until nLines) {
-    val inc  = io.incVec(i)
+    val inc  = incVec(i)
     val up   = Mux(inc && freq(i) =/= 15.U, freq(i) + 1.U, freq(i))
     val down = Mux(tick && up =/= 0.U, up - 1.U, up)
     freq(i) := down
     when (io.wr.valid && io.wr.bits.alloc && io.wr.bits.line === i.U) { freq(i) := 5.U }   // last connect wins
   }
-  if (withTaint) {   // [T-IFT v4, B1] one update LUT per line beside the FREQ update, enabled by the same per-line incVec bit
-    for (i <- 0 until nLines) when (io.incVec(i)) { tS.get(i) := io.incSecVec.get(i); tA.get(i) := io.incAtkVec.get(i) }
+  if (withTaint) {   // [T-IFT v4, B1] one update LUT per line beside the FREQ update, enabled by the same per-line increment bit
+    for (i <- 0 until nLines) when (incVec(i)) { tS.get(i) := incSecVec.get(i); tA.get(i) := incAtkVec.get(i) }
   }
 
   // ---- write mirror ----
   when (io.wr.valid) {
     val l = io.wr.bits.line
-    key(l) := io.wr.bits.key; v(l) := io.wr.bits.v
+    v(l) := io.wr.bits.v                                 // [B1] the key goes through the write queue (enq) to the BRAM CAM and keyCopy
     coh.foreach(_.write(l, io.wr.bits.coh))              // [TF-LUTRAM] the Mems' only write port (same enable as before)
     when (io.wr.bits.alloc) { dom(l) := io.wr.bits.dom; s(l) := io.wr.bits.s; inv(l) := io.wr.bits.inv
                               sec.foreach(_.write(l, io.wr.bits.sec)); rsv(l) := false.B       // [TF-LUTRAM]
@@ -157,6 +304,7 @@ class CevCRF(val nLines: Int, val keyBits: Int, val nSearch: Int, val isI: Boole
   when (io.rsvSet.valid)  { rsv(io.rsvSet.bits) := true.B; rsvDom(io.rsvSet.bits) := io.rsvSetDom }
   when (io.clearDom.valid) { for (i <- 0 until nLines) when (dom(i) === io.clearDom.bits || inv(i)) { v(i) := false.B } }
   when (io.clearAll) { v.foreach(_ := false.B); rsv.foreach(_ := false.B) }   // last: wins over a same-cycle write
+  if (!isI) assert(!io.clearDom.valid, "Ceviche D$ CRF: clearDom is not mirrored in the write queue copies")
 
   // ---- VSU candidate read (one 1:nLines mux per field) ----
   io.cV := v(io.cIdx); io.cDom := dom(io.cIdx); io.cFreq := freq(io.cIdx); io.cRsv := rsv(io.cIdx)

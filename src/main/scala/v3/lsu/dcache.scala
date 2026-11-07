@@ -977,7 +977,8 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   val cevLineW   = log2Ceil(cevLines)
   val cevKeyW    = paddrBits - blockOffBits
   val cevCrf     = if (ENABLE_CEVICHE) Some(Module(new CevCRF(cevLines, cevKeyW, memWidth, isI = false, withSec = false,
-                                                              expireCycles = 128, withTaint = ENABLE_IFT))) else None   // [T-IFT v4, B1] per-line replacement taint
+                                                              expireCycles = 128, withTaint = ENABLE_IFT,
+                                                              dbgChecks = ENABLE_CF_DEBUG_PRINTF))) else None   // [T-IFT v4, B1] per-line replacement taint; [B1] CAM asserts in debug builds
   val cevVsu     = if (ENABLE_CEVICHE) Some(Module(new CevVSU(cevLines, hardDefault = cevLines * 3 / 4,
                                                               softDefault = cevLines / 2, nReq = cfg.nMSHRs, withTaint = ENABLE_IFT))) else None
   def cevRow(l: UInt): UInt = l(idxBits - 1, 0)
@@ -1241,6 +1242,9 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
                                    mshrs.io.meta_read.bits.idx(idxBits - 1, 0))))
     val s1_known_way = Wire(UInt(nWays.W)); s1_known_way := Mux(s1_type === t_replay, s1_replay_way_en, Mux(s1_type === t_wb, s1_wb_way_en, s1_mshr_meta_read_way_en))   // [elabfix] explicit width for OHToUInt in cevLineOf
     for (w <- 0 until memWidth) { cevCrf.get.io.sKey(w) := s1_addr(w) >> blockOffBits
+                                  // [B1] the BRAM CAM reads its row in s0: the key of the cycle before sKey (s1_addr = RegNext(s0_req.addr)); lane 0 of the
+                                  // SpecASan paint clear is overridden below
+                                  cevCrf.get.io.s0Key(w) := s0_req(w).addr >> blockOffBits
                                   cevCrf.get.io.sDom(w) := false.B; cevCrf.get.io.sShare(w) := false.B }
     widthMap(w => Mux(s1_is_cam, cevCrf.get.io.sLine(w), cevLineOf(s1_known_row, s1_known_way)))
   }
@@ -1248,7 +1252,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     widthMap(w => Mux(s1_is_cam, cevCrf.get.io.sHit(w), true.B))
   val s2_cev_line: Seq[UInt]  = if (!ENABLE_CEVICHE) Seq.fill(memWidth)(0.U(1.W)) else RegNext(VecInit(s1_cev_line))
   val s2_cev_coh: Seq[UInt]   = if (!ENABLE_CEVICHE) Seq.fill(memWidth)(0.U(2.W)) else RegNext(widthMap(w => cevCrf.get.io.sCoh(w)))
-  val s2_cev_match: Seq[UInt] = if (!ENABLE_CEVICHE) Seq.fill(memWidth)(0.U(1.W)) else RegNext(widthMap(w => cevCrf.get.io.sMatch(w)))
+  // [N1] (was s2_cev_match = RegNext(sMatch), a 1024-bit register per lane): the CRF decodes the FREQ increment from the s2 line, see incEn / incLine
   // [Ceviche D3b] the CAM hit is on a line granted to an in-flight miss as its victim (CRF rsv): nack, see s2_nack_victim
   val s2_cev_rsv: Seq[Bool]   = if (!ENABLE_CEVICHE) Seq.fill(memWidth)(false.B) else
     RegNext(widthMap(w => s1_is_cam && cevCrf.get.io.sHit(w) && cevCrf.get.io.sRsv(w)))
@@ -1359,8 +1363,12 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   val s2_new_hit_state  = widthMap(w => s2_hit_state(w).onAccess(s2_req(w).uop.mem_cmd)._3)
   // [Ceviche D4] FREQ +1 per demand access (lsu, prefetch); s2_valid already excludes s1_kill / branch kills.
   cevCrf.foreach { c =>
-    c.io.incVec := (0 until memWidth).map(w => Mux(cev_on && s2_valid(w) && s2_tag_match(w) && s2_type.isOneOf(t_lsu, t_prefetch),
-                                                   s2_cev_match(w), 0.U)).reduce(_ | _)
+    // [N1] same terms as before, now per lane {enable, line}: a hit in s1 (s2_tag_match) means the CAM match was one-hot at s2_cev_line
+    // (= the registered sLine of a CAM type), so the CRF's decode of the line equals the old registered sMatch.
+    for (w <- 0 until memWidth) {
+      c.io.incEn(w)   := cev_on && s2_valid(w) && s2_tag_match(w) && s2_type.isOneOf(t_lsu, t_prefetch)
+      c.io.incLine(w) := s2_cev_line(w)
+    }
   }
 
   val s2_hit = widthMap(w => (s2_tag_match(w) && s2_has_permission(w) && s2_hit_state(w) === s2_new_hit_state(w) && !mshrs.io.block_hit(w)) || s2_type.isOneOf(t_replay, t_wb))
@@ -2025,8 +2033,8 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       val cf_cev_isec = widthMap(w => cf_cev_inc(w) && (s2_req(w).cf_addr_sec.getOrElse(false.B) || cf_fill_sec(w)))
       val cf_cev_iatk = widthMap(w => cf_cev_inc(w) && cf_req_atki(w))
       // [v4, B1] per-line taint inputs: built exactly like incVec (D4), restricted to the tainted increments
-      c.io.incSecVec.foreach(_ := (0 until memWidth).map(w => Mux(cf_cev_isec(w), s2_cev_match(w), 0.U)).reduce(_ | _))
-      c.io.incAtkVec.foreach(_ := (0 until memWidth).map(w => Mux(cf_cev_iatk(w), s2_cev_match(w), 0.U)).reduce(_ | _))
+      c.io.incSec.foreach(x => for (w <- 0 until memWidth) x(w) := cf_cev_isec(w))   // [N1] per lane; the CRF decodes them with incLine
+      c.io.incAtk.foreach(x => for (w <- 0 until memWidth) x(w) := cf_cev_iatk(w))
       when (cf_cev_isec.reduce(_ || _)) { cf_cev_isp := PriorityMux(cf_cev_isec, cf_req_pc12) }
       when (cf_cev_iatk.reduce(_ || _)) { cf_cev_iap := PriorityMux(cf_cev_iatk, cf_req_pc12) }
       // [v4, B1] the global pool / occupancy taint advances at grants only (the allocation that last advanced that state)
@@ -2512,12 +2520,8 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
         !c.io.poolEmpty, u.io.rebal, c.io.occ(0), c.io.occ(1), c.io.cV, c.io.cDom)
     }
   }
-  // [Ceviche D13] at most one CRF match per lane (domain-masked D$: one copy per block).  The PopCount of 1024 is large, so
-  // simulation / debug-print builds only (FPGA builds do not carry it).  The MSHR and I$ asserts belong to M2 / I4.
-  if (ENABLE_CEVICHE && ENABLE_CF_DEBUG_PRINTF) {
-    for (w <- 0 until memWidth)
-      assert(!(cevCrf.get.io.sHit(w) && PopCount(cevCrf.get.io.sMatch(w)) =/= 1.U), "Ceviche D$: multiple CRF matches")
-  }
+  // [Ceviche D13] at most one CRF match per lane (domain-masked D$: one copy per block): [B1] the assert moved into the CRF (CevCRF
+  // dbgChecks = ENABLE_CF_DEBUG_PRINTF, which also holds the queue / key-change / s0Key checks), where the match vector now lives.
 
   // ==== [reconf-fix Phase C] L1 invalidate-all walker (RESTORE ONLY) =========
   // `csrw 0xbc4, 0x2` starts a full-array meta wipe through the normal meta
@@ -4003,6 +4007,12 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     // after s_pdrain waited for `quiet` (no s1/s2 request, MSHRs/WB/prober idle) with new requests held off, so lane 0's search port
     // serves no request this cycle and every consumer of its outputs (D2 read, D3b, D4, s1_tag_match_way) is gated by s1/s2_valid = 0.
     when (sa_tags.get.io.lclr.valid && cev_on) { cevCrf.get.io.sKey(0) := sa_tags.get.io.lclr.bits >> blockOffBits }
+    // [B1] the BRAM CAM reads in s0: the same key one cycle earlier.  s_papply is entered only from s_pdrain when `quiet` (tag unit,
+    // line ~737), so the apply cycle's predecessor is hold && !lclr.valid && quiet; pr_pa (lclr.bits) is a register that is stable
+    // in both cycles, and in the s_pdrain cycle no request is in s0 (hold), so lane 0's s0 key is free to take it.
+    when (sa_tags.get.io.hold && !sa_tags.get.io.lclr.valid && sa_tags.get.io.quiet && cev_on) {
+      cevCrf.get.io.s0Key(0) := sa_tags.get.io.lclr.bits >> blockOffBits
+    }
   }
   if (SPECASAN) when (sa_tags.get.io.hold) {   // [SA-D6] paint drain/apply: no new LSU or prefetch request enters s0
     io.lsu.req.ready              := false.B
