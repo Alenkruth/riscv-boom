@@ -196,12 +196,16 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       // replace the entry (a learned entry: "do nothing"; a confident entry with age > 0: age - 1) leaves the
       // entry's tag / counters / confidence as they are, so it keeps its writer's domain (P5: a state entry takes
       // the domain of the update that writes it).  Every other branch (a tag match, or a replacement with the
-      // new tag) takes the update's domain as before.  The secret shadow below keeps its rewrite (not in V14;
-      // the same shape, listed as open).  About 2 LUT (a 2:1 on the 1-bit domain by terms the when-chain already
-      // computes), 0 FF, 0 levels (it ends at the entries register).  IFT off: domain is None.
+      // new tag) takes the update's domain as before.  About 2 LUT (a 2:1 on the 1-bit domain by terms the when-chain
+      // already computes), 0 FF, 0 levels (it ends at the entries register).  IFT off: domain is None.
+      // [LOOPSECOWN] (owner 2026-11-05, RULES.md section C "Loop predictor secret label"): the secret label now follows
+      // the owning update like the domain label (U8 symmetry): a non-owning update (cf_no_owner) keeps the entry's
+      // secret, so a clean aging update no longer clears a secret-trained entry (under-taint) and a secret aging update
+      // no longer marks a clean one (over-taint).  Cost: ~1-2 LUT (one 2:1 on the 1-bit secret by the same cf_no_owner
+      // term), 0 FF, 0 levels.  IFT off: secret is None, unchanged.
       val cf_no_owner = !tag_match && (entry.conf === 7.U || (entry.conf =/= 0.U && entry.age =/= 0.U))
       wentry.domain.foreach(_ := Mux(cf_no_owner, entry.domain.getOrElse(0.U(1.W)), io.update_domain))
-      wentry.secret.foreach(_ := io.update_secret)
+      wentry.secret.foreach(_ := Mux(cf_no_owner, entry.secret.getOrElse(false.B), io.update_secret))   // [LOOPSECOWN]
       wentry.written.foreach(_ := true.B)   // [LOOPRESET]
       entries(io.update_idx) := wentry
     } .elsewhen (io.update_repair && !doing_reset) {
