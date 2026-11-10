@@ -187,7 +187,10 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
       // Fixed size: rotate within the hardware-built numEntries only.
       Cat(in(numEntries-k-1, 0), in(numEntries-1, numEntries-k))
     } else {
-      val cases = fetchBufferEntryOptions.zipWithIndex.map { case (n, idx) =>
+      // [R1 small-build clamp] cap each option at the built size so small builds (Small/Medium BOOM, numEntries 8/16)
+      // with ENABLE_RECONF elaborate (no negative pad). Identity at numEntries >= max option (64).
+      val cases = fetchBufferEntryOptions.zipWithIndex.map { case (n0, idx) =>
+        val n = n0 min numEntries
         val pad = numEntries - n
         val rotated = if (pad == 0) Cat(in(n-k-1, 0), in(n-1, n-k))
                       else Cat(0.U(pad.W), in(n-k-1, 0), in(n-1, n-k))
@@ -411,8 +414,9 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
       if (numRows == 1) ptr
       else Cat(ptr(numRows-2, 0), ptr(numRows-1))
     } else {
-    val cases = fetchBufferEntryOptions.zipWithIndex.map { case (n, idx) =>
-      val rows = n / coreWidth
+    // [R1 small-build clamp] same cap as rotateLeft: option entries limited to the built size (identity at 64).
+    val cases = fetchBufferEntryOptions.zipWithIndex.map { case (n0, idx) =>
+      val rows = (n0 min numEntries) / coreWidth
       val pad  = numRows - rows
       val rotated = if (rows == 1) Cat(0.U(pad.W), ptr(0))
                     else if (pad == 0) Cat(ptr(rows-2, 0), ptr(rows-1))

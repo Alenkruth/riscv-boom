@@ -1658,14 +1658,16 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   private val wayIdxW = log2Ceil(nWays)
   private def cfPadW(x: UInt): UInt = 0.U(wayIdxW.W) | x
   private def cfPlruWay(state: UInt): UInt =
-    MuxLookup(cfg_way_applied, 0.U(wayIdxW.W))(cacheWayOptions.zipWithIndex.map { case (k, i) =>
+    MuxLookup(cfg_way_applied, 0.U(wayIdxW.W))(cacheWayOptions.zipWithIndex.map { case (k0, i) =>
+      val k = k0 min nWays  // [R1 small-build clamp] 4-way D$ (Small/Medium) with reconf; identity at nWays = 8
       i.U -> (if (k == 1) 0.U(wayIdxW.W)
               else cfPadW(plru_replacer.get_replace_way(state(k-2, 0), k))) })
   // Rocket's packing (Replacement.scala:88-96): row i holds "way j more recent than way i", j > i.
   private def cfLruMoreRecent(state: UInt, i: Int, j: Int): Bool =
     state((0 until i).map(r => nWays - r - 1).sum + (j - i - 1))
   private def cfLruWay(state: UInt): UInt =
-    MuxLookup(cfg_way_applied, 0.U(wayIdxW.W))(cacheWayOptions.zipWithIndex.map { case (k, i) =>
+    MuxLookup(cfg_way_applied, 0.U(wayIdxW.W))(cacheWayOptions.zipWithIndex.map { case (k0, i) =>
+      val k = k0 min nWays  // [R1 small-build clamp] as cfPlruWay
       i.U -> (if (k == 1) 0.U(wayIdxW.W)
               else cfPadW(OHToUInt(VecInit((0 until k).map { v =>
                      (((v + 1) until k).map(j => cfLruMoreRecent(state, v, j)) ++
