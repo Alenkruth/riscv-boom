@@ -147,7 +147,7 @@ class SpecLdWakeup(val pregSz: Int) extends Bundle
 class IssueUnitIO(
   val issueWidth: Int,
   val numWakeupPorts: Int,
-  val dispatchWidth: Int)
+  val dispatchWidth: Int, val isFpIq: Boolean = false)   // [R2] FP queue never takes the width cap (Mega FP IQ is 2-wide)
   (implicit p: Parameters) extends BoomBundle
   with CoreFuzzingConstants
 {
@@ -211,7 +211,7 @@ class IssueUnitIO(
   // [WCAP] width CSR 0xbcc (2-bit index into coreWidthOptions: 0 = N=4, 1 = N=2, 2 = N=1) for the per-queue
   // issue-grant cap min(N, issueWidth) (owner 2026-10-28, RULES C "Width CSR design").  Reconf only, and only for a
   // queue with more than one port (the 1-port FP queue never caps): a stock / reconf-off build has no such port.
-  val cf_width_idx = if (ENABLE_RECONF && issueWidth > 1) Some(Input(UInt(2.W))) else None
+  val cf_width_idx = if (ENABLE_RECONF && issueWidth > 1 && !isFpIq) Some(Input(UInt(2.W))) else None
 
   // Task 3.4 (D18): kill-time contention records, one drain per cycle per IQ (the core
   // arbitrates the IQs onto the squash lane), and the per-cycle overflow flag (a slot killed
@@ -248,7 +248,7 @@ abstract class IssueUnit(
   with IssueUnitConstants
   with freechips.rocketchip.util.CoreFuzzingConstants
 {
-  val io = IO(new IssueUnitIO(issueWidth, numWakeupPorts, dispatchWidth))
+  val io = IO(new IssueUnitIO(issueWidth, numWakeupPorts, dispatchWidth, iqType == IQT_FP.litValue))
 
   // Runtime issue queue size selection.  Authoritative list lives in rocket-chip
   // util/CoreFuzzing.scala: issueQueueEntryOptions = Seq(32, 24, 16, 8).
