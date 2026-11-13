@@ -595,8 +595,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   io.ifu.cf_debug_frontend_enable := custom_csrs.cf_debug_enable && custom_csrs.cf_debug_frontend_enable
   io.ifu.cf_debug_rob_enable      := custom_csrs.cf_debug_rob_enable && custom_csrs.cf_debug_enable
   // corefuzzing: attacker range for ICache/RAS domain tracking in frontend
-  io.ifu.cf_attacker_start_addr   := custom_csrs.cf_attacker_start_addr
-  io.ifu.cf_attacker_end_addr     := custom_csrs.cf_attacker_end_addr
+  // [C1] IFT-less Ceviche: the range CSRs exist for its own domain bit only (cev_atk_*); the legacy ports keep the no-IFT constant
+  // (start = end = 0x80000000, empty range) so the IFT-off BPD/RAS domain logic stays as in a non-Ceviche IFT-less build.
+  io.ifu.cf_attacker_start_addr   := (if (CEV_OWN_DOM) 0x80000000L.U(32.W) else custom_csrs.cf_attacker_start_addr)
+  io.ifu.cf_attacker_end_addr     := (if (CEV_OWN_DOM) 0x80000000L.U(32.W) else custom_csrs.cf_attacker_end_addr)
+  io.ifu.cev_atk_start_addr.foreach(_ := custom_csrs.cf_attacker_start_addr)
+  io.ifu.cev_atk_end_addr.foreach(_   := custom_csrs.cf_attacker_end_addr)
   // corefuzzing: secret range for ITLB secret shadow tracking in frontend
   io.ifu.cf_secret_start_addr     := custom_csrs.cf_secret_start_addr
   io.ifu.cf_secret_end_addr       := custom_csrs.cf_secret_end_addr
@@ -997,7 +1001,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // Ceviche (K2): the domain whose fence.i commits this cycle; 1 = attacker. A debug-mode jalr flush (no domain) is
   // reported as "all domains" by the I$ (I5) because it never coincides with a fence.i commit (debug mode).
   io.ifu.cf_cev_inval_dom.foreach(_ := (0 until coreWidth).map(i => rob.io.commit.arch_valids(i) && rob.io.commit.uops(i).is_fencei &&
-                                         rob.io.commit.uops(i).cf_domain_id.get === 1.U).reduce(_||_))
+                                         rob.io.commit.uops(i).cev_domain).reduce(_||_))   // [C1] IFT: cf_domain_id === 1 as before; IFT-less: cev_dom
   io.ifu.cf_cev_dbg_flush.foreach(_ := (0 until coreWidth).map(i => RegNext(dec_valids(i) && dec_uops(i).is_jalr && csr.io.status.debug)).reduce(_||_))
 
   // TODO FIX THIS HACK

@@ -310,6 +310,7 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
                          (in_uops(i).debug_pc >= io.cf_attacker_start_addr) &&
                          (in_uops(i).debug_pc < io.cf_attacker_end_addr)
     in_uops(i).cf_domain_id.foreach(_ := fb_in_attacker.asUInt)
+    in_uops(i).cev_dom.foreach(_ := fb_in_attacker)   // [C1] IFT-less Ceviche: same PC-range compare (the frontend feeds the range CSRs here)
     in_uops(i).cf_attacker_influence.foreach(_ := false.B)
     in_uops(i).cf_secret_access.foreach(_ := false.B)
     in_uops(i).cf_secret_propagation.foreach(_ := false.B)

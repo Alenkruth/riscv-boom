@@ -427,6 +427,10 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   // corefuzzing: secret address range for ITLB secret shadow computation in frontend
   val cf_secret_start_addr   = Output(UInt(vaddrBitsExtended.W))
   val cf_secret_end_addr     = Output(UInt(vaddrBitsExtended.W))
+  // [C1] IFT-less Ceviche: the live attacker range for its own domain bit.  cf_attacker_* above stay tied to the no-IFT constant
+  // so the IFT-off BPD/RAS/redirect domain logic that reads them does not become live in a Ceviche build.
+  val cev_atk_start_addr = if (CEV_OWN_DOM) Some(Output(UInt(vaddrBitsExtended.W))) else None
+  val cev_atk_end_addr   = if (CEV_OWN_DOM) Some(Output(UInt(vaddrBitsExtended.W))) else None
 
   // corefuzzing: multi-port dispatch/execute-time FTQ secret marking (replaces commit-time single port)
   // Driven from core.scala dispatch and lsu.scala TLB stage; forwarded to FTQ.cf_secret_ftq_updates
@@ -639,6 +643,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s0_fetch_is_attacker = (io.cpu.cf_attacker_start_addr =/= 0.U) &&
     (s0_vpc >= io.cpu.cf_attacker_start_addr) && (s0_vpc < io.cpu.cf_attacker_end_addr)
   // [R124GATE3] patch 28 (B51): IFT-only (feeds only the ICache domain-mismatch compare).
+  // [C1] the Ceviche I$ domain at s1 for IFT-less Ceviche: the same s1 form as s1_vpc_atk (range registered one cycle, compared at s1,
+  // enable = start =/= 0 as cf_rng_en_q).  Registers exist only with CEV_OWN_DOM.
+  val cev_rng_q = if (CEV_OWN_DOM) Some(RegNext(VecInit(io.cpu.cev_atk_start_addr.get, io.cpu.cev_atk_end_addr.get))) else None
+  val cev_rng_en_q = if (CEV_OWN_DOM) Some(RegNext(io.cpu.cev_atk_start_addr.get =/= 0.U)) else None
+  val s1_cev_dom = cev_rng_q.map(q => cev_rng_en_q.get && (s1_vpc >= q(0)) && (s1_vpc < q(1))).getOrElse(false.B)
   val s1_fetch_domain = if (ENABLE_IFT) s1_vpc_atk else false.B   // [F4S1RNG] (was RegNext(s0_fetch_is_attacker))
   // corefuzzing: compute fetch secret flag based on s0_vpc vs secret CSR range
   val s0_fetch_is_secret = (io.cpu.cf_secret_start_addr =/= io.cpu.cf_secret_end_addr) &&
@@ -727,7 +736,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   }
   val s2_pred_atk_lbl = s2_pred_atk_q || cf_f3_pred_atk_pre   // the s2 fetch's full attacker label [ICPREDF3]
   icache.io.s1_domain_id := s1_fetch_domain || s1_redir_atk
-  icache.io.cf_cev_s1_dom.foreach(_ := s1_fetch_domain)   // Ceviche: the running domain by PC range, without the IFT redirect bit
+  icache.io.cf_cev_s1_dom.foreach(_ := (if (CEV_OWN_DOM) s1_cev_dom else s1_fetch_domain))   // [C1]   // Ceviche: the running domain by PC range, without the IFT redirect bit
   // [M3ATKWIN] lean58 (Fable audit M3; RULES A U8 "symmetric", reading 1): a line FILLED while the attacker window is open takes the attacker fill
   // domain (the twin of the secret window term on s1_is_secret, registered the same way).  Fill side only: the
   // fetch's own domain for the I$ mismatch compare is unchanged (a domain compare, unlike the secret flag, would
@@ -1434,8 +1443,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   fb.io.cf_debug_fetchbuf_enable := io.cpu.cf_debug_frontend_enable
   fb.io.brupdate                 := io.cpu.brupdate
   fb.io.cf_debug_rob_enable      := io.cpu.cf_debug_rob_enable
-  fb.io.cf_attacker_start_addr   := io.cpu.cf_attacker_start_addr
-  fb.io.cf_attacker_end_addr     := io.cpu.cf_attacker_end_addr
+  // [C1] IFT-less Ceviche: the fetch buffer computes cev_dom from the live range; every other config: unchanged.
+  fb.io.cf_attacker_start_addr   := io.cpu.cev_atk_start_addr.getOrElse(io.cpu.cf_attacker_start_addr)
+  fb.io.cf_attacker_end_addr     := io.cpu.cev_atk_end_addr.getOrElse(io.cpu.cf_attacker_end_addr)
   fb.io.cf_dbg.foreach(_ := io.cpu.cf_dbg.getOrElse(false.B))   // [DBGFREEZE] patch 85 (b)
   ftq.io.cf_debug_ftq_enable   := io.cpu.cf_debug_frontend_enable
   ftq.io.cf_ftq_idx            := io.cpu.cf_ftq_idx

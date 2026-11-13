@@ -59,7 +59,8 @@ class NLPrefetcher(implicit edge: TLEdgeOut, p: Parameters) extends DataPrefetch
   val req_cmd   = Reg(UInt(M_SZ.W))
   // [R124GATE] patch 26 (ruling 124): the [PFTAINT] flops exist only with ENABLE_IFT; IFT off
   // the prefetch request is the plain NullMicroOp one (as before step 17).
-  val req_dom   = if (ENABLE_IFT) Reg(UInt(1.W)) else WireInit(0.U(1.W))   // [PFTAINT]
+  // [C1.r1] IFT-less Ceviche also keeps the trigger's domain flop (1 FF), so its prefetched line is owned by the triggering domain as with IFT.
+  val req_dom   = if (ENABLE_IFT || CEV_OWN_DOM) Reg(UInt(1.W)) else WireInit(0.U(1.W))   // [PFTAINT]
   val req_asec  = if (ENABLE_IFT) Reg(Bool()) else WireInit(false.B)
   val req_aatk  = if (ENABLE_IFT) Reg(Bool()) else WireInit(false.B)
   val req_pc12  = if (ENABLE_IFT) Reg(UInt(inflPcBitsCF.W)) else WireInit(0.U(inflPcBitsCF.W))
@@ -75,6 +76,8 @@ class NLPrefetcher(implicit edge: TLEdgeOut, p: Parameters) extends DataPrefetch
       req_asec  := io.req_asec
       req_aatk  := io.req_aatk
       req_pc12  := io.req_pc12
+    } else if (CEV_OWN_DOM) {   // [C1.r1]
+      req_dom   := io.req_dom
     }
   } .elsewhen (io.prefetch.fire) {
     req_valid := false.B
@@ -96,6 +99,7 @@ class NLPrefetcher(implicit edge: TLEdgeOut, p: Parameters) extends DataPrefetch
     io.prefetch.bits.uop.cf_domain_id.foreach(_ := req_dom)
     io.prefetch.bits.uop.debug_pc     := Cat(req_pc12, 0.U(2.W))
   }
+  io.prefetch.bits.uop.cev_dom.foreach(_ := req_dom(0))   // [C1.r1] IFT-less Ceviche: the trigger's domain (NullMicroOp gives 0)
   io.prefetch.bits.cf_addr_sec.foreach(_ := req_asec)
   io.prefetch.bits.cf_addr_atk.foreach(_ := req_aatk)   // [ATKRES]
   io.prefetch.bits.cf_res_v.foreach(_ := false.B)

@@ -165,6 +165,8 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     val cev_line_o = if (ENABLE_CEVICHE && ENABLE_IFT) Some(Output(Valid(UInt(log2Ceil(nSets*nWays).W)))) else None
     // corefuzzing: domain of the stored request — valid while MSHR is active, used at meta_write time
     val cf_req_domain   = Output(UInt(1.W))
+    // [C1.r1] IFT-less Ceviche: the request's own domain bit (req.uop.cev_dom), for the prefetcher's trigger domain (as cf_req_domain with IFT)
+    val cev_req_dom     = if (CEV_OWN_DOM) Some(Output(Bool())) else None
     val cf_req_op_count = Output(UInt(uopIDCounterWidthCF.W))
     val cf_req_pc12     = Output(UInt(inflPcBitsCF.W))   // [PCPROV] filler PC[13:2] (wire off req.uop)
     val cf_req_secret   = Output(Bool())
@@ -378,6 +380,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
      (!(io.req_sec_val && io.req_sec_rdy) && io.req_pri_val && io.req_pri_rdy))))
   // corefuzzing: expose stored request domain for fill-completion tracking in dcache
   io.cf_req_domain   := req.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W))
+  io.cev_req_dom.foreach(_ := req.uop.cev_dom.get)   // [C1.r1]
   io.cf_req_op_count := req.uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
   // [R124GATE] patch 26: IFT off drives 0, so nothing reads req.uop.debug_pc (40 FF per MSHR).
   io.cf_req_pc12     := (if (ENABLE_IFT) req.uop.debug_pc(inflPcBitsCF + 1, 2) else 0.U)   // [PCPROV]
@@ -542,7 +545,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     // release for a reservation (rsv clears only at an allocating write), so the line would leak and count against the hard limit.
     val q = io.cev_vreq.get
     q.valid := cev_on && state === s_meta_read && !cev_line_v && !req.tag_match
-    q.bits  := req.uop.cf_domain_id.getOrElse(0.U(1.W))(0)
+    q.bits  := (if (CEV_OWN_DOM) req.uop.cev_dom.get else req.uop.cf_domain_id.getOrElse(0.U(1.W))(0))   // [C1] IFT-less Ceviche: cev_dom
     when (q.fire) {
       cev_line_v := true.B
       cev_line   := io.cev_vgrant.get
@@ -700,6 +703,10 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
         cf_sec_aatk_pc := io.req.uop.debug_pc(inflPcBitsCF + 1, 2)
       }
     }
+    // [C1.r1] IFT-less Ceviche: the same requester-domain OR as [SECDOM] does for cf_domain_id with IFT, so the VSU request at
+    // s_meta_read (cev_vreq.bits) keys on the domain the IFT Ceviche build uses: a demand secondary that joins a miss, or promotes a
+    // parked prefetch (s_prefetch -> s_meta_read), brings its domain.  1 LUT per MSHR; exists only with CEV_OWN_DOM.
+    if (CEV_OWN_DOM) { req.uop.cev_dom.get := req.uop.cev_dom.get || io.req.uop.cev_dom.get }
   }
 
   def handle_pri_req(old_state: UInt): UInt = {
@@ -1779,7 +1786,8 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     prefetcher.io.req_pc12    := RegNext(Mux1H(commit_vals, mshrs.map(m =>
                                    Mux(m.io.cf_req_addr_sec || m.io.cf_req_addr_atk, m.io.cf_req_res_pc, m.io.cf_req_pc12))))
   } else {
-    prefetcher.io.req_dom     := 0.U
+    // [C1.r1] IFT-less Ceviche: the triggering MSHR's own domain, muxed and registered like req_addr (as [PFTAINT] with IFT); else 0 as before.
+    prefetcher.io.req_dom     := (if (CEV_OWN_DOM) RegNext(Mux1H(commit_vals, mshrs.map(_.io.cev_req_dom.get))).asUInt else 0.U)
     prefetcher.io.req_asec    := false.B
     prefetcher.io.req_aatk    := false.B
     prefetcher.io.req_pc12    := 0.U

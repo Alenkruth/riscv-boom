@@ -287,6 +287,10 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   // uop copy (ROB, LDQ/STQ, IQ slots, BKQs, fetch buffer, FU pipes, D$ s1/s2, MSHRs) holds them.
   // IFT on: the same type at the same position, so the IFT-on bundle and Verilog are unchanged.
   val cf_domain_id            = if (ENABLE_IFT) Some(UInt(iftTagWidth.W)) else None
+  // [C1] Ceviche without IFT: the 1-bit PC-range domain (1 = attacker), set in the fetch buffer.  Exists only with Ceviche on and IFT off.
+  val cev_dom                 = if (CEV_OWN_DOM) Some(Bool()) else None
+  // The domain Ceviche keys on: the IFT domain (cf_domain_id === 1) with IFT, cev_dom without (false when neither exists).
+  def cev_domain: Bool = cf_domain_id.map(_ === 1.U).getOrElse(cev_dom.getOrElse(false.B))
   val cf_attacker_influence   = if (ENABLE_IFT) Some(Bool()) else None
   val cf_secret_access        = if (ENABLE_IFT) Some(Bool()) else None      // set when the micro-op accesses a secret
   val cf_secret_propagation   = if (ENABLE_IFT) Some(Bool()) else None      // set when the micro-op is in the dependence chain of originating in a secret

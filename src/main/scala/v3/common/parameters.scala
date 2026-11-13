@@ -201,7 +201,8 @@ case class BoomCoreParams(
   require(!enableSpecASan || (isPow2(specasanTagWindowBytes) && specasanTagWindowBytes >= (BigInt(specasanTagCacheEntries) << 10) &&
           specasanTagWindowBase % specasanTagWindowBytes == 0), "SpecASan: the tagged window must be a power of two, aligned, and cover the buffer")
   require(!enableSpecASan || specasanPaintQueue >= 2, "SpecASan: paint queue depth")
-  require(!enableCeviche || enableIFT,    "Ceviche uses the IFT domain plumbing (cf_domain_id, fetch domain)")
+  // [C1] Ceviche no longer needs IFT: with IFT off it gets its own 1-bit PC-range domain (uop.cev_dom, frontend cev_atk_*), see CEV_OWN_DOM.
+  // IFT on, nothing changes (the IFT domain is used as before).  The enableReconf require below stays.
   require(!enableCeviche || enableReconf, "Ceviche switches the D$ mode through the 2.10f writeback walk (exists only with enableReconf)")
   // [DIV2] r1: the ONE flag every consumer reads (execution-units.scala unit 2, DIV_CTL CSR decl).  hasDiv2 alone is not enough:
   // WithFuzzingBoom is also the base of BaselineBoom*/IFTOnly/power-cal/OOC configs (no reconfiguration; some at INT issue
@@ -516,7 +517,8 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
 
   def cf_chill = getOrElse(chillCSRCF, _.value(0), false.B)
 
-  override def attackerAddrStartCSRCF = if (cfIFTEnabled) {
+  // [C1] the attacker range CSRs also exist for IFT-less Ceviche (its own domain source); the secret range CSRs stay IFT-only.
+  override def attackerAddrStartCSRCF = if (cfIFTEnabled || cfCevicheEnabled) {
     val mask = BigInt(0x7FFFFFFF)
     val init = BigInt(0x0) // the default value is 0x0 here
     // the idea is that the program will write the offset of
@@ -524,7 +526,7 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     Some(CustomCSR(attackerAddrStartCSRIdCF, mask, Some(init)))
   } else None
 
-  override def attackerAddrEndCSRCF = if (cfIFTEnabled) {
+  override def attackerAddrEndCSRCF = if (cfIFTEnabled || cfCevicheEnabled) {
     val mask = BigInt(0x7FFFFFFF)
     val init = BigInt(0x0) // the default value is 0x0 here
     // the idea is that the program will write the offset of
@@ -829,6 +831,9 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val specasanTagCacheEntries     = boomParams.specasanTagCacheEntries
   val specasanPaintQueue          = boomParams.specasanPaintQueue
   val ENABLE_CEVICHE              = boomParams.enableCeviche
+  // [C1] Ceviche without IFT: its own domain bit (uop.cev_dom, fed from the attacker range CSRs by the fetch buffer).  False in every
+  // config that elaborated before C1 (Ceviche required IFT), so those configs are unchanged.
+  val CEV_OWN_DOM                 = boomParams.enableCeviche && !boomParams.enableIFT
   val DCACHE_REPL_DEFAULT = boomParams.dcacheReplPolicy // [r147] D$ replacement design default (0/1/2)
   val ENABLE_CF_DEBUG_PRINTF = boomParams.enableCfDebugPrintf // compile-time gate for [FLUSH]/[SPECULATIVE] debug printfs
   val ENABLE_CF_CACHE_SHADOW_PRINTF = boomParams.enableCfDebugPrintf && boomParams.enableCfCacheShadowPrintf // D$ shadow prints for dcheck

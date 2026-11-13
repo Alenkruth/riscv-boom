@@ -288,6 +288,7 @@ trait ScalarOpConstants
     uop.ctrl := cs
     // Initialize all CoreFuzzing IFT fields to deterministic zero values
     uop.cf_domain_id.foreach(_ := 0.U)
+    uop.cev_dom.foreach(_ := false.B)   // [C1]
     uop.cf_attacker_influence.foreach(_ := false.B)
     uop.cf_secret_access.foreach(_ := false.B)
     uop.cf_secret_propagation.foreach(_ := false.B)
