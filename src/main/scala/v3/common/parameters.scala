@@ -441,13 +441,16 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   def sa_paint_data = getOrElse(specasanPaintCSRCF, _.wdata, 0.U(64.W))
   def sa_stat_set(v: UInt): Unit = publish(specasanStatCSRCF, v)
   // ---- Ceviche (ceviche-plan-v5.md section 6) ----
-  override def cevicheCtlCSRCF = if (cfCevicheEnabled) Some(CustomCSR(cevicheCtlCSRIdCF, (BigInt(1) << 51) - 1, Some(BigInt(0)))) else None
+  override def cevicheCtlCSRCF = if (cfCevicheEnabled) Some(CustomCSR(cevicheCtlCSRIdCF, (BigInt(1) << 52) - 1, Some(BigInt(0)))) else None   // [CEVDS] bit 51 added
   def cf_ceviche_en     = getOrElse(cevicheCtlCSRCF, _.value(0),      false.B)
   def cf_ceviche_pol    = getOrElse(cevicheCtlCSRCF, _.value(8,1),    0.U(8.W))    // {pol1[3:0], pol0[3:0]}, nibble = {S,I,W,R}
   def cf_ceviche_hard_d = getOrElse(cevicheCtlCSRCF, _.value(19,9),   0.U(11.W))   // lines; 0 -> 768 (75 % of 1024)
   def cf_ceviche_soft_d = getOrElse(cevicheCtlCSRCF, _.value(30,20),  0.U(11.W))   // lines; 0 -> 512 (50 %)
   def cf_ceviche_hard_i = getOrElse(cevicheCtlCSRCF, _.value(40,31),  0.U(10.W))   // lines; 0 -> 384
   def cf_ceviche_soft_i = getOrElse(cevicheCtlCSRCF, _.value(50,41),  0.U(10.W))   // lines; 0 -> 256
+  // [CEVDS] D$ sharing policy: 1 = strict (domain-keyed hit; a cross-domain access waits until it is non-speculative, then the other
+  // domain's copy is written back / invalidated and the access misses into its own domain), 0 = permissive (CEV4-1 (a), reset)
+  def cf_ceviche_dstrict = getOrElse(cevicheCtlCSRCF, _.value(51),     false.B)
   // ---- [DIV2] second integer divider (second-divider-plan-20261103.md section 3) ----
   override def divCtlCSRCF = if (cfDiv2Enabled) Some(CustomCSR(divCtlCSRIdCF, BigInt(0x1), Some(BigInt(0)))) else None
   def cf_div2_en        = getOrElse(divCtlCSRCF, _.value(0), false.B)

@@ -199,6 +199,7 @@ with CoreFuzzingConstants
   val cf_ceviche_en     = if (ENABLE_CEVICHE) Some(Output(Bool()))     else None
   val cf_ceviche_hard_d = if (ENABLE_CEVICHE) Some(Output(UInt(11.W))) else None
   val cf_ceviche_soft_d = if (ENABLE_CEVICHE) Some(Output(UInt(11.W))) else None
+  val cf_ceviche_dstrict = if (ENABLE_CEVICHE) Some(Output(Bool())) else None   // [CEVDS] CEVICHE_CTL[51]
   // [reconf-fix Phase C] L1 invalidate-all walker (CSR 0xbc4, RESTORE-ONLY):
   // write pulse + wdata (bit1 = discard walk), and busy back-channel to core
   // (published as 0xbcd[17]).  Constant-tied in the baseline flavor → pruned.
@@ -415,6 +416,7 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   val cf_ceviche_en     = if (ENABLE_CEVICHE) Some(Input(Bool()))     else None      // Ceviche: CEVICHE_CTL[0]
   val cf_ceviche_hard_d = if (ENABLE_CEVICHE) Some(Input(UInt(11.W))) else None      // Ceviche: D$ hard limit (0 = 768)
   val cf_ceviche_soft_d = if (ENABLE_CEVICHE) Some(Input(UInt(11.W))) else None      // Ceviche: D$ soft limit (0 = 512)
+  val cf_ceviche_dstrict = if (ENABLE_CEVICHE) Some(Input(Bool())) else None         // [CEVDS] Ceviche: D$ strict policy (CEVICHE_CTL[51])
 }
 
 class LSUIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
@@ -1767,6 +1769,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   io.dmem.cf_ceviche_en.foreach(_     := io.core.cf_ceviche_en.get)
   io.dmem.cf_ceviche_hard_d.foreach(_ := io.core.cf_ceviche_hard_d.get)
   io.dmem.cf_ceviche_soft_d.foreach(_ := io.core.cf_ceviche_soft_d.get)
+  io.dmem.cf_ceviche_dstrict.foreach(_ := io.core.cf_ceviche_dstrict.get)   // [CEVDS]
   io.dmem.cf_debug_dcache_enable := io.core.cf_debug_dcache_enable && io.core.cf_debug_lsu_enable
   io.dmem.cf_debug_repl_enable   := io.core.cf_debug_repl_enable
   // [reconf-fix Phase C] invalidate-walker trigger down, busy back up

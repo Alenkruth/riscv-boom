@@ -37,8 +37,12 @@ class CevCamRam extends BlackBox with HasBlackBoxResource {
 // N1: the FREQ increment arrives as {lane enable, s2 line}; the one-hot vectors are decoded here (no nLines-wide bus at the boundary).
 class CevCRF(val nLines: Int, val keyBits: Int, val nSearch: Int, val isI: Boolean, val withSec: Boolean,
              val expireCycles: Int, val withTaint: Boolean = false, val withIftDom: Boolean = false,
-             val dbgChecks: Boolean = false) extends Module {
+             val dbgChecks: Boolean = false, val rowBits: Int = 0) extends Module {
   val lineBits = log2Ceil(nLines)
+  // [CEVPOOL] runtime pool size (owner 2026-11-15): with rowBits > 0, line L = {way = L >> rowBits, row = L(rowBits-1, 0)} is in the pool
+  // only when its row and way are inside the applied geometry, given as the masks actRow = activeRows - 1 and actWay = activeWays - 1
+  // (powers of two, flops written at the apply).  rowBits = 0: every line is in the pool (unit bench, no masks).
+  val wayBits = if (rowBits > 0) lineBits - rowBits else 0
   val io = IO(new Bundle {
     // ---- search (combinational within the caller's s1; caller registers the results) ----
     val sKey   = Input(Vec(nSearch, UInt(keyBits.W)))
@@ -96,6 +100,9 @@ class CevCRF(val nLines: Int, val keyBits: Int, val nSearch: Int, val isI: Boole
     val poolEmpty = Output(Bool())
     val freeIdx   = Output(UInt(lineBits.W))            // lowest-index free line (valid when !poolEmpty)
     val occ       = Output(Vec(2, UInt((lineBits + 1).W)))
+    // ---- [CEVPOOL] applied pool geometry (rowBits > 0 only) ----
+    val actRow = if (rowBits > 0) Some(Input(UInt(rowBits.W))) else None
+    val actWay = if (rowBits > 0 && wayBits > 0) Some(Input(UInt(wayBits.W))) else None
   })
   // [B1] The key lives in the BRAM CAM (a bit per line and slice row) and in keyCopy, which supplies the old key to the erase.  keyCopy is
   // written at the set cycle only, so it always names the key whose bits the BRAM holds (or will hold after the set in flight).
@@ -311,7 +318,14 @@ class CevCRF(val nLines: Int, val keyBits: Int, val nSearch: Int, val isI: Boole
   if (withTaint) { io.cTS.get := tS.get(io.cIdx); io.cTA.get := tA.get(io.cIdx) }   // [T-IFT v4, B1] two more bit-slices of the same mux: 0 added levels
 
   // ---- free pool: invalid and not reserved (1:1 register = line; BOOM free-list style priority select) ----
-  val free = VecInit((0 until nLines).map(i => !v(i) && !rsv(i))).asUInt
+  // [CEVPOOL] a line outside the applied geometry is never free, so it is never granted, never keyed and never matched (the apply
+  // that shrinks the pool also clears every line: D$ walk apply / I$ flush, both clearAll).  row r < activeRows <=> actRow(msb(r)),
+  // way w < activeWays <=> actWay(msb(w)) for thermometer masks: 2 mask flops per line, one LUT with !v and !rsv.
+  def inPool(i: Int): Bool = if (rowBits == 0) true.B else {
+    val r = i & ((1 << rowBits) - 1); val w = i >> rowBits
+    (if (r == 0) true.B else io.actRow.get(log2Floor(r))) && (if (w == 0) true.B else io.actWay.get(log2Floor(w)))
+  }
+  val free = VecInit((0 until nLines).map(i => !v(i) && !rsv(i) && inPool(i))).asUInt
   io.poolEmpty := !free.orR
   io.freeIdx   := PriorityEncoder(free)
 
@@ -331,7 +345,7 @@ class CevCRF(val nLines: Int, val keyBits: Int, val nSearch: Int, val isI: Boole
 
 // Paper 5.2 + Fig. 4 with the Section 5.2 text reading of rebalancing (plan 1.4-1/2/3).
 class CevVSU(val nLines: Int, val hardDefault: Int, val softDefault: Int, val rebalInterval: Int = 100000,
-             val nReq: Int = 1, val withTaint: Boolean = false) extends Module {
+             val nReq: Int = 1, val withTaint: Boolean = false, val masked: Boolean = false) extends Module {
   val lineBits = log2Ceil(nLines)
   val cntBits  = lineBits + 1
   val reqIdW   = log2Ceil(nReq) max 1                   // requester id width (D$: nMSHRs, M3; I$: one refill)
@@ -356,9 +370,20 @@ class CevVSU(val nLines: Int, val hardDefault: Int, val softDefault: Int, val re
     val reqId    = Input(UInt(reqIdW.W))
     val lock     = Output(Valid(UInt(reqIdW.W)))
     val roundEnd = Output(Bool())
+    // [CEVPOOL] the pool's line mask {actWay, actRow} (masked only): candidates are drawn inside it, the default limits scale with it
+    val lineMask = if (masked) Some(Input(UInt(lineBits.W))) else None
   })
-  val HL = Mux(io.hardCsr === 0.U, hardDefault.U, io.hardCsr)
-  val SL = Mux(io.softCsr === 0.U, softDefault.U, io.softCsr)
+  // [CEVPOOL] default limits = 3/4 and 1/2 of the active lines; registered (the mask moves only at an apply, which clears the pool),
+  // reset to the full-pool values, so the full geometry gives the elaboration defaults exactly.
+  // [CEVPOOL fix] active lines = (actRow + 1) * (actWay + 1) = 2^(ones in lineMask): each field is 2^k - 1.  lineMask + 1 equals it only
+  // when the row field is full or the way field is 0; at a mixed geometry (e.g. D$ 32 sets x 2 ways: lineMask 0x09f, +1 = 160 for a
+  // 64-line pool) it gave limits above the pool, so the hard limit never bound and rebalancing never fired.  PopCount of the lineBits
+  // mask flops + a one-hot decode + the adder, all into the register: no added level on the takeFree / wantX compares.
+  val poolLines = io.lineMask.map(m => UIntToOH(PopCount(m), cntBits))
+  val hlDef = poolLines.map(p => RegNext((p >> 1) + (p >> 2), hardDefault.U(cntBits.W)))
+  val slDef = poolLines.map(p => RegNext(p >> 1, softDefault.U(cntBits.W)))
+  val HL = Mux(io.hardCsr === 0.U, hlDef.getOrElse(hardDefault.U), io.hardCsr)
+  val SL = Mux(io.softCsr === 0.U, slDef.getOrElse(softDefault.U), io.softCsr)
   val rd = io.req.bits; val od = !rd
   val rebCnt = RegInit(0.U(17.W))
   val rebOk  = rebCnt >= rebalInterval.U
@@ -404,7 +429,8 @@ class CevVSU(val nLines: Int, val hardDefault: Int, val softDefault: Int, val re
     }
     is (sScan) {
       // issue one random candidate per cycle (8 total); evaluate the previous one
-      when (k < 8.U) { candQ := lfsr(lineBits - 1, 0); candQv := true.B; k := k + 1.U } .otherwise { candQv := false.B }
+      when (k < 8.U) { candQ := (if (masked) lfsr(lineBits - 1, 0) & io.lineMask.get else lfsr(lineBits - 1, 0)); candQv := true.B; k := k + 1.U }   // [CEVPOOL] inside the pool
+      .otherwise { candQv := false.B }
       when (candQv) {
         val ok = io.cV && !io.cRsv && io.cDom === tgtDom
         when (ok && (!bestV || io.cFreq < bestF)) { bestV := true.B; bestF := io.cFreq; bestI := candQ }   // first on ties

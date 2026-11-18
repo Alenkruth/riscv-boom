@@ -29,7 +29,7 @@ class IftRGroup extends Bundle {
   val vvalid = Bool()      // [44]    the chosen victim way holds a valid line
   val way    = UInt(3.W)   // [43:41] written way (UPGRADEWAY-corrected)
   val set    = UInt(7.W)   // [40:34] masked set
-  val kind   = UInt(2.W)   // [33:32] 1 hit refresh, 2 allocation, 3 prefetch allocation
+  val kind   = UInt(2.W)   // [33:32] 1 hit refresh, 2 allocation, 3 prefetch allocation, 0 Ceviche strict XEV eviction [XEVR]
 }
 
 /** M: D$ tag/coherence write (metaWriteArb output).  [84:66], 19 b. */
