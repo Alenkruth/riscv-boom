@@ -152,6 +152,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     val cev_alloc  = if (ENABLE_CEVICHE) Some(Output(Bool())) else None
     val cev_clr    = if (ENABLE_CEVICHE) Some(Output(Bool())) else None
     val cev_gdom_o = if (ENABLE_CEVICHE) Some(Output(Bool())) else None        // [R1c B5] domain the VSU granted this MSHR's line for
+    val cev_dom_o  = if (ENABLE_CEVICHE) Some(Output(Bool())) else None        // [CEVDS] the requester domain of this MSHR (req.uop.cev_domain, a flop)
     val cev_vbusy  = if (ENABLE_CEVICHE) Some(Output(Bool())) else None        // [R1c B3] holds a victim line past its meta read: probes wait
     val cev_ppast  = if (ENABLE_CEVICHE) Some(Input(Bool())) else None         // [R1c-p2 N1] the prober is past its MSHR check
     // [T-IFT v3] Ceviche + IFT builds: the replacement-state taint the VSU decided with (driven by the D$, latched at this MSHR's
@@ -381,6 +382,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
   // corefuzzing: expose stored request domain for fill-completion tracking in dcache
   io.cf_req_domain   := req.uop.cf_domain_id.getOrElse(0.U(iftTagWidth.W))
   io.cev_req_dom.foreach(_ := req.uop.cev_dom.get)   // [C1.r1]
+  io.cev_dom_o.foreach(_ := req.uop.cev_domain)       // [CEVDS] (strict D$: a secondary merges only into an MSHR of its own domain)
   io.cf_req_op_count := req.uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))
   // [R124GATE] patch 26: IFT off drives 0, so nothing reads req.uop.debug_pc (40 FF per MSHR).
   io.cf_req_pc12     := (if (ENABLE_IFT) req.uop.debug_pc(inflPcBitsCF + 1, 2) else 0.U)   // [PCPROV]
@@ -601,7 +603,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     val m4 = io.cev_m4.get
     m4.valid     := cev_on && state === s_meta_resp_2 && !req.tag_match
     m4.bits.row  := arr_idx
-    m4.bits.way  := OHToUInt(req.way_en)
+    m4.bits.way  := (if (nWays == 1) 0.U(0.W) else OHToUInt(req.way_en))   // [CEV1W] 0-bit way field at 1 way
     m4.bits.pf   := isPrefetch(req.uop.mem_cmd) || prom
     m4.bits.key  := Mux(m4.bits.pf, cf_pri_pc12, req.uop.cf_op_count_id.getOrElse(0.U(uopIDCounterWidthCF.W))(P - 1, 0))
     m4.bits.d    := cev_gdom.get
@@ -740,7 +742,7 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
     req := io.req
     if (ENABLE_CEVICHE) {   // [Ceviche M2 (c)]
       cev_line_v := io.req.tag_match                         // an upgrade keeps its line; a miss gets one from the VSU
-      cev_line   := Cat(OHToUInt(io.req.way_en), io.req.cev_row.get)
+      cev_line   := (if (nWays == 1) io.req.cev_row.get else Cat(OHToUInt(io.req.way_en), io.req.cev_row.get))   // [CEV1W] exact width
     }
     if (SPECASAN) {   // [SA-F1] a lock-pending primary is a fetch (prefetch command: no rpq entry, no response, parks after refill)
       sa_pnd.get  := io.req.sa_unk.get
@@ -1240,6 +1242,7 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
     val cev_vreqId = if (ENABLE_CEVICHE) Some(Output(UInt((log2Ceil(cfg.nMSHRs) max 1).W))) else None   // [T1c v3 F4] the presented MSHR
     val cev_ppast  = if (ENABLE_CEVICHE) Some(Input(Bool())) else None   // [R1c-p2 N1] the prober is past its MSHR check
     val cev_vlock  = if (ENABLE_CEVICHE) Some(Input(Bool())) else None          // [T1c v3 F4] VSU lock.valid: a search runs
+    val cev_dstrict = if (ENABLE_CEVICHE) Some(Input(Bool())) else None         // [CEVDS] applied strict D$ policy (cev_on && CEVICHE_CTL[51])
     val cev_vend   = if (ENABLE_CEVICHE) Some(Input(Bool())) else None          // [T1c v3 F4] VSU roundEnd
     val cev_rt     = if (ENABLE_CEVICHE && ENABLE_IFT) Some(Input(UInt((2 * (1 + inflPcBitsCF)).W))) else None   // [T-IFT v3] to every MSHR
     val cev_vattr  = if (ENABLE_CEVICHE && ENABLE_IFT) Some(Output(UInt((2 + inflPcBitsCF).W))) else None     // [T-IFT v3] the presented MSHR's
@@ -1419,7 +1422,11 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
                                    (io.req(w).bits.addr(untagBits-1,blockOffBits) & io.dcache_set_mask)) &&
                                   (!io.cev_on.get || mshr.io.tag.bits === io.req(w).bits.addr >> cfTagLSB)))
       // [reconf-fix] compare the extended tag (cfTagLSB), matching what the MSHR stores
-      tag_matches(w)(i) := mshr.io.tag.valid && mshr.io.tag.bits === io.req(w).bits.addr >> cfTagLSB
+      // [CEVDS] strict D$: a request of the other domain is not a secondary of this MSHR (it would take this MSHR's data = a cross-domain
+      // hit under miss).  Same block -> idx_match without tag_match -> not primary, not secondary -> nacked; it retries after the fill and
+      // then sees the line as a cross-domain match (dcache.scala [CEVDS]).  One flop-sourced XNOR on the last AND of the compare.
+      tag_matches(w)(i) := mshr.io.tag.valid && mshr.io.tag.bits === io.req(w).bits.addr >> cfTagLSB &&
+                           (if (!ENABLE_CEVICHE) true.B else !io.cev_dstrict.get || mshr.io.cev_dom_o.get === io.req(w).bits.uop.cev_domain)
       way_matches(w)(i) := mshr.io.way.valid && mshr.io.way.bits === io.req(w).bits.way_en
     }
     //   wb_tag_list(i) := mshr.io.wb_req.bits.tag   // [dead-code 2026-08-13] see decl

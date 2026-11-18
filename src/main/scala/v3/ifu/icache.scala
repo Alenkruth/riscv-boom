@@ -155,15 +155,17 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val ENABLE_IFT = tileParams.core.asInstanceOf[BoomCoreParams].enableIFT
   val ENABLE_CEVICHE = tileParams.core.asInstanceOf[BoomCoreParams].enableCeviche
   // ---- Ceviche I$ (ceviche-plan-v5.md I1-I7, T5c; CevCRF / CevVSU from T1c) ----
-  require(!ENABLE_CEVICHE || (!enableICacheDelay && nWays > 1), "Ceviche I$: not supported with enableICacheDelay or a direct-mapped I$")
+  require(!ENABLE_CEVICHE || !enableICacheDelay, "Ceviche I$: not supported with enableICacheDelay")   // [CEV1W] 1 way allowed: see cevIWay
   val cevILines = nSets * nWays                                   // 512
-  val cevILineW = log2Ceil(cevILines)
+  val cevILineW = log2Ceil(cevILines); def cevIWay(l: UInt): UInt = if (nWays == 1) 0.U else l(cevILineW - 1, idxBits)   // [CEV1W] way of line l (1 way: the line is its row)
   val cev_i_on  = if (ENABLE_CEVICHE) RegInit(false.B) else false.B
   val cevICrf   = if (ENABLE_CEVICHE) Some(Module(new CevCRF(cevILines, paddrBits - blockOffBits, 1, isI = true,
                                                              withSec = ENABLE_IFT, expireCycles = 64,
                                                              withIftDom = ENABLE_IFT,   // [T-IFT v5] I$ IFT domain copy
-                                                             dbgChecks = tileParams.core.asInstanceOf[BoomCoreParams].enableCfDebugPrintf))) else None   // [B1]
-  val cevIVsu   = if (ENABLE_CEVICHE) Some(Module(new CevVSU(cevILines, hardDefault = cevILines * 3 / 4, softDefault = cevILines / 2))) else None
+                                                             dbgChecks = tileParams.core.asInstanceOf[BoomCoreParams].enableCfDebugPrintf,
+                                                             rowBits = idxBits))) else None   // [B1] [CEVPOOL]
+  val cevIVsu   = if (ENABLE_CEVICHE) Some(Module(new CevVSU(cevILines, hardDefault = cevILines * 3 / 4, softDefault = cevILines / 2,
+                                                             masked = true))) else None   // [CEVPOOL]
   def pol(d: Bool): UInt = Mux(d, io.cf_ceviche_pol.get(7, 4), io.cf_ceviche_pol.get(3, 0))   // {S, I, W, R}
   val io = IO(new ICacheBundle(outer))
   val (tl_out, edge_out) = outer.masterNode.out(0)
@@ -278,7 +280,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     val repl_way_raw = random.LFSR(16, refill_done)(log2Ceil(nWays) - 1, 0)
     (repl_way_raw & (cf_icache_active_ways - 1.U))(log2Ceil(nWays) - 1, 0)
   }
-  val repl_way = if (!ENABLE_CEVICHE) replWayStock() else Mux(cev_i_on, cev_refill_line(cevILineW - 1, idxBits), replWayStock())
+  val repl_way = if (!ENABLE_CEVICHE) replWayStock() else Mux(cev_i_on, cevIWay(cev_refill_line), replWayStock())
   // Row of the data array written by the refill beats (the line's row in Ceviche mode, the address set otherwise).
   val refill_row = if (!ENABLE_CEVICHE) refill_idx else Mux(cev_i_on, cev_refill_row, refill_idx)
   cevIVsu.foreach { u =>
@@ -440,7 +442,14 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     val cf_state_ic_tap = RegNext(w, 0.U.asTypeOf(w))   // the IC tap register (named cf_state_*: SP-27, review M5)
     t := cf_state_ic_tap
   }
-  val cev_i_toggle = if (ENABLE_CEVICHE) io.cf_ceviche_en.get =/= cev_i_on else false.B
+  // [CEVPOOL] Ceviche pool = the lines in the active rows/ways of 0xbcb.  cev_i_geo = the applied {way, set} conf: it follows the CSR while
+  // Ceviche is off; with Ceviche on, a change is applied like a mode switch (flush + CRF clearAll; the I$ holds no dirty data).
+  val cev_i_geo     = if (ENABLE_CEVICHE) RegInit(0.U(4.W)) else 0.U(4.W)
+  val cev_i_rmask   = if (ENABLE_CEVICHE) RegInit(((1 << idxBits) - 1).U(idxBits.W)) else 0.U(1.W)
+  val cev_i_wmask   = if (ENABLE_CEVICHE && nWays > 1) RegInit(((1 << log2Ceil(nWays)) - 1).U(log2Ceil(nWays).W)) else 0.U(1.W)
+  val cev_i_conf    = if (ENABLE_CEVICHE) Cat(io.cf_icache_way_conf, io.cf_icache_set_conf) else 0.U(4.W)
+  val cev_i_geo_chg = if (ENABLE_CEVICHE) cev_i_on && cev_i_conf =/= cev_i_geo else false.B
+  val cev_i_toggle = if (ENABLE_CEVICHE) io.cf_ceviche_en.get =/= cev_i_on || cev_i_geo_chg else false.B   // [CEVPOOL] mode or pool change
   val cev_i_flush  = if (ENABLE_CEVICHE) io.invalidate || cev_i_toggle else io.invalidate
   when (cev_i_flush) {
     vb_array := 0.U
@@ -455,7 +464,14 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     c.io.clearAll       := cev_i_toggle || (io.invalidate && io.cf_cev_dbg_flush.get)
     c.io.clearDom.valid := cev_i_on && io.invalidate && !io.cf_cev_dbg_flush.get
     c.io.clearDom.bits  := io.cf_cev_inval_dom.get
-    assert(!cev_i_on || (io.cf_icache_set_conf === 0.U && io.cf_icache_way_conf === 0.U), "Ceviche needs the full I$ geometry")
+    // [CEVPOOL] (was: assert full I$ geometry in Ceviche mode) the pool follows 0xbcb; masks written in the apply cycle, used from the next.
+    when (!cev_i_on || cev_i_toggle) {
+      cev_i_geo   := cev_i_conf
+      cev_i_rmask := (icacheSetOptionsVec(io.cf_icache_set_conf) - 1.U)(idxBits - 1, 0)
+      if (nWays > 1) cev_i_wmask := (cacheWayOptionsVec(io.cf_icache_way_conf) - 1.U)(log2Ceil(nWays) - 1, 0)
+    }
+    c.io.actRow.get := cev_i_rmask; c.io.actWay.foreach(_ := cev_i_wmask)
+    cevIVsu.get.io.lineMask.get := (if (nWays > 1) Cat(cev_i_wmask, cev_i_rmask) else cev_i_rmask)
     // [TF-LUTRAM] sSec / sIftDom are index reads at sLine: equal to the old Mux1H only for a one-hot match (G3: one own and one
     // shared copy, own first).  D13 twin: [B1] moved into the CRF (dbgChecks, simulation / debug-print builds only).
   }
@@ -473,7 +489,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     // Ceviche mode: the hit is the CRF line's way. [T5c] A hit on the way written by a refill beat this cycle is dropped
     // (the data read of that way is disabled by !wen, see I3); a false miss is replayed by the frontend like any miss.
     s1_tag_hit(i) := (if (!ENABLE_CEVICHE) s1_vb && tag === s1_tag && (i.U < cf_icache_active_ways)
-                      else Mux(cev_i_on, s1_cev_hit && s1_cev_line(cevILineW - 1, idxBits) === i.U &&
+                      else Mux(cev_i_on, s1_cev_hit && cevIWay(s1_cev_line) === i.U &&
                                          !(refill_one_beat && !invalidated && repl_way === i.U),
                                s1_vb && tag === s1_tag && (i.U < cf_icache_active_ways)))
   }
@@ -548,7 +564,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
       else {
         // Ceviche mode: read in s1 at (line row, offset) of way i, raw SRAM output used in s2; stock mode: the stock s0 read + RegNext.
         val s1_line_addr = Cat(0.U(1.W), s1_cev_line(idxBits - 1, 0), s1_vaddr(blockOffBits - 1, 0))
-        val cev_ren      = s1_valid && s1_cev_hit && s1_cev_line(cevILineW - 1, idxBits) === i.U && !wen
+        val cev_ren      = s1_valid && s1_cev_hit && cevIWay(s1_cev_line) === i.U && !wen
         val raw = dataArray.read(Mux(cev_i_on, row(s1_line_addr), mem_idx), Mux(cev_i_on, cev_ren, !wen && s0_ren))
         s2_dout(i) := Mux(RegNext(cev_i_on), raw, RegNext(raw))
       }
@@ -622,7 +638,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
       } else {
         // Ceviche mode: both banks read in s1 at the rows of the line's address (same row functions as the stock s0 read).
         val s1_line_addr = Cat(0.U(1.W), s1_cev_line(idxBits - 1, 0), s1_vaddr(blockOffBits - 1, 0))
-        val cev_ren      = s1_valid && s1_cev_hit && s1_cev_line(cevILineW - 1, idxBits) === i.U && !wen
+        val cev_ren      = s1_valid && s1_cev_hit && cevIWay(s1_cev_line) === i.U && !wen
         val ren          = Mux(cev_i_on, cev_ren, !wen && s0_ren)
         val raw = Cat(dataArraysB1(i).read(Mux(cev_i_on, b1Row(s1_line_addr), mem_idx1), ren),
                       dataArraysB0(i).read(Mux(cev_i_on, b0Row(s1_line_addr), mem_idx0), ren))

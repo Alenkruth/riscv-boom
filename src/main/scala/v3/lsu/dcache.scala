@@ -893,6 +893,28 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   // [Ceviche D8/D10] "the walk applies a mode change this cycle" (D10 (b) drives it with `cev_toggle_apply := ...`, T4c);
   // constant false until then.  Read by the CRF mirror (D8 clearAll).
   val cev_toggle_apply = if (ENABLE_CEVICHE) WireDefault(false.B) else false.B
+  // [CEVDS] strict D$ sharing policy (CEVICHE_CTL[51], reset 0 = permissive CEV4-1 (a)).  A live registered copy, not applied by the walk:
+  // both policies keep ONE copy of a block in the L1 (strict never makes a second copy, it moves the line), so a change at any time
+  // leaves a valid state.  Effective only with cev_on.  cev_xv_inv: the cross-domain eviction (XEV, walk block) invalidates its line
+  // this cycle (port 2, mirrored into the CRF, D8); cev_xv_busy: XEV is running (the walk waits for it).
+  val cev_dstrict = if (ENABLE_CEVICHE) RegNext(io.lsu.cf_ceviche_dstrict.get, false.B) else false.B
+  val cev_xv_inv  = if (ENABLE_CEVICHE) WireDefault(false.B) else false.B
+  val cev_xv_busy = if (ENABLE_CEVICHE) WireDefault(false.B) else false.B
+  // [CEVDS] after an XEV, the moved block is held for the non-speculative requester until it allocates its MSHR (or 256 cycles pass):
+  // a younger speculative access of the other domain must not refill it first (ping-pong livelock).  Flops, read in s1.
+  val cev_xv_hold = if (ENABLE_CEVICHE) RegInit(false.B) else false.B
+  val cev_xv_key  = if (ENABLE_CEVICHE) Reg(UInt((paddrBits - blockOffBits).W)) else 0.U(1.W)
+  // [CEVXIFT] the moving line's IFT rows, latched at the XEV start and kept equal to the arrays until the invalidate (see the XEV block):
+  // cf_xv_res = its ift_res_meta entry {asec, aatk, PC[13:2]}, cf_xv_fill = its ift_fill_meta {domain, PC[13:2]} (the filler).
+  // Ceviche + IFT builds only.  The XEV eviction record (ift_evf, written in the invalidate cycle) is built from them (cf_xv_* below).
+  val cf_xv_res   = if (ENABLE_CEVICHE && ENABLE_IFT) Reg(UInt((2 + inflPcBitsCF).W)) else 0.U((2 + inflPcBitsCF).W)
+  val cf_xv_fill  = if (ENABLE_CEVICHE && ENABLE_IFT) Reg(UInt((1 + inflPcBitsCF).W)) else 0.U((1 + inflPcBitsCF).W)
+  // [XEVR] the XEV line's way (a slice of the XEV FSM's xv_line flop, assigned in the XEV block) for the STATE R kind-0 record.
+  val cev_xv_way  = if (ENABLE_CEVICHE && ENABLE_IFT) WireDefault(0.U(log2Ceil(nWays).max(1).W)) else 0.U(1.W)
+  // [CEVPOOL] Ceviche pool = the lines in the active rows/ways of the applied 0xbc1 geometry: masks (activeSets - 1, activeWays - 1)
+  // written with cfg_*_applied in the walk's sDone (the walk has written back and invalidated every line, and the apply clears the CRF).
+  val cev_rmask = if (ENABLE_CEVICHE) RegInit(((1 << idxBits) - 1).U(idxBits.W)) else 0.U(1.W)
+  val cev_wmask = if (ENABLE_CEVICHE && nWays > 1) RegInit(((1 << log2Ceil(nWays)) - 1).U(log2Ceil(nWays).W)) else 0.U(1.W)
   // Staged = a geometry change has been requested but not yet applied.  Level-derived
   // (no CSR write pulse needed): the CSR value only moves on a write, and the flag
   // self-clears when the values match again.
@@ -978,12 +1000,15 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   val cevKeyW    = paddrBits - blockOffBits
   val cevCrf     = if (ENABLE_CEVICHE) Some(Module(new CevCRF(cevLines, cevKeyW, memWidth, isI = false, withSec = false,
                                                               expireCycles = 128, withTaint = ENABLE_IFT,
-                                                              dbgChecks = ENABLE_CF_DEBUG_PRINTF))) else None   // [T-IFT v4, B1] per-line replacement taint; [B1] CAM asserts in debug builds
+                                                              dbgChecks = ENABLE_CF_DEBUG_PRINTF, rowBits = idxBits))) else None   // [T-IFT v4, B1] per-line replacement taint; [B1] CAM asserts in debug builds; [CEVPOOL]
   val cevVsu     = if (ENABLE_CEVICHE) Some(Module(new CevVSU(cevLines, hardDefault = cevLines * 3 / 4,
-                                                              softDefault = cevLines / 2, nReq = cfg.nMSHRs, withTaint = ENABLE_IFT))) else None
+                                                              softDefault = cevLines / 2, nReq = cfg.nMSHRs, withTaint = ENABLE_IFT,
+                                                              masked = true))) else None   // [CEVPOOL]
+  cevCrf.foreach { c => c.io.actRow.get := cev_rmask; c.io.actWay.foreach(_ := cev_wmask) }                       // [CEVPOOL]
+  cevVsu.foreach { u => u.io.lineMask.get := (if (nWays > 1) Cat(cev_wmask, cev_rmask) else cev_rmask) }       // [CEVPOOL]
   def cevRow(l: UInt): UInt = l(idxBits - 1, 0)
-  def cevWayOH(l: UInt): UInt = UIntToOH(l(cevLineW - 1, idxBits), nWays)
-  def cevLineOf(idx: UInt, wayOH: UInt): UInt = Cat(OHToUInt(wayOH), idx(idxBits - 1, 0))
+  def cevWayOH(l: UInt): UInt = if (nWays == 1) 1.U(1.W) else UIntToOH(l(cevLineW - 1, idxBits), nWays)   // [CEV1W] 1 way: the only way
+  def cevLineOf(idx: UInt, wayOH: UInt): UInt = if (nWays == 1) idx(idxBits - 1, 0) else Cat(OHToUInt(wayOH), idx(idxBits - 1, 0))   // [CEV1W] exact width
   cevVsu.foreach { u =>
     u.io.hardCsr := io.lsu.cf_ceviche_hard_d.get; u.io.softCsr := io.lsu.cf_ceviche_soft_d.get
     u.io.occ := cevCrf.get.io.occ; u.io.poolEmpty := cevCrf.get.io.poolEmpty; u.io.freeIdx := cevCrf.get.io.freeIdx
@@ -1000,6 +1025,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
     cevCrf.get.io.rsvSetDom := u.io.req.bits                            // [T1c v2] domain of the granted request (M3 pick output)
   }
   mshrs.io.cev_on.foreach(_ := cev_on)
+  mshrs.io.cev_dstrict.foreach(_ := cev_on && cev_dstrict)   // [CEVDS] no cross-domain secondary
   val dataWriteArb = Module(new Arbiter(new L1DataWriteReq, 2))
   // 0 goes to pipeline, 1 goes to MSHR refills
   val dataReadArb = Module(new Arbiter(new BoomL1DataReadReq, 3))
@@ -1256,6 +1282,22 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // [Ceviche D3b] the CAM hit is on a line granted to an in-flight miss as its victim (CRF rsv): nack, see s2_nack_victim
   val s2_cev_rsv: Seq[Bool]   = if (!ENABLE_CEVICHE) Seq.fill(memWidth)(false.B) else
     RegNext(widthMap(w => s1_is_cam && cevCrf.get.io.sHit(w) && cevCrf.get.io.sRsv(w)))
+  // [CEVDS] strict D$: the CAM match of a demand / prefetch access is on a line OWNED BY THE OTHER DOMAIN (CRF dom, the VSU grant's
+  // domain) = a cross-domain match.  It is not a hit (s2_tag_match_way masked below), takes no MSHR (s2_cev_nomshr) and is nacked; the
+  // XEV (walk block) moves the line out once the access is non-speculative.  Probes stay domain-agnostic (coherence).  The requester
+  // domain is uop.cev_domain, the same bit the MSHR presents to the VSU (mshrs.scala q.bits) and the CRF stores as the owner.
+  // Levels: sDomOut is the Mux1H of the CRF dom at the match (an AND-OR tree beside sHit's OR tree), then 1 LUT, into this flop.
+  val s2_cev_x: Seq[Bool] = if (!ENABLE_CEVICHE) Seq.fill(memWidth)(false.B) else
+    RegNext(widthMap(w => cev_on && cev_dstrict && s1_is_cam && s1_type =/= t_probe && cevCrf.get.io.sHit(w) &&
+                          (cevCrf.get.io.sDomOut(w) =/= s1_req(w).uop.cev_domain)), VecInit(Seq.fill(memWidth)(false.B)))
+  // [CEVDS] the access is at the ROB head in s1 (a load cannot commit before its data returns, so it is still the head in s2)
+  val s2_cev_head: Seq[Bool] = if (!ENABLE_CEVICHE) Seq.fill(memWidth)(false.B) else
+    RegNext(widthMap(w => s1_req(w).uop.rob_idx === io.lsu.rob_head_idx))
+  // [CEVDS] XEV hold: a demand / prefetch access to the moved block that is neither a write nor at the ROB head is nacked meanwhile
+  val s2_cev_xh: Seq[Bool] = if (!ENABLE_CEVICHE) Seq.fill(memWidth)(false.B) else
+    RegNext(widthMap(w => cev_xv_hold && (s1_type === t_lsu || s1_type === t_prefetch) && (s1_addr(w) >> blockOffBits) === cev_xv_key &&
+                          !(s1_type === t_lsu && (isWrite(s1_req(w).uop.mem_cmd) || s1_req(w).uop.rob_idx === io.lsu.rob_head_idx))),
+            VecInit(Seq.fill(memWidth)(false.B)))
   // [Ceviche D2 (c)] late data read at the line found in s1
   data.io.cev.foreach { c =>
     c.on := cev_on
@@ -1353,7 +1395,13 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   for (w <- 0 until memWidth)
     s2_req(w).uop.br_mask := GetNewBrMask(io.lsu.brupdate, s1_req(w).uop)
 
-  val s2_tag_match_way = RegNext(s1_tag_match_way)
+  // [CEVDS] a strict cross-domain match is not a hit (flop AND on the way vector; s2_cev_x = 0 unless cev_on && strict)
+  // [CEVXIFT] s2_cev_way_u: the same register before the mask (= s2_tag_match_way except on a strict cross-domain match, where it still
+  // names the matched line's way).  Selects the per-line IFT rows (s2_fill_entry / s2_res_entry) in Ceviche + IFT builds, so the XEV can
+  // latch the moving line's marks; every reader of those two entries is gated by an s2 hit or a replay (s2_cev_x = 0 for both).
+  val s2_cev_way_u: Seq[UInt] = if (!ENABLE_CEVICHE) Seq.fill(memWidth)(0.U(nWays.W)) else widthMap(w => RegNext(s1_tag_match_way(w)))
+  val s2_tag_match_way = if (!ENABLE_CEVICHE) RegNext(s1_tag_match_way)
+                         else widthMap(w => s2_cev_way_u(w) & ~Fill(nWays, s2_cev_x(w)))
   val s2_tag_match     = s2_tag_match_way.map(_.orR)
   // [Ceviche D3] CAM types take the coherence state from the CRF (registered in s1); known-L types keep the meta read.
   val s2_hit_state     = if (!ENABLE_CEVICHE) widthMap(i => Mux1H(s2_tag_match_way(i), wayMap((w: Int) => RegNext(meta(i).io.resp(w).coh))))
@@ -1729,7 +1777,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // [R1c B4/B1] and (Ceviche mode) so is ANY CAM access to a reserved line (a permission miss on it would allocate a second MSHR on
   // the line) and an upgrade while the VSU is busy: neither takes an MSHR.
   val s2_cev_nomshr: Seq[Bool] = if (!ENABLE_CEVICHE) Seq.fill(memWidth)(false.B) else   // [R1c-p2 P1]
-    widthMap(w => (cev_on && s2_cev_rsv(w)) || s2_cev_upg_blk(w))
+    widthMap(w => (cev_on && s2_cev_rsv(w)) || s2_cev_upg_blk(w) || s2_cev_x(w) || s2_cev_xh(w))   // [CEVDS] strict cross-domain match / XEV hold: nack, no MSHR
   // [T-IFT v5] the Ceviche nack causes and the hit line, for the IFT nack attribution in the MSHR file (flops: s2 registers, VSU busy)
   mshrs.io.cf_cev_nk.foreach(n => for (w <- 0 until memWidth) {
     n(w).rsv := cev_on && s2_cev_rsv(w); n(w).upg := s2_cev_upg_blk(w); n(w).line := s2_cev_line(w) })
@@ -1928,11 +1976,43 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   val cf_m4_pres    = if (CEVIFT) cev_on && cf_m4.get.valid else false.B               // flops (MSHR state, cev_on)
   val cf_m4_ok      = if (CEVIFT) cf_m4_pres && mshrs.io.meta_resp.valid else false.B  // not nacked by the prober
   val cf_m4_vv      = if (CEVIFT) cf_m4_ok && mshrs.io.meta_resp.bits.coh.isValid() else false.B   // the granted line held a valid block: it leaves
-  val cf_m4_set     = if (CEVIFT) mshrs.io.meta_resp.bits.tag(idxBits - 1, 0) else 0.U(idxBits.W)  // the victim BLOCK's address set (tag = block address, D7)
+  // [M4MASK] (brief ceviche-m4mask-xevR-20261115) masked like every ift_evf reader (dcacheMaskIdx) and the XEV record (cf_xv_set): with a
+  // reduced 0xbc1 pool the unmasked set put the record of a block whose set bits lie above the mask in a row no reader reads (lost
+  // CACHE_EVICTION edge).  Full pool (mask all ones): unchanged.  One AND with a CSR-derived flop (merges into the WA select LUT).
+  val cf_m4_set     = if (CEVIFT) mshrs.io.meta_resp.bits.tag(idxBits - 1, 0) & dcache_set_mask(idxBits - 1, 0) else 0.U(idxBits.W)  // the victim BLOCK's address set (tag = block address, D7)
   val cf_m4_tag     = if (CEVIFT) (mshrs.io.meta_resp.bits.tag >> (cfTagLSB - blockOffBits))(cfTagBits - 1, 0) else 0.U(cfTagBits.W)   // the stock record tag
   val cf_m4b        = cf_m4.map(_.bits)
+  // [CEVXIFT] (brief ceviche-xev-ift-20261115) the strict-mode cross-domain eviction (XEV, [CEVDS]) is a D$ eviction too: it is recorded
+  // through the same lane-0 path as the M4 event, in its invalidate cycle (metaWriteArb port 2 fires with cev_xv_inv; a line that moved
+  // meanwhile is not invalidated and records nothing; a dirty line is written back first, the record is still made at the invalidate).
+  // Record {r, s, a, d, victim tag, PC} in the stock ift_evf meaning, with the stock reader rules (dcache s2_evf_*, the MSHR edge):
+  //   victim tag / set = the moved block (cev_xv_key; the set is masked like every reader's dcacheMaskIdx);
+  //   s  = the line's secret mark (ift_res_meta asec: filled or touched by an s_acc / s_prop load or a secret-derived address);
+  //   a  = the line was filled by the attacker domain (ift_fill_meta domain) or carries the attacker-address mark (aatk);
+  //   d  = filled by the attacker domain (the value bit, as a stock attacker allocation);
+  //   PC = the mark's PC when s, else the attacker filler's PC (fill meta) when filled by the attacker, else the aatk mark's PC;
+  //   r  = 0 (the PC names the line's own access, not the replacement state).
+  // The reader is the XEV requester itself: its retry misses on that block (no other copy exists, and the [CEVDS] hold nacks the other
+  // domain's speculative accesses to it until the requester's MSHR fires) and consumes the record, so the requester's load gets the
+  // CACHE_EVICTION edge {sec = s, atk = a for a domain-0 reader} with that PC and the stock value taint.  This is the edge a permissive
+  // D$ gives the same access when it HITS the other domain's line (residency res_line / ratk_fire, attacker-fill evict_fire), so the
+  // cross-domain flow is recorded in strict mode as in permissive mode; the other direction (the requester's own access -> the domain it
+  // took the line from) is the next XEV on that block, whose line the requester's retry filled (its fill meta / marks name it).
+  // Levels: the record fields are flops (cf_xv_res / cf_xv_fill, cev_xv_key) and one 2-3-input LUT each; the field selects are the
+  // registered state decode cev_xv_inv (a 2:1 in front of the M4 selects, beside the stock ones); the event term (port-2 fire) joins
+  // cf_evicts(0) beside cf_m4_vv.  +0..1 LUT on the ift_evf WE/WA/DI cone (the M4 cone already has it); 0 FF here.
+  val cf_xv_pres    = if (CEVIFT) cev_xv_inv && metaWriteArb.io.in(2).fire else false.B
+  val cf_xv_s       = cf_xv_res(inflPcBitsCF + 1)
+  val cf_xv_fa      = cf_xv_fill(inflPcBitsCF)
+  val cf_xv_a       = cf_xv_fa || cf_xv_res(inflPcBitsCF)
+  val cf_xv_pc      = Mux(cf_xv_s || !cf_xv_fa, cf_xv_res(inflPcBitsCF - 1, 0), cf_xv_fill(inflPcBitsCF - 1, 0))
+  val cf_xv_set     = if (CEVIFT) cev_xv_key(idxBits - 1, 0) & dcache_set_mask(idxBits - 1, 0) else 0.U(idxBits.W)
+  val cf_xv_tag     = if (CEVIFT) (cev_xv_key >> (cfTagLSB - blockOffBits))(cfTagBits - 1, 0) else 0.U(cfTagBits.W)
+  // [CEVXIFT] lane 0's Ceviche record field: the XEV record in the XEV invalidate cycle (state decode, a flop), else the M4 record's
+  // (the two never coincide: no MSHR is active during an XEV, asserted below).  Used only inside the CEVIFT branches.
+  private def cfXv[T <: Data](w: Int, xv: T, m4: T): T = if (w == 0) Mux(cev_xv_inv, xv, m4) else m4
   val cf_evicts     = widthMap(w => if (!ENABLE_CEVICHE) cf_pri_alloc(w) && !s2_tag_match(w) && s2_repl_meta(w).coh.isValid()
-                                    else Mux(cev_on, (if (w == 0) cf_m4_vv else false.B),
+                                    else Mux(cev_on, (if (w == 0) (if (CEVIFT) cf_m4_vv || cf_xv_pres else cf_m4_vv) else false.B),
                                              cf_pri_alloc(w) && !s2_tag_match(w) && s2_repl_meta(w).coh.isValid()))
   val cf_rs_v       = widthMap(w => Mux(cf_repl_rand, cf_lfsr_sec_v,  s2_repl_sec(w)(inflPcBitsCF)))
   val cf_rs_pc      = widthMap(w => Mux(cf_repl_rand, cf_lfsr_sec_pc, s2_repl_sec(w)(inflPcBitsCF - 1, 0)))
@@ -1943,9 +2023,9 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   val cf_fill_sec   = widthMap(w => isRead(s2_req(w).uop.mem_cmd) && (s2_req(w).uop.cf_secret_access.getOrElse(false.B) ||
                                                                        s2_req(w).uop.cf_secret_propagation.getOrElse(false.B)))
   val cf_evict_sec  = widthMap(w => if (!CEVIFT) cf_evicts(w) && (s2_req(w).cf_addr_sec.getOrElse(false.B) || cf_fill_sec(w) || cf_rs_v(w))
-                                    else cf_evicts(w) && Mux(cev_on, cf_m4b.get.s, s2_req(w).cf_addr_sec.getOrElse(false.B) || cf_fill_sec(w) || cf_rs_v(w)))   // [T-IFT v5]
+                                    else cf_evicts(w) && Mux(cev_on, cfXv(w, cf_xv_s, cf_m4b.get.s), s2_req(w).cf_addr_sec.getOrElse(false.B) || cf_fill_sec(w) || cf_rs_v(w)))   // [T-IFT v5]
   val cf_evict_pc   = widthMap(w => if (!CEVIFT) Mux(s2_req(w).cf_addr_sec.getOrElse(false.B) || cf_fill_sec(w), cf_req_pc12(w), cf_rs_pc(w))
-                                    else Mux(cev_on, cf_m4b.get.pc, Mux(s2_req(w).cf_addr_sec.getOrElse(false.B) || cf_fill_sec(w), cf_req_pc12(w), cf_rs_pc(w))))
+                                    else Mux(cev_on, cfXv(w, cf_xv_pc, cf_m4b.get.pc), Mux(s2_req(w).cf_addr_sec.getOrElse(false.B) || cf_fill_sec(w), cf_req_pc12(w), cf_rs_pc(w))))
   // [ATKEVICT] step 17 (ruling 116 C): attacker-caused evictions, the same rule with the domain
   // in place of the address taint.  d = the allocating access is attacker-domain.
   val cf_ra_v       = widthMap(w => Mux(cf_repl_rand, cf_lfsr_atk_v,  s2_repl_atk(w)(inflPcBitsCF)))
@@ -1969,11 +2049,11 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
                                       (isRead(s2_req(w).uop.mem_cmd) && s2_req(w).uop.cf_attacker_influence.get)
                                     else cf_req_atk(w) || s2_req(w).cf_addr_atk.getOrElse(false.B))
   val cf_evict_d    = widthMap(w => if (!CEVIFT) cf_evicts(w) && cf_req_atk(w)
-                                    else cf_evicts(w) && Mux(cev_on, cf_m4b.get.d, cf_req_atk(w)))                                // [T-IFT v5]
+                                    else cf_evicts(w) && Mux(cev_on, cfXv(w, cf_xv_fa, cf_m4b.get.d), cf_req_atk(w)))                                // [T-IFT v5]
   val cf_evict_atk  = widthMap(w => if (!CEVIFT) cf_evicts(w) && (cf_req_atki(w) || cf_ra_v(w))
-                                    else cf_evicts(w) && Mux(cev_on, cf_m4b.get.a, cf_req_atki(w) || cf_ra_v(w)))                // [T-IFT v5]
+                                    else cf_evicts(w) && Mux(cev_on, cfXv(w, cf_xv_a, cf_m4b.get.a), cf_req_atki(w) || cf_ra_v(w)))                // [T-IFT v5]
   val cf_evict_apc  = widthMap(w => if (!CEVIFT) Mux(cf_req_atki(w), cf_req_pc12(w), cf_ra_pc(w))
-                                    else Mux(cev_on, cf_m4b.get.pc, Mux(cf_req_atki(w), cf_req_pc12(w), cf_ra_pc(w))))
+                                    else Mux(cev_on, cfXv(w, cf_xv_pc, cf_m4b.get.pc), Mux(cf_req_atki(w), cf_req_pc12(w), cf_ra_pc(w))))
   // consumption: the miss whose tag was the recorded victim (it now gets the edge)
   val cf_evf_take   = widthMap(w => mshrs.io.req(w).fire && s2_evf_live(w))
   // [EVFLAST] step 19 (owner ruling, generic, replaces step 17's "an attacker-only eviction does
@@ -1994,7 +2074,9 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // recorded while an older record is live, and a promoted clean one does not clear it
   // (over-taint); the exact form records at promotion (MSHR s_prefetch -> s_meta_read).
   // 1-2 LUT on the evf write enable (pf and the forwarded s2_evf live bits are early).
-  val cf_evf_pf     = widthMap(w => isPrefetch(s2_req(w).uop.mem_cmd))
+  // [CEVXIFT] the XEV cycle holds no s2 request (LSU / prefetch held off since the XEV start): lane 0's stale s2 command must not
+  // apply the prefetch rule to the XEV record.
+  val cf_evf_pf     = widthMap(w => if (CEVIFT && w == 0) isPrefetch(s2_req(w).uop.mem_cmd) && !cev_xv_inv else isPrefetch(s2_req(w).uop.mem_cmd))
   val cf_evf_pend   = widthMap(w => s2_evf_s(w) || s2_evf_a(w))
   val cf_evf_wr     = widthMap(w => (cf_evicts(w) && (!cf_evf_pf(w) || (cf_evf_new(w) && !cf_evf_pend(w)))) || cf_evf_take(w))
   if (ENABLE_IFT) {
@@ -2057,11 +2139,15 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
       assert(!(cf_m4_pres && s2_type =/= t_mshr_meta_read), "T-IFT v5: M4 event without the MSHR's meta read in s2")
       assert(!(cf_m4_pres && (cf_repl_rst || cf_evf_take(0) || (if (memWidth > 1) cf_evf_wr(1) else false.B))),
              "T-IFT v5: another ift_evf writer in the M4 cycle")
+      // [CEVXIFT] the XEV invalidate cycle has the ift_evf port to itself: no MSHR is active (the XEV drained to idle and asserts no
+      // allocation), so no M4 event and no consuming miss; the reset sweep ends long before cev_on can be set.
+      assert(!(cev_xv_inv && (cf_m4_pres || cf_repl_rst || cf_evf_take.reduce(_ || _))), "CEVXIFT: another ift_evf writer in the XEV cycle")
     }
     cf_evf_we := cf_repl_rst || cf_evf_wr.reduce(_||_)   // stock text (Ceviche: cf_evf_wr(0) includes the M4 event)
     // [T-IFT v5] lane 0's record address in Ceviche mode, in the M4 cycle: the victim block's address set (a later miss on that block reads it there)
-    def cf_evf_set(w: Int): UInt = if (w == 0) Mux(cf_m4_pres, cf_m4_set, dcacheMaskIdx(s2_req(w).addr)) else dcacheMaskIdx(s2_req(w).addr)
-    def cf_evf_tag(w: Int): UInt = if (w == 0) Mux(cf_m4_pres, cf_m4_tag, s2_repl_meta(w).tag(cfTagBits - 1, 0))
+    // [CEVXIFT] and in the XEV invalidate cycle: the moved block's (masked) address set and tag
+    def cf_evf_set(w: Int): UInt = if (w == 0) Mux(cf_m4_pres, cf_m4_set, Mux(cev_xv_inv, cf_xv_set, dcacheMaskIdx(s2_req(w).addr))) else dcacheMaskIdx(s2_req(w).addr)
+    def cf_evf_tag(w: Int): UInt = if (w == 0) Mux(cf_m4_pres, cf_m4_tag, Mux(cev_xv_inv, cf_xv_tag, s2_repl_meta(w).tag(cfTagBits - 1, 0)))
                                    else s2_repl_meta(w).tag(cfTagBits - 1, 0)   // [Ceviche D7] keep the record width
     cf_evf_wa := (if (!ENABLE_CEVICHE) Mux(cf_repl_rst, cf_repl_rst_idx, dcacheMaskIdx(s2_req(ew).addr))
                   else Mux(cf_repl_rst, cf_repl_rst_idx, VecInit((0 until memWidth).map(cf_evf_set))(ew)))   // [T-IFT v5]
@@ -2081,7 +2167,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     // existing PC select, ending at the same ift_evf LUTRAM DI: 0 added.
     val cf_own_sec = s2_req(ew).cf_addr_sec.getOrElse(false.B) || cf_fill_sec(ew)
     val cf_evf_r   = (if (!CEVIFT) Mux(cf_evict_sec(ew), !cf_own_sec, !cf_req_atki(ew))
-                      else Mux(cev_on, cf_m4b.get.r, Mux(cf_evict_sec(ew), !cf_own_sec, !cf_req_atki(ew))))   // [T-IFT v5] the M4 record's r
+                      else Mux(cev_on, cf_m4b.get.r && !cev_xv_inv, Mux(cf_evict_sec(ew), !cf_own_sec, !cf_req_atki(ew))))   // [T-IFT v5] the M4 record's r; [CEVXIFT] XEV: r = 0
     cf_evf_wd := (if (!ENABLE_CEVICHE) Mux(!cf_repl_rst && cf_evf_new(ew), Cat(cf_evf_r, cf_evict_sec(ew), cf_evict_atk(ew), cf_evict_d(ew),
                                 s2_repl_meta(ew).tag,
                                 Mux(cf_evict_sec(ew), cf_evict_pc(ew), cf_evict_apc(ew))),
@@ -2370,19 +2456,28 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     val m4       = cf_m4b.get
     val cev_miss = cev_on && stAlloc && !VecInit(s2_tag_match)(uw)
     assert(!(cf_m4_pres && (upd || stAlloc)), "T-IFT v5: an s2 replacement event in the M4 cycle")
-    stw.r_v        := (((upd || stAlloc) && !cev_miss) || m4r) && !cf_repl_rst
-    stw.r.kind     := Mux(m4r, Mux(m4.pf, 3.U, 2.U), Mux(stAlloc, Mux(stPf, 3.U, 2.U), 1.U))
-    stw.r.set      := Mux(m4r, m4.row, Mux(cev_on, VecInit((0 until memWidth).map(cfS2Row))(uw), set))
-    stw.r.way      := Mux(m4r, m4.way, way)
-    stw.r.vvalid   := Mux(m4r, cf_evicts(0), cf_evicts(uw))
-    stw.r.upg      := !m4r && stAlloc && VecInit(s2_tag_match)(uw)
-    stw.r.esec     := Mux(m4r, cf_evict_sec(0), cf_evict_sec(uw))
-    stw.r.eatk     := Mux(m4r, cf_evict_atk(0), cf_evict_atk(uw))
-    stw.r.sec      := Mux(m4r, m4.osec, cf_rsec_wd(inflPcBitsCF))
-    stw.r.atk      := Mux(m4r, m4.oatk, cf_ratk_wd(inflPcBitsCF))
-    stw.r.dom      := Mux(m4r, m4.d, s2_req(uw).uop.cf_domain_id.get(0))
-    stw.r.key      := Mux(m4r, m4.key, Mux(stAlloc && stPf, cf_req_pc12(uw), s2_req(uw).uop.cf_op_count_id.get(11, 0)))
-    stw.r.mshr     := Mux(m4r, m4.mshr, Mux(stAlloc, mshrs.io.cf_st_alloc_idx.get, 0.U))
+    // [XEVR] (brief ceviche-m4mask-xevR-20261115, owner 'Add R record') R kind 0 = the strict-mode cross-domain eviction (XEV) of one
+    // line, in its invalidate cycle (cf_xv_pres: port-2 fire with cev_xv_inv), the cycle its ift_evf record is written ([CEVXIFT]).
+    // Fields: set = the ift_evf row written (cf_xv_set, the moved block's masked address set), way = the line's way (the same cycle's
+    // M src 3 record carries the line's row), vv = 1, upg = 0, esec / eatk = the record's s / a, dom = its d (filled by the attacker
+    // domain), key = its PC[13:2], sec = atk = 0 (the XEV writes no replacement taint), mshr = 0.  The R slot is free that cycle: no s2
+    // request, no M4 event, no reset sweep (asserted).  Levels: every select is cev_xv_inv (a state decode of a flop) in front of the
+    // existing tap-register D inputs; the fields are flops / existing lane-0 labels.  Outputs only (tap register): 0 on core paths.
+    val xvr      = cev_xv_inv
+    assert(!(cev_xv_inv && (upd || stAlloc || m4r || cf_repl_rst)), "XEVR: another R event in the XEV invalidate cycle")
+    stw.r_v        := ((((upd || stAlloc) && !cev_miss) || m4r) && !cf_repl_rst) || cf_xv_pres
+    stw.r.kind     := Mux(xvr, 0.U, Mux(m4r, Mux(m4.pf, 3.U, 2.U), Mux(stAlloc, Mux(stPf, 3.U, 2.U), 1.U)))
+    stw.r.set      := Mux(xvr, cf_xv_set, Mux(m4r, m4.row, Mux(cev_on, VecInit((0 until memWidth).map(cfS2Row))(uw), set)))
+    stw.r.way      := Mux(xvr, cev_xv_way, Mux(m4r, m4.way, way))
+    stw.r.vvalid   := Mux(m4r || xvr, cf_evicts(0), cf_evicts(uw))
+    stw.r.upg      := !m4r && !xvr && stAlloc && VecInit(s2_tag_match)(uw)
+    stw.r.esec     := Mux(m4r || xvr, cf_evict_sec(0), cf_evict_sec(uw))
+    stw.r.eatk     := Mux(m4r || xvr, cf_evict_atk(0), cf_evict_atk(uw))
+    stw.r.sec      := !xvr && Mux(m4r, m4.osec, cf_rsec_wd(inflPcBitsCF))
+    stw.r.atk      := !xvr && Mux(m4r, m4.oatk, cf_ratk_wd(inflPcBitsCF))
+    stw.r.dom      := Mux(xvr, cf_xv_fa, Mux(m4r, m4.d, s2_req(uw).uop.cf_domain_id.get(0)))
+    stw.r.key      := Mux(xvr, cf_xv_pc, Mux(m4r, m4.key, Mux(stAlloc && stPf, cf_req_pc12(uw), s2_req(uw).uop.cf_op_count_id.get(11, 0))))
+    stw.r.mshr     := Mux(xvr, 0.U, Mux(m4r, m4.mshr, Mux(stAlloc, mshrs.io.cf_st_alloc_idx.get, 0.U)))
     }
     // ---- M: the one meta write per cycle (metaWriteArb: in 0 MSHR file, 1 prober, 2 walker in reconf builds).
     val stMwc  = metaWriteArb.io.chosen
@@ -2495,7 +2590,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     // mirrored (the meta array is still cleared; CAM types read v/coh only from the CRF, known-L types from the meta array).
     // [R1c B6 hygiene] port-2 writes (0xbc4 wipe, walk row invalidates) carry way_en = all ones and are not mirrored (wipe end and
     // walk apply clearAll).
-    c.io.wr.valid      := mw.fire && cev_on && !(fromMshr && f.bits.cev_clr.get) && metaWriteArb.io.chosen =/= 2.U
+    c.io.wr.valid      := mw.fire && cev_on && !(fromMshr && f.bits.cev_clr.get) && (metaWriteArb.io.chosen =/= 2.U || cev_xv_inv)   // [CEVDS] XEV: one line
     c.io.wr.bits.line  := cevLineOf(mw.bits.idx, mw.bits.way_en)
     c.io.wr.bits.key   := mw.bits.data.tag                 // full block address in Ceviche mode (D7, M2, M6)
     c.io.wr.bits.v     := mw.bits.data.coh.isValid()
@@ -2872,6 +2967,10 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     val hit = (ift_rm_wv(way) & ift_rm_oh(way) & eq).orR
     RegEnable(Mux(hit, ift_rm_wd(way), ift_res_meta(way).read(ra)), en)   // [H1T] no deferred fill mark to forward
   }
+  // [CEVXIFT] per lane: the s2 line's ift_res_meta entry and its ift_fill_meta {domain, PC}, selected by s2_cev_way_u, so that a strict
+  // cross-domain match (not a hit) still names the matched line; the XEV latches the requester lane's pair at its start.
+  val cf_xl_res  = if (ENABLE_CEVICHE && ENABLE_IFT) Some(Wire(Vec(memWidth, UInt(iftResBits.W)))) else None
+  val cf_xl_fill = if (ENABLE_CEVICHE && ENABLE_IFT) Some(Wire(Vec(memWidth, UInt((1 + inflPcBitsCF).W)))) else None
 
   for (w <- 0 until memWidth) {
     cache_resp(w).valid := s2_valid(w) && s2_send_resp(w)
@@ -2890,9 +2989,15 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     val s2_store_ways_f = VecInit((0 until nWays).map(i =>
       Mux(ift_sm_fwd_hit.map(_(w)(i)).getOrElse(false.B), ift_sm_last_dat(i), s2_store_ways(i))))
     // Mux by one-hot hit way (known in s2)
-    val s2_fill_entry  = Mux1H(s2_tag_match_way(w), s2_fill_ways)
+    // [CEVXIFT] Ceviche + IFT: the fill and residency rows are selected by the UNMASKED way (s2_cev_way_u): equal to s2_tag_match_way
+    // except on a strict cross-domain match, where every reader below is off (cf_lsu_hit = 0, not a replay; the mark write is gated by
+    // the masked way) and only the XEV latch (cf_xl_*) reads them.  The select is a flop either way (one AND fewer than the masked one).
+    val s2_ift_way     = if (ENABLE_CEVICHE && ENABLE_IFT) s2_cev_way_u(w) else s2_tag_match_way(w)
+    val s2_fill_entry  = Mux1H(s2_ift_way, s2_fill_ways)
     val s2_store_entry = Mux1H(s2_tag_match_way(w), s2_store_ways_f)
-    val s2_res_entry   = Mux1H(s2_tag_match_way(w), s2_res_ways)   // [RESID]
+    val s2_res_entry   = Mux1H(s2_ift_way, s2_res_ways)   // [RESID]
+    cf_xl_res.foreach(_(w) := s2_res_entry)                                   // [CEVXIFT]
+    cf_xl_fill.foreach(_(w) := s2_fill_entry(inflPcBitsCF, 0))                // [CEVXIFT] {domain, PC[13:2]}
     // [F9DW] lean58 timing F9 (timing-audit-20261023 sections 2.1, 6): the response's per-doubleword tests (stored
     // since fill, secret, attacker, edge) select the addressed DW of EACH way first, from s2 flops (the way's store
     // meta and the request address), and only then pick the hit way, instead of selecting the whole 32-bit entry by
@@ -3752,7 +3857,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     val (_, wk_param, _) = ClientMetadata(ClientStates.Dirty).onCacheControl(M_FLUSH)
 
     switch (wk_state) {
-      is (sIdle)    { when (cfg_change)  { wk_state := sDrain;   wk_block  := true.B } }
+      is (sIdle)    { when (cfg_change && !cev_xv_busy)  { wk_state := sDrain;   wk_block  := true.B } }   // [CEVDS] after a running XEV
       is (sDrain)   { when (dcache_idle) { wk_state := sQuiesce; wk_pblock := true.B } }
       is (sQuiesce) { when (dcache_idle) { wk_state := sRead;    wk_row    := 0.U } }
       is (sRead)    { when (wk_rd_fire)  { wk_state := sResp } }
@@ -3785,6 +3890,8 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
           cfg_set_applied := io.lsu.cf_dcache_set_conf
           cfg_way_applied := io.lsu.cf_dcache_way_conf
           if (ENABLE_CEVICHE) { cev_on := io.lsu.cf_ceviche_en.get }   // [Ceviche D10 (b)] the only writer of cev_on (G1)
+          if (ENABLE_CEVICHE) { cev_rmask := (dcacheSetOptionsVec(io.lsu.cf_dcache_set_conf) - 1.U)(idxBits - 1, 0)   // [CEVPOOL]
+                                if (nWays > 1) cev_wmask := (cacheWayOptionsVec(io.lsu.cf_dcache_way_conf) - 1.U)(log2Ceil(nWays) - 1, 0) }
           wk_state := sIdle; wk_block := false.B; wk_pblock := false.B
         }
       }
@@ -3795,8 +3902,7 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     // ones), so the CRF still holds the old lines until this clearAll (the walk invalidated the whole array).
     if (ENABLE_CEVICHE) {
       cev_toggle_apply := wk_state === sDone && dcache_idle   // [R1c B6]
-      // [Ceviche D10 (d)] sim-only contract: Ceviche needs the full D$ geometry (0xbc1 set/way = 0); both are applied in the same sDone cycle.
-      assert(!cev_on || (cfg_set_applied === 0.U && cfg_way_applied === 0.U), "Ceviche needs the full D$ geometry (0xbc1 set/way = 0)")
+      // [CEVPOOL] (was [Ceviche D10 (d)]: assert full D$ geometry in Ceviche mode) the pool follows 0xbc1 (cev_rmask / cev_wmask above).
     }
 
     // Meta read: MSHR port 3. The MSHRs are idle for the whole walk (asserted below).
@@ -3839,6 +3945,149 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
 
     // Simulation checks (no synthesized fan-out: assert-only logic is trimmed on FPGA).
     assert(!(wk_pblock && mshrs.io.req.map(_.fire).reduce(_||_)), "D$ walk: MSHR allocated during walk")
+
+    // ==== [CEVDS] XEV: cross-domain eviction of ONE line (strict D$ policy) ====
+    // A strict cross-domain match (s2_cev_x) that is non-speculative (a committed store / AMO / SC: BOOM sends those after commit; a load
+    // at the ROB head) moves the block out of the other domain: the walk's own sequence restricted to one line, on the walk's ports.
+    // Hold off LSU + prefetch, drain to idle, hold off probes, read the line's row, re-check (still that block, still valid), write it back
+    // when Dirty (voluntary Release TtoN, as the walk), wait for the ReleaseAck, invalidate the line (port 2, mirrored into the CRF: v := 0).
+    // The access retries (it was nacked) and misses into its own domain through the VSU.  A clean line is dropped silently, as the walk and
+    // the stock MSHR victim path (mshrs.scala s_meta_resp_2 -> s_commit_line) do.  A speculative cross-domain access only waits (nack):
+    // it neither hits, fills, nor evicts.  Prefetches never start an XEV (dropped).  Timing: no logic on s0/s1; one 4-bit state register,
+    // the lane pick from s2 flops; the ports reuse the walk's muxes (one more select term each).
+    if (ENABLE_CEVICHE) {
+      val xIdle :: xDrain :: xQuiesce :: xRead :: xResp :: xWb :: xWbW :: xInval :: Nil = Enum(8)
+      val xv_state = RegInit(xIdle)
+      val xv_line  = Reg(UInt(cevLineW.W))
+      val xv_key   = cev_xv_key
+      val xv_hcnt  = Reg(UInt(8.W))
+      val xv_tag   = Reg(UInt(cfTagBits.W))
+      val xv_req   = widthMap(w => s2_valid(w) && s2_cev_x(w) && s2_type === t_lsu && !s2_cev_rsv(w) &&
+                                   (isWrite(s2_req(w).uop.mem_cmd) || s2_cev_head(w)))
+      val xv_any   = xv_req.reduce(_ || _)
+      val xv_row   = cevRow(xv_line)
+      val xv_wayOH = cevWayOH(xv_line)
+      val xv_way   = if (nWays == 1) 0.U else xv_line(cevLineW - 1, idxBits)
+      cev_xv_busy := xv_state =/= xIdle
+      cev_xv_inv  := xv_state === xInval
+      switch (xv_state) {
+        is (xIdle)    { when (xv_any && wk_state === sIdle && !cfg_change) {
+                          xv_state := xDrain
+                          xv_line  := Mux1H(PriorityEncoderOH(xv_req), s2_cev_line)
+                          xv_key   := Mux1H(PriorityEncoderOH(xv_req), s2_req.map(_.addr >> blockOffBits)) } }
+        is (xDrain)   { when (dcache_idle) { xv_state := xQuiesce } }
+        is (xQuiesce) { when (dcache_idle) { xv_state := xRead } }
+        is (xRead)    { when (metaReadArb.io.in(3).fire) { xv_state := xResp } }
+        is (xResp)    {
+          val r = wk_resp(xv_way)
+          xv_tag := r.tag
+          xv_state := Mux(!(r.coh.isValid() && r.tag === xv_key), xIdle,                  // the line moved meanwhile: nothing to do
+                      Mux(r.coh.state === ClientStates.Dirty, xWb, xInval))
+        }
+        is (xWb)      { when (wbArb.io.in(1).fire) { xv_state := xWbW } }
+        is (xWbW)     { when (dcache_idle) { xv_state := xInval } }                      // WB idle = ReleaseAck received
+        is (xInval)   { when (metaWriteArb.io.in(2).fire) { xv_state := xIdle; cev_xv_hold := true.B; xv_hcnt := 0.U } }
+      }
+      // hold release: the requester (or anyone non-speculative) allocated the block's MSHR, the counter ran out, or a new XEV starts
+      when (cev_xv_hold) { xv_hcnt := xv_hcnt + 1.U }
+      when (cev_xv_hold && (xv_hcnt === 255.U || xv_state === xDrain ||
+                            (0 until memWidth).map(w => mshrs.io.req(w).fire && (mshrs.io.req(w).bits.addr >> blockOffBits) === cev_xv_key).reduce(_ || _))) {
+        cev_xv_hold := false.B
+      }
+      when (!(cev_on && cev_dstrict)) { cev_xv_hold := false.B }
+      val xv_block  = xv_state =/= xIdle
+      val xv_pblock = xv_state.isOneOf(xQuiesce, xRead, xResp, xWb, xWbW, xInval)
+      when (xv_state === xRead) {
+        metaReadArb.io.in(3).valid           := true.B
+        metaReadArb.io.in(3).bits.req(0).idx := xv_row
+        mshrs.io.meta_read.ready             := false.B
+      }
+      when (xv_state === xWb) {
+        wbArb.io.in(1).valid          := true.B
+        wbArb.io.in(1).bits.tag       := xv_tag
+        wbArb.io.in(1).bits.idx       := xv_row                // Ceviche mode: the line's row (D10 (c))
+        wbArb.io.in(1).bits.cev_blk.foreach(_ := xv_key)       // the Release address (W1)
+        wbArb.io.in(1).bits.param     := wk_param
+        wbArb.io.in(1).bits.way_en    := xv_wayOH
+        wbArb.io.in(1).bits.source    := 0.U
+        wbArb.io.in(1).bits.voluntary := true.B
+        mshrs.io.wb_req.ready         := false.B
+      }
+      when (xv_state === xInval) {
+        metaWriteArb.io.in(2).valid         := true.B
+        metaWriteArb.io.in(2).bits.idx      := xv_row
+        metaWriteArb.io.in(2).bits.way_en   := xv_wayOH
+        metaWriteArb.io.in(2).bits.data.tag := xv_key           // the CRF mirror re-writes the same key with v = 0 (no CAM change)
+        metaWriteArb.io.in(2).bits.data.coh := ClientMetadata.onReset
+      }
+      when (xv_block) {
+        io.lsu.req.ready              := false.B
+        metaReadArb.io.in(5).valid    := false.B
+        mshrs.io.prefetch.ready       := false.B
+        io.lsu.ordered                := false.B
+        // [CEVHANG] retire parked s_prefetch MSHRs (as the walk does with cfg_change and SpecASan with [SA-D6]).  A parked MSHR is not
+        // state_invalid, so dcache_idle (xDrain / xQuiesce / xWbW) waits for it, but it leaves s_prefetch only on a request (held off
+        // above), a probe, a fence/CSR wait (clear_all) or this clear: without it the XEV waits forever (cev13 case C, 2026-11-15:
+        // an attacker store started XEV with the victim's last next-line prefetch parked; "Pipeline has hung").  A parked MSHR holds
+        // no VSU grant and no cache line (Ceviche M2 (d)), so the drop is the stock silent drop of a clean prefetched block.
+        // Levels: xv_block is a decode of the xv_state flop; one more OR input on clear_prefetch_all (cfg_change today), which ends at
+        // the MSHR state flops; 0 on any s0-s2 or ready path.  ~1 LUT.
+        // [CEVHANG2] only when s2 is empty: in the first two xv_block cycles s2 can still hold an LSU / prefetch request (it entered s0
+        // before the block) that allocates an MSHR, and the allocator may pick a parked MSHR (s_prefetch gives req_pri_rdy,
+        // AgePriorityEncoder).  In s_prefetch the clear wins over that allocation (mshrs.scala s_prefetch branch: clear -> s_invalid
+        // before the pri branch), so the request would be lost (a load never answered, a store acked at s2 but never written).  The
+        // stock fence clear has the same guard (clear_all && !req.valid).  mshrs.io.req(w).valid needs s2_valid(w), so !s2_valid is
+        // sufficient, and it is a flop term (no level on the s2 nack / MSHR-ready paths).  Liveness: dcache_idle itself needs
+        // !s2_valid, so on every cycle the drain could complete but for a parked MSHR the clear is on.
+        when (!s2_valid.reduce(_ || _)) { mshrs.io.clear_prefetch_all := true.B }
+      }
+      when (xv_pblock) {
+        prober.io.req.valid := false.B
+        tl_out.b.ready      := false.B
+      }
+      // [CEVXIFT] the moving line's IFT rows for the XEV eviction record (cf_xv_* at the ift_evf write).  Latched from the requester
+      // lane's s2 rows at the start (the lane the FSM picks, its line = xv_line); then kept equal to the arrays: any ift_res_meta write
+      // to that (row, way) from the start cycle to the invalidate (an in-flight hit of the owner domain that marks the line, an
+      // upgrade's fill mark) replaces the latched entry, as the array does (the merged write is the full entry).  ift_fill_meta changes
+      // only at a fill, which a valid line does not get.  Flops + the per-way merged write bus (no new port, nothing reaches the cache).
+      // Levels: the forward compare (7-bit row of a flop or of the s2 lane pick, the way bit, the bus WE) and an 8:1 data select end
+      // at these registers; 0 on existing paths.  ~90-100 LUT (8 row compares, 14-bit 8:1 forward select, latch muxes), 27 FF.
+      if (ENABLE_IFT) {
+        cev_xv_way := xv_way                                   // [XEVR] flop slice, 0 logic
+        val xv_go   = xv_state === xIdle && xv_any && wk_state === sIdle && !cfg_change
+        val xv_pick = PriorityEncoderOH(xv_req)
+        val cur_ln  = Mux(xv_block, xv_line, Mux1H(xv_pick, s2_cev_line))
+        val cur_row = cevRow(cur_ln)
+        val cur_way = cevWayOH(cur_ln)
+        val xv_fw   = VecInit((0 until nWays).map(i => cur_way(i) && ift_rm_we(i) && ift_rm_wa(i) === cur_row)).asUInt
+        val xv_fwd  = Mux1H(xv_fw, ift_rm_wd)
+        when (xv_go) {
+          cf_xv_res  := Mux(xv_fw.orR, xv_fwd, Mux1H(xv_pick, cf_xl_res.get))
+          cf_xv_fill := Mux1H(xv_pick, cf_xl_fill.get)
+        } .elsewhen (xv_block && xv_fw.orR) {
+          cf_xv_res  := xv_fwd
+        }
+        if (ENABLE_CF_DEBUG_PRINTF) {
+          when (cf_xv_pres) {
+            printf("[CEVXIFT] set=%d tag=%x s=%d a=%d d=%d pc=%x line=%d\n", cf_xv_set, cf_xv_tag, cf_xv_s, cf_xv_a, cf_xv_fa,
+                   cf_xv_pc, xv_line)
+          }
+        }
+      }
+      assert(!(xv_block && wk_state =/= sIdle), "Ceviche XEV: overlaps the walk")
+      assert(!(xv_pblock && mshrs.io.req.map(_.fire).reduce(_||_)), "Ceviche XEV: MSHR allocated during XEV")
+      if (ENABLE_CF_DEBUG_PRINTF) {
+        when (xv_state === xIdle && xv_any && wk_state === sIdle && !cfg_change) {
+          printf("[CEVX] start line=%d blk=%x lane_req=%b\n", Mux1H(PriorityEncoderOH(xv_req), s2_cev_line),
+                 Mux1H(PriorityEncoderOH(xv_req), s2_req.map(_.addr >> blockOffBits)), xv_req.asUInt)
+        }
+        when (xv_state === xResp) {
+          printf("[CEVX] check line=%d valid=%d dirty=%d same=%d\n", xv_line, wk_resp(xv_way).coh.isValid(),
+                 wk_resp(xv_way).coh.state === ClientStates.Dirty, wk_resp(xv_way).tag === xv_key)
+        }
+        when (xv_state === xInval && metaWriteArb.io.in(2).fire) { printf("[CEVX] inval line=%d\n", xv_line) }
+      }
+    }
     assert(!(wk_pblock && s3_valid),                              "D$ walk: store hit during walk")
     // prober.io.req.valid is forced low under wk_pblock, so check the prober state instead:
     // the walk must never read or invalidate while an earlier probe is still in flight.
@@ -4020,7 +4269,16 @@ mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
     io.lsu.req.ready              := false.B
     metaReadArb.io.in(5).valid    := false.B
     mshrs.io.prefetch.ready       := false.B
-    mshrs.io.clear_prefetch_all   := true.B    // [SA-D6] retire parked s_prefetch MSHRs: they never leave s_prefetch while requests are held, and their req.sa_lk predates the paint
+    // [SA-D6] retire parked s_prefetch MSHRs: they never leave s_prefetch while requests are held, and their req.sa_lk predates the paint
+    // [SACLR] only when s2 is empty.  hold is a decode of the tag unit's state flop, so the LSU / prefetch requests that entered s0 in
+    // the two cycles before s_pdrain (the s_idle -> s_pdrain cycle included) are in s2 in the first two hold cycles and can allocate an
+    // MSHR.  The allocator may pick a parked MSHR (s_prefetch gives req_pri_rdy, AgePriorityEncoder), or the request may be its
+    // secondary; in s_prefetch the clear wins over both (mshrs.scala s_prefetch branch: clear -> s_invalid first), so the request
+    // would be lost (a load never answered, a store acked at s2 but never written).  Same guard as the stock fence clear
+    // (clear_all && !req.valid) and [CEVHANG2].  mshrs.io.req(w).valid needs s2_valid(w), so !s2_valid is sufficient; it is a flop
+    // term (no level on the s2 nack / MSHR-ready paths).  Liveness: quiet needs !s2_valid and every MSHR invalid, so on every
+    // cycle the drain could complete but for a parked MSHR the clear is on.
+    when (!s2_valid.reduce(_ || _)) { mshrs.io.clear_prefetch_all := true.B }
   }
 
   override def toString: String = BoomCoreStringPrefix(
