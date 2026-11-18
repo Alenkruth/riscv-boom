@@ -55,6 +55,10 @@ class RenameFreeList(
 
     // 3-bit index into pregFileSizeOptions for runtime physical register file size selection
     val cf_preg_idx = Input(UInt(3.W))
+    // [MSFIX3] masked-static fix 2026-11-15 (concern 3): active width N from 0xbcc (core.scala
+    // custom_csrs.cf_active_width, values 4/2/1).  Lanes w >= N carry no uops once the fetch buffer
+    // packs a narrowed width into lanes 0..N-1 ([MSFIX1]), so they must not pre-select (hold) a preg.
+    val cf_active_width = Input(UInt(3.W))
   })
   // The free list register array and its branch allocation lists.
   val free_list = RegInit(UInt(numPregs.W), ~(1.U(numPregs.W)))
@@ -130,8 +134,18 @@ class RenameFreeList(
                                        br_alloc_lists(i) & ~br_deallocs | alloc_masks(0))
   }
 
+  // [MSFIX3] lane_on(w) = (w < N), from flops: mode flops follow the CSR one cycle late (0xbcc changes only
+  // in debug halt over DMI with the pipeline empty), so lane_on is a flop output, never a deep term.  At the
+  // built width (and in a static build, where cf_active_width = coreWidth) every lane is on: identical logic.
+  val lane_on = VecInit((0 until plWidth).map { w =>
+    if (w == 0 || !ENABLE_RECONF) true.B   // reconf off: constant, the gate folds away
+    else RegNext(io.cf_active_width > w.U, true.B)
+  })
+  // A lane that is switched off returns the preg it holds in r_sel (one cycle, at the CSR change).
+  val lane_ret = Wire(Vec(plWidth, UInt(numPregs.W)))
+
   // Update the free list.
-  free_list := (free_list & ~sel_mask | dealloc_mask) & ~(1.U(numPregs.W))
+  free_list := (free_list & ~sel_mask | dealloc_mask | lane_ret.reduce(_|_)) & ~(1.U(numPregs.W))
 
   // Pipeline logic | hookup outputs.
   for (w <- 0 until plWidth) {
@@ -139,8 +153,10 @@ class RenameFreeList(
     val r_valid = RegInit(false.B)
     val r_sel   = RegEnable(OHToUInt(sels(w)), sel_fire(w))
 
-    r_valid := r_valid && !io.reqs(w) || can_sel
-    sel_fire(w) := (!r_valid || io.reqs(w)) && can_sel
+    // [MSFIX3] an off lane neither pre-selects nor holds: +1 static input on the existing LUTs, 0 levels.
+    r_valid := (r_valid && !io.reqs(w) || can_sel) && lane_on(w)
+    sel_fire(w) := (!r_valid || io.reqs(w)) && can_sel && lane_on(w)
+    lane_ret(w) := UIntToOH(r_sel)(numPregs-1,0) & Fill(n, r_valid && !lane_on(w))
 
     io.alloc_pregs(w).bits  := r_sel
     io.alloc_pregs(w).valid := r_valid

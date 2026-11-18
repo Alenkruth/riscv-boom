@@ -143,15 +143,53 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // unfiltered keys made the build's own full width look like a narrowed one (fetch throttled with a
   // cooldown of fetchWidth/2-1 cycles at coreWidth 2).  The filter keeps every key at coreWidth 4,
   // so the fuzzing build elaborates identically.
-  val groups_per_row = MuxLookup(io.cf_active_width, 1.U(3.W))(
-    Seq(2 -> (coreWidth/2), 1 -> coreWidth).filter(_._1 < coreWidth).map { case (n, g) => n.U -> g.U })
+  // [MSFIX1] masked-static fix 2026-11-15 (concern 1): a narrowed width N now fills only slots 0..N-1 of each
+  // row at enqueue (enq_idxs below), so a row is one dequeue group at every width: no sub-row slicing, no
+  // empty-sub-group skip cycles, and the uops leave in lanes 0..N-1 like a static N-wide core.  Was
+  // MuxLookup(width){2 -> coreWidth/2, 1 -> coreWidth}.
+  val groups_per_row = 1.U(3.W)
   // last_group: true when this is the final sub-group of the current row
   // At N=coreWidth: groups_per_row=1, sub_row_cnt=0, 0===0 → always true (no change to head advance)
   val last_group = (sub_row_cnt === groups_per_row - 1.U)
   // fetch_cooldown_period: (fetchWidth/N) - 1; 0 at N=coreWidth so gate is always open.
   // Derived from fetchWidth/coreWidth parameters so values update if parameters change.
-  val fetch_cooldown_period = MuxLookup(io.cf_active_width, 0.U(3.W))(   // [STATIC-CLAMP] keys < coreWidth only
-    Seq(2 -> (fetchWidth/2 - 1), 1 -> (fetchWidth - 1)).filter(_._1 < coreWidth).map { case (n, c) => n.U -> c.U })
+  // [MSFIX1] no fetch cooldown at any width: a static N-wide core has none; the buffer's room check alone
+  // throttles fetch.  Was (fetchWidth/N)-1 = 7 cycles after every enqueue at N=1, 3 at N=2.
+  val fetch_cooldown_period = 0.U(3.W)
+
+  // [MSFIX1] width modes as flops (0xbcc changes only in debug halt; csrw is unique + flush_on_commit, so the
+  // buffer is cleared around the change and the one-cycle lag is invisible).  Only widths below the built
+  // coreWidth are modes; a static narrower build (reconf off, cf_active_width = coreWidth) has none.
+  val msNarrowWidths = Seq(2, 1).filter(_ < coreWidth)
+  val msMode = msNarrowWidths.map(n => n -> RegNext(io.cf_active_width === n.U, false.B)).toMap
+  // Fetch width a static core of width N would have (stock SmallBoom/MediumBoom: fetchWidth 4,
+  // config-mixins.scala:247/:346).  Used only for the enqueue room check; the built packet stays fetchWidth wide.
+  def msEmuFetch(n: Int): Int = if (n >= coreWidth) fetchWidth else (4 min fetchWidth)
+  // Physical segment of an option at width N: the option counts INSTRUCTIONS; at N < coreWidth each row holds N,
+  // so the option needs option*coreWidth/N physical entries (capped at the built size: 64 entries = 16 rows,
+  // so options above 16 alias to 16 at N=1 and above 32 to 32 at N=2).
+  def msSeg(n0: Int, n: Int): Int = ((n0 * coreWidth / n) min numEntries)
+  // Rotate a numEntries one-hot left by a constant k inside a segment of n entries (k taken mod n).
+  def msRot(in: UInt, n: Int, k0: Int): UInt = {
+    val k = k0 % n
+    val pad = numEntries - n
+    if (k == 0) in
+    else if (pad == 0) Cat(in(n-k-1, 0), in(n-1, n-k))
+    else Cat(0.U(pad.W), in(n-k-1, 0), in(n-1, n-k))
+  }
+  // Rotate the entry one-hot by a per-width constant kOf(N) inside the active segment.  All selects are flops
+  // (msMode, cf_fb_idx), so each output bit is a static mux of a few wires: no level on the data side.
+  def msRotW(in: UInt, kOf: Int => Int): UInt = {
+    if (!ENABLE_RECONF) msRot(in, numEntries, kOf(coreWidth))
+    else {
+      val narrow = for (n <- msNarrowWidths; (n0, idx) <- fetchBufferEntryOptions.zipWithIndex)
+        yield (msMode(n) && io.cf_fb_idx === idx.U) -> msRot(in, msSeg(n0, n), kOf(n))
+      val full = fetchBufferEntryOptions.zipWithIndex.map { case (n0, idx) =>
+        (io.cf_fb_idx === idx.U) -> msRot(in, n0 min numEntries, kOf(coreWidth)) }
+      val r = MuxCase(0.U(numEntries.W), narrow ++ full)
+      Mux(r.orR, r, 1.U(numEntries.W))
+    }
+  }
 
   // used ChatGPT to write these switch statements (head and tail) for debugging - alex, corefuzzing
   // for numRows = 16
@@ -203,8 +241,30 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
 
   // this mechanism is fine as long as the rotations are done with respect with the current buffer dimensions
   // adjusments to rotateLeft should correct the functionality - alex, corefuzzing
-  val might_hit_head = (1 until fetchWidth).map(k => VecInit(rotateLeft(tail, k).asBools.zipWithIndex.filter
-    {case (e,i) => i % coreWidth == 0}.map {case (e,i) => e}).asUInt).map(tail => head & tail).reduce(_|_).orR
+  // [MSFIX1] room check in rows.  The tail is always at a row start (padded after every packet), so a packet
+  // of c instructions at width N needs ceil(c/N) rows.  A static N-wide core reserves room for its whole fetch
+  // width (msEmuFetch(N)); a packet larger than that (RVC, up to fetchWidth) needs its own count.  So row r
+  // (r >= 1 past the tail row) must be free when max(c, msEmuFetch(N)) > r*N.  At N = coreWidth this is
+  // fetchWidth > r*coreWidth: exactly the old check (row starts within fetchWidth-1 entries of the tail).
+  // Was: room for a full fetchWidth packet at every width (8 rows at N=1: an 8-entry buffer refilled only when empty).
+  val msCnt = PopCount(io.enq.bits.mask)   // from the f4 register; no dependence on io.enq.valid
+  val msMinN = (msNarrowWidths :+ coreWidth).min
+  val msMaxRows = (fetchWidth + msMinN - 1) / msMinN
+  def msNeedGt(r: Int): Bool = {
+    def needAt(n: Int): Bool = if (msEmuFetch(n) > r * n) true.B else (msCnt > (r * n).U)
+    msNarrowWidths.foldLeft(needAt(coreWidth)) { case (acc, n) => Mux(msMode(n), needAt(n), acc) }
+  }
+  // Reconf off (static builds): the original expression, so their Verilog does not change.
+  val might_hit_head = if (!ENABLE_RECONF) {
+    (1 until fetchWidth).map(k => VecInit(rotateLeft(tail, k).asBools.zipWithIndex.filter
+      {case (e,i) => i % coreWidth == 0}.map {case (e,i) => e}).asUInt).map(tail => head & tail).reduce(_|_).orR
+  } else {
+    (1 until msMaxRows).map { r =>
+      val rt = msRotW(tail, _ => coreWidth * r)
+      val rowHit = (VecInit((0 until numRows).map(j => rt(j * coreWidth))).asUInt & head).orR
+      rowHit && msNeedGt(r)
+    }.foldLeft(false.B)(_ || _)
+  }
   val at_head = (VecInit(tail.asBools.zipWithIndex.filter {case (e,i) => i % coreWidth == 0}
     .map {case (e,i) => e}).asUInt & head).orR
   // corefuzzing: block enqueue in the same cycle as io.clear to keep head/tail/ram_valid
@@ -416,13 +476,17 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
       else Cat(ptr(numRows-2, 0), ptr(numRows-1))
     } else {
     // [R1 small-build clamp] same cap as rotateLeft: option entries limited to the built size (identity at 64).
-    val cases = fetchBufferEntryOptions.zipWithIndex.map { case (n0, idx) =>
-      val rows = (n0 min numEntries) / coreWidth
+    // [MSFIX1] at a narrowed width N the segment is msSeg(option, N) entries (rows of N used slots).
+    def rowRot(rows: Int): UInt = {
       val pad  = numRows - rows
-      val rotated = if (rows == 1) Cat(0.U(pad.W), ptr(0))
-                    else if (pad == 0) Cat(ptr(rows-2, 0), ptr(rows-1))
-                    else Cat(0.U(pad.W), ptr(rows-2, 0), ptr(rows-1))
-      (io.cf_fb_idx === idx.U) -> rotated
+      if (rows == 1) Cat(0.U(pad.W), ptr(0))
+      else if (pad == 0) Cat(ptr(rows-2, 0), ptr(rows-1))
+      else Cat(0.U(pad.W), ptr(rows-2, 0), ptr(rows-1))
+    }
+    val narrow = for (n <- msNarrowWidths; (n0, idx) <- fetchBufferEntryOptions.zipWithIndex)
+      yield (msMode(n) && io.cf_fb_idx === idx.U) -> rowRot(msSeg(n0, n) / coreWidth)
+    val cases = narrow ++ fetchBufferEntryOptions.zipWithIndex.map { case (n0, idx) =>
+      (io.cf_fb_idx === idx.U) -> rowRot((n0 min numEntries) / coreWidth)
     }
     val r = MuxCase(0.U(numRows.W), cases)
     Mux(r.orR, r, 1.U(numRows.W))
@@ -432,25 +496,50 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // Use rotateLeft(enq_idx, 1) to advance the numEntries-wide entry-level tail pointer by one entry
   // within the active buffer segment.  inc() operates on the numRows-wide row-level head pointer
   // only; calling inc() on a wide tail would zero-extend and corrupt it.
-  var enq_idx = tail
-  for (i <- 0 until fetchWidth) {
-    enq_idxs(i) := enq_idx
-    enq_idx = Mux(in_mask(i), rotateLeft(enq_idx, 1), enq_idx)
+  // [MSFIX1] parallel form: the valid instruction with p older valid instructions in the packet goes to row
+  // p/N, slot p%N past the tail (at N = coreWidth: entry tail+p, as the old serial chain).  prefix p is a
+  // PopCount of register bits; the 8 candidate one-hots are static rotations of the tail.  Old: a serial chain
+  // of fetchWidth rotate-or-hold muxes (enq_idx = Mux(in_mask(i), rotateLeft(enq_idx, 1), enq_idx)).
+  def msPos(p: Int)(n: Int): Int = coreWidth * (p / n) + (p % n)
+  var enq_idx = tail   // reconf off: the original serial chain (Verilog unchanged)
+  if (!ENABLE_RECONF) {
+    for (i <- 0 until fetchWidth) {
+      enq_idxs(i) := enq_idx
+      enq_idx = Mux(in_mask(i), rotateLeft(enq_idx, 1), enq_idx)
+    }
+  } else {
+    val msCand = (0 until fetchWidth).map(p => msRotW(tail, msPos(p)))
+    for (i <- 0 until fetchWidth) {
+      if (i == 0) enq_idxs(i) := tail
+      else {
+        val pre = PopCount(in_mask.take(i))
+        enq_idxs(i) := Mux1H((0 to i).map(p => pre === p.U), msCand.take(i + 1))
+      }
+    }
   }
 
   // Pad the final tail pointer to the next row boundary.
   // A partial fetch packet (in_mask not all-ones) leaves enq_idx in the middle of a row.
   // Leaving tail there causes will_hit_tail=1 → do_deq=0 → pipeline deadlock.
   // Advance at most coreWidth-1 steps until we land on a row-start position.
-  val enq_is_row_start = VecInit(
-    (0 until numEntries).filter(_ % coreWidth == 0).map(j => enq_idx(j))).reduce(_ || _)
-  var padded_enq_idx_v = enq_idx
-  for (_ <- 1 until coreWidth) {
-    val p_at_start = VecInit(
-      (0 until numEntries).filter(_ % coreWidth == 0).map(j => padded_enq_idx_v(j))).reduce(_ || _)
-    padded_enq_idx_v = Mux(p_at_start, padded_enq_idx_v, rotateLeft(padded_enq_idx_v, 1))
+  // [MSFIX1] the next tail = ceil(c/N) rows past the tail (c = valid instructions of this packet); the same
+  // value the old rotate-then-pad produced at N = coreWidth.
+  val padded_enq_idx = if (!ENABLE_RECONF) {
+    // reconf off: the original rotate-then-pad (Verilog unchanged)
+    val enq_is_row_start = VecInit(
+      (0 until numEntries).filter(_ % coreWidth == 0).map(j => enq_idx(j))).reduce(_ || _)
+    var padded_enq_idx_v = enq_idx
+    for (_ <- 1 until coreWidth) {
+      val p_at_start = VecInit(
+        (0 until numEntries).filter(_ % coreWidth == 0).map(j => padded_enq_idx_v(j))).reduce(_ || _)
+      padded_enq_idx_v = Mux(p_at_start, padded_enq_idx_v, rotateLeft(padded_enq_idx_v, 1))
+    }
+    Mux(enq_is_row_start, enq_idx, padded_enq_idx_v)
+  } else {
+    val msInCnt = PopCount(in_mask)
+    Mux1H((0 to fetchWidth).map(c => msInCnt === c.U),
+      (0 to fetchWidth).map(c => msRotW(tail, n => coreWidth * ((c + n - 1) / n))))
   }
-  val padded_enq_idx = Mux(enq_is_row_start, enq_idx, padded_enq_idx_v)
 
   // Step 3: Write MicroOps into the RAM.
   for (i <- 0 until fetchWidth) {
@@ -499,12 +588,8 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   // N=4: MuxCase default=true → all 4 slots always active (no slicing at full width)
   // N=2: sub_row_cnt=0 → slots 0,1 (w/2==0); sub_row_cnt=1 → slots 2,3 (w/2==1)
   // N=1: sub_row_cnt==w → exactly one slot active per cycle
-  val sub_row_mask = VecInit((0 until coreWidth).map { w =>
-    MuxCase(true.B, Seq(   // [STATIC-CLAMP] keys < coreWidth only (see groups_per_row)
-      2 -> (w/2),
-      1 -> w
-    ).filter(_._1 < coreWidth).map { case (n, k) => (io.cf_active_width === n.U) -> (sub_row_cnt === k.U) })
-  })
+  // [MSFIX1] every slot of the head row is served at once (rows of N used slots at a narrowed width).
+  val sub_row_mask = VecInit(Seq.fill(coreWidth)(true.B))
   val deq_valids_sub = VecInit(deq_valids.zip(sub_row_mask).map { case (v, m) => v && m })
   io.deq.bits.uops zip deq_valids_sub        map {case (d,v) => d.valid := v}
   io.deq.bits.uops zip deq_vec(head_row)      map {case (d,q) => d.bits  := q}

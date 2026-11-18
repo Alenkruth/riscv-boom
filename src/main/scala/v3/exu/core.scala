@@ -534,6 +534,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   io.lsu.cf_ceviche_en.foreach(_     := custom_csrs.cf_ceviche_en)
   io.lsu.cf_ceviche_hard_d.foreach(_ := custom_csrs.cf_ceviche_hard_d)
   io.lsu.cf_ceviche_soft_d.foreach(_ := custom_csrs.cf_ceviche_soft_d)
+  io.lsu.cf_ceviche_dstrict.foreach(_ := custom_csrs.cf_ceviche_dstrict)   // [CEVDS]
   io.ifu.cf_ceviche_en.foreach(_     := custom_csrs.cf_ceviche_en)
   io.ifu.cf_ceviche_pol.foreach(_    := custom_csrs.cf_ceviche_pol)
   io.ifu.cf_ceviche_hard_i.foreach(_ := custom_csrs.cf_ceviche_hard_i)
@@ -630,6 +631,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   rename_stage.io.cf_preg_idx      := custom_csrs.cf_preg_idx
   fp_rename_stage.io.cf_preg_idx   := custom_csrs.cf_preg_idx
   pred_rename_stage.io.cf_preg_idx := custom_csrs.cf_preg_idx
+  // [MSFIX3] masked-static fix 2026-11-15: active width to the free lists (pred rename has no free list)
+  rename_stage.io.cf_active_width      := custom_csrs.cf_active_width
+  fp_rename_stage.io.cf_active_width   := custom_csrs.cf_active_width
+  pred_rename_stage.io.cf_active_width := custom_csrs.cf_active_width
 
   // corefuzzing
   // Quiescing control signals.  Declared as outer-scope Wires so that consumers

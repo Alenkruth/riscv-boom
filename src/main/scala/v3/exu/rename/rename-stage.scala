@@ -102,6 +102,8 @@ abstract class AbstractRenameStage(
 
     // 3-bit index into pregFileSizeOptions for physical register file size reconfiguration
     val cf_preg_idx = Input(UInt(3.W))
+    // [MSFIX3] active width N (0xbcc) for the free list's per-lane pre-selection gate
+    val cf_active_width = Input(UInt(3.W))
 
     // Fix 5: retroactive commit-time taint. If a committing instruction's source pregs are
     // now tainted (C7 fired for a producer in a prior cycle) but cf_src_tainted was false
@@ -348,6 +350,7 @@ class RenameStage(
   freelist.io.brupdate := io.brupdate
   freelist.io.debug.pipeline_empty := io.debug_rob_empty
   freelist.io.cf_preg_idx := io.cf_preg_idx
+  freelist.io.cf_active_width := io.cf_active_width
 
   assert (ren2_alloc_reqs zip freelist.io.alloc_pregs map {case (r,p) => !r || p.bits =/= 0.U} reduce (_&&_),
            "[rename-stage] A uop is trying to allocate the zero physical register.")
